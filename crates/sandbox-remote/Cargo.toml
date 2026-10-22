@@ -1,7 +1,7 @@
 [package]
 name = "sandbox-remote"
 publish = true
-version = "0.1.0"
+version = "0.2.0"
 documentation = "https://docs.rs/sandbox-remote/"
 description = "Remote (AWS Lambda) sandbox RAP server for Infinity coding agents."
 edition = "2024"
@@ -13,7 +13,7 @@ name = "sandbox-remote"
 path = "src/main.rs"
 
 [dependencies]
-sandbox-core = { path = "../sandbox-core", version = "^0.1.0" }
+sandbox-core = { path = "../sandbox-core", version = "^0.2.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 async-trait = { workspace = true }

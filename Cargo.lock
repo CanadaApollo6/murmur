@@ -2665,7 +2665,7 @@ dependencies = [
 
 [[package]]
 name = "infinity-agent-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-client-protocol",
  "alacritty_terminal",
@@ -2705,7 +2705,7 @@ dependencies = [
 
 [[package]]
 name = "infinity-agent-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2765,7 +2765,7 @@ dependencies = [
 
 [[package]]
 name = "infinity-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2802,7 +2802,7 @@ dependencies = [
 
 [[package]]
 name = "infinity-mcp-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "infinity-agent-core",
@@ -2838,7 +2838,7 @@ dependencies = [
 
 [[package]]
 name = "infinity-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "rap-protocol",
@@ -2850,7 +2850,7 @@ dependencies = [
 
 [[package]]
 name = "infinity-provider-bedrock"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2869,7 +2869,7 @@ dependencies = [
 
 [[package]]
 name = "infinity-provider-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2886,7 +2886,7 @@ dependencies = [
 
 [[package]]
 name = "infinity-provider-rig"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2897,7 +2897,7 @@ dependencies = [
 
 [[package]]
 name = "infinity-rap-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "infinity-agent-core",
@@ -4111,7 +4111,7 @@ dependencies = [
 
 [[package]]
 name = "rap-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "http-body-util",
@@ -4127,7 +4127,7 @@ dependencies = [
 
 [[package]]
 name = "rap-github-event-poller"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "clap",
@@ -4142,7 +4142,7 @@ dependencies = [
 
 [[package]]
 name = "rap-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -4155,7 +4155,7 @@ dependencies = [
 
 [[package]]
 name = "rap-steering-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "clap",
@@ -4634,7 +4634,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -4654,7 +4654,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-local"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -4678,7 +4678,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-remote"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
