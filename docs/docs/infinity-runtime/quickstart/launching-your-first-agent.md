@@ -18,8 +18,8 @@ The project needs two Infinity crates: `infinity-agent-core`, which is the runti
 
 ```toml
 [dependencies]
-infinity-agent-core = "0.1"
-infinity-provider-bedrock = "0.1"
+infinity-agent-core = "0.2"
+infinity-provider-bedrock = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
