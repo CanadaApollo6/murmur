@@ -3,3 +3,10 @@ Copyright 2026 Hydro Contributors
 
 The Initial Developer of some parts of the framework is Amazon Web Services.
 Copyright 2026 Amazon.com, Inc. or its affiliates.
+
+murmur
+Copyright 2026 Riel St. Amand and murmur contributors
+
+murmur is a fork of Infinity (https://github.com/hydro-project/infinity),
+detached at commit 1abc6fcff1f186124f924b56aa92c3a3684c90c5. Files changed
+after that commit are recorded in this repository's git history.

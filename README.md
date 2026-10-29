@@ -1,31 +1,23 @@
-# [Infinity](https://infinity.hydro.run)
+# murmur
 
-Infinity is a Rust framework for building massively concurrent agentic systems, light enough to fit 75k agents in the memory of a Raspberry Pi. Infinity does for agents what async did for threads: instead of blocking on slow tools, Infinity agents run them concurrently, yield while they wait, and cost nothing until the next event arrives.
+murmur is an agent runtime for one machine first and many machines later. It hosts local-model agents and CLI agents (Claude Code, Codex, Muse, Pi and Prime Agent) as peers. Any agent can message any other by address, and every message passes through one broker. The broker keeps the mail durable, records who saw what, and enforces budgets.
 
-```rust
-let system = AgentSystemBuilder::new_local(
-    InMemoryConversationStore::new(),
-    InMemoryStateStore::new(),
-    StaticModel::new(provider, "global.anthropic.claude-sonnet-4-6").await?,
-)
-.start();
+The long-term target is large agent swarms that work across machines without spreading bad ideas or growing their own bureaucracy. The design treats a verified "this task is impossible" as a success. It checks claims about the environment before anyone acts on them, and it gives an immune team spread statistics and risk flags instead of message content.
 
-let mut thread = system.thread_builder().launch().await;
-thread.send_user_text("Write a haiku about Rust").await?;
+## Status
 
-while let Some(event) = thread.recv().await {
-    println!("{event:?}");
-}
-```
+Design stage. Nothing in this repository runs as murmur yet.
 
-Between turns, an agent is pure data, just its conversation history with no task, no stack, and no open connection, so a waiting agent hibernates for free and wakes on the next message. The same agent code runs unchanged in a resident process on your laptop and on serverless platforms like AWS Lambda, where scale to zero is the default.
+- [Design](docs/murmur/design.md): the `agentd` broker, CLI adapters, local inference on one GPU, and the swarm layer.
+- [Type sketch](docs/murmur/sketch/lib.rs): Rust signatures with `todo!()` bodies.
+- [Grounding notes](docs/murmur/grounding/03-constraints.md): what the Infinity code does today, with file and line references.
 
-**Get started today at [infinity.hydro.run](https://infinity.hydro.run)!**
+The first implementation step is the peer-message change to the Infinity core described in the design's "Next implementation step".
 
-## Learn More
+## Based on Infinity
 
-- **[Infinity Runtime](https://infinity.hydro.run/docs/infinity-runtime/overview)**: Build your first agent with the [quickstart](https://infinity.hydro.run/docs/infinity-runtime/quickstart/launching-your-first-agent), see how yielding turns and hibernation work in the [architecture guide](https://infinity.hydro.run/docs/infinity-runtime/architecture), and [deploy on AWS Lambda](https://infinity.hydro.run/docs/infinity-runtime/serverless/quickstart) with the included CDK constructs.
+murmur is a fork of [Infinity](https://github.com/hydro-project/infinity) by the Hydro contributors, detached at commit `1abc6fc`. It does not track upstream. The crates keep their `infinity-*` names for now, and the runtime, RAP and provider protocol are Infinity's. Infinity's own README is in [docs/infinity-README.md](docs/infinity-README.md). murmur is not affiliated with or endorsed by the Infinity project.
 
-- **[Reactive Agent Protocol (RAP)](https://infinity.hydro.run/docs/rap/what-is-rap)**: Serve tools over the network without holding a connection open: results and subscription events are delivered whenever they are ready, even to agents that currently have no process at all. Existing MCP servers run unchanged through a compatibility layer, and anyone can implement the open [specification](https://infinity.hydro.run/docs/rap/spec/overview).
+## License
 
-- **[Infinity Code](https://infinity.hydro.run/docs/infinity-code/overview)**: A coding agent built on the runtime for concurrent work: it runs builds and tests in the background while their output streams in, edits in parallel threads with stacked sandboxes, and hands you each result as a diff to review.
+Apache-2.0, the same as Infinity. See [LICENSE.txt](LICENSE.txt) and [NOTICE](NOTICE).

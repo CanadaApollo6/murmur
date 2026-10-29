@@ -25,7 +25,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-repository = "https://github.com/hydro-project/infinity"
+repository = "https://github.com/CanadaApollo6/murmur"
 
 [workspace.dependencies]
 # Shared
