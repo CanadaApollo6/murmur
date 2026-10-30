@@ -291,4 +291,4 @@ v1 (one machine, a handful of agents) builds the parts that change stored data, 
 
 ## Next implementation step
 
-Commits 1 (peer messages) and 2 (provider cancellation) and the ACP spike are done. Next: the agentd mailroom with the ACP adapter for Claude and Codex. Before the first agentd release, add `act`, `task` and `exposure` to the mailroom schema and the `exposures` and `tasks` tables (`sketch/swarm.rs`), so history recorded from day one carries lineage.
+Commits 1 (peer messages) and 2 (provider cancellation), the ACP spike and the agentd mailroom (`crates/agentd`: SQLite store, delivery state machine, `HopLimit`, and the `act`, `task` and `exposure` lineage from the first message) are done. Next: the ACP adapter for Claude and Codex and the per-agent supervisor actor that drives the mailroom, then the `send_message` surfaces and `agentctl`.
