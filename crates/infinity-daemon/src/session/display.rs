@@ -89,7 +89,7 @@ pub(crate) fn history_message_to_daemon(
             result,
             tool_call_id,
             child_thread_id,
-            ..
+            invocation,
         } => {
             let text = if let Some(ToolResultContent::Text(t)) = result.content.first() {
                 t.text.clone()
@@ -98,6 +98,13 @@ pub(crate) fn history_message_to_daemon(
             };
             let name = if let Some(child_id) = child_thread_id {
                 format!("Report from child thread {}", child_id)
+            } else if tool_call_id.as_str().is_empty()
+                && let Some(from) = invocation
+                    .as_ref()
+                    .and_then(|call| call.function.arguments.get("from"))
+                    .and_then(serde_json::Value::as_str)
+            {
+                format!("message from {from}")
             } else {
                 history
                     .iter()

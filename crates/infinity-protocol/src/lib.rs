@@ -259,6 +259,12 @@ pub enum ClientMessage {
         thread_id: ThreadRef,
         text: String,
     },
+    DeliverPeerMessage {
+        thread_id: ThreadRef,
+        message_id: String,
+        from: String,
+        text: String,
+    },
     /// Disconnect from the session while letting the agent continue to run in the background.
     Disconnect,
     /// Immediately attempt to detach. If the agent is idle, the daemon shuts
