@@ -259,6 +259,9 @@ pub enum ClientMessage {
         thread_id: ThreadRef,
         text: String,
     },
+    Interrupt {
+        thread_id: ThreadRef,
+    },
     DeliverPeerMessage {
         thread_id: ThreadRef,
         message_id: String,

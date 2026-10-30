@@ -13,7 +13,7 @@ mod sender;
 pub use driver::{ThreadLifecycleEvent, ThreadLifecycleState};
 pub use handle::ThreadHandle;
 pub use launch::{LaunchingSystem, ThreadBuilder};
-pub use router::{RunningSystem, SubscribeHandle};
+pub use router::{InterruptHandle, RunningSystem, SubscribeHandle};
 pub use sender::{ChannelSendError, ChannelSender};
 
 pub(crate) use launch::{LaunchRegistry, UnionConfigSource, UnionModelSource};

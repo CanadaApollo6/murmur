@@ -84,11 +84,16 @@ fn is_compaction_complete(msg: &InputMessage) -> bool {
         .is_some_and(SyntheticKind::is_compaction_complete)
 }
 
+pub(crate) struct WorkerReceivers<Sub> {
+    pub input: mpsc::UnboundedReceiver<(InputMessage, String)>,
+    pub subscribe: mpsc::UnboundedReceiver<(Sub, oneshot::Sender<()>)>,
+    pub interrupt: mpsc::UnboundedReceiver<()>,
+}
+
 pub(crate) async fn drive_thread<C, S, H, O>(
     inner: Rc<SystemInner<C, S, ChannelSender, H>>,
     thread_id: ThreadId,
-    mut rx: mpsc::UnboundedReceiver<(InputMessage, String)>,
-    mut subscribe_rx: mpsc::UnboundedReceiver<(O::SubscribeRequest, oneshot::Sender<()>)>,
+    channels: WorkerReceivers<O::SubscribeRequest>,
     observer: O,
     active_threads: ActiveThreads,
     lifecycle_tx: mpsc::UnboundedSender<ThreadLifecycleEvent>,
@@ -98,6 +103,11 @@ pub(crate) async fn drive_thread<C, S, H, O>(
     H: HttpClient + 'static,
     O: ThreadObserver + 'static,
 {
+    let WorkerReceivers {
+        input: mut rx,
+        subscribe: mut subscribe_rx,
+        interrupt: mut interrupt_rx,
+    } = channels;
     active_threads
         .lock()
         .expect("bug: mutex poisoned")
@@ -210,6 +220,14 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                         continue;
                     }
                 },
+                Some(()) = interrupt_rx.recv() => {
+                    let res = in_flight.take().expect("bug: missing interrupted step").cancel().await;
+                    handle_step_result(
+                        res, &observer, &thread_id, &mut total_tokens,
+                        &mut compaction_triggered, &mut pending_batch,
+                    );
+                    continue;
+                },
                 req = subscribe_rx.recv(), if !subscribe_closed => {
                     match req {
                         Some((req, ack)) => {
@@ -222,6 +240,7 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                 }
             }
         } else {
+            while interrupt_rx.try_recv().is_ok() {}
             let mut batch: Vec<(InputMessage, String)> = std::mem::take(&mut pending_batch);
             while let Ok(item) = rx.try_recv() {
                 batch.push(item);
@@ -263,6 +282,7 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                                         None => return,
                                     }
                                 }
+                                Some(()) = interrupt_rx.recv() => {}
                                 req = subscribe_rx.recv(), if !subscribe_closed => {
                                     match req {
                                         Some((req, ack)) => {
@@ -310,6 +330,7 @@ pub(crate) async fn drive_thread<C, S, H, O>(
             continue;
         }
 
+        while interrupt_rx.try_recv().is_ok() {}
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
         in_flight = Some(InFlightStep {
             fut: Box::pin(thread.step_no_defer(batch, &observer, cancel_rx)),

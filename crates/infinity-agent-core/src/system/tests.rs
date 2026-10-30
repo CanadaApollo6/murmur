@@ -2470,3 +2470,57 @@ async fn input_committed_observer_sees_persisted_input_only_after_validation() {
         |(_, e)| matches!(e, AgentEvent::InputCommitted { dedup_id } if dedup_id == "peer-durable")
     ));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn routed_interrupt_cancels_step_without_input_or_phantom_driver() {
+    for with_output in [false, true] {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (mut running, mut rx, mut ctrl, conv) = start_system(vec![], None);
+                let interrupt = running.interrupt_handle();
+                running
+                    .send_user_text(ThreadId::from_ref("t1"), "original input")
+                    .await;
+                ctrl.next_request().await;
+                if with_output {
+                    ctrl.send_text("partial output");
+                    loop {
+                        if let Evt::E(AgentEvent::TextChunk { .. }) = next_evt(&mut rx).await {
+                            break;
+                        }
+                    }
+                }
+                assert!(interrupt.interrupt(ThreadId::from_ref("t1")));
+                let mut committed = false;
+                loop {
+                    match next_evt(&mut rx).await {
+                        Evt::E(AgentEvent::InputCommitted { .. }) => committed = true,
+                        Evt::E(AgentEvent::CompletionFinished { .. }) => break,
+                        _ => {}
+                    }
+                }
+                assert_eq!(committed, with_output);
+                wait_idle(&mut running).await;
+                assert_eq!(
+                    persisted(&conv, "t1").contains("partial output"),
+                    with_output
+                );
+                assert!(!persisted(&conv, "t1").contains("<interrupt>"));
+                assert!(
+                    ctrl.try_next_request().is_none(),
+                    "interrupt must not start another step"
+                );
+                assert!(interrupt.interrupt(ThreadId::from_ref("ghost")));
+                running
+                    .send_user_text(ThreadId::from_ref("t2"), "next input")
+                    .await;
+                ctrl.next_request().await;
+                assert!(conv.thread_info(ThreadId::from_ref("ghost")).is_none());
+                ctrl.send_text("done");
+                ctrl.finish();
+                collect_until_finished(&mut rx).await;
+                wait_idle(&mut running).await;
+            })
+            .await;
+    }
+}

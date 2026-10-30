@@ -323,3 +323,19 @@ async fn peer_message_over_socket_reaches_thread_and_replays_with_receipts() {
         assert!(matches!(peers[0], DaemonMessage::SubscriptionEvent { name, text, .. } if name == "message from @planner" && text == "peer payload"));
     }).await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn protocol_interrupt_cancels_in_flight_completion() {
+    tokio::task::LocalSet::new().run_until(async {
+        let mut h = start_harness().await.expect("start harness");
+        let thread_id = create_session_and_chat(&mut h).await;
+        h.client_tx.send(ClientMessage::UserInput { thread_id: thread_id.clone(), text: "keep working".into() }).expect("send input");
+        h.ctrl.next_request().await;
+        h.ctrl.send_text("partial");
+        wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::TextChunk { chunk, .. } if chunk == "partial")).await;
+        h.client_tx.send(ClientMessage::Interrupt { thread_id: thread_id.clone() }).expect("send interrupt");
+        let done = wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::ResponseDone { .. })).await;
+        assert!(matches!(done, DaemonMessage::ResponseDone { thread_id: Some(id), .. } if id == thread_id));
+        assert!(h.ctrl.try_next_request().is_none());
+    }).await;
+}
