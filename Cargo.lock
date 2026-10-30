@@ -2866,6 +2866,7 @@ dependencies = [
 name = "infinity-daemon"
 version = "0.2.0"
 dependencies = [
+ "agentd",
  "async-trait",
  "bytes",
  "chrono",

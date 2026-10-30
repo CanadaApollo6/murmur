@@ -150,7 +150,7 @@ pub(crate) async fn drive_thread<C, S, H, O>(
 
     let mut in_flight: Option<InFlightStep<'_>> = None;
 
-    loop {
+    'driver: loop {
         let new_inputs: Vec<(InputMessage, String)> = if let Some(flight) = in_flight.as_mut() {
             tokio::select! {
                 biased;
@@ -226,6 +226,9 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                         res, &observer, &thread_id, &mut total_tokens,
                         &mut compaction_triggered, &mut pending_batch,
                     );
+                    if let Err(error) = thread.interrupt(&observer).await {
+                        observer.on_event(&thread_id, &AgentEvent::Info { text: format!("Interrupt failed: {error}") });
+                    }
                     continue;
                 },
                 req = subscribe_rx.recv(), if !subscribe_closed => {
@@ -240,7 +243,16 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                 }
             }
         } else {
-            while interrupt_rx.try_recv().is_ok() {}
+            if interrupt_rx.try_recv().is_ok()
+                && let Err(error) = thread.interrupt(&observer).await
+            {
+                observer.on_event(
+                    &thread_id,
+                    &AgentEvent::Info {
+                        text: format!("Interrupt failed: {error}"),
+                    },
+                );
+            }
             let mut batch: Vec<(InputMessage, String)> = std::mem::take(&mut pending_batch);
             while let Ok(item) = rx.try_recv() {
                 batch.push(item);
@@ -282,7 +294,12 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                                         None => return,
                                     }
                                 }
-                                Some(()) = interrupt_rx.recv() => {}
+                                Some(()) = interrupt_rx.recv() => {
+                                    if let Err(error) = thread.interrupt(&observer).await {
+                                        observer.on_event(&thread_id, &AgentEvent::Info { text: format!("Interrupt failed: {error}") });
+                                    }
+                                    continue 'driver;
+                                }
                                 req = subscribe_rx.recv(), if !subscribe_closed => {
                                     match req {
                                         Some((req, ack)) => {
@@ -330,7 +347,6 @@ pub(crate) async fn drive_thread<C, S, H, O>(
             continue;
         }
 
-        while interrupt_rx.try_recv().is_ok() {}
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
         in_flight = Some(InFlightStep {
             fut: Box::pin(thread.step_no_defer(batch, &observer, cancel_rx)),

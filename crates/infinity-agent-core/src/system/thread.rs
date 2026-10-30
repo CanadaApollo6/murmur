@@ -238,6 +238,60 @@ where
             .is_some_and(|(_, name)| name != CLOSE_THREAD_TOOL)
     }
 
+    /// Settle cancelled work without starting a new model round. Completion is
+    /// acknowledged only after both the tool result and choice removal persist.
+    pub(crate) async fn interrupt<O: ThreadObserver>(&self, observer: &O) -> Result<(), BoxError> {
+        let thread_id = &self.history.thread_id;
+        let pending_tool = self.pending_tool_call().is_some();
+        if pending_tool {
+            self.history.interrupt_pending_tool_call();
+            // A dispatched tool call has already passed model validation. Its
+            // cancellation result needs no further inference to become durable.
+            self.history.mark_inputs_model_validated();
+            self.history.sync().await?;
+        }
+        let interrupted = self.history.take_interrupted_tool_calls();
+        if !interrupted.is_empty() {
+            let config = self.resolved_config().await?;
+            if let Some(notifier) = &config.rap_notifier {
+                for call_id in interrupted {
+                    notifier.notify_tool_cancelled(thread_id, &call_id).await;
+                }
+            }
+        }
+        let choices = self.pending_choices.borrow().clone();
+        let settled = pending_tool || !choices.is_empty();
+        for choice in choices {
+            self.inner
+                .state_store
+                .remove_pending_user_choice(thread_id, &choice.id)
+                .await?;
+            self.pending_choices
+                .borrow_mut()
+                .retain(|c| c.id != choice.id);
+            observer.on_event(
+                thread_id,
+                &AgentEvent::UserChoiceDismissed {
+                    choice_id: choice.id,
+                },
+            );
+        }
+        if pending_tool {
+            observer.on_event(
+                thread_id,
+                &AgentEvent::ToolResult {
+                    segments: vec![rap_protocol::DisplaySegment::Text(
+                        event_processor::TOOL_CALL_INTERRUPTED_TEXT.into(),
+                    )],
+                },
+            );
+        }
+        if settled {
+            observer.on_event(thread_id, &AgentEvent::CompletionFinished { usage: None });
+        }
+        Ok(())
+    }
+
     /// Apply the deferral policy to a batch of inputs.
     ///
     /// While the thread waits on a pending active tool call, deferrable

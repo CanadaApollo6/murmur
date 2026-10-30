@@ -305,7 +305,7 @@ async fn session_end_uses_durable_evidence_and_preserves_newer_offers() {
 }
 
 #[tokio::test]
-async fn default_attempt_cap_holds_sixth_offer_and_release_grants_fresh_attempts() {
+async fn default_attempt_cap_holds_at_settlement_and_release_grants_fresh_attempts() {
     let (dir, mail, a, _) = setup(Config::default()).await;
     let env = seed(&mail, a, "queued").await;
     for attempt in 1..=5 {
@@ -324,12 +324,11 @@ async fn default_attempt_cap_holds_sixth_offer_and_release_grants_fresh_attempts
     let mail = Mailroom::open(dir.path().join("broker.db"), Config::default())
         .await
         .expect("reopen");
-    let result = mail
-        .mark_offered(&[env.id()], Incarnation(6))
-        .await
-        .expect("cap");
-    assert!(result.offered.is_empty());
-    assert_eq!(result.held, vec![env.id()]);
+    assert!(matches!(
+        mail.delivery(env.id()).await.expect("held").state,
+        DeliveryState::Held { .. }
+    ));
+    assert_eq!(mail.held(Some(a)).await.expect("held mail").len(), 1);
     assert_eq!(mail.delivery(env.id()).await.expect("attempts").attempts, 5);
     assert!(mail.pending_for(a).await.expect("pending").is_empty());
     mail.release(env.id()).await.expect("release");

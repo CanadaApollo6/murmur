@@ -55,6 +55,7 @@ playwright-rs = { version = "0.14", optional = true, default-features = false, f
 nix = { version = "0.31", features = ["signal"] }
 
 [dev-dependencies]
+agentd = { path = "../agentd" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 rap-test-servers = { path = "../rap-test-servers" }
 tempfile = { workspace = true }

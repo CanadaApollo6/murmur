@@ -2596,3 +2596,97 @@ async fn overflowing_peer_is_never_replaced_or_receipted_and_can_be_reoffered() 
             AgentEvent::InputCommitted { dedup_id } if dedup_id == "peer-overflow")));
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn routed_interrupt_durably_settles_waiting_tool_and_choice() {
+    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
+    use crate::traits::{ConversationStore, StateStore};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (model, mut ctrl) = model_source(None);
+            let conv = InMemoryConversationStore::new();
+            let state = InMemoryStateStore::new();
+            conv.ensure_root_thread(ThreadId::from_ref("t1"))
+                .await
+                .expect("root");
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut running =
+                super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
+                    .tools(vec![Box::new(AsyncTool) as Box<dyn Tool<ChannelSender>>])
+                    .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+            running
+                .send_user_text(ThreadId::from_ref("t1"), "ask")
+                .await;
+            ctrl.next_request().await;
+            ctrl.send_tool_call("waiting", "async_tool", serde_json::json!({}));
+            ctrl.finish();
+            collect_until_finished(&mut rx).await;
+            running
+                .send(
+                    InputMessage {
+                        content: InputMessageContent::UserChoice(UserChoiceRequired {
+                            content_type: "user_choice_required".into(),
+                            id: "waiting".into(),
+                            call_id: None,
+                            prompt: "Choose".into(),
+                            choices: vec!["A".into()],
+                            default: 0,
+                            response_url: "http://example.test/choice".into(),
+                        }),
+                        group_id: "t1".into(),
+                        metadata: None,
+                        synthetic: None,
+                        display_as: None,
+                        subscription: false,
+                    },
+                    "choice",
+                )
+                .await;
+            loop {
+                if matches!(
+                    next_evt(&mut rx).await,
+                    Evt::E(AgentEvent::UserChoiceRequired { .. })
+                ) {
+                    break;
+                }
+            }
+            assert!(
+                running
+                    .interrupt_handle()
+                    .interrupt(ThreadId::from_ref("t1"))
+            );
+            loop {
+                if matches!(
+                    next_evt(&mut rx).await,
+                    Evt::E(AgentEvent::UserChoiceDismissed { .. })
+                ) {
+                    break;
+                }
+            }
+            assert!(
+                state
+                    .get_pending_user_choices(ThreadId::from_ref("t1"))
+                    .await
+                    .expect("choices")
+                    .is_empty()
+            );
+            collect_until_finished(&mut rx).await;
+            wait_idle(&mut running).await;
+            assert!(persisted(&conv, "t1").contains("Tool call interrupted by user"));
+            let (replay_tx, mut replay_rx) = mpsc::unbounded_channel();
+            running.subscribe(ThreadId::from_ref("t1"), replay_tx).await;
+            let Evt::Replay(snapshot) = next_evt(&mut replay_rx).await else {
+                panic!("replay")
+            };
+            assert!(snapshot.pending_choices.is_empty());
+            assert!(!matches!(
+                snapshot.history.last(),
+                Some(crate::message::InfinityMessage::ToolCall { .. })
+            ));
+            assert!(
+                ctrl.try_next_request().is_none(),
+                "cancel must not start inference"
+            );
+        })
+        .await;
+}

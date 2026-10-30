@@ -168,17 +168,18 @@ impl ThreadObserver for DaemonObserver {
                 })
                 .collect::<Vec<_>>();
             let views = self.conversation_store.get_views(thread_id);
-            if !history.is_empty() || !choices.is_empty() || !views.is_empty() {
-                let _ = request.tx.send(DaemonMessage::Replay {
+            // Empty snapshots still acknowledge live attachment.
+            if request
+                .tx
+                .send(DaemonMessage::Replay {
                     history,
                     pending_choices: choices,
                     views,
-                    // Only an actual in-flight completion counts: while
-                    // waiting on a tool result the clients derive their
-                    // "waiting for tool call" spinner from the trailing
-                    // ToolCall in the history instead.
                     in_progress: snapshot.in_progress,
-                });
+                })
+                .is_err()
+            {
+                tracing::debug!("Replay subscriber disconnected");
             }
         }
         let mut subs = self.subscribers.lock().expect("bug: mutex poisoned");
