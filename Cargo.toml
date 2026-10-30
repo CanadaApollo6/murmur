@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/agentd",
     "crates/infinity-agent-core",
     "crates/infinity-agent-lambda",
     "crates/infinity-mcp-bridge",
