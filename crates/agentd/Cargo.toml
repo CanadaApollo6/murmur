@@ -7,14 +7,18 @@ license = "Apache-2.0"
 repository = { workspace = true }
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.3"
+toml = "0.9"
 async-trait = { workspace = true }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { version = "0.3", features = ["serde"] }
-tokio = { workspace = true, features = ["rt", "process", "io-util", "time"] }
+tokio = { workspace = true, features = ["rt", "process", "io-util", "io-std", "time", "net", "signal"] }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 ulid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
@@ -25,8 +29,16 @@ tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["signal"] }
+nix = { version = "0.31", features = ["signal", "user"] }
 
 [[bin]]
 name = "agentd-fake-acp"
 path = "tests/support/fake_acp.rs"
+
+[[bin]]
+name = "agentd"
+path = "src/bin/agentd.rs"
+
+[[bin]]
+name = "agentctl"
+path = "src/bin/agentctl.rs"

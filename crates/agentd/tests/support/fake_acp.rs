@@ -31,6 +31,64 @@ fn permission(session: &str, id: &str, reject: bool) {
         "options":options}}),
     );
 }
+struct Mcp {
+    child: std::process::Child,
+    input: std::process::ChildStdin,
+    output: std::io::BufReader<std::process::ChildStdout>,
+}
+impl Mcp {
+    fn open(entry: &Value) -> Self {
+        let mut cmd = std::process::Command::new(entry["command"].as_str().expect("MCP command"));
+        for arg in entry["args"].as_array().expect("MCP args") {
+            cmd.arg(arg.as_str().expect("MCP arg"));
+        }
+        for env in entry["env"].as_array().expect("MCP env") {
+            cmd.env(
+                env["name"].as_str().expect("env name"),
+                env["value"].as_str().expect("env value"),
+            );
+        }
+        let mut child = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("MCP spawn");
+        let mut mcp = Self {
+            input: child.stdin.take().expect("MCP stdin"),
+            output: std::io::BufReader::new(child.stdout.take().expect("MCP stdout")),
+            child,
+        };
+        let init = mcp.call(json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2024-11-05"}}));
+        assert_eq!(init["result"]["serverInfo"]["name"], "agentd");
+        let tools = mcp.call(json!({"jsonrpc":"2.0","id":"tools","method":"tools/list"}));
+        assert!(
+            tools["result"]["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .any(|t| t["name"] == "send_message")
+        );
+        mcp
+    }
+    fn call(&mut self, request: Value) -> Value {
+        writeln!(self.input, "{request}").expect("MCP request");
+        self.input.flush().expect("MCP flush");
+        let mut line = String::new();
+        assert!(
+            self.output.read_line(&mut line).expect("MCP read") > 0,
+            "MCP closed"
+        );
+        serde_json::from_str(&line).expect("MCP JSON")
+    }
+}
+impl Drop for Mcp {
+    fn drop(&mut self) {
+        if self.child.try_wait().expect("MCP status").is_none() {
+            self.child.kill().expect("MCP kill");
+        }
+        self.child.wait().expect("MCP reap");
+    }
+}
 fn main() {
     let root = PathBuf::from(std::env::var_os("FAKE_ROOT").expect("FAKE_ROOT"));
     let mut log = OpenOptions::new()
@@ -41,7 +99,7 @@ fn main() {
     writeln!(
         log,
         "{}",
-        json!({"pid":std::process::id(),"cwd":std::env::current_dir().expect("cwd")})
+        json!({"pid":std::process::id(),"cwd":std::env::current_dir().expect("cwd"),"args":std::env::args().collect::<Vec<_>>()})
     )
     .expect("log pid");
     let (tx, rx) = mpsc::channel();
@@ -55,6 +113,8 @@ fn main() {
         }
     });
     let session = "fake-session";
+    let mut mcp = None;
+    let mut broker_token = String::new();
     let mut mode_set = false;
     let mut flight: Option<Value> = None;
     let mut held = false;
@@ -97,8 +157,24 @@ fn main() {
                     json!({"protocolVersion":1,"agentCapabilities":{"loadSession": !root.join("no-resume").exists()}}),
                 );
             }
-            Some("session/new") => reply(id, json!({"sessionId":session})),
+            Some("session/new") => {
+                if let Some(entry) = msg["params"]["mcpServers"]
+                    .as_array()
+                    .and_then(|a| a.iter().find(|v| v["name"] == "agentd"))
+                {
+                    broker_token = entry["env"][0]["value"].as_str().expect("token").to_owned();
+                    mcp = Some(Mcp::open(entry));
+                }
+                reply(id, json!({"sessionId":session}));
+            }
             Some("session/load") => {
+                if let Some(entry) = msg["params"]["mcpServers"]
+                    .as_array()
+                    .and_then(|a| a.iter().find(|v| v["name"] == "agentd"))
+                {
+                    broker_token = entry["env"][0]["value"].as_str().expect("token").to_owned();
+                    mcp = Some(Mcp::open(entry));
+                }
                 assert_eq!(msg["params"]["sessionId"], session);
                 update(session, "history replay");
                 if root.join("fail-load").exists() {
@@ -112,7 +188,11 @@ fn main() {
             Some("session/set_mode") => {
                 assert_eq!(
                     msg["params"]["modeId"].as_str(),
-                    Some(std::env::var("FAKE_MODE").expect("mode").as_str())
+                    Some(
+                        std::fs::read_to_string(root.join("expected-mode"))
+                            .unwrap_or_else(|_| std::env::var("FAKE_MODE").expect("mode"))
+                            .as_str()
+                    )
                 );
                 mode_set = true;
                 reply(id, json!({}));
@@ -124,6 +204,23 @@ fn main() {
                 count += 1;
                 File::create(root.join(format!("prompt-{count}"))).expect("prompt marker");
                 let text = msg["params"]["prompt"].to_string();
+                if text.contains("mcp-send") {
+                    let mcp = mcp.as_mut().expect("broker MCP entry");
+                    let request = json!({"jsonrpc":"2.0","id":"peer-send","method":"tools/call","params":{"name":"send_message","arguments":{"to":"@b","body":"peer payload"}}});
+                    let first = mcp.call(request.clone());
+                    let retry = mcp.call(request);
+                    assert_eq!(first["result"]["isError"], false, "{first}");
+                    let list = mcp.call(json!({"jsonrpc":"2.0","id":"list","method":"tools/call","params":{"name":"list_agents","arguments":{}}}));
+                    assert_eq!(list["result"]["isError"], false);
+                    std::fs::write(root.join("mcp-retry.json"), retry.to_string())
+                        .expect("MCP retry result");
+                    std::fs::write(root.join("mcp-result.json"), first.to_string())
+                        .expect("MCP result");
+                }
+                if text.contains("echo-token") {
+                    update(session, &broker_token);
+                    eprintln!("fixture secret {broker_token}");
+                }
                 if text.contains("die-before") {
                     std::process::exit(17);
                 }

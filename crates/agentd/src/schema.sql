@@ -6,6 +6,10 @@ CREATE TABLE IF NOT EXISTS agents (
     epoch INTEGER NOT NULL DEFAULT 0 CHECK(epoch >= 0)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS active_agent_names ON agents(name) WHERE retired=0;
+CREATE TABLE IF NOT EXISTS agent_specs (
+    agent TEXT PRIMARY KEY REFERENCES agents(id),
+    spec TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS messages (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT NOT NULL UNIQUE,

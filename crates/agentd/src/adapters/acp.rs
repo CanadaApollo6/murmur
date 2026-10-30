@@ -40,6 +40,7 @@ struct AcpSession {
     reader: JoinHandle<()>,
     stderr_reader: JoinHandle<()>,
     stderr: Arc<Mutex<VecDeque<u8>>>,
+    secret: Option<String>,
     rx: mpsc::Receiver<Result<Value, String>>,
     events: VecDeque<SessionEvent>,
     kind: KindConfig,
@@ -60,6 +61,11 @@ fn protocol(e: impl std::fmt::Display) -> AdapterError {
 #[async_trait]
 impl Adapter for AcpAdapter {
     async fn open(&self, req: OpenRequest<'_>) -> Result<Box<dyn Session>, AdapterError> {
+        let secret = req
+            .mcp_server
+            .as_ref()
+            .and_then(|v| v["env"][0]["value"].as_str())
+            .map(str::to_owned);
         let mut cmd = Command::new(&self.0.command);
         cmd.args(&self.0.args)
             .envs(&self.0.env)
@@ -82,6 +88,7 @@ impl Adapter for AcpAdapter {
         let stdout = child.stdout.take().ok_or(AdapterError::Ended)?;
         let mut stderr_pipe = child.stderr.take().ok_or(AdapterError::Ended)?;
         let (tx, rx) = mpsc::channel(64);
+        let stdout_secret = secret.clone();
         let reader = tokio::spawn(async move {
             let mut input = BufReader::new(stdout);
             loop {
@@ -96,7 +103,13 @@ impl Adapter for AcpAdapter {
                     Ok(_) if frame.last() != Some(&b'\n') => {
                         Err("ACP frame too large or truncated".into())
                     }
-                    Ok(_) => serde_json::from_slice(&frame).map_err(|e| e.to_string()),
+                    Ok(_) => {
+                        let text = String::from_utf8_lossy(&frame);
+                        let redacted = stdout_secret
+                            .as_ref()
+                            .map_or_else(|| text.to_string(), |s| text.replace(s, "[redacted]"));
+                        serde_json::from_str(&redacted).map_err(|e| e.to_string())
+                    }
                     Err(e) => Err(e.to_string()),
                 };
                 let failed = result.is_err();
@@ -134,6 +147,7 @@ impl Adapter for AcpAdapter {
             reader,
             stderr_reader,
             stderr,
+            secret,
             rx,
             events: VecDeque::new(),
             kind: self.0.clone(),
@@ -216,7 +230,9 @@ impl AcpSession {
         self.resumable = init["agentCapabilities"]["loadSession"]
             .as_bool()
             .unwrap_or(false);
-        let mut params = json!({"cwd":req.spec.cwd,"mcpServers":self.kind.mcp_servers});
+        let mut servers = self.kind.mcp_servers.clone();
+        servers.extend(req.mcp_server.clone());
+        let mut params = json!({"cwd":req.spec.cwd,"mcpServers":servers});
         if let Some(token) = req.resume {
             let saved: AcpResume = token.decode().map_err(protocol)?;
             if saved.kind != self.kind.name {
@@ -232,9 +248,22 @@ impl AcpSession {
             let result = self.request("session/new", params).await?;
             self.session_id = string(&result, "sessionId")?;
         }
+        let mode = match req.spec.permissions.sandbox {
+            SandboxLevel::ReadOnly => &self.kind.mode,
+            SandboxLevel::WorkspaceWrite => self
+                .kind
+                .workspace_write_mode
+                .as_ref()
+                .unwrap_or(&self.kind.mode),
+            SandboxLevel::FullAccess => self
+                .kind
+                .full_access_mode
+                .as_ref()
+                .unwrap_or(&self.kind.mode),
+        };
         self.request(
             "session/set_mode",
-            json!({"sessionId":self.session_id,"modeId":self.kind.mode}),
+            json!({"sessionId":self.session_id,"modeId":mode}),
         )
         .await?;
         if let Some(model) = &req.spec.model {
@@ -531,9 +560,14 @@ impl Session for AcpSession {
                     .iter()
                     .copied()
                     .collect::<Vec<_>>();
+                let tail = String::from_utf8_lossy(&tail);
+                let tail = self
+                    .secret
+                    .as_ref()
+                    .map_or_else(|| tail.to_string(), |s| tail.replace(s, "[redacted]"));
                 // Deliver evidence queued before the failure (e.g. TurnStarted) first.
                 self.events.push_back(SessionEvent::Ended {
-                    reason: format!("{e}; {}", String::from_utf8_lossy(&tail)),
+                    reason: format!("{e}; {}", tail),
                 });
                 self.ended = true;
             }

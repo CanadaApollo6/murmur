@@ -13,7 +13,7 @@ use crate::model::*;
 
 pub use crate::adapter::TurnOutcome;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AgentSpec {
     pub name: AgentName,
     pub kind: String,
@@ -179,6 +179,7 @@ pub struct Broker {
     agents: Mutex<HashMap<AgentId, AgentHandle>>,
     events: broadcast::Sender<Event>,
     config: Config,
+    mcp: Option<Arc<crate::surfaces::Bindings>>,
 }
 impl Broker {
     pub fn new(mailroom: Arc<Mailroom>, kinds: Vec<KindConfig>, config: Config) -> Result<Self> {
@@ -193,6 +194,11 @@ impl Broker {
         for kind in kinds {
             if kind.command.is_empty()
                 || kind.mode.is_empty()
+                || kind
+                    .workspace_write_mode
+                    .as_ref()
+                    .is_some_and(String::is_empty)
+                || kind.full_access_mode.as_ref().is_some_and(String::is_empty)
                 || kind.request_timeout.is_zero()
                 || kind.cancel_timeout.is_zero()
             {
@@ -210,7 +216,25 @@ impl Broker {
             agents: Mutex::new(HashMap::new()),
             events,
             config,
+            mcp: None,
         })
+    }
+    pub fn with_mcp(mut self, bindings: Arc<crate::surfaces::Bindings>) -> Self {
+        self.mcp = Some(bindings);
+        self
+    }
+    pub async fn handle(&self, id: AgentId) -> Option<AgentHandle> {
+        self.agents.lock().await.get(&id).cloned()
+    }
+    pub(crate) async fn nudge(&self, id: AgentId) {
+        if let Some(handle) = self.agents.lock().await.get(&id) {
+            match handle.commands.try_send(Command::Nudge) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!(agent=%id, "mail queued for stopped actor")
+                }
+            }
+        }
     }
     /// The receiver is display-only and may lag. SQLite remains delivery authority.
     pub fn events(&self) -> broadcast::Receiver<Event> {
@@ -228,6 +252,7 @@ impl Broker {
             return Err(Error::Rejected("agent already supervised".into()));
         }
         let (lease, incarnation, resume) = self.mailroom.claim_actor(id, spec.kind.clone()).await?;
+        self.mailroom.save_spec(id, spec.clone()).await?;
         let (tx, commands) = mpsc::channel(64);
         let (phase_tx, phase) = watch::channel(Phase::Dormant);
         let handle = AgentHandle {
@@ -237,6 +262,7 @@ impl Broker {
         };
         let actor = AgentActor {
             _lease: lease,
+            mcp: self.mcp.clone(),
             id,
             idle_after: spec.idle_after.or(kind.idle_after),
             spec,
@@ -259,15 +285,11 @@ impl Broker {
         agents.insert(id, handle.clone());
         Ok(handle)
     }
-    /// Trusted in-process caller supplies the sender. Surface authentication is deferred.
+    /// Trusted in-process API. External callers are authenticated by surfaces.
     pub async fn send(&self, message: NewMessage) -> Result<(SendOutcome, Envelope)> {
         let id = message.to;
         let outcome = self.mailroom.accept(message).await?;
-        if let Some(handle) = self.agents.lock().await.get(&id)
-            && handle.commands.send(Command::Nudge).await.is_err()
-        {
-            tracing::debug!(agent=%id, "mail queued for stopped actor");
-        }
+        self.nudge(id).await;
         Ok(outcome)
     }
     pub async fn shutdown(&self) -> Result<()> {
@@ -288,6 +310,7 @@ impl Broker {
 }
 
 struct AgentActor {
+    mcp: Option<Arc<crate::surfaces::Bindings>>,
     _lease: crate::mailroom::ActorLease,
     id: AgentId,
     spec: AgentSpec,
@@ -330,6 +353,9 @@ impl AgentActor {
         let result = self.drive().await;
         if let Err(error) = &result {
             tracing::error!(agent=%self.id,%error,"agent actor failed");
+        }
+        if let Some(mcp) = &self.mcp {
+            mcp.revoke(self.id).await;
         }
         if let Some(session) = self.session.take()
             && let Err(error) = session.suspend().await
@@ -387,6 +413,14 @@ impl AgentActor {
     }
     async fn start(&mut self) -> Result<()> {
         self.phase(Phase::Starting);
+        let mcp_server = match &self.mcp {
+            Some(mcp) => Some(
+                mcp.mint(self.id, self.incarnation)
+                    .await
+                    .map_err(|e| Error::Rejected(e.to_string()))?,
+            ),
+            None => None,
+        };
         match self
             .adapter
             .open(OpenRequest {
@@ -394,6 +428,7 @@ impl AgentActor {
                 spec: &self.spec,
                 resume: self.resume.as_ref(),
                 incarnation: self.incarnation,
+                mcp_server,
             })
             .await
         {
@@ -410,6 +445,11 @@ impl AgentActor {
                     reason: error.to_string(),
                 }),
             Err(error) => self.crash(error.to_string()),
+        }
+        if self.session.is_none()
+            && let Some(mcp) = &self.mcp
+        {
+            mcp.revoke(self.id).await;
         }
         Ok(())
     }
@@ -602,6 +642,9 @@ impl AgentActor {
         }
     }
     async fn stop_session(&mut self) -> Result<()> {
+        if let Some(mcp) = &self.mcp {
+            mcp.revoke(self.id).await;
+        }
         if let Some(session) = self.session.take() {
             session
                 .suspend()
