@@ -570,16 +570,12 @@ where
         self.in_flight.set(false);
         *self.current_thinking.borrow_mut() = None;
 
-        // ── Commit phase: the turn becomes durable before anything external
-        // can react to it. ──
+        // Persistence errors withhold receipts but must not strand tool dispatch.
         self.history.sync().await?;
         self.emit_committed(observer, &thread_id);
         observer.on_event(&thread_id, &AgentEvent::CompletionFinished { usage });
 
-        // ── Dispatch phase: fire the tool call (if any) after the commit
-        // barrier, so the call is durable in history before its result can
-        // possibly arrive. A failed dispatch enqueues an error tool result
-        // so the agent recovers instead of waiting forever. ──
+        // A failed dispatch enqueues an error result so the thread can advance.
         if let Some(action) = action
             && let Err(e) = event_processor::execute_action_with_error_result(
                 action,

@@ -804,8 +804,13 @@ impl ConversationStore for PersistentConversationStore {
     ) -> Result<(), MemoryError> {
         self.ensure_thread_loaded(session_id);
         tracing::trace!("Appending messages to store");
+        let previous = self.core.thread_messages(session_id).unwrap_or_default();
         self.core.append_messages(session_id, messages).await?;
-        self.save_thread(session_id)?;
+        if let Err(error) = self.save_thread(session_id) {
+            // sync retries failed appends, so the cache must not retain this batch.
+            self.core.set_thread_messages(session_id, previous);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1100,10 +1105,15 @@ impl StateStore for PersistentStateStore {
         message_ids: Vec<String>,
     ) -> Result<(), MemoryError> {
         self.ensure_loaded(thread_id);
+        let previous = self.core.thread_state(thread_id);
         self.core
             .add_processed_message_ids(thread_id, message_ids)
             .await?;
-        self.save_key(thread_id)?;
+        if let Err(error) = self.save_key(thread_id) {
+            // Reloading a driver must not mistake cached IDs for written IDs.
+            self.core.set_thread_state(thread_id, previous);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1305,6 +1315,116 @@ mod tests {
                 .is_err(),
             "dedup must report a failed state write"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_write_failure_does_not_block_dispatch_or_recovery() {
+        use infinity_agent_core::message::{
+            InputMessage, InputMessageContent, SyntheticKind, TaggedSyntheticKind,
+        };
+        use infinity_agent_core::system::local::ChannelSender;
+        use infinity_agent_core::system::{
+            AgentEvent, AgentSystemBuilder, StaticModel, ThreadObserver,
+        };
+        use infinity_agent_core::tools::{Tool, ToolContext};
+        use infinity_provider_protocol::{ModelEntry, SingleModelProvider};
+        use rap_protocol::{ProviderCallId, ToolCallId};
+        use tokio::sync::mpsc;
+
+        struct Observer(mpsc::UnboundedSender<AgentEvent>);
+        #[async_trait(?Send)]
+        impl ThreadObserver for Observer {
+            type SubscribeRequest = ();
+            fn on_event(&self, _: &ThreadId<str>, event: &AgentEvent) {
+                self.0.send(event.clone()).expect("observe event");
+            }
+        }
+        struct Dispatch(mpsc::UnboundedSender<ToolCallId>);
+        #[async_trait]
+        impl Tool<ChannelSender> for Dispatch {
+            fn name(&self) -> &str {
+                "dispatch"
+            }
+            fn description(&self) -> &str {
+                "dispatch"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object"})
+            }
+            async fn execute(
+                &self,
+                _: serde_json::Value,
+                id: ToolCallId,
+                _: Option<ProviderCallId>,
+                _: &ToolContext<ChannelSender>,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                self.0.send(id)?;
+                Ok(())
+            }
+        }
+        for fail_payload in [false, true] {
+            tokio::task::LocalSet::new().run_until(async {
+                let dir = tempfile::tempdir().expect("create temp dir");
+                let conv = PersistentConversationStore::new_with_dir(dir.path(), test_model(), Arc::new(crate::ids::UuidIdSource));
+                let tid = ThreadId::from_ref("root");
+                conv.ensure_root_thread(tid).await.expect("ensure root");
+                let sessions = crate::session_store::SessionStore::load(
+                    dir.path().join("sessions.json").to_str().expect("session path"), mpsc::unbounded_channel().0,
+                );
+                let state = PersistentStateStore::new(dir.path(), conv.clone(), Arc::new(tokio::sync::Mutex::new(sessions)));
+                let blocked = dir.path().join(if fail_payload { "root.json" } else { "root.state.json" });
+                if fail_payload { std::fs::remove_file(&blocked).expect("remove snapshot"); }
+                std::fs::create_dir(&blocked).expect("block write");
+                let (model, mut ctrl) = infinity_provider_protocol::mock::mock_model();
+                let entry = ModelEntry { model_id: "mock".into(), display_name: "mock".into(), context_window: 0, max_output_tokens: None, supports_image_input: false };
+                let model = StaticModel::from_entry(Arc::new(SingleModelProvider::new(entry.clone(), model)), &entry);
+                let (events_tx, mut events) = mpsc::unbounded_channel();
+                let (dispatch_tx, mut dispatch) = mpsc::unbounded_channel();
+                let running = AgentSystemBuilder::new_local(conv.clone(), state, model)
+                    .tools(vec![Box::new(Dispatch(dispatch_tx)) as Box<dyn Tool<ChannelSender>>])
+                    .start_with_observer(move |_| Observer(events_tx.clone()));
+                let peer = InputMessage {
+                    content: InputMessageContent::User(UserContent::ToolResult(infinity_provider_protocol::message::ToolResult {
+                        id: "".into(), call_id: None, content: vec![infinity_provider_protocol::message::ToolResultContent::text("original peer payload")],
+                    })), group_id: tid.to_owned(), metadata: None,
+                    synthetic: Some(SyntheticKind::Tagged(TaggedSyntheticKind::PeerMessage { from: "planner".into() })), display_as: None, subscription: false,
+                };
+                running.send(peer.clone(), "peer-recover").await;
+                tokio::time::timeout(std::time::Duration::from_secs(2), ctrl.next_request()).await.expect("peer completion");
+                ctrl.send_tool_call("tc-work", "dispatch", serde_json::json!({}));
+                ctrl.finish();
+                let dispatched = tokio::time::timeout(std::time::Duration::from_secs(2), dispatch.recv()).await
+                    .expect("persistence failure must not strand tool dispatch").expect("dispatched tool");
+                assert_eq!(dispatched.as_str(), "tc-work");
+                while let Ok(event) = events.try_recv() {
+                    assert!(!matches!(event, AgentEvent::InputCommitted { dedup_id } if dedup_id == "peer-recover"), "failed write must not receipt peer");
+                }
+                std::fs::remove_dir(&blocked).expect("restore writes");
+                let result = InputMessage {
+                    content: InputMessageContent::User(UserContent::ToolResult(infinity_provider_protocol::message::ToolResult {
+                        id: "tc-work".into(), call_id: None, content: vec![infinity_provider_protocol::message::ToolResultContent::text("tool answered")],
+                    })), group_id: tid.to_owned(), metadata: None, synthetic: None, display_as: None, subscription: false,
+                };
+                running.send(result, "result-1").await;
+                let req = tokio::time::timeout(std::time::Duration::from_secs(2), ctrl.next_request()).await.expect("tool result must advance thread");
+                assert!(format!("{:?}", req.chat_history).contains("tool answered"));
+                ctrl.send_text("recovered"); ctrl.finish();
+                loop { if matches!(events.recv().await.expect("completion event"), AgentEvent::CompletionFinished { .. }) { break; } }
+                while events.try_recv().is_ok() {}
+                running.send(peer, "peer-recover").await;
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop { if matches!(events.recv().await.expect("receipt event"), AgentEvent::InputCommitted { dedup_id } if dedup_id == "peer-recover") { break; } }
+                }).await.expect("re-offer must be receipted after recovery");
+                assert!(ctrl.try_next_request().is_none(), "re-offer must be deduped");
+                let snapshot = std::fs::read_to_string(dir.path().join("root.json")).expect("read persisted payload");
+                assert_eq!(snapshot.matches("original peer payload").count(), 1, "peer must be stored exactly once");
+                assert!(std::fs::read_to_string(dir.path().join("root.state.json")).expect("read persisted ids").contains("peer-recover"));
+                running.send_user_text(tid, "later input").await;
+                tokio::time::timeout(std::time::Duration::from_secs(2), ctrl.next_request()).await.expect("later input must advance thread");
+                ctrl.send_text("done"); ctrl.finish();
+                running.shutdown().await;
+            }).await;
+        }
     }
 
     fn asst_msg(text: &str) -> InfinityMessage {

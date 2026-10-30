@@ -148,6 +148,7 @@ pub struct HistoryManager<C: ConversationStore, S: StateStore> {
     processed_message_ids: RefCell<HashSet<String>>,
     durable_message_ids: RefCell<HashSet<String>>,
     committed_ids: RefCell<Vec<String>>,
+    pending_receipt_ids: RefCell<Vec<String>>,
     metadata: RefCell<Option<serde_json::Value>>,
     // Un-persisted content moves through three phases:
     //
@@ -231,6 +232,7 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             history: RefCell::new(history),
             durable_message_ids: RefCell::new(processed_message_ids.clone()),
             committed_ids: RefCell::new(Vec::new()),
+            pending_receipt_ids: RefCell::new(Vec::new()),
             processed_message_ids: RefCell::new(processed_message_ids),
             metadata: RefCell::new(metadata),
             pending_items: RefCell::new(Vec::new()),
@@ -642,17 +644,21 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         );
 
         let pending_items = std::mem::take(&mut *self.pending_items.borrow_mut());
-        if pending_items.is_empty() {
-            return Ok(());
+        if !pending_items.is_empty() {
+            let msgs = pending_items
+                .iter()
+                .map(|item| (item.message.clone(), item.message_id.clone()))
+                .collect();
+            if let Err(error) = self
+                .conversation_store
+                .append_messages(&self.thread_id, msgs)
+                .await
+            {
+                tracing::error!(%error, "Failed to persist thread messages");
+                *self.pending_items.borrow_mut() = pending_items;
+                return Ok(());
+            }
         }
-        let msgs: Vec<(InfinityMessage, String)> = pending_items
-            .iter()
-            .map(|item| (item.message.clone(), item.message_id.clone()))
-            .collect();
-        self.conversation_store
-            .append_messages(&self.thread_id, msgs)
-            .await
-            .map_err(|e| Box::new(e) as BoxError)?;
         // Only inputs that are not naturally idempotent need durable dedup
         // IDs: user text and subscription events (a redelivered subscription
         // event would mint a fresh invocation and be appended again). Tool
@@ -668,15 +674,22 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             })
             .map(|i| i.message_id.clone())
             .collect();
-        if !msg_ids.is_empty() {
-            self.state_store
-                .add_processed_message_ids(&self.thread_id, msg_ids.clone())
+        self.pending_receipt_ids.borrow_mut().extend(msg_ids);
+        let receipt_ids = self.pending_receipt_ids.borrow().clone();
+        if !receipt_ids.is_empty() {
+            if let Err(error) = self
+                .state_store
+                .add_processed_message_ids(&self.thread_id, receipt_ids.clone())
                 .await
-                .map_err(|e| Box::new(e) as BoxError)?;
+            {
+                tracing::error!(%error, "Failed to persist processed message IDs");
+                return Ok(());
+            }
+            self.pending_receipt_ids.borrow_mut().clear();
             self.durable_message_ids
                 .borrow_mut()
-                .extend(msg_ids.iter().cloned());
-            self.committed_ids.borrow_mut().extend(msg_ids);
+                .extend(receipt_ids.iter().cloned());
+            self.committed_ids.borrow_mut().extend(receipt_ids);
         }
         Ok(())
     }
