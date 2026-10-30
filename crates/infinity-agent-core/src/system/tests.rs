@@ -2524,3 +2524,75 @@ async fn routed_interrupt_cancels_step_without_input_or_phantom_driver() {
             .await;
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn overflowing_peer_is_never_replaced_or_receipted_and_can_be_reoffered() {
+    for mixed_tail in [false, true] {
+        let (model, mut ctrl) = model_source(None);
+        let conv = crate::stores::InMemoryConversationStore::new();
+        let system = super::AgentSystemBuilder::new(
+            conv.clone(),
+            crate::stores::InMemoryStateStore::new(),
+            model,
+            ChannelSender::new_pair().0,
+        )
+        .build();
+        let thread = super::thread::Thread::load(system.inner.clone(), "t1".into())
+            .await
+            .expect("load thread");
+        let observer = super::EventCollector::new();
+        let peer = peer_input("t1", "overflow", "full peer payload");
+        let mut batch = vec![peer.clone()];
+        if mixed_tail {
+            batch.push(user_text_input("t1", "other oversized input"));
+        }
+        let (_cancel, cancel) = tokio::sync::oneshot::channel();
+        let step = thread.step_no_defer(batch, &observer, cancel);
+        tokio::pin!(step);
+        let respond = async {
+            ctrl.next_request().await;
+            ctrl.send_error(infinity_provider_protocol::CompletionError::provider(
+                infinity_provider_protocol::ErrorClass::ContextOverflow,
+                "context overflow",
+            ));
+        };
+        tokio::select! {
+            result = &mut step => panic!("step ended before overflow response: {result:?}"),
+            () = respond => {}
+        }
+        tokio::select! {
+            result = &mut step => { result.expect("overflow is reported as an event"); }
+            _ = ctrl.next_request() => {
+                ctrl.send_text("accepted replacement"); ctrl.finish();
+                step.await.expect("replacement completion");
+            }
+        }
+        assert!(
+            !observer.take().iter().any(|(_, event)| matches!(event,
+            AgentEvent::InputCommitted { dedup_id } if dedup_id == "peer-overflow")),
+            "overflow must not receipt a peer whose full payload was not stored"
+        );
+        let stored = persisted(&conv, "t1");
+        assert!(!stored.contains("full peer payload"));
+        assert!(!stored.contains(crate::event_processor::TOOL_RESULT_TOO_LARGE_PLACEHOLDER));
+        assert!(!stored.contains(crate::event_processor::TOOL_CALL_INTERRUPTED_TEXT));
+        let (_cancel, cancel) = tokio::sync::oneshot::channel();
+        let retry = thread.step_no_defer(vec![peer], &observer, cancel);
+        let respond = async {
+            let req = tokio::time::timeout(std::time::Duration::from_secs(2), ctrl.next_request())
+                .await
+                .expect("overflow must release peer dedup ID for re-offer");
+            assert_eq!(tool_result_texts(&req), vec!["full peer payload"]);
+            ctrl.send_text("received full payload");
+            ctrl.finish();
+        };
+        let (result, ()) = tokio::join!(retry, respond);
+        result.expect("re-offered peer completion");
+        let stored = persisted(&conv, "t1");
+        assert_eq!(stored.matches("full peer payload").count(), 1);
+        assert!(!stored.contains(crate::event_processor::TOOL_RESULT_TOO_LARGE_PLACEHOLDER));
+        assert!(!stored.contains(crate::event_processor::TOOL_CALL_INTERRUPTED_TEXT));
+        assert!(observer.take().iter().any(|(_, event)| matches!(event,
+            AgentEvent::InputCommitted { dedup_id } if dedup_id == "peer-overflow")));
+    }
+}

@@ -125,6 +125,8 @@ pub enum CompletionEvent {
 pub struct PendingItem {
     message: InfinityMessage,
     message_id: String,
+    #[serde(skip)]
+    synthetic_kind: Option<TaggedSyntheticKind>,
 }
 
 /// Result of matching an incoming tool result against the history tail (see
@@ -249,6 +251,15 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         message: InfinityMessage,
         message_id: String,
     ) -> Result<bool, BoxError> {
+        self.handle_content_with_kind(message, message_id, None)
+    }
+
+    fn handle_content_with_kind(
+        &self,
+        message: InfinityMessage,
+        message_id: String,
+        synthetic_kind: Option<TaggedSyntheticKind>,
+    ) -> Result<bool, BoxError> {
         if self.processed_message_ids.borrow().contains(&message_id) {
             if self.durable_message_ids.borrow().contains(&message_id) {
                 self.committed_ids.borrow_mut().push(message_id.clone());
@@ -294,7 +305,7 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             self.interrupt_pending_tool_call();
         }
 
-        self.append_unvalidated(message, message_id.clone());
+        self.append_unvalidated(message, message_id.clone(), synthetic_kind);
         self.processed_message_ids.borrow_mut().insert(message_id);
         Ok(true)
     }
@@ -355,7 +366,11 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
                 },
                 display_segments: None,
             };
-            self.append_unvalidated(synthetic_result, format!("{}-interrupted", tool_call.id));
+            self.append_unvalidated(
+                synthetic_result,
+                format!("{}-interrupted", tool_call.id),
+                None,
+            );
         }
     }
 
@@ -401,6 +416,7 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         self.turn_buffer.borrow_mut().push(PendingItem {
             message: infinity_message,
             message_id: completion_id,
+            synthetic_kind: None,
         });
     }
 
@@ -474,7 +490,12 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
     /// result) to the in-memory history. The item is not persistable yet:
     /// it stays in `unvalidated_items` until the model produces output for
     /// it (see [`Self::mark_inputs_model_validated`]).
-    fn append_unvalidated(&self, message: InfinityMessage, message_id: String) {
+    fn append_unvalidated(
+        &self,
+        message: InfinityMessage,
+        message_id: String,
+        synthetic_kind: Option<TaggedSyntheticKind>,
+    ) {
         assert!(
             self.turn_buffer.borrow().is_empty(),
             "bug: append_unvalidated called with un-flushed turn_buffer content"
@@ -484,6 +505,7 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         self.unvalidated_items.borrow_mut().push(PendingItem {
             message,
             message_id,
+            synthetic_kind,
         });
     }
 
@@ -508,6 +530,7 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         self.pending_items.borrow_mut().push(PendingItem {
             message,
             message_id,
+            synthetic_kind: None,
         });
     }
 
@@ -526,10 +549,10 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         self.unvalidated_items.borrow().len()
     }
 
-    /// Drop all unvalidated *user* inputs: items that are neither tool
-    /// results nor subscription events (those are placeholder-replaceable,
-    /// see [`Self::replace_unvalidated_tool_results`], and answering a tool
-    /// call is always better than stranding it). Dropped items are removed
+    /// Drop unvalidated user and peer inputs, which have no safe substitute.
+    /// Other tool results and subscription events can use placeholders
+    /// (see [`Self::replace_unvalidated_tool_results`]) to avoid stranding
+    /// their tool calls. Dropped items are removed
     /// from the in-memory history and their dedup IDs forgotten so a
     /// redelivery is not silently ignored. Returns how many items were
     /// dropped.
@@ -551,7 +574,10 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         let mut kept = Vec::new();
         let mut dropped = 0;
         for item in unvalidated.drain(..) {
-            if matches!(
+            if !matches!(
+                item.synthetic_kind,
+                Some(TaggedSyntheticKind::PeerMessage { .. })
+            ) && matches!(
                 item.message,
                 InfinityMessage::ToolResult { .. } | InfinityMessage::SubscriptionEvent { .. }
             ) {
@@ -568,7 +594,7 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
     }
 
     /// Replace the content of every unvalidated tool result — including the
-    /// bodies of subscription events, which carry a tool result — with
+    /// bodies of subscription events except peer messages — with
     /// `placeholder` (in both the persistence queue and the in-memory
     /// history). Returns `true` if at least one was replaced.
     ///
@@ -586,6 +612,12 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         let tail_start = history.len() - unvalidated.len();
         let mut replaced = false;
         for (i, item) in unvalidated.iter_mut().enumerate() {
+            if matches!(
+                item.synthetic_kind,
+                Some(TaggedSyntheticKind::PeerMessage { .. })
+            ) {
+                continue;
+            }
             let result = match &mut item.message {
                 InfinityMessage::ToolResult {
                     result,
@@ -1096,7 +1128,11 @@ where
             child_thread_id: None,
             invocation: Some(Box::new(invocation)),
         };
-        return if current_history.handle_content(msg, message_id)? {
+        return if current_history.handle_content_with_kind(
+            msg,
+            message_id,
+            Some(TaggedSyntheticKind::PeerMessage { from: from.clone() }),
+        )? {
             Ok(PrepareResult::Ready)
         } else {
             Ok(PrepareResult::Handled)
