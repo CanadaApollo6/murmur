@@ -211,3 +211,66 @@ pub struct HeldMail {
     pub envelope: Envelope,
     pub state: DeliveryState,
 }
+
+id!(PermissionId);
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PermissionPolicy {
+    pub sandbox: SandboxLevel,
+    pub rules: Vec<PermissionRule>,
+    pub timeout: Option<std::time::Duration>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub enum SandboxLevel {
+    #[default]
+    ReadOnly,
+    WorkspaceWrite,
+    FullAccess,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PermissionRule {
+    /// Exact normalized tool name, or `*` for all tools.
+    pub tool: String,
+    pub decision: RuleDecision,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum RuleDecision {
+    Allow,
+    Deny,
+    Ask,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PermissionRequest {
+    pub id: PermissionId,
+    pub agent: AgentId,
+    pub incarnation: Incarnation,
+    pub tool: String,
+    pub title: String,
+    pub detail: String,
+    pub options: Vec<PermissionOption>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PermissionOption {
+    pub key: String,
+    pub label: String,
+    pub effect: PermissionEffect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermissionEffect {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+}
+
+#[derive(Clone, Debug)]
+pub enum PermissionAnswer {
+    Choose(String),
+    CancelTurn,
+}

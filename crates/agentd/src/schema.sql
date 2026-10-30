@@ -56,3 +56,10 @@ CREATE TABLE IF NOT EXISTS exposures (
 );
 PRAGMA user_version=1;
 COMMIT;
+
+CREATE TABLE IF NOT EXISTS actor_state (
+    agent TEXT PRIMARY KEY REFERENCES agents(id),
+    incarnation INTEGER NOT NULL,
+    resume TEXT,
+    kind TEXT NOT NULL
+);
