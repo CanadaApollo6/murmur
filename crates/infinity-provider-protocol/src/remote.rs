@@ -21,6 +21,10 @@
 //!   `StreamEnd`. Mid-stream provider errors are forwarded as `Chunk(Err)`
 //!   lines without ending the stream, mirroring the in-process behavior
 //!   where a stream may yield `Err` items.
+//!
+//! The client must keep its write half open until it has read the last line.
+//! The server treats EOF from the client as a hang-up and drops the provider's
+//! work, so a queued invocation frees its place without waiting for a write.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -509,9 +513,11 @@ mod tests {
         Stream,
     }
 
-    /// A provider that never finishes and signals when the server drops its work.
+    /// A provider that never finishes. It signals when its work starts and when
+    /// the server drops that work.
     struct HangingProvider {
         stall: Stall,
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         dropped: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     }
 
@@ -527,6 +533,9 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<ModelStream, CompletionError> {
             let signal = DropSignal(self.dropped.lock().expect("drop signal lock").take());
+            if let Some(tx) = self.entered.lock().expect("entry signal lock").take() {
+                let _ = tx.send(());
+            }
             match self.stall {
                 Stall::Invoke => {
                     let _signal = signal;
@@ -542,31 +551,49 @@ mod tests {
     }
 
     async fn assert_hang_up_cancels(stall: Stall) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, mut dropped_rx) = tokio::sync::oneshot::channel();
         let provider = Arc::new(HangingProvider {
             stall,
-            dropped: std::sync::Mutex::new(Some(tx)),
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            dropped: std::sync::Mutex::new(Some(dropped_tx)),
         });
         let (path, server) = serve_provider(provider).expect("bind provider socket");
         tokio::spawn(server);
 
         let remote = RemoteModelProvider::new(&path);
-        match stall {
+        // `async_trait` boxes the future, so dropping `invoke` drops the connection.
+        let mut invoke = remote.invoke_model("mock", test_request("hello"));
+        let response = match stall {
             Stall::Invoke => {
-                let invoke = remote.invoke_model("mock", test_request("hello"));
-                // Give the request time to reach the provider, then hang up.
-                let _ = tokio::time::timeout(std::time::Duration::from_millis(100), invoke).await;
+                tokio::select! {
+                    _ = &mut invoke => panic!("a queued invocation should not return"),
+                    entered = entered_rx => entered.expect("entry signal"),
+                }
+                None
             }
             Stall::Stream => {
-                let response = remote
-                    .invoke_model("mock", test_request("hello"))
-                    .await
-                    .expect("invoke model");
-                drop(response);
+                let response = (&mut invoke).await.expect("invoke model");
+                entered_rx.await.expect("entry signal");
+                Some(response)
             }
-        }
+        };
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+        // The work must survive while the client is still connected.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            matches!(
+                dropped_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "server dropped the provider's work while the client was connected"
+        );
+
+        // Hang up: dropping the client side closes the socket.
+        drop(response);
+        drop(invoke);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_rx)
             .await
             .expect("server should drop the provider's work once the client hangs up")
             .expect("drop signal");
