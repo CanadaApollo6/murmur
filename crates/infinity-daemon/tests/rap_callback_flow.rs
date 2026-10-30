@@ -30,6 +30,13 @@ struct TestHarness {
 /// Boot a session manager with a mock model, serve its RAP callback listener,
 /// and connect one client. Must run inside a `LocalSet`.
 async fn start_harness() -> Result<TestHarness, BoxError> {
+    start_harness_at(tempfile::tempdir()?, tempfile::tempdir()?).await
+}
+
+async fn start_harness_at(
+    state_dir: tempfile::TempDir,
+    cwd: tempfile::TempDir,
+) -> Result<TestHarness, BoxError> {
     let (model, ctrl) = mock_model();
     let entry = ModelEntry {
         model_id: "mock-model".to_owned(),
@@ -38,8 +45,6 @@ async fn start_harness() -> Result<TestHarness, BoxError> {
         max_output_tokens: None,
         supports_image_input: false,
     };
-    let state_dir = tempfile::tempdir()?;
-    let cwd = tempfile::tempdir()?;
 
     let bridge = infinity_rap_bridge::RapCallbackBridge::bind().await?;
     let callback_url = bridge.callback_url().to_owned();
@@ -639,8 +644,29 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
         if permanent {
             assert_eq!(crashes, 4, "fifth failed cancellation must reach Failed");
             agent.stop().await.expect("stop failed actor");
+            wait_for_message(&mut h.daemon_rx, |m| {
+                matches!(m, DaemonMessage::Error { text, .. } if text.contains("settlement exhausted"))
+            }).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            while let Ok(message) = h.daemon_rx.try_recv() {
+                assert!(
+                    !matches!(message, DaemonMessage::Info { text, .. } if text.contains("Interrupt failed")),
+                    "held settlement must stop automatic write retries"
+                );
+            }
         }
         drop(fault);
+        if permanent {
+            h.client_tx
+                .send(ClientMessage::Interrupt {
+                    thread_id: root.clone(),
+                })
+                .expect("retry settlement after repair");
+            wait_for_message(&mut h.daemon_rx, |m| {
+                matches!(m, DaemonMessage::ThreadIdle { .. })
+            })
+            .await;
+        }
         if permanent {
             agent = broker
                 .spawn(spec.clone())
@@ -1000,4 +1026,341 @@ async fn queued_resume_mail_outlives_attachment_idle_receipt_timeout() {
     tokio::task::LocalSet::new()
         .run_until(queued_attachment_mail_probe(true))
         .await;
+}
+
+async fn r4_human_sleep_probe() {
+    use agentd::mailroom::{Mailroom, NewMessage};
+    use agentd::model::*;
+    use agentd::supervisor::{AgentSpec, Broker, Event, Phase};
+
+    let mut h = start_harness().await.expect("harness");
+    let socket = h.cwd.path().join("broker-infinity.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("socket");
+    let manager = h.manager.clone();
+    let accept = tokio::task::spawn_local(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            tokio::task::spawn_local(infinity_daemon::client_handler::handle_client(
+                stream,
+                manager.clone(),
+            ));
+        }
+    });
+    let mailroom = Arc::new(
+        Mailroom::open(h.cwd.path().join("broker.db"), Default::default())
+            .await
+            .expect("mailroom"),
+    );
+    let broker = Broker::new(
+        mailroom.clone(),
+        vec![{
+            let mut kind = agentd::KindConfig::infinity(socket);
+            kind.cancel_timeout = Duration::from_millis(100);
+            kind
+        }],
+        agentd::supervisor::Config {
+            backoff_initial: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .expect("broker");
+    let mut events = broker.events();
+    let spec = AgentSpec {
+        name: AgentName::parse("model").expect("name"),
+        kind: "infinity".into(),
+        cwd: h.cwd.path().into(),
+        model: None,
+        permissions: PermissionPolicy::default(),
+        idle_after: None,
+    };
+    let agent = broker.spawn(spec.clone()).await.expect("spawn");
+    let mut phases = agent.phases();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *phases.borrow_and_update() != Phase::Idle {
+            phases.changed().await.expect("phase");
+        }
+    })
+    .await
+    .expect("initial idle");
+    let root = h
+        .manager
+        .lock()
+        .await
+        .list_sessions(None)
+        .await
+        .into_keys()
+        .next()
+        .expect("root");
+    h.client_tx
+        .send(ClientMessage::Connect {
+            root_thread_id: root.clone(),
+            thread_id: None,
+            keeps_session_alive: true,
+        })
+        .expect("connect observer");
+    wait_for_message(&mut h.daemon_rx, |m| {
+        matches!(m, DaemonMessage::Replay { .. })
+    })
+    .await;
+    let human = |body: &str| NewMessage {
+        from: Sender::Human,
+        to: agent.id,
+        body: Body::new(body).expect("body"),
+        reply_to: None,
+        client_key: ClientKey(body.into()),
+        act: agentd::swarm::Act::Inform,
+        task: None,
+    };
+    broker.send(human("run tool")).await.expect("send");
+    h.ctrl.next_request().await;
+    h.ctrl.send_tool_call(
+        "waiting",
+        "sleep_until_event_or_input",
+        serde_json::json!({}),
+    );
+    h.ctrl.finish();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(events.recv().await.expect("event"), Event::Consumed { .. }) {}
+    })
+    .await
+    .expect("receipt");
+    wait_for_message(&mut h.daemon_rx, |m| {
+        matches!(m, DaemonMessage::ResponseDone { .. })
+    })
+    .await;
+    let (_, envelope) = broker
+        .send(human("wake from human"))
+        .await
+        .expect("human wake");
+    let request = tokio::time::timeout(Duration::from_millis(600), h.ctrl.next_request())
+        .await
+        .expect(
+            "human mail must wake passive sleep without requiring another agent or manual cancel",
+        );
+    let history = format!("{:?}", request.chat_history);
+    assert!(history.contains("human operator") && history.contains("wake from human"));
+    h.ctrl.send_text("awake");
+    h.ctrl.finish();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(events.recv().await.expect("event"), Event::Consumed { ids, .. } if ids.contains(&envelope.id())) {}
+    }).await.expect("human receipt");
+    broker.shutdown().await.expect("shutdown");
+    accept.abort();
+}
+#[tokio::test(flavor = "current_thread")]
+async fn r4_human_wakes_passive_sleep() {
+    tokio::task::LocalSet::new()
+        .run_until(r4_human_sleep_probe())
+        .await;
+}
+
+async fn r4_before_restart() -> (tempfile::TempDir, tempfile::TempDir) {
+    use agentd::mailroom::{Mailroom, NewMessage};
+    use agentd::model::*;
+    use agentd::supervisor::{AgentSpec, Broker, Event, Phase};
+
+    let mut h = start_harness().await.expect("harness");
+    let socket = h.cwd.path().join("broker-infinity.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("socket");
+    let manager = h.manager.clone();
+    let accept = tokio::task::spawn_local(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            tokio::task::spawn_local(infinity_daemon::client_handler::handle_client(
+                stream,
+                manager.clone(),
+            ));
+        }
+    });
+    let mailroom = Arc::new(
+        Mailroom::open(h.cwd.path().join("broker.db"), Default::default())
+            .await
+            .expect("mailroom"),
+    );
+    let broker = Broker::new(
+        mailroom.clone(),
+        vec![{
+            let mut kind = agentd::KindConfig::infinity(socket);
+            kind.cancel_timeout = Duration::from_millis(100);
+            kind
+        }],
+        agentd::supervisor::Config {
+            backoff_initial: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .expect("broker");
+    let mut events = broker.events();
+    let spec = AgentSpec {
+        name: AgentName::parse("model").expect("name"),
+        kind: "infinity".into(),
+        cwd: h.cwd.path().into(),
+        model: None,
+        permissions: PermissionPolicy::default(),
+        idle_after: None,
+    };
+    let agent = broker.spawn(spec.clone()).await.expect("spawn");
+    let mut phases = agent.phases();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *phases.borrow_and_update() != Phase::Idle {
+            phases.changed().await.expect("phase");
+        }
+    })
+    .await
+    .expect("initial idle");
+    let root = h
+        .manager
+        .lock()
+        .await
+        .list_sessions(None)
+        .await
+        .into_keys()
+        .next()
+        .expect("root");
+    h.client_tx
+        .send(ClientMessage::Connect {
+            root_thread_id: root.clone(),
+            thread_id: None,
+            keeps_session_alive: true,
+        })
+        .expect("connect observer");
+    wait_for_message(&mut h.daemon_rx, |m| {
+        matches!(m, DaemonMessage::Replay { .. })
+    })
+    .await;
+    let human = |body: &str| NewMessage {
+        from: Sender::Human,
+        to: agent.id,
+        body: Body::new(body).expect("body"),
+        reply_to: None,
+        client_key: ClientKey(body.into()),
+        act: agentd::swarm::Act::Inform,
+        task: None,
+    };
+    broker.send(human("run tool")).await.expect("send");
+    h.ctrl.next_request().await;
+    h.ctrl
+        .send_tool_call("waiting", "sleep", serde_json::json!({"seconds": 60}));
+    h.ctrl.finish();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(events.recv().await.expect("event"), Event::Consumed { .. }) {}
+    })
+    .await
+    .expect("receipt");
+    wait_for_message(&mut h.daemon_rx, |m| {
+        matches!(m, DaemonMessage::ResponseDone { .. })
+    })
+    .await;
+    broker.shutdown().await.expect("shutdown broker");
+    drop(broker);
+    Arc::try_unwrap(mailroom)
+        .ok()
+        .expect("sole owner")
+        .close()
+        .await
+        .expect("close");
+    accept.abort();
+    (h._state_dir, h.cwd)
+}
+async fn r4_after_restart(state_dir: tempfile::TempDir, cwd: tempfile::TempDir) {
+    use agentd::mailroom::{Mailroom, NewMessage};
+    use agentd::model::*;
+    use agentd::supervisor::{AgentSpec, Broker, Event, Phase};
+
+    let mut h = start_harness_at(state_dir, cwd).await.expect("harness");
+    let socket = h.cwd.path().join("broker-infinity.sock");
+    std::fs::remove_file(&socket).expect("remove stale scratch socket");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("socket");
+    let manager = h.manager.clone();
+    let accept = tokio::task::spawn_local(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            tokio::task::spawn_local(infinity_daemon::client_handler::handle_client(
+                stream,
+                manager.clone(),
+            ));
+        }
+    });
+    let mailroom = Arc::new(
+        Mailroom::open(h.cwd.path().join("broker.db"), Default::default())
+            .await
+            .expect("mailroom"),
+    );
+    let broker = Broker::new(
+        mailroom.clone(),
+        vec![{
+            let mut kind = agentd::KindConfig::infinity(socket);
+            kind.cancel_timeout = Duration::from_millis(100);
+            kind
+        }],
+        agentd::supervisor::Config {
+            backoff_initial: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .expect("broker");
+    let mut events = broker.events();
+    let spec = AgentSpec {
+        name: AgentName::parse("model").expect("name"),
+        kind: "infinity".into(),
+        cwd: h.cwd.path().into(),
+        model: None,
+        permissions: PermissionPolicy::default(),
+        idle_after: None,
+    };
+    let agent = broker.spawn(spec.clone()).await.expect("spawn");
+    let mut phases = agent.phases();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *phases.borrow_and_update() != Phase::Idle {
+            phases.changed().await.expect("phase");
+        }
+    })
+    .await
+    .expect("initial idle");
+    let (_, envelope) = broker
+        .send(NewMessage {
+            from: Sender::Human,
+            to: agent.id,
+            body: Body::new("human after daemon restart").expect("body"),
+            reply_to: None,
+            client_key: ClientKey("after-restart".into()),
+            act: agentd::swarm::Act::Inform,
+            task: None,
+        })
+        .await
+        .expect("send");
+    let request = tokio::time::timeout(Duration::from_secs(1), h.ctrl.next_request())
+        .await
+        .expect("daemon restart must not strand mail behind an orphaned timer");
+    assert!(format!("{:?}", request.chat_history).contains("interrupted: daemon restarted"));
+    h.ctrl.send_text("recovered");
+    h.ctrl.finish();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(events.recv().await.expect("event"), Event::Consumed { ids, .. } if ids.contains(&envelope.id())) {}
+    }).await.expect("restart receipt");
+    let payloads = std::fs::read_dir(h._state_dir.path().join("threads"))
+        .expect("threads")
+        .map(|entry| std::fs::read_to_string(entry.expect("entry").path()).expect("thread payload"))
+        .collect::<String>();
+    assert_eq!(payloads.matches("interrupted: daemon restarted").count(), 1);
+    broker.shutdown().await.expect("shutdown");
+    accept.abort();
+}
+#[test]
+fn r4_daemon_restart_orphaned_tool() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (state_dir, cwd) =
+        runtime.block_on(tokio::task::LocalSet::new().run_until(r4_before_restart()));
+    drop(runtime);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("replacement runtime");
+    runtime.block_on(tokio::task::LocalSet::new().run_until(r4_after_restart(state_dir, cwd)));
 }

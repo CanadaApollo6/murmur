@@ -92,8 +92,8 @@ struct ResolvedConfig<M: InputSender, H: HttpClient> {
 /// reloads it from the stores) and resident embeddings park it on a channel.
 ///
 /// The thread's configuration (tools, prompt, notifier) is resolved lazily
-/// on the first step rather than at load, so loading a thread for replay or
-/// subscription does not touch (or boot) its tool servers.
+/// on the first step. A resident system also resolves configuration when
+/// loading an unanswered executor call, to decide whether it survived restart.
 pub struct Thread<C: ConversationStore, S: StateStore, M: InputSender, H: HttpClient> {
     inner: Rc<SystemInner<C, S, M, H>>,
     history: HistoryManager<C, S>,
@@ -129,14 +129,57 @@ where
             .state_store
             .get_pending_user_choices(&history.thread_id)
             .await?;
-        Ok(Self {
+        let thread = Self {
             inner,
             history,
             config: RefCell::new(None),
             current_thinking: RefCell::new(None),
             in_flight: Cell::new(false),
             pending_choices: RefCell::new(pending_choices),
-        })
+        };
+        if let Some(loaded) = &thread.inner.loaded_threads
+            && !loaded.borrow().contains(&thread.history.thread_id)
+        {
+            let mut orphaned = matches!(thread.history.history.borrow().last(),
+                Some(crate::message::InfinityMessage::ToolResult { result, .. })
+                    if result.content.iter().any(|content| matches!(content,
+                        ToolResultContent::Text(text) if text.text == "interrupted: daemon restarted")));
+            // Spawn and compaction seed calls are structural anchors, not executors.
+            if let Some((_, name)) = thread.pending_tool_call()
+                && !matches!(
+                    name.as_str(),
+                    CLOSE_THREAD_TOOL | "spawn_thread" | "__harness_begin_compaction__"
+                )
+            {
+                let config = thread.resolved_config().await?;
+                let survives = config
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name() == name)
+                    .is_some_and(|tool| tool.survives_restart());
+                if !survives {
+                    thread
+                        .history
+                        .interrupt_pending_tool_call_with_text("interrupted: daemon restarted");
+                    thread.history.settle_tool_results_on_interrupt().await?;
+                    thread.history.take_interrupted_tool_calls();
+                    orphaned = true;
+                }
+            }
+            if orphaned {
+                let choices = thread.pending_choices.borrow().clone();
+                for choice in choices {
+                    thread
+                        .inner
+                        .state_store
+                        .remove_pending_user_choice(&thread.history.thread_id, &choice.id)
+                        .await?;
+                }
+                thread.pending_choices.borrow_mut().clear();
+            }
+            loaded.borrow_mut().insert(thread.history.thread_id.clone());
+        }
+        Ok(thread)
     }
 
     /// Resolve (once) this thread's configuration and append the built-in
@@ -261,7 +304,15 @@ where
             let config = self.resolved_config().await?;
             if let Some(notifier) = &config.rap_notifier {
                 for call_id in interrupted {
-                    notifier.notify_tool_cancelled(thread_id, &call_id).await;
+                    if tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        notifier.notify_tool_cancelled(thread_id, &call_id),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!(%thread_id, %call_id, "RAP cancellation notification timed out");
+                    }
                 }
             }
         }

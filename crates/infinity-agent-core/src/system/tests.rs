@@ -1390,7 +1390,7 @@ async fn rebooted_session_settles_persisted_unanswered_tool_call() {
             let req = ctrl2.next_request().await;
             let history = format!("{:?}", req.chat_history);
             assert!(
-                history.contains("Tool call interrupted by user"),
+                history.contains("interrupted: daemon restarted"),
                 "reboot + user input must settle the stranded call; history: {history}"
             );
             assert!(history.contains("hello again"), "history: {history}");
@@ -1404,7 +1404,7 @@ async fn rebooted_session_settles_persisted_unanswered_tool_call() {
             // Everything from the recovered round is validated + persisted.
             let stored = persisted(&conv, "t1");
             assert!(
-                stored.contains("Tool call interrupted by user")
+                stored.contains("interrupted: daemon restarted")
                     && stored.contains("hello again")
                     && stored.contains("back online"),
                 "recovered round must persist; store: {stored}"
@@ -2687,6 +2687,249 @@ async fn routed_interrupt_durably_settles_waiting_tool_and_choice() {
                 ctrl.try_next_request().is_none(),
                 "cancel must not start inference"
             );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r4_interrupt_with_unresponsive_rap_notification() {
+    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
+    use crate::traits::{ConversationStore, StateStore};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (model, mut ctrl) = model_source(None);
+            let conv = InMemoryConversationStore::new();
+            let state = InMemoryStateStore::new();
+            conv.ensure_root_thread(ThreadId::from_ref("t1"))
+                .await
+                .expect("root");
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let url = format!("http://{}", listener.local_addr().expect("address"));
+            tokio::task::spawn_local(async move {
+                use tokio::io::AsyncReadExt;
+                let (mut stream, _) = listener.accept().await.expect("connection");
+                let mut buffer = [0u8; 4096];
+                let n = stream.read(&mut buffer).await.expect("request");
+                eprintln!(
+                    "R4 unresponsive RAP received {}",
+                    String::from_utf8_lossy(&buffer[..n])
+                );
+                std::future::pending::<()>().await;
+            });
+            let mut running =
+                super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
+                    .tools(vec![Box::new(AsyncTool) as Box<dyn Tool<ChannelSender>>])
+                    .rap_notifier(rap_client::notifier::RapNotifier::new(
+                        vec![url],
+                        rap_client::http::SimpleHttpClient::new(),
+                    ))
+                    .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+            running
+                .send_user_text(ThreadId::from_ref("t1"), "ask")
+                .await;
+            ctrl.next_request().await;
+            ctrl.send_tool_call("waiting", "async_tool", serde_json::json!({}));
+            ctrl.finish();
+            collect_until_finished(&mut rx).await;
+            running
+                .send(
+                    InputMessage {
+                        content: InputMessageContent::UserChoice(UserChoiceRequired {
+                            content_type: "user_choice_required".into(),
+                            id: "waiting".into(),
+                            call_id: None,
+                            prompt: "Choose".into(),
+                            choices: vec!["A".into()],
+                            default: 0,
+                            response_url: "http://example.test/choice".into(),
+                        }),
+                        group_id: "t1".into(),
+                        metadata: None,
+                        synthetic: None,
+                        display_as: None,
+                        subscription: false,
+                    },
+                    "choice",
+                )
+                .await;
+            loop {
+                if matches!(
+                    next_evt(&mut rx).await,
+                    Evt::E(AgentEvent::UserChoiceRequired { .. })
+                ) {
+                    break;
+                }
+            }
+            assert!(
+                running
+                    .interrupt_handle()
+                    .interrupt(ThreadId::from_ref("t1"))
+            );
+            loop {
+                if matches!(
+                    next_evt(&mut rx).await,
+                    Evt::E(AgentEvent::UserChoiceDismissed { .. })
+                ) {
+                    break;
+                }
+            }
+            assert!(
+                state
+                    .get_pending_user_choices(ThreadId::from_ref("t1"))
+                    .await
+                    .expect("choices")
+                    .is_empty()
+            );
+            collect_until_finished(&mut rx).await;
+            wait_idle(&mut running).await;
+            assert!(persisted(&conv, "t1").contains("Tool call interrupted by user"));
+            let (replay_tx, mut replay_rx) = mpsc::unbounded_channel();
+            running.subscribe(ThreadId::from_ref("t1"), replay_tx).await;
+            let Evt::Replay(snapshot) = next_evt(&mut replay_rx).await else {
+                panic!("replay")
+            };
+            assert!(snapshot.pending_choices.is_empty());
+            assert!(!matches!(
+                snapshot.history.last(),
+                Some(crate::message::InfinityMessage::ToolCall { .. })
+            ));
+            assert!(
+                ctrl.try_next_request().is_none(),
+                "cancel must not start inference"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn human_deferrable_mail_waits_for_active_tool_and_receipts_its_dedup_id() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (running, mut rx, mut ctrl, conv) = start_system(vec![Box::new(AsyncTool)], None);
+        running.send_user_text(ThreadId::from_ref("t1"), "work").await;
+        ctrl.next_request().await;
+        ctrl.send_tool_call("active", "async_tool", serde_json::json!({}));
+        ctrl.finish();
+        collect_until_finished(&mut rx).await;
+        let mut human = peer_input("t1", "human-mail", "Mail from the human operator");
+        human.0.synthetic = Some(SyntheticKind::Tagged(TaggedSyntheticKind::PeerMessage { from: "human".into() }));
+        running.send(human.0.clone(), &human.1).await;
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(30), ctrl.next_request()).await.is_err(),
+            "deferrable human mail must wait for the real active-tool result");
+        assert!(!persisted(&conv, "t1").contains("human operator"));
+        let result = tool_result_input("t1", "active", "real active-tool result");
+        running.send(result.0, &result.1).await;
+        let request = ctrl.next_request().await;
+        let history = format!("{:?}", request.chat_history);
+        assert!(history.contains("real active-tool result") && history.contains("human operator"));
+        assert!(!history.contains("interrupted"));
+        ctrl.send_text("received human mail");
+        ctrl.finish();
+        loop {
+            if matches!(next_evt(&mut rx).await, Evt::E(AgentEvent::InputCommitted { dedup_id }) if dedup_id == human.1) { break; }
+        }
+        collect_until_finished(&mut rx).await;
+        running.send(human.0, &human.1).await;
+        loop {
+            if matches!(next_evt(&mut rx).await, Evt::E(AgentEvent::InputCommitted { dedup_id }) if dedup_id == human.1) { break; }
+        }
+        assert!(ctrl.try_next_request().is_none(), "durable human mail must dedup without inference");
+        running.shutdown().await;
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restart_settles_orphaned_active_tool_but_preserves_external_executor() {
+    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
+    struct RestartTool(bool);
+    #[async_trait]
+    impl Tool<ChannelSender> for RestartTool {
+        fn name(&self) -> &str {
+            "active_tool"
+        }
+        fn description(&self) -> &str {
+            "active tool"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn survives_restart(&self) -> bool {
+            self.0
+        }
+        async fn execute(
+            &self,
+            _: serde_json::Value,
+            _: rap_protocol::ToolCallId,
+            _: Option<rap_protocol::ProviderCallId>,
+            _: &ToolContext<ChannelSender>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+    }
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for external in [false, true] {
+                let conv = InMemoryConversationStore::new();
+                let state = InMemoryStateStore::new();
+                let (model, mut ctrl) = model_source(None);
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let running =
+                    super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
+                        .tool(Box::new(RestartTool(external)))
+                        .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+                running
+                    .send_user_text(ThreadId::from_ref("t1"), "work")
+                    .await;
+                ctrl.next_request().await;
+                ctrl.send_tool_call("active", "active_tool", serde_json::json!({}));
+                ctrl.finish();
+                collect_until_finished(&mut rx).await;
+                running.shutdown().await;
+                let (model, mut ctrl) = model_source(None);
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let running = super::AgentSystemBuilder::new_local(conv.clone(), state, model)
+                    .tool(Box::new(RestartTool(external)))
+                    .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+                let (tx, mut replay) = mpsc::unbounded_channel();
+                running.subscribe(ThreadId::from_ref("t1"), tx).await;
+                let Evt::Replay(snapshot) = next_evt(&mut replay).await else {
+                    panic!("replay")
+                };
+                assert_eq!(snapshot.idle, !external);
+                assert_eq!(
+                    persisted(&conv, "t1").contains("interrupted: daemon restarted"),
+                    !external
+                );
+                let peer = peer_input("t1", "after-restart", "peer after restart");
+                running.send(peer.0, &peer.1).await;
+                if external {
+                    assert!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_millis(30),
+                            ctrl.next_request()
+                        )
+                        .await
+                        .is_err()
+                    );
+                    let result = tool_result_input("t1", "active", "external executor survived");
+                    running.send(result.0, &result.1).await;
+                }
+                let request = ctrl.next_request().await;
+                let history = format!("{:?}", request.chat_history);
+                assert!(history.contains("peer after restart"));
+                if external {
+                    assert!(
+                        history.contains("external executor survived")
+                            && !history.contains("interrupted")
+                    );
+                }
+                ctrl.send_text("recovered");
+                ctrl.finish();
+                collect_until_finished(&mut rx).await;
+                running.shutdown().await;
+            }
         })
         .await;
 }
