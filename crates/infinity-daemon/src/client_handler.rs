@@ -7,7 +7,7 @@ use infinity_agent_core::message::{
 use infinity_protocol::{
     ClientMessage, DaemonMessage, RemoteName, ThreadRef, length_delimited_codec,
 };
-use infinity_provider_protocol::message::UserContent;
+use infinity_provider_protocol::message::{Text, ToolResult, ToolResultContent, UserContent};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
@@ -217,6 +217,17 @@ fn strip_client_message(msg: ClientMessage, remote_name: &RemoteName) -> ClientM
     match msg {
         ClientMessage::UserInput { thread_id, text } => ClientMessage::UserInput {
             thread_id: thread_id.strip(remote_name),
+            text,
+        },
+        ClientMessage::DeliverPeerMessage {
+            thread_id,
+            message_id,
+            from,
+            text,
+        } => ClientMessage::DeliverPeerMessage {
+            thread_id: thread_id.strip(remote_name),
+            message_id,
+            from,
             text,
         },
         ClientMessage::SoftDetach { root_thread_id } => ClientMessage::SoftDetach {
@@ -529,6 +540,27 @@ pub async fn handle_client_channels(
                                 thread_id: Some(thread_id),
                                 text: "failed to send input".into(),
                             });
+                        }
+                    }
+                    ClientMessage::DeliverPeerMessage { thread_id, message_id, from, text } => {
+                        if thread_id.remote.is_some() {
+                            let _ = daemon_tx.send(DaemonMessage::Error { thread_id: Some(thread_id), text: "remote is not connected".into() });
+                            continue;
+                        }
+                        let input = InputMessage {
+                            content: InputMessageContent::User(UserContent::ToolResult(ToolResult {
+                                id: String::new(),
+                                call_id: None,
+                                content: vec![ToolResultContent::Text(Text { text })],
+                            })),
+                            group_id: thread_id.id.clone(),
+                            metadata: None,
+                            synthetic: Some(SyntheticKind::Tagged(TaggedSyntheticKind::PeerMessage { from })),
+                            display_as: None,
+                            subscription: false,
+                        };
+                        if !session_manager.lock().await.send_input((input, Some(format!("peer-{message_id}")))).await {
+                            let _ = daemon_tx.send(DaemonMessage::Error { thread_id: Some(thread_id), text: "failed to send input".into() });
                         }
                     }
                     ClientMessage::Disconnect => {

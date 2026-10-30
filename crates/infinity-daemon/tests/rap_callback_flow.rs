@@ -277,3 +277,49 @@ async fn reqwest_post(url: &str, body: &str) -> u16 {
         .await
         .expect("POST to the callback listener")
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn peer_message_over_socket_reaches_thread_and_replays_with_receipts() {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+    use infinity_provider_protocol::message::{AssistantContent, Message, UserContent};
+    use tokio_util::codec::Framed;
+
+    tokio::task::LocalSet::new().run_until(async {
+        let mut h = start_harness().await.expect("start harness");
+        let thread_id = create_session_and_chat(&mut h).await;
+        let (client, server) = tokio::net::UnixStream::pair().expect("client socket pair");
+        tokio::task::spawn_local(infinity_daemon::client_handler::handle_client(server, h.manager.clone()));
+        let mut client = Framed::new(client, infinity_protocol::length_delimited_codec());
+        let peer = ClientMessage::DeliverPeerMessage {
+            thread_id: thread_id.clone(), message_id: "mail-1".into(), from: "@planner".into(), text: "peer payload".into(),
+        };
+        let wire = Bytes::from(serde_json::to_vec(&peer).expect("serialize peer"));
+        client.send(wire.clone()).await.expect("send peer");
+        let req = tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request()).await.expect("peer reaches model");
+        let pair = &req.chat_history[req.chat_history.len()-2..];
+        assert!(matches!(&pair[0], Message::Assistant { content }
+            if matches!(&content[0], AssistantContent::ToolCall(call) if call.id == "peer-mail-1"
+                && call.function.name == "receive_event__injected" && call.function.arguments["from"] == "@planner")));
+        assert!(matches!(&pair[1], Message::User { content }
+            if matches!(&content[0], UserContent::ToolResult(result) if result.id == "peer-mail-1")));
+        let display = wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::SubscriptionEvent { .. })).await;
+        assert!(matches!(display, DaemonMessage::SubscriptionEvent { name, text, .. } if name == "message from @planner" && text == "peer payload"));
+        h.ctrl.send_text("received");
+        h.ctrl.finish();
+        for delivery in 0..2 {
+            let receipt = wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::InputCommitted { dedup_id, .. } if dedup_id == "peer-mail-1")).await;
+            assert!(matches!(receipt, DaemonMessage::InputCommitted { thread_id: Some(id), .. } if id == thread_id));
+            if delivery == 0 {
+                client.send(wire.clone()).await.expect("redeliver peer");
+            }
+        }
+        assert!(h.ctrl.try_next_request().is_none(), "duplicate must not run inference");
+        h.client_tx.send(ClientMessage::Connect { root_thread_id: thread_id, thread_id: None, keeps_session_alive: true }).expect("reconnect for replay");
+        let replay = wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
+        let DaemonMessage::Replay { history, .. } = replay else { unreachable!() };
+        let peers: Vec<_> = history.iter().filter(|m| matches!(m, DaemonMessage::SubscriptionEvent { .. })).collect();
+        assert_eq!(peers.len(), 1);
+        assert!(matches!(peers[0], DaemonMessage::SubscriptionEvent { name, text, .. } if name == "message from @planner" && text == "peer payload"));
+    }).await;
+}
