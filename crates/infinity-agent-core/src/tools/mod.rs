@@ -77,12 +77,6 @@ pub trait Tool<M: InputSender>: Send + Sync {
         context: &ToolContext<M>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-    /// True only when an executor outside this system can deliver the result
-    /// after the system restarts. In-process and daemon-owned tools default false.
-    fn survives_restart(&self) -> bool {
-        false
-    }
-
     fn supports_sync(&self) -> bool {
         false
     }

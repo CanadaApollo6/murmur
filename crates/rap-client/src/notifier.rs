@@ -36,30 +36,39 @@ impl<H: HttpClient> RapNotifier<H> {
     }
 
     /// Best-effort notification that a tool call has been cancelled.
+    /// The entire broadcast has a two-second budget so an unresponsive server
+    /// cannot block input, interruption, or restart recovery.
     pub async fn notify_tool_cancelled(
         &self,
         thread_id: &rap_protocol::ThreadId<str>,
         tool_call_id: &rap_protocol::ToolCallId<str>,
     ) {
-        let payload = serde_json::json!({
-            "thread_id": thread_id,
-            "tool_call_id": tool_call_id,
-        })
-        .to_string();
-        for url in &self.server_urls {
-            let endpoint = format!("{}/cancel_tool_call", url.trim_end_matches('/'));
-            match self.client.post(&endpoint, &payload).await {
-                Ok(status) => {
-                    tracing::info!(
-                        "Notified {} of tool cancellation (status: {})",
-                        endpoint,
-                        status
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to notify {} of tool cancellation: {}", endpoint, e);
+        if tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let payload = serde_json::json!({
+                "thread_id": thread_id,
+                "tool_call_id": tool_call_id,
+            })
+            .to_string();
+            for url in &self.server_urls {
+                let endpoint = format!("{}/cancel_tool_call", url.trim_end_matches('/'));
+                match self.client.post(&endpoint, &payload).await {
+                    Ok(status) => {
+                        tracing::info!(
+                            "Notified {} of tool cancellation (status: {})",
+                            endpoint,
+                            status
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to notify {} of tool cancellation: {}", endpoint, e);
+                    }
                 }
             }
+        })
+        .await
+        .is_err()
+        {
+            tracing::warn!(%thread_id, %tool_call_id, "RAP cancellation notification timed out");
         }
     }
 
