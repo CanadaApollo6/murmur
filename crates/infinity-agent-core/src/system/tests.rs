@@ -2332,3 +2332,141 @@ async fn peer_wakes_passive_sleep() {
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn peer_redelivery_committed_once_in_history_after_reload() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (mut running, mut rx, mut ctrl, conv) = start_system(vec![], None);
+            running
+                .send_user_text(ThreadId::from_ref("t1"), "hello")
+                .await;
+            ctrl.next_request().await;
+            ctrl.send_text("hi");
+            ctrl.finish();
+            collect_until_finished(&mut rx).await;
+            let (peer, id) = peer_input("t1", "redelivered", "unique peer payload");
+            running.send(peer.clone(), &id).await;
+            let req = ctrl.next_request().await;
+            assert_eq!(tool_result_texts(&req), vec!["unique peer payload"]);
+            ctrl.send_text("received");
+            ctrl.finish();
+            loop {
+                if let Evt::E(AgentEvent::InputCommitted { dedup_id }) = next_evt(&mut rx).await {
+                    assert_eq!(dedup_id, id);
+                    break;
+                }
+            }
+            collect_until_finished(&mut rx).await;
+            wait_idle(&mut running).await;
+            running.send(peer, &id).await;
+            loop {
+                if let Evt::E(AgentEvent::InputCommitted { dedup_id }) = next_evt(&mut rx).await {
+                    assert_eq!(dedup_id, id);
+                    break;
+                }
+            }
+            wait_idle(&mut running).await;
+            assert!(
+                ctrl.try_next_request().is_none(),
+                "durable duplicate must not run inference"
+            );
+            let stored = conv
+                .thread_messages(ThreadId::from_ref("t1"))
+                .expect("stored history");
+            let peers: Vec<_> = stored
+                .iter()
+                .filter(|(m, _)| {
+                    matches!(m, crate::message::InfinityMessage::SubscriptionEvent { .. })
+                })
+                .collect();
+            assert_eq!(peers.len(), 1);
+            assert!(format!("{peers:?}").contains("peer-redelivered"));
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn input_committed_observer_sees_persisted_input_only_after_validation() {
+    struct DurableObserver {
+        conv: crate::stores::InMemoryConversationStore,
+        events: super::EventCollector,
+    }
+    #[async_trait(?Send)]
+    impl super::ThreadObserver for DurableObserver {
+        type SubscribeRequest = ();
+        fn on_event(&self, thread_id: &ThreadId<str>, event: &AgentEvent) {
+            if let AgentEvent::InputCommitted { dedup_id } = event
+                && dedup_id == "peer-durable"
+            {
+                assert!(persisted(&self.conv, thread_id.as_str()).contains("durable payload"));
+            }
+            super::ThreadObserver::on_event(&self.events, thread_id, event);
+        }
+    }
+    let (model, mut ctrl) = model_source(None);
+    let conv = crate::stores::InMemoryConversationStore::new();
+    let observer = DurableObserver {
+        conv: conv.clone(),
+        events: super::EventCollector::new(),
+    };
+    let system = super::AgentSystemBuilder::new(
+        conv.clone(),
+        crate::stores::InMemoryStateStore::new(),
+        model,
+        ChannelSender::new_pair().0,
+    )
+    .build();
+    let thread = super::thread::Thread::load(system.inner.clone(), "t1".into())
+        .await
+        .expect("load thread");
+    let (_cancel1, cancel1) = tokio::sync::oneshot::channel();
+    let peer = peer_input("t1", "durable", "durable payload");
+    let failed = thread.step_no_defer(vec![peer.clone()], &observer, cancel1);
+    let respond = async {
+        ctrl.next_request().await;
+        assert!(!persisted(&conv, "t1").contains("durable payload"));
+        ctrl.send_error(infinity_provider_protocol::CompletionError::provider(
+            infinity_provider_protocol::ErrorClass::Fatal,
+            "inference failed",
+        ));
+    };
+    let (result, ()) = tokio::join!(failed, respond);
+    result.expect("failed completion is reported as an event");
+    let events = observer.events.take();
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, AgentEvent::CompletionFinished { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, AgentEvent::InputCommitted { .. }))
+    );
+    assert!(!persisted(&conv, "t1").contains("durable payload"));
+    let (_cancel2, cancel2) = tokio::sync::oneshot::channel();
+    thread
+        .step_no_defer(vec![peer], &observer, cancel2)
+        .await
+        .expect("unvalidated duplicate");
+    assert!(
+        !observer
+            .events
+            .take()
+            .iter()
+            .any(|(_, e)| matches!(e, AgentEvent::InputCommitted { .. }))
+    );
+    let (_cancel3, cancel3) = tokio::sync::oneshot::channel();
+    let retry = thread.step_no_defer(vec![user_text_input("t1", "retry")], &observer, cancel3);
+    let respond = async {
+        ctrl.next_request().await;
+        ctrl.send_text("validated");
+        ctrl.finish();
+    };
+    let (result, ()) = tokio::join!(retry, respond);
+    result.expect("validated completion");
+    assert!(observer.events.take().iter().any(
+        |(_, e)| matches!(e, AgentEvent::InputCommitted { dedup_id } if dedup_id == "peer-durable")
+    ));
+}

@@ -7,6 +7,10 @@ use infinity_provider_protocol::message::{AssistantContent, ToolResultContent, U
 pub(crate) fn agent_event_to_daemon(thread_id: &ThreadId<str>, evt: &AgentEvent) -> DaemonMessage {
     let tid = Some(ThreadRef::local(thread_id.to_owned()));
     match evt {
+        AgentEvent::InputCommitted { dedup_id } => DaemonMessage::InputCommitted {
+            thread_id: tid,
+            dedup_id: dedup_id.clone(),
+        },
         AgentEvent::CompletionStarted => DaemonMessage::StartOutput { thread_id: tid },
         AgentEvent::TextChunk { text } => DaemonMessage::TextChunk {
             thread_id: tid,
