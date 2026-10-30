@@ -913,7 +913,8 @@ async fn agentctl_spawns_an_infinity_kind_and_relays_approval() {
         ClientMessage::UserChoiceAnswered { selected: 0, .. }
     ));
     input.emit(fake_infinity::receipt("human-id".into()));
-    input.emit(fake_infinity::done());
+    input.emit(fake_infinity::round_done());
+    input.emit(fake_infinity::idle());
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let agents = d.ctl(&["ls"]).await;

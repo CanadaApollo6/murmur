@@ -176,6 +176,7 @@ impl ThreadObserver for DaemonObserver {
                     pending_choices: choices,
                     views,
                     in_progress: snapshot.in_progress,
+                    idle: snapshot.idle,
                 })
                 .is_err()
             {

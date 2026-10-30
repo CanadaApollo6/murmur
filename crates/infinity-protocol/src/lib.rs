@@ -442,6 +442,10 @@ pub enum DaemonMessage {
         view_type: String,
         content: serde_json::Value,
     },
+    /// Core has no queued work, unresolved tool, or pending choice.
+    ThreadIdle {
+        thread_id: Option<ThreadRef>,
+    },
     /// Batch replay of history messages, sent on connect/load.
     Replay {
         history: Vec<DaemonMessage>,
@@ -456,6 +460,10 @@ pub enum DaemonMessage {
         /// events will follow.
         #[serde(default)]
         in_progress: bool,
+        /// Core has no completion, unresolved tool, or pending choice.
+        /// Missing on older daemons, so consumers must conservatively wait.
+        #[serde(default)]
+        idle: bool,
     },
     /// Sent immediately on socket connection with session list and default model info.
     Welcome {
