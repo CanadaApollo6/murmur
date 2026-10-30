@@ -359,18 +359,21 @@ impl PersistentConversationStore {
 
     /// Write a single thread's data to `{dir}/{thread_id}.json` and metadata to `.meta.json`.
     /// No-op when persistence is disabled.
-    fn save_thread(&self, thread_id: &ThreadId<str>) {
-        let Some(ref dir) = self.dir else { return };
+    fn save_thread(&self, thread_id: &ThreadId<str>) -> Result<(), MemoryError> {
+        let Some(ref dir) = self.dir else {
+            return Ok(());
+        };
         let snapshot = ThreadSnapshot {
             messages: self.core.thread_messages(thread_id).unwrap_or_default(),
             compaction_summaries: self.core.thread_compaction_summaries(thread_id),
         };
 
         let path = dir.join(format!("{}.json", thread_id));
-        if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
-            std::fs::write(path, json).ok();
-        }
+        let json =
+            serde_json::to_string_pretty(&snapshot).map_err(|e| MemoryError(e.to_string()))?;
+        std::fs::write(path, json).map_err(|e| MemoryError(e.to_string()))?;
         self.save_thread_metadata(thread_id);
+        Ok(())
     }
 
     /// Ensure a thread's metadata (core info + extras) is loaded from disk.
@@ -752,7 +755,7 @@ impl PersistentConversationStore {
                 .lock()
                 .expect("bug: mutex poisoned")
                 .insert(tid.clone());
-            self.save_thread(&tid);
+            self.save_thread(&tid)?;
             self.save_views(&tid);
         }
         Ok(())
@@ -772,7 +775,7 @@ impl ConversationStore for PersistentConversationStore {
                 thread_id.to_owned(),
                 ThreadExtras::new(self.default_model.clone()),
             );
-            self.save_thread(thread_id);
+            self.save_thread(thread_id)?;
         }
         Ok(())
     }
@@ -802,7 +805,7 @@ impl ConversationStore for PersistentConversationStore {
         self.ensure_thread_loaded(session_id);
         tracing::trace!("Appending messages to store");
         self.core.append_messages(session_id, messages).await?;
-        self.save_thread(session_id);
+        self.save_thread(session_id)?;
         Ok(())
     }
 
@@ -849,7 +852,7 @@ impl ConversationStore for PersistentConversationStore {
             meta_loaded.insert(new_id.clone());
         }
 
-        self.save_thread(&new_id);
+        self.save_thread(&new_id)?;
         self.save_thread_metadata(parent_thread_id);
         self.notify_session(parent_thread_id);
         Ok(new_id)
@@ -923,7 +926,7 @@ impl ConversationStore for PersistentConversationStore {
         self.core
             .save_compaction_summary(thread_id, summary, up_to_order)
             .await?;
-        self.save_thread(thread_id);
+        self.save_thread(thread_id)?;
         Ok(())
     }
 
@@ -1053,12 +1056,12 @@ impl PersistentStateStore {
 
     /// Write a single key's state data to `{dir}/{key}.state.json`. The file
     /// is the serialized core [`ThreadState`] snapshot.
-    fn save_key(&self, key: &ThreadId<str>) {
+    fn save_key(&self, key: &ThreadId<str>) -> Result<(), MemoryError> {
         let snapshot = self.core.thread_state(key);
         let path = self.dir.join(format!("{}.state.json", key));
-        if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
-            std::fs::write(path, json).ok();
-        }
+        let json =
+            serde_json::to_string_pretty(&snapshot).map_err(|e| MemoryError(e.to_string()))?;
+        std::fs::write(path, json).map_err(|e| MemoryError(e.to_string()))
     }
 
     /// Ensure a key's data is loaded from disk into the core store.
@@ -1100,7 +1103,7 @@ impl StateStore for PersistentStateStore {
         self.core
             .add_processed_message_ids(thread_id, message_ids)
             .await?;
-        self.save_key(thread_id);
+        self.save_key(thread_id)?;
         Ok(())
     }
 
@@ -1119,7 +1122,7 @@ impl StateStore for PersistentStateStore {
     ) -> Result<(), MemoryError> {
         self.ensure_loaded(root_thread_id);
         self.core.set_metadata(root_thread_id, metadata).await?;
-        self.save_key(root_thread_id);
+        self.save_key(root_thread_id)?;
         Ok(())
     }
 
@@ -1140,7 +1143,7 @@ impl StateStore for PersistentStateStore {
         self.core
             .add_active_subscription(thread_id, tool_call_id)
             .await?;
-        self.save_key(thread_id);
+        self.save_key(thread_id)?;
         Ok(())
     }
 
@@ -1153,7 +1156,7 @@ impl StateStore for PersistentStateStore {
         self.core
             .remove_active_subscription(thread_id, tool_call_id)
             .await?;
-        self.save_key(thread_id);
+        self.save_key(thread_id)?;
         Ok(())
     }
 
@@ -1164,7 +1167,7 @@ impl StateStore for PersistentStateStore {
     ) -> Result<(), MemoryError> {
         self.ensure_loaded(thread_id);
         self.core.add_pending_user_choice(thread_id, choice).await?;
-        self.save_key(thread_id);
+        self.save_key(thread_id)?;
         self.conversation_store.notify_session(thread_id);
         Ok(())
     }
@@ -1178,7 +1181,7 @@ impl StateStore for PersistentStateStore {
         self.core
             .remove_pending_user_choice(thread_id, choice_id)
             .await?;
-        self.save_key(thread_id);
+        self.save_key(thread_id)?;
         self.conversation_store.notify_session(thread_id);
         Ok(())
     }
@@ -1252,6 +1255,58 @@ mod tests {
             "flattened ThreadMeta must keep the flat on-disk format"
         );
     }
+    #[tokio::test]
+    async fn append_messages_reports_write_failure() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let store = PersistentConversationStore::new_with_dir(
+            dir.path(),
+            test_model(),
+            Arc::new(crate::ids::UuidIdSource),
+        );
+        let tid = ThreadId::from_ref("root");
+        store.ensure_root_thread(tid).await.expect("ensure root");
+        let path = dir.path().join("root.json");
+        std::fs::remove_file(&path).expect("remove snapshot");
+        std::fs::create_dir(&path).expect("block snapshot write");
+        assert!(
+            store
+                .append_messages(tid, vec![(user_msg("payload"), "peer-1".into())])
+                .await
+                .is_err(),
+            "append must report a failed payload write"
+        );
+    }
+
+    #[tokio::test]
+    async fn processed_ids_report_write_failure() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let conv = PersistentConversationStore::new_with_dir(
+            dir.path(),
+            test_model(),
+            Arc::new(crate::ids::UuidIdSource),
+        );
+        let sessions = crate::session_store::SessionStore::load(
+            dir.path()
+                .join("sessions.json")
+                .to_str()
+                .expect("session path"),
+            tokio::sync::mpsc::unbounded_channel().0,
+        );
+        let store = PersistentStateStore::new(
+            dir.path(),
+            conv,
+            Arc::new(tokio::sync::Mutex::new(sessions)),
+        );
+        std::fs::create_dir(dir.path().join("root.state.json")).expect("block state write");
+        assert!(
+            store
+                .add_processed_message_ids(ThreadId::from_ref("root"), vec!["peer-1".into()])
+                .await
+                .is_err(),
+            "dedup must report a failed state write"
+        );
+    }
+
     fn asst_msg(text: &str) -> InfinityMessage {
         InfinityMessage::from_message(Message::Assistant {
             content: vec![AssistantContent::text(text)],
