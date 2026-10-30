@@ -29,7 +29,10 @@ fn kind(root: &Path, codex: bool) -> KindConfig {
     };
     kind.env
         .insert("FAKE_ROOT".into(), root.display().to_string());
-    kind.env.insert("FAKE_MODE".into(), kind.mode.clone());
+    kind.env.insert(
+        "FAKE_MODE".into(),
+        if codex { "read-only" } else { "default" }.into(),
+    );
     kind.mcp_servers = vec![json!({"name":"later","command":"unused","args":[],"env":[]})];
     kind.idle_after = None;
     kind.request_timeout = Duration::from_secs(3);
@@ -331,7 +334,17 @@ async fn death_before_start_requeues_and_after_start_is_uncertain() {
         ("die-after", true),
         ("protocol-error", false),
     ] {
-        let mut t = Test::new(Default::default()).await;
+        let mut t = Test::at(
+            tempfile::tempdir().expect("tempdir"),
+            Default::default(),
+            Config {
+                crash_limit: 1,
+                ..config()
+            },
+            false,
+            None,
+        )
+        .await;
         let id = t.send(body).await;
         if started {
             t.started(id).await;
@@ -340,7 +353,7 @@ async fn death_before_start_requeues_and_after_start_is_uncertain() {
             matches!(
                 e,
                 Event::PhaseChanged {
-                    phase: Phase::Crashed { .. },
+                    phase: Phase::Failed { .. },
                     ..
                 }
             )
@@ -850,4 +863,275 @@ async fn live_claude_acp() {
 #[ignore = "requires logged-in Codex shim at AGENTD_CODEX_ACP"]
 async fn live_codex_acp() {
     live("AGENTD_CODEX_ACP", true).await;
+}
+
+#[tokio::test]
+async fn cancel_answers_permissions_arriving_after_cancel() {
+    for allow in [false, true] {
+        let policy = PermissionPolicy {
+            rules: if allow {
+                vec![PermissionRule {
+                    tool: "edit".into(),
+                    decision: RuleDecision::Allow,
+                }]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        };
+        let mut t = Test::new(policy).await;
+        let id = t.send("late-permissions").await;
+        t.started(id).await;
+        t.agent.cancel().await.expect("cancel");
+        match t
+            .event(|e| {
+                matches!(
+                    e,
+                    Event::PermissionPending(_)
+                        | Event::TurnEnded { .. }
+                        | Event::PhaseChanged {
+                            phase: Phase::Crashed { .. } | Phase::Failed { .. },
+                            ..
+                        }
+                )
+            })
+            .await
+        {
+            Event::TurnEnded { outcome, .. } => {
+                assert_eq!(outcome, TurnOutcome::Cancelled);
+            }
+            event => panic!("permission escaped cancellation: {event:?}"),
+        }
+        assert!(
+            t.agent
+                .pending_permissions()
+                .await
+                .expect("pending")
+                .is_empty()
+        );
+        for wire_id in ["permission-late-1", "permission-late-2"] {
+            assert!(
+                t.wire().iter().any(|m| m["id"] == wire_id
+                    && m["result"]["outcome"] == json!({"outcome":"cancelled"}))
+            );
+        }
+        assert_eq!(
+            t.mailroom.delivery(id).await.expect("delivery").state,
+            DeliveryState::Consumed
+        );
+        let next = t.send("permission").await;
+        if !allow {
+            let request = t.pending().await;
+            t.agent
+                .answer_permission(
+                    request.id,
+                    request.incarnation,
+                    PermissionAnswer::Choose("yes".into()),
+                )
+                .await
+                .expect("answer next turn");
+        }
+        t.consumed(next).await;
+        t.finish().await;
+    }
+}
+
+async fn tail_update_crash(update: Value, started: bool) {
+    let root = tempfile::tempdir().expect("tempdir");
+    std::fs::write(root.path().join("tail-update.json"), update.to_string()).expect("tail update");
+    let mut t = Test::at(
+        root,
+        Default::default(),
+        Config {
+            crash_limit: 1,
+            ..config()
+        },
+        false,
+        None,
+    )
+    .await;
+    let first = t.send("hold").await;
+    t.started(first).await;
+    let next = t.send("die-before").await;
+    t.release();
+    t.event(|e| {
+        matches!(
+            e,
+            Event::PhaseChanged {
+                phase: Phase::Failed { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    let state = t.mailroom.delivery(next).await.expect("delivery").state;
+    if started {
+        assert!(
+            matches!(state, DeliveryState::Uncertain { .. }),
+            "{update}: {state:?}"
+        );
+    } else {
+        assert_eq!(
+            state,
+            DeliveryState::Queued,
+            "metadata must not start a turn: {update}"
+        );
+    }
+    assert_eq!(
+        t.mailroom.delivery(first).await.expect("delivery").state,
+        DeliveryState::Consumed
+    );
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn session_metadata_does_not_start_next_turn() {
+    for update in [
+        json!({"sessionUpdate":"available_commands_update","availableCommands":[]}),
+        json!({"sessionUpdate":"current_mode_update","currentModeId":"default"}),
+        json!({"sessionUpdate":"config_option_update","configOptions":[]}),
+        json!({"sessionUpdate":"session_info_update","title":"Previous turn"}),
+        json!({"sessionUpdate":"usage_update","used":10,"size":100}),
+        json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"echo"}}),
+    ] {
+        tail_update_crash(update, false).await;
+    }
+}
+
+#[tokio::test]
+async fn execution_updates_start_turn_before_crash() {
+    for update in [
+        json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reply"}}),
+        json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}),
+        json!({"sessionUpdate":"plan","entries":[]}),
+        json!({"sessionUpdate":"tool_call","toolCallId":"call","title":"Read file","kind":"read","status":"pending"}),
+        json!({"sessionUpdate":"tool_call_update","toolCallId":"call","status":"completed"}),
+    ] {
+        tail_update_crash(update, true).await;
+    }
+}
+
+#[tokio::test]
+async fn simultaneous_permission_timeouts_cancel_without_failing_actor() {
+    let mut t = Test::new(PermissionPolicy {
+        timeout: Some(Duration::from_secs(60)),
+        ..Default::default()
+    })
+    .await;
+    let id = t.send("two-permissions").await;
+    let first = t.pending().await;
+    let second = t.pending().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::time::resume();
+    let ended = t
+        .event(|e| {
+            matches!(
+                e,
+                Event::TurnEnded { .. }
+                    | Event::PhaseChanged {
+                        phase: Phase::Failed { .. },
+                        ..
+                    }
+            )
+        })
+        .await;
+    assert!(
+        matches!(
+            ended,
+            Event::TurnEnded {
+                outcome: TurnOutcome::Cancelled,
+                ..
+            }
+        ),
+        "expired requests must cancel without failing: {ended:?}"
+    );
+    assert_eq!(
+        t.agent.phase(),
+        Phase::Idle,
+        "expired requests must not fail the actor"
+    );
+    assert_eq!(
+        t.mailroom.delivery(id).await.expect("delivery").state,
+        DeliveryState::Consumed
+    );
+    for request in [first, second] {
+        assert!(matches!(
+            t.agent
+                .answer_permission(
+                    request.id,
+                    request.incarnation,
+                    PermissionAnswer::Choose("yes".into())
+                )
+                .await,
+            Err(Error::StalePermission)
+        ));
+    }
+    assert!(
+        t.agent
+            .pending_permissions()
+            .await
+            .expect("pending")
+            .is_empty()
+    );
+    let next = t.send("response-only").await;
+    t.consumed(next).await;
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn ignored_cancel_crashes_and_settles_delivery() {
+    for (body, started) in [("ignore-cancel silent", false), ("ignore-cancel", true)] {
+        let mut t = Test::at(
+            tempfile::tempdir().expect("tempdir"),
+            Default::default(),
+            Config {
+                crash_limit: 1,
+                ..config()
+            },
+            false,
+            None,
+        )
+        .await;
+        let id = t.send(body).await;
+        if started {
+            t.started(id).await;
+        } else {
+            t.event(|e| matches!(e, Event::Offered { .. })).await;
+        }
+        t.agent.cancel().await.expect("cancel");
+        let queued = t.send("response-only").await;
+        t.event(|e| {
+            matches!(
+                e,
+                Event::PhaseChanged {
+                    phase: Phase::Failed { .. },
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(
+            t.wire()
+                .iter()
+                .filter(|m| m["method"] == "session/prompt")
+                .count(),
+            1,
+            "mail must wait while cancelling"
+        );
+        assert_eq!(
+            t.mailroom.delivery(queued).await.expect("delivery").state,
+            DeliveryState::Queued
+        );
+        let state = t.mailroom.delivery(id).await.expect("delivery").state;
+        assert!(
+            if started {
+                matches!(state, DeliveryState::Uncertain { .. })
+            } else {
+                state == DeliveryState::Queued
+            },
+            "cancel timeout: {state:?}"
+        );
+        t.finish().await;
+    }
 }

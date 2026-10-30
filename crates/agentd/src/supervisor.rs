@@ -191,7 +191,11 @@ impl Broker {
         let (events, _) = broadcast::channel(1024);
         let mut by_kind = HashMap::new();
         for kind in kinds {
-            if kind.command.is_empty() || kind.mode.is_empty() || kind.request_timeout.is_zero() {
+            if kind.command.is_empty()
+                || kind.mode.is_empty()
+                || kind.request_timeout.is_zero()
+                || kind.cancel_timeout.is_zero()
+            {
                 return Err(Error::Rejected(
                     "kind needs command, mode and timeout".into(),
                 ));
@@ -671,6 +675,10 @@ impl AgentActor {
             .map(|(id, (r, _))| (*id, r.clone()))
             .collect::<Vec<_>>();
         for (id, request) in expired {
+            // Cancelling one request withdraws every other request in this turn.
+            if !self.pending.contains_key(&id) {
+                continue;
+            }
             let answer = request
                 .options
                 .iter()
