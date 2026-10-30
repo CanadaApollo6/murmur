@@ -22,6 +22,8 @@ pub struct UserChoice {
 /// subscribers or buffer them freely.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// Confirms durable input even when a redelivery skips completion.
+    InputCommitted { dedup_id: String },
     /// A user text input was accepted into the thread's history.
     UserInput { text: String },
     /// A tool result (from an asynchronously dispatched tool call) was

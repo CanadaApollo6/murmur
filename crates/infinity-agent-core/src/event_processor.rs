@@ -146,6 +146,8 @@ pub struct HistoryManager<C: ConversationStore, S: StateStore> {
     ancestor_chain: Vec<ThreadId>,
     pub history: RefCell<Vec<InfinityMessage>>,
     processed_message_ids: RefCell<HashSet<String>>,
+    durable_message_ids: RefCell<HashSet<String>>,
+    committed_ids: RefCell<Vec<String>>,
     metadata: RefCell<Option<serde_json::Value>>,
     // Un-persisted content moves through three phases:
     //
@@ -227,6 +229,8 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             root_thread_id,
             ancestor_chain,
             history: RefCell::new(history),
+            durable_message_ids: RefCell::new(processed_message_ids.clone()),
+            committed_ids: RefCell::new(Vec::new()),
             processed_message_ids: RefCell::new(processed_message_ids),
             metadata: RefCell::new(metadata),
             pending_items: RefCell::new(Vec::new()),
@@ -244,6 +248,9 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         message_id: String,
     ) -> Result<bool, BoxError> {
         if self.processed_message_ids.borrow().contains(&message_id) {
+            if self.durable_message_ids.borrow().contains(&message_id) {
+                self.committed_ids.borrow_mut().push(message_id.clone());
+            }
             tracing::info!("Message {} already processed, skipping", message_id);
             return Ok(false);
         }
@@ -662,12 +669,20 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             .map(|i| i.message_id.clone())
             .collect();
         if !msg_ids.is_empty() {
-            let _ = self
-                .state_store
-                .add_processed_message_ids(&self.thread_id, msg_ids)
-                .await;
+            self.state_store
+                .add_processed_message_ids(&self.thread_id, msg_ids.clone())
+                .await
+                .map_err(|e| Box::new(e) as BoxError)?;
+            self.durable_message_ids
+                .borrow_mut()
+                .extend(msg_ids.iter().cloned());
+            self.committed_ids.borrow_mut().extend(msg_ids);
         }
         Ok(())
+    }
+
+    pub fn take_committed_ids(&self) -> Vec<String> {
+        std::mem::take(&mut *self.committed_ids.borrow_mut())
     }
 
     pub async fn update_metadata(&self, metadata: serde_json::Value) -> Result<(), BoxError> {

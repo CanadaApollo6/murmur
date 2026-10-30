@@ -337,6 +337,10 @@ pub enum ClientMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DaemonMessage {
+    InputCommitted {
+        thread_id: Option<ThreadRef>,
+        dedup_id: String,
+    },
     Connected {
         root_thread_id: ThreadRef,
         thread_id: ThreadRef,

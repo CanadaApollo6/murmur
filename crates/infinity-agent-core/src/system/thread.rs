@@ -292,6 +292,12 @@ where
         Ok(batch)
     }
 
+    fn emit_committed(&self, observer: &impl ThreadObserver, thread_id: &ThreadId<str>) {
+        for dedup_id in self.history.take_committed_ids() {
+            observer.on_event(thread_id, &AgentEvent::InputCommitted { dedup_id });
+        }
+    }
+
     /// Prepare a single input message into history, emitting the
     /// corresponding events. Returns `true` when the input is actionable
     /// (a completion should run). Errors from the observer's durability
@@ -480,6 +486,7 @@ where
             // stay unvalidated — and unpersisted — until a completion
             // produces model output for them.
             self.history.sync().await?;
+            self.emit_committed(observer, &thread_id);
             return Ok(StepOutcome::Skipped);
         }
 
@@ -566,6 +573,7 @@ where
         // ── Commit phase: the turn becomes durable before anything external
         // can react to it. ──
         self.history.sync().await?;
+        self.emit_committed(observer, &thread_id);
         observer.on_event(&thread_id, &AgentEvent::CompletionFinished { usage });
 
         // ── Dispatch phase: fire the tool call (if any) after the commit

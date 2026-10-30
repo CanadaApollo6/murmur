@@ -62,6 +62,13 @@ fn prefix_thread_id(thread_id: Option<ThreadRef>, remote_name: &RemoteName) -> O
 
 fn prefix_daemon_message(msg: DaemonMessage, remote_name: &RemoteName) -> DaemonMessage {
     match msg {
+        DaemonMessage::InputCommitted {
+            thread_id,
+            dedup_id,
+        } => DaemonMessage::InputCommitted {
+            thread_id: prefix_thread_id(thread_id, remote_name),
+            dedup_id,
+        },
         DaemonMessage::Connected {
             root_thread_id,
             thread_id,
