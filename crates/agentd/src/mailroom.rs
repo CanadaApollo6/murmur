@@ -285,6 +285,24 @@ impl Mailroom {
         self.call(move |s| Ok(s.db.query_row("SELECT a.name,COALESCE(s.kind,'unknown') FROM agents a LEFT JOIN actor_state s ON s.agent=a.id WHERE a.id=?", [json(&agent)?], |r| Ok((r.get(0)?,r.get(1)?)))?)).await
     }
 
+    pub(crate) async fn save_spec(
+        &self,
+        id: AgentId,
+        spec: crate::supervisor::AgentSpec,
+    ) -> Result<()> {
+        self.call(move |s| {
+            s.db.execute("INSERT INTO agent_specs(agent,spec) VALUES (?,?) ON CONFLICT(agent) DO UPDATE SET spec=excluded.spec", params![json(&id)?, json(&spec)?])?;
+            Ok(())
+        }).await
+    }
+
+    pub async fn specs(&self) -> Result<Vec<(AgentId, crate::supervisor::AgentSpec)>> {
+        self.call(|s| {
+            let mut q = s.db.prepare("SELECT agent,spec FROM agent_specs JOIN agents ON agent=agents.id WHERE retired=0 ORDER BY name")?;
+            Ok(q.query_map([], |r| Ok((json_col(r,0)?, json_col(r,1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
+        }).await
+    }
+
     pub async fn register(&self, name: AgentName) -> Result<AgentId> {
         self.call(move |s| {
             if let Some(id) =

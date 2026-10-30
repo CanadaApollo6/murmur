@@ -13,7 +13,9 @@ pub struct KindConfig {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub mode: String,
-    /// Passed unchanged to ACP new/load. No MCP endpoint is minted here.
+    pub workspace_write_mode: Option<String>,
+    pub full_access_mode: Option<String>,
+    /// Additional MCP servers; the actor appends its authenticated broker entry.
     pub mcp_servers: Vec<serde_json::Value>,
     pub sandbox_args: SandboxArgs,
     pub idle_after: Option<Duration>,
@@ -36,6 +38,22 @@ impl KindConfig {
             args: Vec::new(),
             env: BTreeMap::new(),
             mode: mode.into(),
+            workspace_write_mode: Some(
+                if name == "codex" {
+                    "workspace-write"
+                } else {
+                    "acceptEdits"
+                }
+                .into(),
+            ),
+            full_access_mode: Some(
+                if name == "codex" {
+                    "agent-full-access"
+                } else {
+                    "bypassPermissions"
+                }
+                .into(),
+            ),
             mcp_servers: Vec::new(),
             sandbox_args: SandboxArgs::default(),
             idle_after: Some(Duration::from_secs(600)),
@@ -45,7 +63,8 @@ impl KindConfig {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct SandboxArgs {
     pub read_only: Vec<String>,
     pub workspace_write: Vec<String>,
@@ -74,6 +93,7 @@ pub(crate) struct OpenRequest<'a> {
     pub spec: &'a AgentSpec,
     pub resume: Option<&'a ResumeToken>,
     pub incarnation: Incarnation,
+    pub mcp_server: Option<serde_json::Value>,
 }
 
 #[async_trait]

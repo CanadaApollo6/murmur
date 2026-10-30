@@ -9,3 +9,6 @@ mod adapter;
 mod adapters;
 pub mod supervisor;
 pub use adapter::{KindConfig, SandboxArgs};
+
+#[cfg(unix)]
+pub mod surfaces;
