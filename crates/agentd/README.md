@@ -90,11 +90,8 @@ The live actor lease remains held across idle suspension and crash backoff.
 
 `cargo test -p agentd` runs SQLite tests and subprocess integration tests.
 `agentd-fake-acp` is a scriptable test fixture binary, not a broker executable.
-`python3 crates/agentd/scripts/check-mutations.py` requires behavioral failures
-when guarantees are removed, then requires each restored test to pass.
 
 The ignored `live_claude_acp` and `live_codex_acp` tests use logged-in shims at
 `AGENTD_CLAUDE_ACP` and `AGENTD_CODEX_ACP`. Run them with
 `cargo test -p agentd --test supervisor live_ -- --ignored --nocapture`.
 They verify a first turn, idle suspension, session load and remembered context.
-See [IMPLEMENTATION.md](IMPLEMENTATION.md) for scope decisions and evidence.
