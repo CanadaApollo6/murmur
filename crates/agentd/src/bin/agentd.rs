@@ -1,6 +1,9 @@
 #![deny(clippy::unwrap_used)]
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::Semaphore;
 
 use agentd::mailroom::Mailroom;
 use agentd::supervisor::Broker;
@@ -115,6 +118,8 @@ async fn serve(
         mailroom,
         bindings,
     });
+    let control_slots = Arc::new(Semaphore::new(64));
+    let mcp_slots = Arc::new(Semaphore::new(64));
     let mut connections = tokio::task::JoinSet::new();
     let result = loop {
         let accepted = tokio::select! {
@@ -133,14 +138,26 @@ async fn serve(
         };
         let (stream, is_mcp) = match accepted {
             Ok(s) => s,
-            Err(e) => break Err(e.into()),
+            Err(e) => {
+                eprintln!("agentd: accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
         };
         if let Err(e) = Socket::check_peer(&stream) {
             eprintln!("agentd: {e}");
             continue;
         }
+        let slots = if is_mcp { &mcp_slots } else { &control_slots };
+        let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
+            eprintln!("agentd: connection limit reached (mcp={is_mcp})");
+            continue;
+        };
         let api = Arc::clone(&api);
-        connections.spawn(async move { api.connection(stream, is_mcp).await });
+        connections.spawn(async move {
+            let _permit = permit;
+            api.connection(stream, is_mcp).await
+        });
     };
     connections.shutdown().await;
     result

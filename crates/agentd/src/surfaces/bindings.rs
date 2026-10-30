@@ -20,8 +20,8 @@ impl SessionBinding<'_> {
     pub(super) fn sender(&self) -> AuthenticatedSender {
         AuthenticatedSender(Sender::Agent(self.binding.agent))
     }
-    pub(super) fn key(&self, id: &Value) -> ClientKey {
-        ClientKey(format!("mcp:{}:{}", self.binding.incarnation.0, id))
+    pub(super) fn key(&self, session: &str, id: &Value) -> ClientKey {
+        ClientKey(format!("mcp:{}:{session}:{id}", self.binding.incarnation.0))
     }
 }
 
@@ -44,9 +44,7 @@ impl Bindings {
         }
     }
     pub(crate) async fn mint(&self, agent: AgentId, incarnation: Incarnation) -> Result<Value> {
-        let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes).map_err(|_| "OS random source unavailable")?;
-        let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let token = random_namespace()?;
         let mut tokens = self.tokens.write().await;
         tokens.retain(|_, b| b.agent != agent);
         tokens.insert(token.clone(), Binding { agent, incarnation });
@@ -68,4 +66,10 @@ impl Bindings {
     pub(crate) async fn revoke(&self, agent: AgentId) {
         self.tokens.write().await.retain(|_, b| b.agent != agent);
     }
+}
+
+pub(super) fn random_namespace() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|_| "OS random source unavailable")?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }

@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use agentd::model::*;
 use agentd::supervisor::AgentSpec;
-use agentd::surfaces::{ControlRequest, Result, default_state_dir, read_frame, write_frame};
+use agentd::surfaces::{
+    ControlRequest, Result, Socket, default_state_dir, read_frame, write_frame,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 use tokio::io::BufReader;
@@ -128,11 +130,14 @@ async fn run(args: Args) -> Result<()> {
         Command::Watch => ControlRequest::Watch,
     };
     let watch = matches!(request, ControlRequest::Watch);
+    let held = matches!(request, ControlRequest::Held { .. });
+    let mut held_mail = Vec::new();
     let socket = args
         .socket
         .or_else(|| std::env::var_os("AGENTD_SOCKET").map(PathBuf::from))
         .unwrap_or_else(|| default_state_dir().join("agentd.sock"));
     let stream = UnixStream::connect(socket).await?;
+    Socket::check_peer(&stream)?;
     let (read, mut write) = stream.into_split();
     write_frame(&mut write, &request).await?;
     let mut read = BufReader::new(read);
@@ -147,6 +152,14 @@ async fn run(args: Args) -> Result<()> {
         if watch {
             println!("{value}");
             continue;
+        }
+        if held {
+            if let Some(item) = value.get("held") {
+                held_mail.push(item.clone());
+                continue;
+            }
+            println!("{}", serde_json::to_string_pretty(&held_mail)?);
+            return Ok(());
         }
         let result = &value["result"];
         if let Some(status) = result["status"].as_str() {

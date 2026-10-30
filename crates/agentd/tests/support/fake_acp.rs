@@ -99,7 +99,8 @@ fn main() {
     writeln!(
         log,
         "{}",
-        json!({"pid":std::process::id(),"cwd":std::env::current_dir().expect("cwd"),"args":std::env::args().collect::<Vec<_>>()})
+        json!({"pid":std::process::id(),"cwd":std::env::current_dir().expect("cwd"),"args":std::env::args().collect::<Vec<_>>(),
+            "agentd_env":std::env::vars_os().map(|(name, _)| name.to_string_lossy().into_owned()).filter(|name| name.starts_with("AGENTD_")).collect::<Vec<_>>()})
     )
     .expect("log pid");
     let (tx, rx) = mpsc::channel();
