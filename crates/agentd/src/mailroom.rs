@@ -241,6 +241,11 @@ impl Mailroom {
             let mut outcome = OfferOutcome::default();
             for id in ids {
                 let mut d = delivery(&tx, id)?;
+                // A repeated offer under the same incarnation is a retry, not a new attempt.
+                if d.state == (DeliveryState::Offered { incarnation }) {
+                    outcome.offered.push(id);
+                    continue;
+                }
                 if d.state != DeliveryState::Queued {
                     return Err(Error::Transition(d.state));
                 }
@@ -285,6 +290,10 @@ impl Mailroom {
             let tx = s.db.transaction()?;
             for id in ids {
                 let mut d = delivery(&tx, id)?;
+                // Receipts can repeat (core answers a re-offered input again).
+                if d.state == DeliveryState::Consumed {
+                    continue;
+                }
                 require_offered(&d, incarnation)?;
                 let env = message(&tx, id)?;
                 let position = exposure_ref(&tx, env.to)?;
@@ -775,18 +784,25 @@ fn unique(ids: &[MessageId]) -> Result<Vec<MessageId>> {
 fn view(db: &Connection, conversation: ConversationId) -> Result<ConversationView> {
     let mut recent = envelopes(
         db,
-        "SELECT * FROM messages WHERE conversation=? ORDER BY seq",
+        "SELECT * FROM messages WHERE conversation=? ORDER BY seq DESC LIMIT 64",
         [json(&conversation)?],
     )?;
+    recent.reverse();
     let mut pair_exchanges = HashMap::new();
-    for env in &recent {
-        if let Sender::Agent(from) = env.from {
-            let count = pair_exchanges.entry((from, env.to)).or_insert(0_u32);
-            *count = count.saturating_add(1);
+    let mut stmt = db.prepare(
+        "SELECT sender, recipient, COUNT(*) FROM messages WHERE conversation=? GROUP BY sender, recipient",
+    )?;
+    let rows = stmt.query_map([json(&conversation)?], |r| {
+        Ok((
+            json_col::<Sender>(r, 0)?,
+            json_col::<AgentId>(r, 1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        if let (Sender::Agent(from), to, count) = row? {
+            pair_exchanges.insert((from, to), u32::try_from(count).unwrap_or(u32::MAX));
         }
-    }
-    if recent.len() > 64 {
-        recent.drain(..recent.len() - 64);
     }
     Ok(ConversationView {
         conversation,

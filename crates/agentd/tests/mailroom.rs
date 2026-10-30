@@ -102,9 +102,12 @@ async fn transitions_reject_every_illegal_source_state() {
                 "drop" => mail.drop_held(env.id(), "operator").await,
                 _ => unreachable!(),
             };
+            // Repeating an offer under the same incarnation, or a receipt for consumed
+            // mail, is a no-op that succeeds.
             let allowed = match operation {
-                "offer" => state == "queued",
-                "start" | "consume" => state == "offered",
+                "offer" => matches!(state, "queued" | "offered"),
+                "start" => state == "offered",
+                "consume" => matches!(state, "offered" | "consumed"),
                 "release" | "drop" => matches!(state, "held" | "uncertain"),
                 _ => false,
             };
@@ -148,7 +151,7 @@ async fn receipts_and_batches_are_incarnation_checked_and_atomic() {
         .await
         .expect("offer");
     assert!(
-        mail.mark_offered(&[first.id(), second.id()], Incarnation(2))
+        mail.mark_offered(&[first.id(), second.id()], Incarnation(3))
             .await
             .is_err()
     );
@@ -892,5 +895,49 @@ async fn concurrent_children_cannot_double_allocate_the_parent_remainder() {
     assert!(matches!(right, Err(Error::BudgetExceeded)));
     assert_eq!(mail.task(id).await.expect("parent").spent, budget(6));
     assert_eq!(mail.pending_for(b).await.expect("one child").len(), 1);
+    mail.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn repeated_offers_and_receipts_are_no_ops() {
+    let (_dir, mail, a, _) = setup(Config::default()).await;
+    let first = seed(&mail, a, "consumed").await;
+    let second = seed(&mail, a, "queued").await;
+
+    mail.mark_offered(&[second.id()], Incarnation(1))
+        .await
+        .expect("offer");
+    let again = mail
+        .mark_offered(&[second.id()], Incarnation(1))
+        .await
+        .expect("repeated offer");
+    assert_eq!(again.offered, vec![second.id()]);
+    assert_eq!(
+        mail.delivery(second.id()).await.expect("delivery").attempts,
+        1
+    );
+
+    // A batch holding a repeated receipt still consumes the new message.
+    mail.mark_consumed(&[first.id(), second.id()], Incarnation(1))
+        .await
+        .expect("consume");
+    assert_eq!(
+        mail.delivery(second.id()).await.expect("delivery").state,
+        DeliveryState::Consumed
+    );
+    let sources: Vec<_> = mail
+        .exposures(a, Epoch(0))
+        .await
+        .expect("exposures")
+        .into_iter()
+        .map(|(_, source)| source)
+        .collect();
+    assert_eq!(
+        sources,
+        vec![
+            ExposureSource::Message(first.id()),
+            ExposureSource::Message(second.id())
+        ]
+    );
     mail.close().await.expect("close");
 }
