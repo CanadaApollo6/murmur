@@ -2809,6 +2809,8 @@ Used by:
   clap_lex 1.1.0
   colorchoice 1.0.5
   crc32fast 1.5.0
+  fallible-iterator 0.3.0
+  fallible-streaming-iterator 0.1.9
   hex 0.4.3
   is_terminal_polyfill 1.70.2
   jni-sys 0.3.1
@@ -6680,6 +6682,7 @@ License: Apache License 2.0
 
 Used by:
   hashlink 0.10.0
+  hashlink 0.9.1
 
 --------------------------------------------------------------------------------
                               Apache License
@@ -8846,6 +8849,7 @@ limitations under the License.
 License: Apache License 2.0
 
 Used by:
+  agentd 0.1.0
   infinity-agent-cli 0.2.0
   infinity-agent-core 0.2.0
   infinity-agent-lambda 0.1.0
@@ -10185,6 +10189,34 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 License: MIT License
 
 Used by:
+  libsqlite3-sys 0.30.1
+  rusqlite 0.32.1
+
+--------------------------------------------------------------------------------
+Copyright (c) 2014-2021 The rusqlite developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================================================
+License: MIT License
+
+Used by:
   hyper 1.9.0
 
 --------------------------------------------------------------------------------
@@ -10948,6 +10980,35 @@ Used by:
 MIT License
 
 Copyright (c) 2017 
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+License: MIT License
+
+Used by:
+  ulid 1.2.1
+
+--------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2017 Dylan Hart
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
