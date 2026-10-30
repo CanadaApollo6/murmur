@@ -22,6 +22,8 @@ pub struct UserChoice {
 /// subscribers or buffer them freely.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// The resident driver has no queued work, unresolved tool, or choice.
+    ThreadIdle,
     /// Confirms durable input even when a redelivery skips completion.
     InputCommitted { dedup_id: String },
     /// A user text input was accepted into the thread's history.
@@ -29,7 +31,8 @@ pub enum AgentEvent {
     /// A tool result (from an asynchronously dispatched tool call) was
     /// accepted into the thread's history, or a synchronous tool produced a
     /// result inline. Clients should render the first segment type they
-    /// support; the raw text is always included as a trailing `Text` segment.
+    /// support. Text results include raw text as a trailing `Text` segment;
+    /// non-text results may have no display segments.
     ToolResult {
         segments: Vec<rap_protocol::DisplaySegment>,
     },
@@ -85,6 +88,8 @@ pub struct ReplaySnapshot {
     pub current_thinking: Option<String>,
     /// Whether a completion is currently streaming.
     pub in_progress: bool,
+    /// No completion, unresolved tool, or pending choice remains.
+    pub idle: bool,
     /// Choices awaiting a user response for this conversation.
     pub pending_choices: Vec<UserChoice>,
 }

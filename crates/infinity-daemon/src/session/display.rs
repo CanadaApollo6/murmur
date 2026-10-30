@@ -7,6 +7,7 @@ use infinity_provider_protocol::message::{AssistantContent, ToolResultContent, U
 pub(crate) fn agent_event_to_daemon(thread_id: &ThreadId<str>, evt: &AgentEvent) -> DaemonMessage {
     let tid = Some(ThreadRef::local(thread_id.to_owned()));
     match evt {
+        AgentEvent::ThreadIdle => DaemonMessage::ThreadIdle { thread_id: tid },
         AgentEvent::InputCommitted { dedup_id } => DaemonMessage::InputCommitted {
             thread_id: tid,
             dedup_id: dedup_id.clone(),
@@ -138,19 +139,15 @@ pub(crate) fn history_message_to_daemon(
             result,
             display_segments,
         } => {
-            if let Some(ToolResultContent::Text(t)) = result.content.first() {
-                // Same prioritized-segments shape the live path emits (see
-                // `AgentEvent::ToolResult` emission in the runtime).
-                Some(DaemonMessage::ToolResult {
-                    segments: rap_protocol::build_display_segments(
-                        display_segments.as_deref(),
-                        &t.text,
-                    ),
-                    thread_id,
-                })
+            let segments = if let Some(ToolResultContent::Text(t)) = result.content.first() {
+                rap_protocol::build_display_segments(display_segments.as_deref(), &t.text)
             } else {
-                None
-            }
+                display_segments.clone().unwrap_or_default()
+            };
+            Some(DaemonMessage::ToolResult {
+                segments,
+                thread_id,
+            })
         }
         InfinityMessage::User { content } => {
             if let UserContent::Text(text) = content {

@@ -197,6 +197,7 @@ fn prefix_daemon_message(msg: DaemonMessage, remote_name: &RemoteName) -> Daemon
             pending_choices,
             views,
             in_progress,
+            idle,
         } => DaemonMessage::Replay {
             history: history
                 .into_iter()
@@ -208,6 +209,10 @@ fn prefix_daemon_message(msg: DaemonMessage, remote_name: &RemoteName) -> Daemon
                 .collect(),
             views,
             in_progress,
+            idle,
+        },
+        DaemonMessage::ThreadIdle { thread_id } => DaemonMessage::ThreadIdle {
+            thread_id: prefix_thread_id(thread_id, remote_name),
         },
         other => other,
     }

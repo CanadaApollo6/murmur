@@ -175,7 +175,8 @@ async fn peer_delivery_only_commits_on_the_matching_root_receipt() {
         dedup_id: format!("peer-{id}"),
     });
     request.emit(fake::receipt("peer-unrelated".into()));
-    request.emit(fake::done());
+    request.emit(fake::round_done());
+    request.emit(fake::idle());
     // An activity event is a barrier proving the preceding false evidence was processed.
     request.emit(DaemonMessage::Info {
         thread_id: fake::thread(),
@@ -188,6 +189,7 @@ async fn peer_delivery_only_commits_on_the_matching_root_receipt() {
         DeliveryState::Offered { .. }
     ));
     request.emit(fake::receipt(format!("peer-{id}")));
+    request.emit(fake::idle());
     t.consumed(id).await;
     t.idle().await;
     t.finish().await;
@@ -229,7 +231,8 @@ async fn human_receipt_requires_echo_and_a_non_peer_commit() {
         Phase::Busy,
         "receipt is independent of response completion"
     );
-    request.emit(fake::done());
+    request.emit(fake::round_done());
+    request.emit(fake::idle());
     t.idle().await;
     t.finish().await;
 }
@@ -312,7 +315,8 @@ async fn no_receipt_never_consumes_and_exhausted_retries_are_held() {
             ClientMessage::DeliverPeerMessage { .. }
         ));
         request.emit(fake::start());
-        request.emit(fake::done());
+        request.emit(fake::round_done());
+        request.emit(fake::idle());
         if attempt < 5 {
             t.event(|e| matches!(e, Event::PhaseChanged { phase: Phase::Crashed { attempt: n, .. }, .. } if *n == attempt)).await;
             assert!(matches!(
@@ -371,7 +375,8 @@ async fn interrupt_is_a_daemon_control_message() {
         matches!(cancel.message, ClientMessage::Interrupt { thread_id } if thread_id == fake::root())
     );
     input.emit(fake::receipt("human-id".into()));
-    input.emit(fake::done());
+    input.emit(fake::round_done());
+    input.emit(fake::idle());
     t.consumed(id).await;
     t.event(|e| {
         matches!(
@@ -446,7 +451,8 @@ async fn permission_round_trip_preserves_choices_and_fences_incarnations() {
         matches!(answer.message, ClientMessage::UserChoiceAnswered { choice_id, selected: 1 } if choice_id.as_str() == "approval")
     );
     input.emit(fake::receipt(format!("peer-{id}")));
-    input.emit(fake::done());
+    input.emit(fake::round_done());
+    input.emit(fake::idle());
     t.consumed(id).await;
     t.finish().await;
 }
@@ -467,11 +473,12 @@ async fn resume_reuses_root_and_ignores_history_receipts() {
         history: vec![
             fake::start(),
             fake::receipt(format!("peer-{id}")),
-            fake::done(),
+            fake::round_done(),
         ],
         pending_choices: vec![],
         views: Default::default(),
         in_progress: false,
+        idle: true,
     });
     input.emit(DaemonMessage::Info {
         thread_id: fake::thread(),
@@ -483,7 +490,8 @@ async fn resume_reuses_root_and_ignores_history_receipts() {
         DeliveryState::Offered { .. }
     ));
     input.emit(fake::receipt(format!("peer-{id}")));
-    input.emit(fake::done());
+    input.emit(fake::round_done());
+    input.emit(fake::idle());
     t.consumed(id).await;
     t.finish().await;
 }
@@ -532,6 +540,7 @@ async fn model_agents_never_idle_suspend_and_idle_eof_reopens() {
     let id = t.send(true, "dedup").await;
     let input = t.daemon.next().await;
     input.emit(fake::receipt(format!("peer-{id}")));
+    input.emit(fake::idle());
     t.consumed(id).await;
     t.idle().await;
     input.die();
@@ -571,7 +580,8 @@ async fn peers_reach_a_busy_model_while_human_mail_waits() {
         DeliveryState::Queued
     );
     input.emit(fake::receipt("working-id".into()));
-    input.emit(fake::done());
+    input.emit(fake::round_done());
+    input.emit(fake::idle());
     t.consumed(first).await;
     let human_request = t.daemon.next().await;
     assert!(
@@ -582,7 +592,8 @@ async fn peers_reach_a_busy_model_while_human_mail_waits() {
         text: "later human".into(),
     });
     human_request.emit(fake::receipt("later-id".into()));
-    human_request.emit(fake::done());
+    human_request.emit(fake::round_done());
+    human_request.emit(fake::idle());
     t.consumed(human).await;
     t.finish().await;
 }
@@ -770,7 +781,8 @@ async fn permission_timeout_interrupts_without_guessing_an_arbitrary_choice() {
     input.emit(DaemonMessage::UserChoiceComplete {
         choice_id: "timeout-choice".into(),
     });
-    input.emit(fake::done());
+    input.emit(fake::round_done());
+    input.emit(fake::idle());
     t.consumed(id).await;
     t.idle().await;
     assert!(
@@ -811,6 +823,7 @@ async fn permission_from_a_dead_incarnation_cannot_answer_its_replacement() {
         pending_choices: vec![prompt()],
         views: Default::default(),
         in_progress: false,
+        idle: false,
     });
     let Event::PermissionPending(current) =
         t.event(|e| matches!(e, Event::PermissionPending(_))).await
@@ -841,7 +854,8 @@ async fn permission_from_a_dead_incarnation_cannot_answer_its_replacement() {
         ClientMessage::UserChoiceAnswered { selected: 1, .. }
     ));
     replacement.emit(fake::receipt(format!("peer-{id}")));
-    replacement.emit(fake::done());
+    replacement.emit(fake::round_done());
+    replacement.emit(fake::idle());
     t.consumed(id).await;
     t.finish().await;
 }
@@ -892,7 +906,8 @@ async fn pending_choice_holds_peer_mail_until_answered() {
     peer.emit(fake::receipt(format!("peer-{next}")));
     t.consumed(next).await;
     input.emit(fake::receipt(format!("peer-{first}")));
-    input.emit(fake::done());
+    input.emit(fake::round_done());
+    input.emit(fake::idle());
     t.consumed(first).await;
     t.finish().await;
 }
@@ -911,7 +926,7 @@ async fn busy_peer_receipt_drains_its_completion_before_new_human_mail() {
     let peer = t.send(true, "busy peer").await;
     let peer_input = t.daemon.next().await;
     input.emit(fake::receipt("first-id".into()));
-    input.emit(fake::done());
+    input.emit(fake::round_done());
     t.consumed(first).await;
     peer_input.emit(fake::start());
     peer_input.emit(fake::receipt(format!("peer-{peer}")));
@@ -923,7 +938,8 @@ async fn busy_peer_receipt_drains_its_completion_before_new_human_mail() {
             .is_err(),
         "peer receipt must not release human before peer completion"
     );
-    peer_input.emit(fake::done());
+    peer_input.emit(fake::round_done());
+    peer_input.emit(fake::idle());
     let next = t.daemon.next().await;
     assert!(matches!(&next.message, ClientMessage::UserInput { text, .. } if text == "next human"));
     next.emit(DaemonMessage::UserInputEcho {
@@ -937,7 +953,8 @@ async fn busy_peer_receipt_drains_its_completion_before_new_human_mail() {
         "old completion must not time out new input"
     );
     next.emit(fake::receipt("next-id".into()));
-    next.emit(fake::done());
+    next.emit(fake::round_done());
+    next.emit(fake::idle());
     t.consumed(human).await;
     t.idle().await;
     t.finish().await;
@@ -968,7 +985,7 @@ async fn tool_round_completion_keeps_human_mail_queued_until_followup_finishes()
     input.emit(fake::receipt(format!("peer-{first}")));
     t.consumed(first).await;
     let human = t.send(false, "wait for tool").await;
-    input.emit(fake::done());
+    input.emit(fake::round_done());
     assert!(
         tokio::time::timeout(Duration::from_millis(40), t.daemon.next())
             .await
@@ -983,7 +1000,8 @@ async fn tool_round_completion_keeps_human_mail_queued_until_followup_finishes()
             .is_err(),
         "tool result must not release human before followup"
     );
-    input.emit(fake::done());
+    input.emit(fake::round_done());
+    input.emit(fake::idle());
     let next = t.daemon.next().await;
     assert!(matches!(next.message, ClientMessage::UserInput { .. }));
     next.emit(DaemonMessage::UserInputEcho {
@@ -991,7 +1009,8 @@ async fn tool_round_completion_keeps_human_mail_queued_until_followup_finishes()
         text: "wait for tool".into(),
     });
     next.emit(fake::receipt("human-id".into()));
-    next.emit(fake::done());
+    next.emit(fake::round_done());
+    next.emit(fake::idle());
     t.consumed(human).await;
     t.finish().await;
 }
@@ -1020,6 +1039,7 @@ async fn resume_waits_for_live_replay_before_pumping_human_mail() {
             pending_choices: vec![],
             views: Default::default(),
             in_progress: !pending_tool,
+            idle: false,
         });
         connect.emit(DaemonMessage::Info {
             thread_id: fake::thread(),
@@ -1036,7 +1056,8 @@ async fn resume_waits_for_live_replay_before_pumping_human_mail() {
             connect.emit(tool_result());
             connect.emit(fake::start());
         }
-        connect.emit(fake::done());
+        connect.emit(fake::round_done());
+        connect.emit(fake::idle());
         let next = t.daemon.next().await;
         assert!(matches!(next.message, ClientMessage::UserInput { .. }));
         next.emit(DaemonMessage::UserInputEcho {
@@ -1044,7 +1065,8 @@ async fn resume_waits_for_live_replay_before_pumping_human_mail() {
             text: "after resumed work".into(),
         });
         next.emit(fake::receipt("human-id".into()));
-        next.emit(fake::done());
+        next.emit(fake::round_done());
+        next.emit(fake::idle());
         t.consumed(human).await;
         t.finish().await;
     }
@@ -1062,7 +1084,7 @@ async fn permission_timeout_keeps_approval_until_durable_interrupt_completion() 
     input.emit(fake::start());
     input.emit(tool_call());
     input.emit(fake::receipt(format!("peer-{id}")));
-    input.emit(fake::done());
+    input.emit(fake::round_done());
     input.emit(DaemonMessage::UserChoiceRequired {
         thread_id: fake::thread(),
         id: "waiting".into(),
@@ -1086,7 +1108,8 @@ async fn permission_timeout_keeps_approval_until_durable_interrupt_completion() 
     input.emit(DaemonMessage::UserChoiceComplete {
         choice_id: "waiting".into(),
     });
-    input.emit(fake::done());
+    input.emit(fake::round_done());
+    input.emit(fake::idle());
     t.idle().await;
     assert!(
         t.agent
@@ -1108,5 +1131,73 @@ async fn permission_timeout_keeps_approval_until_durable_interrupt_completion() 
             .expect("permissions")
             .is_empty()
     );
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn core_idle_settles_tools_without_display_results() {
+    let mut t = Test::new().await;
+    let first = t.send(true, "run tool").await;
+    let input = t.daemon.next().await;
+    input.emit(fake::start());
+    input.emit(tool_call());
+    input.emit(fake::receipt(format!("peer-{first}")));
+    t.consumed(first).await;
+    let human = t.send(false, "next human").await;
+    input.emit(fake::round_done());
+    input.emit(fake::start());
+    input.emit(fake::round_done());
+    input.emit(DaemonMessage::ThreadIdle {
+        thread_id: Some("child".into()),
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), t.daemon.next())
+            .await
+            .is_err(),
+        "round completion and child idle cannot release root human mail"
+    );
+    input.emit(fake::idle());
+    let next = t.daemon.next().await;
+    assert!(matches!(&next.message, ClientMessage::UserInput { text, .. } if text == "next human"));
+    next.emit(DaemonMessage::UserInputEcho {
+        thread_id: fake::thread(),
+        text: "next human".into(),
+    });
+    next.emit(fake::receipt("human-id".into()));
+    next.emit(fake::round_done());
+    next.emit(fake::idle());
+    t.consumed(human).await;
+    t.idle().await;
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn resume_uses_core_idle_instead_of_display_history() {
+    let mut t = Test::new().await;
+    t.agent.stop().await.expect("stop");
+    t.daemon.state.lock().expect("state").manual_replay = true;
+    t.agent = t.broker.spawn(spec(t.root.path())).await.expect("resume");
+    let connect = t.daemon.next().await;
+    connect.emit(DaemonMessage::Replay {
+        history: vec![tool_call()],
+        pending_choices: vec![],
+        views: Default::default(),
+        in_progress: false,
+        idle: true,
+    });
+    t.idle().await;
+    let id = t.send(false, "human after replay").await;
+    let input = t.daemon.next().await;
+    assert!(
+        matches!(&input.message, ClientMessage::UserInput { text, .. } if text == "human after replay")
+    );
+    input.emit(DaemonMessage::UserInputEcho {
+        thread_id: fake::thread(),
+        text: "human after replay".into(),
+    });
+    input.emit(fake::receipt("human-id".into()));
+    input.emit(fake::idle());
+    t.consumed(id).await;
+    t.idle().await;
     t.finish().await;
 }

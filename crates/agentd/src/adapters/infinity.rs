@@ -30,17 +30,6 @@ struct Flight {
     receipt_deadline: Option<Instant>,
 }
 
-#[derive(Default)]
-struct ThreadWork {
-    completion: bool,
-    pending_tool: bool,
-}
-impl ThreadWork {
-    fn busy(&self) -> bool {
-        self.completion || self.pending_tool
-    }
-}
-
 struct Choice {
     wire_id: infinity_protocol::ChoiceId,
     count: usize,
@@ -57,7 +46,7 @@ struct InfinitySession {
     events: VecDeque<SessionEvent>,
     queue: VecDeque<TurnItem>,
     flight: Option<Flight>,
-    work: ThreadWork,
+    thread_busy: bool,
     peers: HashSet<MessageId>,
     peer_deadline: Option<Instant>,
     choices: HashMap<PermissionId, Choice>,
@@ -127,7 +116,7 @@ impl Adapter for InfinityAdapter {
             events: VecDeque::new(),
             queue: VecDeque::new(),
             flight: None,
-            work: ThreadWork::default(),
+            thread_busy: false,
             peers: HashSet::new(),
             peer_deadline: None,
             choices: HashMap::new(),
@@ -317,12 +306,12 @@ impl InfinitySession {
             committed: false,
             receipt_deadline: None,
         });
-        self.work.completion = true;
+        self.thread_busy = true;
         self.send(message)
     }
 
     fn finish_input(&mut self) -> Result<(), AdapterError> {
-        if self.work.busy() || !self.choices.is_empty() {
+        if self.thread_busy || !self.choices.is_empty() {
             return Ok(());
         }
         if self.flight.as_ref().is_some_and(|f| !f.committed) || !self.peers.is_empty() {
@@ -362,7 +351,6 @@ impl InfinitySession {
                     if self.peers.is_empty() {
                         self.peer_deadline = None;
                     }
-                    self.finish_input()?;
                     return Ok(());
                 }
                 let matches = self.flight.as_ref().is_some_and(|f| {
@@ -374,8 +362,6 @@ impl InfinitySession {
                         }
                 });
                 if matches {
-                    // A direct dedup receipt has no output or ResponseDone to wait for.
-                    let direct = self.flight.as_ref().is_some_and(|f| !f.started);
                     self.started();
                     let flight = self
                         .flight
@@ -383,13 +369,9 @@ impl InfinitySession {
                         .expect("bug: matched receipt without flight");
                     flight.committed = true;
                     flight.receipt_deadline = None;
-                    if direct {
-                        self.work.completion = false;
-                    }
                     self.events.push_back(SessionEvent::Committed {
                         ids: vec![flight.id],
                     });
-                    self.finish_input()?;
                 }
             }
             DaemonMessage::UserInputEcho { thread_id, text } if self.root_event(&thread_id) => {
@@ -404,20 +386,18 @@ impl InfinitySession {
             | DaemonMessage::ThinkingStart { thread_id }
                 if self.root_event(&thread_id) =>
             {
-                self.work.completion = true;
+                self.thread_busy = true;
                 self.started()
             }
             DaemonMessage::ToolResult { thread_id, .. } if self.root_event(&thread_id) => {
-                self.work.pending_tool = false;
-                self.work.completion = true;
+                self.thread_busy = true;
                 self.started();
             }
             DaemonMessage::ToolCall {
                 thread_id, name, ..
             } if self.root_event(&thread_id) => {
                 self.started();
-                self.work.completion = true;
-                self.work.pending_tool = name != "close_thread";
+                self.thread_busy = true;
                 self.events.push_back(SessionEvent::Activity(name));
             }
             DaemonMessage::Info { thread_id, text } if self.root_event(&thread_id) => {
@@ -428,19 +408,17 @@ impl InfinitySession {
                 if self.root_event(&thread_id) =>
             {
                 self.started();
-                self.work.completion = true;
+                self.thread_busy = true;
                 self.events.push_back(SessionEvent::Activity(chunk));
             }
-            DaemonMessage::ResponseDone { thread_id, .. } if self.root_event(&thread_id) => {
-                self.work.completion = false;
-                if !self.work.pending_tool {
-                    if !self.peers.is_empty() {
-                        self.peer_deadline = Some(Instant::now() + self.kind.request_timeout);
-                    }
-                    if let Some(flight) = &mut self.flight {
-                        flight.receipt_deadline =
-                            (!flight.committed).then(|| Instant::now() + self.kind.request_timeout);
-                    }
+            DaemonMessage::ThreadIdle { thread_id } if self.root_event(&thread_id) => {
+                self.thread_busy = false;
+                if !self.peers.is_empty() {
+                    self.peer_deadline = Some(Instant::now() + self.kind.request_timeout);
+                }
+                if let Some(flight) = &mut self.flight {
+                    flight.receipt_deadline =
+                        (!flight.committed).then(|| Instant::now() + self.kind.request_timeout);
                 }
                 self.finish_input()?;
             }
@@ -491,29 +469,12 @@ impl InfinitySession {
                 self.choices.retain(|_, choice| choice.wire_id != choice_id);
             }
             DaemonMessage::Replay {
-                history,
                 pending_choices,
-                in_progress,
+                idle,
                 ..
             } => {
-                // Replay restores liveness, never delivery evidence.
-                self.work.pending_tool = false;
-                for event in history {
-                    match event {
-                        DaemonMessage::ToolCall {
-                            thread_id, name, ..
-                        } if self.root_event(&thread_id) => {
-                            self.work.pending_tool = name != "close_thread"
-                        }
-                        DaemonMessage::ToolResult { thread_id, .. }
-                            if self.root_event(&thread_id) =>
-                        {
-                            self.work.pending_tool = false
-                        }
-                        _ => {}
-                    }
-                }
-                self.work.completion = in_progress;
+                // Replay restores core liveness, never delivery evidence.
+                self.thread_busy = !idle;
                 for choice in pending_choices {
                     self.receive(choice)?;
                 }
@@ -545,7 +506,7 @@ impl Session for InfinitySession {
         true
     }
     fn busy(&self) -> bool {
-        self.work.busy() || !self.choices.is_empty()
+        self.thread_busy || !self.choices.is_empty()
     }
     fn accepts_peer_mail(&self) -> bool {
         self.events.is_empty() && self.cancel_deadline.is_none()
@@ -557,7 +518,7 @@ impl Session for InfinitySession {
         if turn.items.is_empty() {
             return Err(protocol("Infinity submit requires mail"));
         }
-        if self.work.busy() || self.flight.is_some() || !self.peers.is_empty() {
+        if self.thread_busy || self.flight.is_some() || !self.peers.is_empty() {
             for item in turn.items {
                 let TurnItem::Peer { envelope, rendered } = item else {
                     return Err(protocol("only peer mail can enter a busy Infinity session"));
@@ -566,6 +527,7 @@ impl Session for InfinitySession {
                     return Err(protocol("peer message needs an agent sender"));
                 };
                 self.peers.insert(envelope.id());
+                self.thread_busy = true;
                 self.send(ClientMessage::DeliverPeerMessage {
                     thread_id: self.root.clone(),
                     message_id: envelope.id().to_string(),

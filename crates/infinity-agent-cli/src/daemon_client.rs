@@ -111,6 +111,7 @@ fn daemon_msg_to_display(msg: DaemonMessage) -> Option<(Option<ThreadRef>, Displ
             (thread_id, DisplayEvent::Info(format!("Error: {text}")))
         }
         DaemonMessage::Connected { .. }
+        | DaemonMessage::ThreadIdle { .. }
         | DaemonMessage::InputCommitted { .. }
         | DaemonMessage::Welcome { .. }
         | DaemonMessage::Replay { .. }

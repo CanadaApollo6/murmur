@@ -190,6 +190,7 @@ where
             history: self.history.current_turn_view(),
             current_thinking: self.current_thinking.borrow().clone(),
             in_progress: self.in_flight.get(),
+            idle: self.is_settled(),
             pending_choices: self.pending_choices.borrow().clone(),
         }
     }
@@ -238,6 +239,12 @@ where
             .is_some_and(|(_, name)| name != CLOSE_THREAD_TOOL)
     }
 
+    pub(crate) fn is_settled(&self) -> bool {
+        !self.in_flight.get()
+            && !self.awaiting_tool_result()
+            && self.pending_choices.borrow().is_empty()
+    }
+
     /// Settle cancelled work without starting a new model round. Completion is
     /// acknowledged only after both the tool result and choice removal persist.
     pub(crate) async fn interrupt<O: ThreadObserver>(&self, observer: &O) -> Result<(), BoxError> {
@@ -245,11 +252,10 @@ where
         let pending_tool = self.pending_tool_call().is_some();
         if pending_tool {
             self.history.interrupt_pending_tool_call();
-            // A dispatched tool call has already passed model validation. Its
-            // cancellation result needs no further inference to become durable.
-            self.history.mark_inputs_model_validated();
-            self.history.sync().await?;
         }
+        // An accepted real result can shadow the call without being durable.
+        // Preserve it, while leaving unrelated user/peer inputs unvalidated.
+        self.history.settle_tool_results_on_interrupt().await?;
         let interrupted = self.history.take_interrupted_tool_calls();
         if !interrupted.is_empty() {
             let config = self.resolved_config().await?;
@@ -520,6 +526,14 @@ where
                 }
             }
             for call_id in interrupted {
+                observer.on_event(
+                    &thread_id,
+                    &AgentEvent::ToolResult {
+                        segments: vec![rap_protocol::DisplaySegment::Text(
+                            event_processor::TOOL_CALL_INTERRUPTED_TEXT.into(),
+                        )],
+                    },
+                );
                 self.inner
                     .state_store
                     .remove_pending_user_choice(&thread_id, &call_id)
@@ -700,14 +714,12 @@ where
             }
             CompletionEvent::SyncToolResult(res) => {
                 *self.current_thinking.borrow_mut() = None;
-                if let Some(ToolResultContent::Text(text)) = res.content.first() {
-                    observer.on_event(
-                        thread_id,
-                        &AgentEvent::ToolResult {
-                            segments: vec![rap_protocol::DisplaySegment::Text(text.text.clone())],
-                        },
-                    );
-                }
+                let segments = if let Some(ToolResultContent::Text(text)) = res.content.first() {
+                    vec![rap_protocol::DisplaySegment::Text(text.text.clone())]
+                } else {
+                    vec![]
+                };
+                observer.on_event(thread_id, &AgentEvent::ToolResult { segments });
             }
             CompletionEvent::Action(CompletionAction::Done(r)) => {
                 // There may be multiple `Done` if the agent synchronously

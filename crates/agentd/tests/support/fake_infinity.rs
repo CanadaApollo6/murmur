@@ -100,6 +100,7 @@ impl FakeDaemon {
                                             }
                                             ClientMessage::DeliverPeerMessage { message_id, .. }
                                                 if state.lock().expect("state").durable.contains(message_id) => {
+                                                reply.send(Some(idle())).expect("dedup idle");
                                                 Some(receipt(format!("peer-{message_id}")))
                                             }
                                             _ => None,
@@ -161,10 +162,16 @@ pub fn start() -> DaemonMessage {
         thread_id: thread(),
     }
 }
-pub fn done() -> DaemonMessage {
+pub fn round_done() -> DaemonMessage {
     DaemonMessage::ResponseDone {
         thread_id: thread(),
         token_usage: None,
+    }
+}
+
+pub fn idle() -> DaemonMessage {
+    DaemonMessage::ThreadIdle {
+        thread_id: thread(),
     }
 }
 
@@ -174,5 +181,6 @@ fn replay() -> DaemonMessage {
         pending_choices: vec![],
         views: Default::default(),
         in_progress: false,
+        idle: true,
     }
 }

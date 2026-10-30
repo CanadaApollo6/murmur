@@ -544,6 +544,24 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         self.pending_items.borrow_mut().extend(drained);
     }
 
+    pub(crate) async fn settle_tool_results_on_interrupt(&self) -> Result<(), BoxError> {
+        let results: Vec<_> = {
+            let mut inputs = self.unvalidated_items.borrow_mut();
+            let count = inputs
+                .iter()
+                .take_while(|item| matches!(item.message, InfinityMessage::ToolResult { .. }))
+                .count();
+            inputs.drain(..count).collect()
+        };
+        self.pending_items.borrow_mut().extend(results);
+        self.sync().await?;
+        if !self.pending_items.borrow().is_empty() || !self.pending_receipt_ids.borrow().is_empty()
+        {
+            return Err("interrupted tool exchange could not be persisted".into());
+        }
+        Ok(())
+    }
+
     /// Number of inputs still awaiting model validation.
     pub fn unvalidated_len(&self) -> usize {
         self.unvalidated_items.borrow().len()
@@ -1448,15 +1466,13 @@ where
             });
         }
         None
-    } else if let InputMessageContent::User(UserContent::ToolResult(res)) = &input_msg.content
-        && let Some(ToolResultContent::Text(text)) = res.content.first()
-    {
-        Some(AgentEvent::ToolResult {
-            segments: rap_protocol::build_display_segments(
-                input_msg.display_as.as_deref(),
-                &text.text,
-            ),
-        })
+    } else if let InputMessageContent::User(UserContent::ToolResult(res)) = &input_msg.content {
+        let segments = if let Some(ToolResultContent::Text(text)) = res.content.first() {
+            rap_protocol::build_display_segments(input_msg.display_as.as_deref(), &text.text)
+        } else {
+            input_msg.display_as.clone().unwrap_or_default()
+        };
+        Some(AgentEvent::ToolResult { segments })
     } else if let InputMessageContent::User(UserContent::Text(ref text)) = input_msg.content {
         let display_text = text.text.strip_prefix("<interrupt>").unwrap_or(&text.text);
         Some(AgentEvent::UserInput {

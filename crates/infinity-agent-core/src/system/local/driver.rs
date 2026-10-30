@@ -228,13 +228,16 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                     );
                     if let Err(error) = thread.interrupt(&observer).await {
                         observer.on_event(&thread_id, &AgentEvent::Info { text: format!("Interrupt failed: {error}") });
+                        return;
                     }
                     continue;
                 },
                 req = subscribe_rx.recv(), if !subscribe_closed => {
                     match req {
                         Some((req, ack)) => {
-                            observer.on_subscribe(&thread_id, req, thread.replay_snapshot());
+                            let mut snapshot = thread.replay_snapshot();
+                            snapshot.idle = false;
+                            observer.on_subscribe(&thread_id, req, snapshot);
                             let _ = ack.send(());
                         }
                         None => subscribe_closed = true,
@@ -252,6 +255,7 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                         text: format!("Interrupt failed: {error}"),
                     },
                 );
+                return;
             }
             let mut batch: Vec<(InputMessage, String)> = std::mem::take(&mut pending_batch);
             while let Ok(item) = rx.try_recv() {
@@ -297,6 +301,7 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                                 Some(()) = interrupt_rx.recv() => {
                                     if let Err(error) = thread.interrupt(&observer).await {
                                         observer.on_event(&thread_id, &AgentEvent::Info { text: format!("Interrupt failed: {error}") });
+                                        return;
                                     }
                                     continue 'driver;
                                 }
@@ -380,7 +385,9 @@ where
     O: ThreadObserver,
 {
     while let Ok((request, ack)) = subscribe_rx.try_recv() {
-        observer.on_subscribe(thread_id, request, thread.replay_snapshot());
+        let mut snapshot = thread.replay_snapshot();
+        snapshot.idle &= batch.is_empty() && rx.is_empty();
+        observer.on_subscribe(thread_id, request, snapshot);
         let _ = ack.send(());
     }
 
@@ -396,6 +403,9 @@ where
         // Active subscriptions do not keep the driver resident. Their events
         // respawn it; embeddings can keep associated resources alive based on
         // subscription state when they observe this idle transition.
+        if thread.is_settled() {
+            observer.on_event(thread_id, &AgentEvent::ThreadIdle);
+        }
         IdleDecision::Exit
     }
 }
@@ -485,6 +495,59 @@ impl Drop for DriverGuard {
 mod tests {
     use crate::system::events::AgentEvent;
     use crate::system::test_support::*;
+
+    #[tokio::test]
+    async fn replay_idle_check_includes_queued_inputs() {
+        use super::*;
+        use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
+        use crate::system::AgentSystemBuilder;
+
+        for queued in [false, true] {
+            let (model, _ctrl) = model_source(None);
+            let system = AgentSystemBuilder::new(
+                InMemoryConversationStore::new(),
+                InMemoryStateStore::new(),
+                model,
+                ChannelSender::new_pair().0,
+            )
+            .build();
+            let thread_id = ThreadId::from_ref("t1");
+            let thread = Thread::load(system.inner.clone(), thread_id.to_owned())
+                .await
+                .expect("thread");
+            let (tx, mut events) = mpsc::unbounded_channel();
+            let observer = TestObserver { tx: tx.clone() };
+            let (inputs, mut rx) = mpsc::unbounded_channel();
+            let (subs, mut subscribe_rx) = mpsc::unbounded_channel();
+            let (ack, _acked) = oneshot::channel();
+            subs.send((tx, ack)).expect("subscribe");
+            if queued {
+                inputs.send(user_text_input("t1", "queued")).expect("input");
+            }
+            let decision = check_before_idle(
+                &mut vec![],
+                &mut rx,
+                &mut subscribe_rx,
+                &observer,
+                &thread,
+                thread_id,
+            );
+            let Evt::Replay(snapshot) = events.try_recv().expect("replay") else {
+                panic!("expected replay");
+            };
+            assert_eq!(snapshot.idle, !queued);
+            if queued {
+                assert!(matches!(decision, IdleDecision::Continue));
+                assert!(events.try_recv().is_err(), "queued work cannot emit idle");
+            } else {
+                assert!(matches!(decision, IdleDecision::Exit));
+                assert!(matches!(
+                    events.try_recv().expect("idle event"),
+                    Evt::E(AgentEvent::ThreadIdle)
+                ));
+            }
+        }
+    }
 
     /// An active subscription does not keep a driver resident: once the
     /// subscription tool's result settles the call, the driver idles out, and a

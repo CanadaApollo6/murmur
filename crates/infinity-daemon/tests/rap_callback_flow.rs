@@ -416,3 +416,315 @@ async fn broker_permission_timeout_durably_cancels_waiting_choice() {
         accept.abort();
     }).await;
 }
+
+#[derive(Clone, Copy)]
+enum ToolSettlementProbe {
+    PeerWake,
+    Image,
+    Empty,
+    CancelRealResult,
+}
+
+async fn tool_settlement_probe(probe: ToolSettlementProbe) {
+    use agentd::mailroom::{Mailroom, NewMessage};
+    use agentd::model::*;
+    use agentd::supervisor::{AgentSpec, Broker, Event, Phase, TurnOutcome};
+    use infinity_agent_core::message::{InputMessage, InputMessageContent};
+    use infinity_provider_protocol::message::{
+        Image, ImageMediaType, ImageSource, ToolResult, ToolResultContent, UserContent,
+    };
+
+    let mut h = start_harness().await.expect("harness");
+    let socket = h.cwd.path().join("broker-infinity.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("socket");
+    let manager = h.manager.clone();
+    let accept = tokio::task::spawn_local(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            tokio::task::spawn_local(infinity_daemon::client_handler::handle_client(
+                stream,
+                manager.clone(),
+            ));
+        }
+    });
+    let mailroom = Arc::new(
+        Mailroom::open(h.cwd.path().join("broker.db"), Default::default())
+            .await
+            .expect("mailroom"),
+    );
+    let broker = Broker::new(
+        mailroom.clone(),
+        vec![agentd::KindConfig::infinity(socket)],
+        Default::default(),
+    )
+    .expect("broker");
+    let mut events = broker.events();
+    let spec = AgentSpec {
+        name: AgentName::parse("model").expect("name"),
+        kind: "infinity".into(),
+        cwd: h.cwd.path().into(),
+        model: None,
+        permissions: PermissionPolicy::default(),
+        idle_after: None,
+    };
+    let mut agent = broker.spawn(spec.clone()).await.expect("spawn");
+    let mut phases = agent.phases();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *phases.borrow_and_update() != Phase::Idle {
+            phases.changed().await.expect("phase");
+        }
+    })
+    .await
+    .expect("initial idle");
+    let root = h
+        .manager
+        .lock()
+        .await
+        .list_sessions(None)
+        .await
+        .into_keys()
+        .next()
+        .expect("root");
+    h.client_tx
+        .send(ClientMessage::Connect {
+            root_thread_id: root.clone(),
+            thread_id: None,
+            keeps_session_alive: true,
+        })
+        .expect("connect observer");
+    wait_for_message(&mut h.daemon_rx, |m| {
+        matches!(m, DaemonMessage::Replay { .. })
+    })
+    .await;
+    let human = |body: &str| NewMessage {
+        from: Sender::Human,
+        to: agent.id,
+        body: Body::new(body).expect("body"),
+        reply_to: None,
+        client_key: ClientKey(body.into()),
+        act: agentd::swarm::Act::Inform,
+        task: None,
+    };
+    broker.send(human("run tool")).await.expect("send");
+    h.ctrl.next_request().await;
+    if matches!(probe, ToolSettlementProbe::CancelRealResult) {
+        h.ctrl
+            .send_tool_call("waiting", "sleep", serde_json::json!({"seconds": 0.05}));
+    } else {
+        h.ctrl.send_tool_call(
+            "waiting",
+            "sleep_until_event_or_input",
+            serde_json::json!({}),
+        );
+    }
+    h.ctrl.finish();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(events.recv().await.expect("event"), Event::Consumed { .. }) {}
+    })
+    .await
+    .expect("receipt");
+    wait_for_message(&mut h.daemon_rx, |m| {
+        matches!(m, DaemonMessage::ResponseDone { .. })
+    })
+    .await;
+    match probe {
+        ToolSettlementProbe::PeerWake => {
+            let sender = mailroom
+                .register(AgentName::parse("peer").expect("name"))
+                .await
+                .expect("register");
+            broker
+                .send(NewMessage {
+                    from: Sender::Agent(sender),
+                    ..human("wake up")
+                })
+                .await
+                .expect("peer");
+        }
+        ToolSettlementProbe::Image | ToolSettlementProbe::Empty => {
+            let content = if matches!(probe, ToolSettlementProbe::Image) {
+                vec![ToolResultContent::Image(Image {
+                    data: ImageSource::Base64("AA==".into()),
+                    media_type: Some(ImageMediaType::PNG),
+                })]
+            } else {
+                vec![]
+            };
+            assert!(
+                h.manager
+                    .lock()
+                    .await
+                    .send_input((
+                        InputMessage {
+                            content: InputMessageContent::User(UserContent::ToolResult(
+                                ToolResult {
+                                    id: "waiting".into(),
+                                    call_id: None,
+                                    content
+                                }
+                            )),
+                            group_id: root.id.clone(),
+                            metadata: None,
+                            synthetic: None,
+                            display_as: None,
+                            subscription: false,
+                        },
+                        None
+                    ))
+                    .await
+            );
+        }
+        ToolSettlementProbe::CancelRealResult => {}
+    }
+    tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request())
+        .await
+        .expect("tool followup");
+    if matches!(probe, ToolSettlementProbe::CancelRealResult) {
+        agent.cancel().await.expect("cancel followup before output");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                events.recv().await.expect("event"),
+                Event::TurnEnded {
+                    outcome: TurnOutcome::Cancelled,
+                    ..
+                }
+            ) {}
+        })
+        .await
+        .expect("cancel ack");
+    } else {
+        let settlement = wait_for_message(&mut h.daemon_rx, |m| {
+            matches!(m, DaemonMessage::ToolResult { .. })
+        })
+        .await;
+        match probe {
+            ToolSettlementProbe::PeerWake => {
+                assert!(format!("{settlement:?}").contains("interrupted"))
+            }
+            _ => assert!(
+                matches!(settlement, DaemonMessage::ToolResult { segments, .. } if segments.is_empty())
+            ),
+        }
+        h.ctrl.send_text("finished the work");
+        h.ctrl.finish();
+        wait_for_message(&mut h.daemon_rx, |m| {
+            matches!(m, DaemonMessage::ResponseDone { .. })
+        })
+        .await;
+        broker.send(human("next human")).await.expect("human");
+        tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request())
+            .await
+            .expect("human mail must progress after settled tool and final response");
+        h.ctrl.send_text("human answered");
+        h.ctrl.finish();
+        wait_for_message(&mut h.daemon_rx, |m| {
+            matches!(m, DaemonMessage::ResponseDone { .. })
+        })
+        .await;
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *phases.borrow_and_update() != Phase::Idle {
+            phases.changed().await.expect("phase");
+        }
+    })
+    .await
+    .expect("idle after settlement");
+    agent.stop().await.expect("stop");
+    agent = broker.spawn(spec).await.expect("resume");
+    let mut phases = agent.phases();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while matches!(
+            *phases.borrow_and_update(),
+            Phase::Dormant | Phase::Starting
+        ) {
+            phases.changed().await.expect("phase");
+        }
+    })
+    .await
+    .expect("attach");
+    assert_eq!(
+        agent.phase(),
+        Phase::Idle,
+        "reconnect must preserve settled tool state"
+    );
+    h.client_tx
+        .send(ClientMessage::Connect {
+            root_thread_id: root,
+            thread_id: None,
+            keeps_session_alive: true,
+        })
+        .expect("inspect durable replay");
+    let replay = wait_for_message(&mut h.daemon_rx, |m| {
+        matches!(m, DaemonMessage::Replay { .. })
+    })
+    .await;
+    eprintln!("settled replay: {replay:?}");
+    let DaemonMessage::Replay {
+        history,
+        pending_choices,
+        ..
+    } = replay
+    else {
+        unreachable!()
+    };
+    assert!(pending_choices.is_empty());
+    let results: Vec<_> = history
+        .iter()
+        .filter_map(|m| match m {
+            DaemonMessage::ToolResult { segments, .. } => Some(segments),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        results.len(),
+        1,
+        "replay must include exactly one tool settlement"
+    );
+    match probe {
+        ToolSettlementProbe::CancelRealResult => assert!(
+            format!("{:?}", results[0]).contains("Slept for 0.05 seconds"),
+            "preserve real result rather than substitute interruption"
+        ),
+        ToolSettlementProbe::PeerWake => {
+            assert!(format!("{:?}", results[0]).contains("interrupted"))
+        }
+        _ => assert!(results[0].is_empty()),
+    }
+    broker.shutdown().await.expect("shutdown");
+    drop(broker);
+    Arc::try_unwrap(mailroom)
+        .ok()
+        .expect("sole owner")
+        .close()
+        .await
+        .expect("close");
+    accept.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn review_peer_wakes_sleep() {
+    tokio::task::LocalSet::new()
+        .run_until(tool_settlement_probe(ToolSettlementProbe::PeerWake))
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn review_image_tool_result() {
+    tokio::task::LocalSet::new()
+        .run_until(tool_settlement_probe(ToolSettlementProbe::Image))
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn review_empty_tool_result() {
+    tokio::task::LocalSet::new()
+        .run_until(tool_settlement_probe(ToolSettlementProbe::Empty))
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn review_real_result_racing_interrupt() {
+    tokio::task::LocalSet::new()
+        .run_until(tool_settlement_probe(ToolSettlementProbe::CancelRealResult))
+        .await;
+}
