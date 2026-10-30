@@ -451,3 +451,11 @@ pub(crate) fn start_launcher_system(
 pub(crate) fn tool_names(req: &infinity_provider_protocol::CompletionRequest) -> Vec<String> {
     req.tools.iter().map(|t| t.name.clone()).collect()
 }
+
+pub(crate) fn peer_input(group_id: &str, message_id: &str, text: &str) -> (InputMessage, String) {
+    let (mut input, _) = tool_result_input(group_id, "", text);
+    input.synthetic = Some(SyntheticKind::Tagged(TaggedSyntheticKind::PeerMessage {
+        from: "@planner".into(),
+    }));
+    (input, format!("peer-{message_id}"))
+}

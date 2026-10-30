@@ -68,6 +68,7 @@ pub fn is_deferrable_synthetic_event(msg: &InputMessage) -> bool {
                 TaggedSyntheticKind::SubscriptionEvent { .. }
                     | TaggedSyntheticKind::ThreadReport { .. }
                     | TaggedSyntheticKind::ParentMessage { .. }
+                    | TaggedSyntheticKind::PeerMessage { .. }
             ) | SyntheticKind::SubscriptionEvent(_)
         )
     })
@@ -259,23 +260,24 @@ where
             return Ok(batch);
         };
 
-        // Flushing is safe when the batch itself settles the pending call
-        // first: either it contains the call's actual tool result, or a user
-        // text input (which deliberately interrupts the pending call). Batch
-        // items are processed before drained deferred items, so ordering is
-        // preserved.
-        let settles_pending = inputs.iter().any(|(msg, _)| {
-            is_user_text_input(msg)
-                || (msg.synthetic.is_none()
-                    && matches!(
-                        &msg.content,
-                        InputMessageContent::User(UserContent::ToolResult(r))
-                            if r.id == pending_call_id
-                    ))
-        });
+        let is_settling_result = |msg: &InputMessage| {
+            msg.synthetic.is_none()
+                && matches!(
+                    &msg.content,
+                    InputMessageContent::User(UserContent::ToolResult(r)) if r.id == pending_call_id
+                )
+        };
+        let settles_pending = inputs
+            .iter()
+            .any(|(msg, _)| is_user_text_input(msg) || is_settling_result(msg));
 
         if settles_pending {
             let mut batch = inputs;
+            // A self-contained event would otherwise interrupt the call before its result.
+            if let Some(i) = batch.iter().position(|(msg, _)| is_settling_result(msg)) {
+                let settling = batch.remove(i);
+                batch.insert(0, settling);
+            }
             batch.extend(defer.drain().await?);
             return Ok(batch);
         }
