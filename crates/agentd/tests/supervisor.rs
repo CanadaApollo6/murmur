@@ -34,6 +34,10 @@ fn kind(root: &Path, codex: bool) -> KindConfig {
         if codex { "read-only" } else { "default" }.into(),
     );
     kind.mcp_servers = vec![json!({"name":"later","command":"unused","args":[],"env":[]})];
+    if root.join("broken-pipe.py").exists() {
+        kind.command = "python3".into();
+        kind.args = vec![root.join("broken-pipe.py").display().to_string()];
+    }
     kind.idle_after = None;
     kind.request_timeout = Duration::from_secs(3);
     kind
@@ -1134,4 +1138,59 @@ async fn ignored_cancel_crashes_and_settles_delivery() {
         );
         t.finish().await;
     }
+}
+
+#[tokio::test]
+async fn late_permission_broken_pipe_retains_start_evidence() {
+    let root = tempfile::tempdir().expect("tempdir");
+    std::fs::write(root.path().join("broken-pipe.py"), r#"
+import sys, json, os, time
+def emit(m):
+    print(json.dumps(m), flush=True)
+for line in sys.stdin:
+    m = json.loads(line)
+    method = m.get('method')
+    if method == 'initialize':
+        emit({'jsonrpc':'2.0','id':m['id'],'result':{'protocolVersion':1,'agentCapabilities':{'loadSession':True}}})
+    elif method == 'session/new':
+        emit({'jsonrpc':'2.0','id':m['id'],'result':{'sessionId':'broken-pipe'}})
+    elif method == 'session/set_mode':
+        emit({'jsonrpc':'2.0','id':m['id'],'result':{}})
+    elif method == 'session/cancel':
+        os.close(0)
+        emit({'jsonrpc':'2.0','id':'late','method':'session/request_permission','params':{'sessionId':'broken-pipe','toolCall':{'toolCallId':'late','title':'Write file','kind':'edit'},'options':[{'optionId':'yes','name':'Allow once','kind':'allow_once'}]}})
+        time.sleep(0.2)
+        sys.exit(0)
+"#).expect("write child");
+    let mut t = Test::at(
+        root,
+        Default::default(),
+        Config {
+            crash_limit: 1,
+            ..config()
+        },
+        false,
+        None,
+    )
+    .await;
+    let id = t.send("silent").await;
+    t.event(|e| matches!(e, Event::Offered { .. })).await;
+    t.agent.cancel().await.expect("cancel");
+    let event = t
+        .event(|e| {
+            matches!(
+                e,
+                Event::PhaseChanged {
+                    phase: Phase::Failed { .. },
+                    ..
+                }
+            )
+        })
+        .await;
+    let state = t.mailroom.delivery(id).await.expect("delivery").state;
+    t.finish().await;
+    assert!(
+        matches!(state, DeliveryState::Uncertain { .. }),
+        "received a permission before failure but lost start evidence: {state:?}, {event:?}"
+    );
 }
