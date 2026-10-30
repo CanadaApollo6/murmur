@@ -144,6 +144,10 @@ pub struct RapTool<H: HttpClient> {
 
 #[async_trait]
 impl<H: HttpClient + 'static, M: InputSender + 'static> Tool<M> for RapTool<H> {
+    fn survives_restart(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         &self.descriptor.name
     }

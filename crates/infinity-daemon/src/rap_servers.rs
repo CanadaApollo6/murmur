@@ -375,6 +375,10 @@ pub struct ManagedRapTool {
 
 #[async_trait]
 impl Tool<ChannelSender> for ManagedRapTool {
+    fn survives_restart(&self) -> bool {
+        matches!(self.server.spec, ServerSpec::External { .. })
+    }
+
     fn name(&self) -> &str {
         &self.descriptor.name
     }

@@ -880,13 +880,17 @@ async fn agentctl_spawns_an_infinity_kind_and_relays_approval() {
         matches!(create.message, ClientMessage::CreateSession { model: Some(m), .. } if m.provider_id == "fake" && m.model_id == "small")
     );
     let input = infinity.next().await;
-    assert!(
-        matches!(&input.message, ClientMessage::UserInput { text, .. } if text == "hello model")
-    );
-    input.emit(DaemonMessage::UserInputEcho {
-        thread_id: fake_infinity::thread(),
-        text: "hello model".into(),
-    });
+    let ClientMessage::DeliverPeerMessage {
+        message_id,
+        from,
+        text,
+        ..
+    } = &input.message
+    else {
+        panic!("expected deferrable human mail")
+    };
+    assert_eq!(from, "human");
+    assert!(text.contains("hello model") && text.contains("human operator"));
     input.emit(fake_infinity::start());
     input.emit(DaemonMessage::UserChoiceRequired {
         thread_id: fake_infinity::thread(),
@@ -912,7 +916,7 @@ async fn agentctl_spawns_an_infinity_kind_and_relays_approval() {
         infinity.next().await.message,
         ClientMessage::UserChoiceAnswered { selected: 0, .. }
     ));
-    input.emit(fake_infinity::receipt("human-id".into()));
+    input.emit(fake_infinity::receipt(format!("peer-{message_id}")));
     input.emit(fake_infinity::round_done());
     input.emit(fake_infinity::idle());
     tokio::time::timeout(Duration::from_secs(5), async {

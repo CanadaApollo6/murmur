@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -21,15 +21,6 @@ struct InfinityResume {
     root: ThreadRef,
 }
 
-struct Flight {
-    id: MessageId,
-    human_text: Option<String>,
-    echoed: bool,
-    started: bool,
-    committed: bool,
-    receipt_deadline: Option<Instant>,
-}
-
 struct Choice {
     wire_id: infinity_protocol::ChoiceId,
     count: usize,
@@ -44,11 +35,9 @@ struct InfinitySession {
     tx: mpsc::UnboundedSender<ClientMessage>,
     rx: mpsc::Receiver<Result<DaemonMessage, String>>,
     events: VecDeque<SessionEvent>,
-    queue: VecDeque<TurnItem>,
-    flight: Option<Flight>,
     thread_busy: bool,
-    peers: HashSet<MessageId>,
-    peer_deadline: Option<Instant>,
+    pending: HashMap<MessageId, bool>,
+    receipt_deadline: Option<Instant>,
     choices: HashMap<PermissionId, Choice>,
     cancel_deadline: Option<Instant>,
     ended: bool,
@@ -114,11 +103,9 @@ impl Adapter for InfinityAdapter {
             tx,
             rx,
             events: VecDeque::new(),
-            queue: VecDeque::new(),
-            flight: None,
             thread_busy: false,
-            peers: HashSet::new(),
-            peer_deadline: None,
+            pending: HashMap::new(),
+            receipt_deadline: None,
             choices: HashMap::new(),
             cancel_deadline: None,
             ended: false,
@@ -255,80 +242,33 @@ impl InfinitySession {
     }
 
     fn started(&mut self) {
-        if let Some(flight) = &mut self.flight
-            && !flight.started
-        {
-            flight.started = true;
-            self.events.push_back(SessionEvent::TurnStarted {
-                ids: vec![flight.id],
-            });
+        let ids = self
+            .pending
+            .iter_mut()
+            .filter_map(|(id, started)| {
+                if *started {
+                    None
+                } else {
+                    *started = true;
+                    Some(*id)
+                }
+            })
+            .collect::<Vec<_>>();
+        if !ids.is_empty() {
+            self.events.push_back(SessionEvent::TurnStarted { ids });
         }
     }
 
-    fn submit_next(&mut self) -> Result<(), AdapterError> {
-        let Some(item) = self.queue.pop_front() else {
-            return Ok(());
-        };
-        let (id, human_text, message) = match item {
-            TurnItem::User(envelope) => {
-                let text = envelope.body().as_str().to_owned();
-                (
-                    envelope.id(),
-                    Some(text.clone()),
-                    ClientMessage::UserInput {
-                        thread_id: self.root.clone(),
-                        text,
-                    },
-                )
-            }
-            TurnItem::Peer { envelope, rendered } => {
-                let Sender::Agent(from) = envelope.from() else {
-                    return Err(protocol("peer message needs an agent sender"));
-                };
-                // The daemon prefixes this raw ID with `peer-` exactly once.
-                (
-                    envelope.id(),
-                    None,
-                    ClientMessage::DeliverPeerMessage {
-                        thread_id: self.root.clone(),
-                        message_id: envelope.id().to_string(),
-                        from: format!("agent:{from}"),
-                        text: rendered,
-                    },
-                )
-            }
-        };
-        self.flight = Some(Flight {
-            id,
-            human_text,
-            echoed: false,
-            started: false,
-            committed: false,
-            receipt_deadline: None,
-        });
-        self.thread_busy = true;
-        self.send(message)
-    }
-
-    fn finish_input(&mut self) -> Result<(), AdapterError> {
-        if self.thread_busy || !self.choices.is_empty() {
-            return Ok(());
+    fn finish_input(&mut self) {
+        if self.thread_busy || !self.choices.is_empty() || !self.pending.is_empty() {
+            return;
         }
-        if self.flight.as_ref().is_some_and(|f| !f.committed) || !self.peers.is_empty() {
-            return Ok(());
-        }
-        self.flight = None;
-        if !self.queue.is_empty() && self.cancel_deadline.is_none() {
-            return self.submit_next();
-        }
-        self.queue.clear();
         let outcome = if self.cancel_deadline.take().is_some() {
             TurnOutcome::Cancelled
         } else {
             TurnOutcome::Completed
         };
         self.events.push_back(SessionEvent::TurnEnded { outcome });
-        Ok(())
     }
 
     fn receive(&mut self, message: DaemonMessage) -> Result<(), AdapterError> {
@@ -338,48 +278,25 @@ impl InfinitySession {
                 dedup_id,
             } if self.root_event(&thread_id) => {
                 if let Some(id) = self
-                    .peers
-                    .iter()
+                    .pending
+                    .keys()
                     .find(|id| dedup_id == format!("peer-{id}"))
                     .copied()
                 {
-                    self.peers.remove(&id);
-                    self.events
-                        .push_back(SessionEvent::TurnStarted { ids: vec![id] });
+                    if !self
+                        .pending
+                        .remove(&id)
+                        .expect("bug: matched missing receipt")
+                    {
+                        self.events
+                            .push_back(SessionEvent::TurnStarted { ids: vec![id] });
+                    }
                     self.events
                         .push_back(SessionEvent::Committed { ids: vec![id] });
-                    if self.peers.is_empty() {
-                        self.peer_deadline = None;
+                    if self.pending.is_empty() {
+                        self.receipt_deadline = None;
+                        self.finish_input();
                     }
-                    return Ok(());
-                }
-                let matches = self.flight.as_ref().is_some_and(|f| {
-                    !f.committed
-                        && if f.human_text.is_some() {
-                            f.echoed && !dedup_id.starts_with("peer-")
-                        } else {
-                            dedup_id == format!("peer-{}", f.id)
-                        }
-                });
-                if matches {
-                    self.started();
-                    let flight = self
-                        .flight
-                        .as_mut()
-                        .expect("bug: matched receipt without flight");
-                    flight.committed = true;
-                    flight.receipt_deadline = None;
-                    self.events.push_back(SessionEvent::Committed {
-                        ids: vec![flight.id],
-                    });
-                }
-            }
-            DaemonMessage::UserInputEcho { thread_id, text } if self.root_event(&thread_id) => {
-                if let Some(flight) = &mut self.flight
-                    && flight.human_text.as_ref() == Some(&text)
-                {
-                    flight.echoed = true;
-                    self.started();
                 }
             }
             DaemonMessage::StartOutput { thread_id }
@@ -389,10 +306,7 @@ impl InfinitySession {
                 self.thread_busy = true;
                 // Attachment idle can precede this newer completion in the socket.
                 // Receipt recovery applies at idle, never during valid inference.
-                if let Some(flight) = &mut self.flight {
-                    flight.receipt_deadline = None;
-                }
-                self.peer_deadline = None;
+                self.receipt_deadline = None;
                 self.started()
             }
             DaemonMessage::ToolResult { thread_id, .. } if self.root_event(&thread_id) => {
@@ -419,14 +333,9 @@ impl InfinitySession {
             }
             DaemonMessage::ThreadIdle { thread_id } if self.root_event(&thread_id) => {
                 self.thread_busy = false;
-                if !self.peers.is_empty() {
-                    self.peer_deadline = Some(Instant::now() + self.kind.request_timeout);
-                }
-                if let Some(flight) = &mut self.flight {
-                    flight.receipt_deadline =
-                        (!flight.committed).then(|| Instant::now() + self.kind.request_timeout);
-                }
-                self.finish_input()?;
+                self.receipt_deadline =
+                    (!self.pending.is_empty()).then(|| Instant::now() + self.kind.request_timeout);
+                self.finish_input();
             }
             DaemonMessage::UserChoiceRequired {
                 thread_id,
@@ -514,7 +423,7 @@ impl Session for InfinitySession {
     fn busy(&self) -> bool {
         self.thread_busy || !self.choices.is_empty()
     }
-    fn accepts_peer_mail(&self) -> bool {
+    fn accepts_busy_mail(&self) -> bool {
         self.events.is_empty() && self.cancel_deadline.is_none()
     }
     async fn submit(&mut self, turn: Turn) -> Result<(), AdapterError> {
@@ -524,30 +433,38 @@ impl Session for InfinitySession {
         if turn.items.is_empty() {
             return Err(protocol("Infinity submit requires mail"));
         }
-        if self.thread_busy || self.flight.is_some() || !self.peers.is_empty() {
-            for item in turn.items {
-                let TurnItem::Peer { envelope, rendered } = item else {
-                    return Err(protocol("only peer mail can enter a busy Infinity session"));
-                };
-                let Sender::Agent(from) = envelope.from() else {
-                    return Err(protocol("peer message needs an agent sender"));
-                };
-                self.peers.insert(envelope.id());
-                self.thread_busy = true;
-                self.send(ClientMessage::DeliverPeerMessage {
-                    thread_id: self.root.clone(),
-                    message_id: envelope.id().to_string(),
-                    from: format!("agent:{from}"),
-                    text: rendered,
-                })?;
-            }
-            return Ok(());
+        for item in turn.items {
+            let (envelope, from, text) = match item {
+                TurnItem::User(envelope) => {
+                    let text = format!(
+                        "<human-message id=\"{}\" from=\"human\">\n{}\n</human-message>\nThis is deferrable mail from your human operator. Reply to the human operator.",
+                        envelope.id(),
+                        envelope.body().as_str()
+                    );
+                    (envelope, "human".to_owned(), text)
+                }
+                TurnItem::Peer { envelope, rendered } => {
+                    let Sender::Agent(from) = envelope.from() else {
+                        return Err(protocol("peer message needs an agent sender"));
+                    };
+                    let from = format!("agent:{from}");
+                    (envelope, from, rendered)
+                }
+            };
+            self.pending.insert(envelope.id(), false);
+            self.thread_busy = true;
+            // The daemon adds `peer-` exactly once, for human and agent mail.
+            self.send(ClientMessage::DeliverPeerMessage {
+                thread_id: self.root.clone(),
+                message_id: envelope.id().to_string(),
+                from,
+                text,
+            })?;
         }
-        self.queue.extend(turn.items);
-        self.submit_next()
+        Ok(())
     }
     async fn cancel(&mut self) -> Result<(), AdapterError> {
-        let active = self.busy() || self.flight.is_some() || !self.peers.is_empty();
+        let active = self.busy() || !self.pending.is_empty();
         self.events
             .retain(|e| !matches!(e, SessionEvent::PermissionRequested(_)));
         if self.cancel_deadline.is_none() {
@@ -585,10 +502,7 @@ impl Session for InfinitySession {
             if self.ended {
                 return None;
             }
-            let deadline = self
-                .cancel_deadline
-                .or_else(|| self.flight.as_ref().and_then(|f| f.receipt_deadline))
-                .or(self.peer_deadline);
+            let deadline = self.cancel_deadline.or(self.receipt_deadline);
             let incoming = tokio::select! {
                 biased;
                 () = async { match deadline {

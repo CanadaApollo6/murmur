@@ -196,26 +196,26 @@ async fn peer_delivery_only_commits_on_the_matching_root_receipt() {
 }
 
 #[tokio::test]
-async fn human_receipt_requires_echo_and_a_non_peer_commit() {
+async fn human_mail_has_a_dedup_id_and_only_the_matching_receipt_consumes_it() {
     let mut t = Test::new().await;
     let id = t.send(false, "human body").await;
-    let request = t.daemon.next().await;
-    assert!(
-        matches!(&request.message, ClientMessage::UserInput { thread_id, text }
-        if *thread_id == fake::root() && text == "human body")
-    );
-    request.emit(fake::receipt("before-echo".into()));
-    request.emit(DaemonMessage::UserInputEcho {
-        thread_id: fake::thread(),
-        text: "different human".into(),
-    });
-    request.emit(fake::receipt("wrong-echo".into()));
-    request.emit(DaemonMessage::UserInputEcho {
+    let input = t.daemon.next().await;
+    assert!(matches!(&input.message,
+        ClientMessage::DeliverPeerMessage { thread_id, message_id, from, text }
+        if *thread_id == fake::root() && message_id == &id.to_string() && from == "human"
+            && text.contains("human body") && text.contains("human operator")));
+    input.emit(DaemonMessage::UserInputEcho {
         thread_id: fake::thread(),
         text: "human body".into(),
     });
-    request.emit(fake::receipt("peer-other".into()));
-    request.emit(DaemonMessage::Info {
+    input.emit(fake::receipt("unrelated-user-id".into()));
+    input.emit(fake::receipt("peer-other".into()));
+    input.emit(DaemonMessage::InputCommitted {
+        thread_id: Some("child".into()),
+        dedup_id: format!("peer-{id}"),
+    });
+    input.emit(fake::round_done());
+    input.emit(DaemonMessage::Info {
         thread_id: fake::thread(),
         text: "barrier".into(),
     });
@@ -224,84 +224,81 @@ async fn human_receipt_requires_echo_and_a_non_peer_commit() {
         t.mailroom.delivery(id).await.expect("delivery").state,
         DeliveryState::Offered { .. }
     ));
-    request.emit(fake::receipt("generated-user-id".into()));
+    input.emit(fake::receipt(format!("peer-{id}")));
     t.consumed(id).await;
-    assert_eq!(
-        t.agent.phase(),
-        Phase::Busy,
-        "receipt is independent of response completion"
-    );
-    request.emit(fake::round_done());
-    request.emit(fake::idle());
+    assert_eq!(t.agent.phase(), Phase::Busy);
+    input.emit(fake::idle());
     t.idle().await;
     t.finish().await;
 }
 
 #[tokio::test]
 async fn reoffer_after_daemon_death_is_deduplicated_and_receipted() {
-    let mut t = Test::new().await;
-    let id = t.send(true, "durable but receipt lost").await;
-    let request = t.daemon.next().await;
-    request.emit(fake::start());
-    let Event::PhaseChanged {
-        incarnation: old, ..
-    } = t
-        .event(|e| {
-            matches!(
-                e,
-                Event::PhaseChanged {
-                    phase: Phase::Busy,
-                    ..
-                }
-            )
-        })
-        .await
-    else {
-        panic!("busy")
-    };
-    t.event(|e| matches!(e, Event::Started { .. })).await;
-    t.daemon
-        .state
-        .lock()
-        .expect("state")
-        .durable
-        .insert(id.to_string());
-    request.die();
-    let connect = t.daemon.next().await;
-    assert!(
-        matches!(connect.message, ClientMessage::Connect { root_thread_id, .. } if root_thread_id == fake::root())
-    );
-    let reoffer = t.daemon.next().await;
-    assert!(
-        matches!(reoffer.message, ClientMessage::DeliverPeerMessage { message_id, .. } if message_id == id.to_string())
-    );
-    let Event::PhaseChanged {
-        incarnation: new, ..
-    } = t
-        .event(|e| {
-            matches!(
-                e,
-                Event::PhaseChanged {
-                    phase: Phase::Starting,
-                    ..
-                }
-            )
-        })
-        .await
-    else {
-        panic!("starting")
-    };
-    assert!(new > old);
-    t.consumed(id).await;
-    assert_eq!(t.daemon.state.lock().expect("state").durable.len(), 1);
-    assert!(
-        t.mailroom
-            .held(Some(t.agent.id))
+    for peer in [false, true] {
+        let mut t = Test::new().await;
+        let id = t.send(peer, "durable but receipt lost").await;
+        let request = t.daemon.next().await;
+        request.emit(fake::start());
+        let Event::PhaseChanged {
+            incarnation: old, ..
+        } = t
+            .event(|e| {
+                matches!(
+                    e,
+                    Event::PhaseChanged {
+                        phase: Phase::Busy,
+                        ..
+                    }
+                )
+            })
             .await
-            .expect("held")
-            .is_empty()
-    );
-    t.finish().await;
+        else {
+            panic!("busy")
+        };
+        t.event(|e| matches!(e, Event::Started { .. })).await;
+        t.daemon
+            .state
+            .lock()
+            .expect("state")
+            .durable
+            .insert(id.to_string());
+        request.die();
+        let connect = t.daemon.next().await;
+        assert!(
+            matches!(connect.message, ClientMessage::Connect { root_thread_id, .. } if root_thread_id == fake::root())
+        );
+        let reoffer = t.daemon.next().await;
+        assert!(
+            matches!(reoffer.message, ClientMessage::DeliverPeerMessage { message_id, .. } if message_id == id.to_string())
+        );
+        let Event::PhaseChanged {
+            incarnation: new, ..
+        } = t
+            .event(|e| {
+                matches!(
+                    e,
+                    Event::PhaseChanged {
+                        phase: Phase::Starting,
+                        ..
+                    }
+                )
+            })
+            .await
+        else {
+            panic!("starting")
+        };
+        assert!(new > old);
+        t.consumed(id).await;
+        assert_eq!(t.daemon.state.lock().expect("state").durable.len(), 1);
+        assert!(
+            t.mailroom
+                .held(Some(t.agent.id))
+                .await
+                .expect("held")
+                .is_empty()
+        );
+        t.finish().await;
+    }
 }
 
 #[tokio::test]
@@ -374,7 +371,7 @@ async fn interrupt_is_a_daemon_control_message() {
     assert!(
         matches!(cancel.message, ClientMessage::Interrupt { thread_id } if thread_id == fake::root())
     );
-    input.emit(fake::receipt("human-id".into()));
+    input.emit(fake::receipt(format!("peer-{id}")));
     input.emit(fake::round_done());
     input.emit(fake::idle());
     t.consumed(id).await;
@@ -553,48 +550,26 @@ async fn model_agents_never_idle_suspend_and_idle_eof_reopens() {
 }
 
 #[tokio::test]
-async fn peers_reach_a_busy_model_while_human_mail_waits() {
+async fn human_and_peer_mail_reach_a_busy_model_without_idle() {
     let mut t = Test::new().await;
     let first = t.send(false, "working").await;
     let input = t.daemon.next().await;
-    input.emit(DaemonMessage::UserInputEcho {
-        thread_id: fake::thread(),
-        text: "working".into(),
-    });
     input.emit(fake::start());
     t.event(|e| matches!(e, Event::Started { .. })).await;
-    let human = t.send(false, "later human").await;
-    let peer = t.send(true, "wake from passive sleep").await;
-    let peer_request = t.daemon.next().await;
-    assert!(
-        matches!(&peer_request.message, ClientMessage::DeliverPeerMessage { message_id, .. } if message_id == &peer.to_string())
-    );
-    peer_request.emit(fake::receipt(format!("peer-{peer}")));
-    t.consumed(peer).await;
-    assert_eq!(
-        t.mailroom
-            .delivery(human)
-            .await
-            .expect("human delivery")
-            .state,
-        DeliveryState::Queued
-    );
-    input.emit(fake::receipt("working-id".into()));
-    input.emit(fake::round_done());
-    input.emit(fake::idle());
+    for peer in [false, true] {
+        let id = t.send(peer, "busy mail").await;
+        let mail = t.daemon.next().await;
+        assert!(
+            matches!(&mail.message, ClientMessage::DeliverPeerMessage { message_id, .. } if message_id == &id.to_string())
+        );
+        mail.emit(fake::receipt(format!("peer-{id}")));
+        t.consumed(id).await;
+        assert_eq!(t.agent.phase(), Phase::Busy);
+    }
+    input.emit(fake::receipt(format!("peer-{first}")));
     t.consumed(first).await;
-    let human_request = t.daemon.next().await;
-    assert!(
-        matches!(&human_request.message, ClientMessage::UserInput { text, .. } if text == "later human")
-    );
-    human_request.emit(DaemonMessage::UserInputEcho {
-        thread_id: fake::thread(),
-        text: "later human".into(),
-    });
-    human_request.emit(fake::receipt("later-id".into()));
-    human_request.emit(fake::round_done());
-    human_request.emit(fake::idle());
-    t.consumed(human).await;
+    input.emit(fake::idle());
+    t.idle().await;
     t.finish().await;
 }
 
@@ -912,54 +887,6 @@ async fn pending_choice_holds_peer_mail_until_answered() {
     t.finish().await;
 }
 
-#[tokio::test]
-async fn busy_peer_receipt_drains_its_completion_before_new_human_mail() {
-    let mut t = Test::new().await;
-    let first = t.send(false, "first").await;
-    let input = t.daemon.next().await;
-    input.emit(DaemonMessage::UserInputEcho {
-        thread_id: fake::thread(),
-        text: "first".into(),
-    });
-    input.emit(fake::start());
-    t.event(|e| matches!(e, Event::Started { .. })).await;
-    let peer = t.send(true, "busy peer").await;
-    let peer_input = t.daemon.next().await;
-    input.emit(fake::receipt("first-id".into()));
-    input.emit(fake::round_done());
-    t.consumed(first).await;
-    peer_input.emit(fake::start());
-    peer_input.emit(fake::receipt(format!("peer-{peer}")));
-    t.consumed(peer).await;
-    let human = t.send(false, "next human").await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(40), t.daemon.next())
-            .await
-            .is_err(),
-        "peer receipt must not release human before peer completion"
-    );
-    peer_input.emit(fake::round_done());
-    peer_input.emit(fake::idle());
-    let next = t.daemon.next().await;
-    assert!(matches!(&next.message, ClientMessage::UserInput { text, .. } if text == "next human"));
-    next.emit(DaemonMessage::UserInputEcho {
-        thread_id: fake::thread(),
-        text: "next human".into(),
-    });
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(
-        t.agent.phase(),
-        Phase::Busy,
-        "old completion must not time out new input"
-    );
-    next.emit(fake::receipt("next-id".into()));
-    next.emit(fake::round_done());
-    next.emit(fake::idle());
-    t.consumed(human).await;
-    t.idle().await;
-    t.finish().await;
-}
-
 fn tool_call() -> DaemonMessage {
     DaemonMessage::ToolCall {
         thread_id: fake::thread(),
@@ -976,47 +903,7 @@ fn tool_result() -> DaemonMessage {
 }
 
 #[tokio::test]
-async fn tool_round_completion_keeps_human_mail_queued_until_followup_finishes() {
-    let mut t = Test::new().await;
-    let first = t.send(true, "run tool").await;
-    let input = t.daemon.next().await;
-    input.emit(fake::start());
-    input.emit(tool_call());
-    input.emit(fake::receipt(format!("peer-{first}")));
-    t.consumed(first).await;
-    let human = t.send(false, "wait for tool").await;
-    input.emit(fake::round_done());
-    assert!(
-        tokio::time::timeout(Duration::from_millis(40), t.daemon.next())
-            .await
-            .is_err(),
-        "round end must not interrupt waiting tool"
-    );
-    input.emit(tool_result());
-    input.emit(fake::start());
-    assert!(
-        tokio::time::timeout(Duration::from_millis(40), t.daemon.next())
-            .await
-            .is_err(),
-        "tool result must not release human before followup"
-    );
-    input.emit(fake::round_done());
-    input.emit(fake::idle());
-    let next = t.daemon.next().await;
-    assert!(matches!(next.message, ClientMessage::UserInput { .. }));
-    next.emit(DaemonMessage::UserInputEcho {
-        thread_id: fake::thread(),
-        text: "wait for tool".into(),
-    });
-    next.emit(fake::receipt("human-id".into()));
-    next.emit(fake::round_done());
-    next.emit(fake::idle());
-    t.consumed(human).await;
-    t.finish().await;
-}
-
-#[tokio::test]
-async fn resume_waits_for_live_replay_before_pumping_human_mail() {
+async fn resume_waits_for_replay_then_delivers_human_mail_while_busy() {
     for pending_tool in [false, true] {
         let mut t = Test::new().await;
         t.agent.stop().await.expect("stop");
@@ -1048,24 +935,11 @@ async fn resume_waits_for_live_replay_before_pumping_human_mail() {
         t.event(|e| matches!(e, Event::Activity { text, .. } if text == "replay barrier"))
             .await;
         assert_eq!(t.agent.phase(), Phase::Busy);
-        assert_eq!(
-            t.mailroom.delivery(human).await.expect("queued").state,
-            DeliveryState::Queued
-        );
-        if pending_tool {
-            connect.emit(tool_result());
-            connect.emit(fake::start());
-        }
-        connect.emit(fake::round_done());
-        connect.emit(fake::idle());
         let next = t.daemon.next().await;
-        assert!(matches!(next.message, ClientMessage::UserInput { .. }));
-        next.emit(DaemonMessage::UserInputEcho {
-            thread_id: fake::thread(),
-            text: "after resumed work".into(),
-        });
-        next.emit(fake::receipt("human-id".into()));
-        next.emit(fake::round_done());
+        assert!(
+            matches!(&next.message, ClientMessage::DeliverPeerMessage { message_id, .. } if message_id == &human.to_string())
+        );
+        next.emit(fake::receipt(format!("peer-{human}")));
         next.emit(fake::idle());
         t.consumed(human).await;
         t.finish().await;
@@ -1135,43 +1009,6 @@ async fn permission_timeout_keeps_approval_until_durable_interrupt_completion() 
 }
 
 #[tokio::test]
-async fn core_idle_settles_tools_without_display_results() {
-    let mut t = Test::new().await;
-    let first = t.send(true, "run tool").await;
-    let input = t.daemon.next().await;
-    input.emit(fake::start());
-    input.emit(tool_call());
-    input.emit(fake::receipt(format!("peer-{first}")));
-    t.consumed(first).await;
-    let human = t.send(false, "next human").await;
-    input.emit(fake::round_done());
-    input.emit(fake::start());
-    input.emit(fake::round_done());
-    input.emit(DaemonMessage::ThreadIdle {
-        thread_id: Some("child".into()),
-    });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(40), t.daemon.next())
-            .await
-            .is_err(),
-        "round completion and child idle cannot release root human mail"
-    );
-    input.emit(fake::idle());
-    let next = t.daemon.next().await;
-    assert!(matches!(&next.message, ClientMessage::UserInput { text, .. } if text == "next human"));
-    next.emit(DaemonMessage::UserInputEcho {
-        thread_id: fake::thread(),
-        text: "next human".into(),
-    });
-    next.emit(fake::receipt("human-id".into()));
-    next.emit(fake::round_done());
-    next.emit(fake::idle());
-    t.consumed(human).await;
-    t.idle().await;
-    t.finish().await;
-}
-
-#[tokio::test]
 async fn resume_uses_core_idle_instead_of_display_history() {
     let mut t = Test::new().await;
     t.agent.stop().await.expect("stop");
@@ -1189,13 +1026,13 @@ async fn resume_uses_core_idle_instead_of_display_history() {
     let id = t.send(false, "human after replay").await;
     let input = t.daemon.next().await;
     assert!(
-        matches!(&input.message, ClientMessage::UserInput { text, .. } if text == "human after replay")
+        matches!(&input.message, ClientMessage::DeliverPeerMessage { text, .. } if text.contains("human after replay"))
     );
     input.emit(DaemonMessage::UserInputEcho {
         thread_id: fake::thread(),
         text: "human after replay".into(),
     });
-    input.emit(fake::receipt("human-id".into()));
+    input.emit(fake::receipt(format!("peer-{id}")));
     input.emit(fake::idle());
     t.consumed(id).await;
     t.idle().await;

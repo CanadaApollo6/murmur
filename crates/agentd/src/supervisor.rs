@@ -494,16 +494,13 @@ impl AgentActor {
         self.start().await
     }
     async fn pump(&mut self) -> Result<()> {
-        let busy_peer_delivery = self.phase == Phase::Busy
+        let busy_delivery = self.phase == Phase::Busy
             && self.pending.is_empty()
-            && self.session.as_ref().is_some_and(|s| s.accepts_peer_mail());
-        if !matches!(self.phase, Phase::Idle | Phase::Dormant) && !busy_peer_delivery {
+            && self.session.as_ref().is_some_and(|s| s.accepts_busy_mail());
+        if !matches!(self.phase, Phase::Idle | Phase::Dormant) && !busy_delivery {
             return Ok(());
         }
-        let mut mail = self.mailroom.pending_for(self.id).await?;
-        if busy_peer_delivery {
-            mail.retain(|envelope| envelope.class() == DeliveryClass::PeerEvent);
-        }
+        let mail = self.mailroom.pending_for(self.id).await?;
         if mail.is_empty() {
             return Ok(());
         }

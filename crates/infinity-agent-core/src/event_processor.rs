@@ -342,6 +342,10 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
     /// synthetic "interrupted" result. (A tool call at the tail is unanswered
     /// by construction: its result would have been appended after it.)
     pub(crate) fn interrupt_pending_tool_call(&self) {
+        self.interrupt_pending_tool_call_with_text(TOOL_CALL_INTERRUPTED_TEXT);
+    }
+
+    pub(crate) fn interrupt_pending_tool_call_with_text(&self, text: &str) {
         let last_call = self.history.borrow().last().and_then(|m| {
             if let InfinityMessage::ToolCall { call, .. } = m {
                 Some(call.clone())
@@ -360,7 +364,7 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
                     call_id: tool_call.call_id.clone(),
                     content: vec![ToolResultContent::Text(
                         infinity_provider_protocol::message::Text {
-                            text: TOOL_CALL_INTERRUPTED_TEXT.to_owned(),
+                            text: text.to_owned(),
                         },
                     )],
                 },

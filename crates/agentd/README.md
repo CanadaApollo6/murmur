@@ -70,22 +70,38 @@ model = "local/qwen3-coder"
 Each Infinity agent owns one root thread, saved in its opaque resume token.
 Missing or archived roots and refused resumes enter `NeedsRecovery` without
 creating a replacement thread. EOF reconnects with a new incarnation. Unconsumed
-mail is re-offered. Peer dedup uses `peer-{MessageId}` in Infinity. Human inputs
-have no stable dedup ID, so a reconnect before their receipt can repeat them.
-Only `InputCommitted` receipts consume mail. Output and echoes are not receipts.
+mail is re-offered. Human and peer mail both use `DeliverPeerMessage`, with
+stable dedup ID `peer-{MessageId}`. Human mail sets `from` to `human` and identifies
+the human operator in its rendered body. Mail waits behind an active tool and
+wakes passive sleep without interrupting inference. Delivery does not require
+`ThreadIdle` or `Replay.idle`. Those signals still drive phase display and
+cancellation acknowledgment. Use `agentctl cancel` to stop a runaway agent.
+Only matching root `InputCommitted` receipts consume mail. Output, echoes, and
+replay history are not receipts. The separate Infinity history and dedup-ID
+writes retain a crash window that can duplicate either sender's mail on re-offer.
+
 If an Infinity cancellation deadline expires, the actor reconnects and reissues
 `Interrupt` when replay is busy, with a fresh cancellation deadline. Repeated
 failures reach the existing crash limit. Core retains accepted tool results and
-retries failed interrupt writes every 100 ms without running inference. It
-reports busy on attachment until settlement persists. This recovery requires
-the daemon to remain alive while storage is unavailable.
+retries failed interrupt writes every 100 ms for three seconds. At exhaustion it
+holds the pending result, emits an error, and stops inference and automatic
+write retries. Repair storage and explicitly interrupt to retry. Retaining an
+accepted result through a storage outage requires the daemon to remain alive.
+RAP cancellation notifications have a two-second timeout and cannot block
+settlement forever.
+
+On first thread load after a daemon restart, core durably settles orphaned
+in-process tools, missing tools, and daemon-owned RAP or MCP executors with
+`interrupted: daemon restarted`. External RAP URL tools can still deliver their
+callbacks, so their pending calls remain intact. Structural child-spawn,
+compaction, and thread-close calls are preserved. Recovery does not re-execute
+tools or start inference.
 
 An idle-derived receipt deadline is cleared when a later root completion starts,
 including the first turn after attachment. Inference may outlast the receipt
-timeout; a new core idle event arms receipt recovery again if a receipt is missing.
-Model agents never idle-suspend. Peer mail can enter a busy model session unless
-an approval is pending. Human inputs enter individually at turn boundaries so
-the adapter can correlate each echo with its receipt.
+timeout; a new core idle event arms receipt recovery if a receipt is missing.
+Model agents never idle-suspend. Both human and peer mail can enter a busy
+Infinity session unless an approval or cancellation is pending.
 
 Infinity's daemon owns sandbox and RAP tool configuration. The socket API cannot
 apply agentd's per-agent sandbox launch flags or MCP entries. The adapter rejects
@@ -161,8 +177,9 @@ split across frames may appear without redaction.
   Specs persist in SQLite; the daemon restores actors on restart.
 - `send(NewMessage)` accepts durable mail, then nudges the recipient. Sender
   identity is trusted in this in-process API; surfaces must authenticate it later.
-  Human mail is user input. Peer mail carries the labelled `<agent-message>`
-  framing. Idle delivery batches all queued envelopes in arrival order.
+  CLI agents receive human mail as user input. Infinity receives deferrable
+  operator mail. Peer mail carries the labelled `<agent-message>` framing.
+  Idle delivery batches all queued envelopes in arrival order.
 - `AgentHandle::{cancel,pending_permissions,answer_permission,phase,phases,stop}`
   control or observe an actor. Answers include the request's incarnation.
   Rules match an exact normalized tool name, or `*`; the first match wins.
@@ -174,7 +191,8 @@ split across frames may appear without redaction.
   for the actors to release storage. Call it before closing the mailroom.
 
 `Phase` covers Dormant, Starting, Idle, Busy, Suspending, Ended, Crashed, Failed,
-and NeedsRecovery. Busy agents never receive another turn. Five crashes in ten
+and NeedsRecovery. Busy CLI agents wait for a turn boundary. Infinity accepts
+deferrable mail while busy. Five crashes in ten
 minutes stop retries; backoff doubles from one second to a 60-second cap.
 A failed resume enters NeedsRecovery without creating a fresh conversation.
 Only resumable agents suspend on idle timeout. `None` on the spec inherits the

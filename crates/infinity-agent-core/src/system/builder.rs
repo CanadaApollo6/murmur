@@ -1,6 +1,8 @@
 //! Building an [`AgentSystem`]: the entry point of the high-level API.
 
 use rap_protocol::ThreadId;
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use async_trait::async_trait;
@@ -74,6 +76,8 @@ where
     pub callback_url: String,
     pub builtin_tools: bool,
     pub tokio_sleep_tools: bool,
+    // Only resident systems own their executors. Step-mode transports own recovery.
+    pub loaded_threads: Option<RefCell<HashSet<ThreadId>>>,
 }
 
 /// Builder for an [`AgentSystem`].
@@ -288,6 +292,7 @@ where
                 callback_url: self.callback_url,
                 builtin_tools: self.builtin_tools,
                 tokio_sleep_tools: self.tokio_sleep_tools,
+                loaded_threads: self.local_rx.as_ref().map(|_| RefCell::new(HashSet::new())),
             }),
             self.local_rx,
         )

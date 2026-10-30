@@ -122,7 +122,7 @@ pub(crate) trait Session: Send {
         false
     }
     /// Busy delivery must not overtake buffered turn-end evidence.
-    fn accepts_peer_mail(&self) -> bool {
+    fn accepts_busy_mail(&self) -> bool {
         false
     }
     async fn submit(&mut self, turn: Turn) -> Result<(), AdapterError>;
