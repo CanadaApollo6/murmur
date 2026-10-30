@@ -74,6 +74,15 @@ impl Adapter for AcpAdapter {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Control settings belong to the daemon, including configured overrides.
+        for name in std::env::vars_os()
+            .map(|(name, _)| name)
+            .chain(self.0.env.keys().map(Into::into))
+        {
+            if name.to_string_lossy().starts_with("AGENTD_") {
+                cmd.env_remove(name);
+            }
+        }
         cmd.args(match req.spec.permissions.sandbox {
             SandboxLevel::ReadOnly => &self.0.sandbox_args.read_only,
             SandboxLevel::WorkspaceWrite => &self.0.sandbox_args.workspace_write,

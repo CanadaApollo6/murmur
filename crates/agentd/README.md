@@ -64,7 +64,12 @@ must support the selected mode; a mode-setting failure prevents prompting.
 `agentctl --socket /absolute/path` or `AGENTD_SOCKET` selects a custom control
 socket. Responses are JSON except for the short send status. Watch emits JSON
 lines, beginning with a snapshot. A `lagged` event signals dropped display events;
-the stream is not a durable audit log.
+the stream is not a durable audit log. Held mail streams one envelope per socket
+frame, followed by a completion frame; `agentctl held` collects these into one
+JSON array. Each socket permits up to 64 concurrent connections. Excess
+connections are closed; accept errors are logged and retried after 100 ms.
+Agent children do not inherit daemon variables whose names start with `AGENTD_`.
+The MCP entry supplies its binding token separately.
 
 State and socket directories must be owned by the current user with mode 0700.
 Both sockets have mode 0600 and check peer UIDs. MCP uses a separate socket that
@@ -72,17 +77,35 @@ accepts only authenticated MCP relay requests. These boundaries exclude other
 OS users, not processes already running as the broker's user.
 
 Every ACP new/load receives an `agentd mcp --socket ...` stdio server entry.
-`AGENTD_MCP_TOKEN` is injected into that entry's environment, never argv or control
-output. The token contains 256 bits from the OS random source and binds one agent
-and incarnation. Session cleanup revokes it; restart mints a new one. The two tools
+`AGENTD_MCP_TOKEN` is injected into that entry's environment. For Claude,
+claude-agent-acp passes the entry to the Claude SDK, which includes its environment
+in `claude --mcp-config <json>`. The token is therefore visible in
+`/proc/<pid>/cmdline`. The broker does not include it in control responses.
+The token contains 256 bits from the OS random source and binds one agent and
+incarnation. Session cleanup revokes it; restart mints a new one. The two tools
 are `send_message { to, body, reply_to? }` and `list_agents {}`. Send keys derive
-from the MCP request ID and incarnation. Retries within that incarnation recover
-the original mail, not a second envelope. This does not promise exactly-once
-execution by the recipient.
+from the incarnation, a random namespace created at each MCP shim startup, and
+the MCP request ID. Retries within one shim session recover the original mail.
+A replacement shim can reuse request IDs without losing new mail. A retry across
+shim restarts can produce a duplicate. Recipient execution remains at least once.
 
 Agent specs, resume handles and mail survive daemon restarts. SIGINT and SIGTERM
 stop connections, shut down broker actors, then drain and close the mailroom.
 Stale sockets are reclaimed; live sockets and regular files are preserved.
+
+## V1 limitations
+
+Any process running as the same OS user, including an agent with shell access,
+can use the control socket as the human. It can also read sibling shims' tokens
+from `/proc` and impersonate other agents. Agent isolation is best-effort until
+agents run under separate UIDs or a sandbox with a private `/proc`.
+
+There is no per-sender mail quota. An agent can flood another agent's queue
+because leaving out `reply_to` restarts the hop count. A per-sender cap and a
+per-turn batch limit are follow-up work.
+
+Token redaction in activity output works per frame and is best-effort. A token
+split across frames may appear without redaction.
 
 ## Broker API
 

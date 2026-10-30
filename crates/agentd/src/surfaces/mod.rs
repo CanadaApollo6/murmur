@@ -271,11 +271,14 @@ impl ControlApi {
             ControlRequest::Watch => Err("watch requires streaming".into()),
         }
     }
-    async fn mcp(&self, bearer: &str, request: Value) -> Value {
+    async fn mcp(&self, bearer: &str, session: &str, request: Value) -> Value {
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let Some(binding) = self.bindings.authenticate_mcp(bearer).await else {
             return rpc_error(id, -32001, "unknown or revoked MCP token");
         };
+        if session.len() != 64 || !session.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return rpc_error(id, -32600, "invalid MCP shim session");
+        }
         if request["jsonrpc"] != "2.0" || !(id.is_string() || id.is_i64() || id.is_u64()) {
             return rpc_error(id, -32600, "invalid MCP request");
         }
@@ -299,7 +302,7 @@ impl ControlApi {
                                 &args.to,
                                 args.body,
                                 args.reply_to,
-                                binding.key(&id),
+                                binding.key(session, &id),
                             )
                             .await
                             .map(|v| v["status"].as_str().unwrap_or("Queued").to_owned()),
@@ -332,7 +335,8 @@ impl ControlApi {
                 let value: Value =
                     serde_json::from_slice(&line).map_err(|_| "invalid MCP relay frame")?;
                 let token = value["token"].as_str().unwrap_or("");
-                let response = self.mcp(token, value["request"].clone()).await;
+                let session = value["session"].as_str().unwrap_or("");
+                let response = self.mcp(token, session, value["request"].clone()).await;
                 write_frame(&mut write, &response).await?;
                 continue;
             }
@@ -361,7 +365,14 @@ impl ControlApi {
                 }
                 return Ok(());
             }
+            let held = matches!(request, ControlRequest::Held { .. });
             let response = match self.control(request).await {
+                Ok(Value::Array(rows)) if held => {
+                    for row in rows {
+                        write_frame(&mut write, &json!({"held":row})).await?;
+                    }
+                    json!({"result":null})
+                }
                 Ok(v) => json!({"result":v}),
                 Err(e) => json!({"error":e.to_string()}),
             };
@@ -517,16 +528,28 @@ pub fn private_dir(path: &Path) -> Result<()> {
 }
 
 pub async fn mcp_stdio(socket: &Path, token: &str) -> Result<()> {
+    let session = bindings::random_namespace()?;
     let mut input = BufReader::new(tokio::io::stdin());
     let mut output = tokio::io::stdout();
     while let Some(line) = read_frame(&mut input).await? {
-        let request: Value = serde_json::from_slice(&line).map_err(|_| "invalid MCP request")?;
+        let request: Value = match serde_json::from_slice(&line) {
+            Ok(request) => request,
+            Err(_) => {
+                write_frame(&mut output, &rpc_error(Value::Null, -32700, "Parse error")).await?;
+                continue;
+            }
+        };
         if request.get("id").is_none() {
             continue;
         }
         let stream = UnixStream::connect(socket).await?;
+        Socket::check_peer(&stream)?;
         let (read, mut write) = stream.into_split();
-        write_frame(&mut write, &json!({"token":token,"request":request})).await?;
+        write_frame(
+            &mut write,
+            &json!({"token":token,"session":session,"request":request}),
+        )
+        .await?;
         let response = read_frame(&mut BufReader::new(read))
             .await?
             .ok_or("MCP relay closed")?;
