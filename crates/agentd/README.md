@@ -1,13 +1,14 @@
 # agentd
 
-Local ACP broker with `agentd`, `agentctl`, and a stdio MCP server for Claude and
-Codex agents. The SQLite mailroom remains the delivery authority.
+Local broker with `agentd`, `agentctl`, Infinity model agents, and a stdio MCP
+server for Claude and Codex agents. The SQLite mailroom remains the delivery authority.
 
 ## Run
 
 ```sh
 cargo build -p agentd --bins
 agentd --config /path/to/kinds.toml
+agentctl spawn planner --kind infinity --cwd /path/to/project
 agentctl spawn reviewer --kind claude --cwd /path/to/project
 agentctl spawn builder --kind codex --cwd /path/to/project --sandbox workspace-write "Ask @reviewer to check the plan."
 agentctl send @reviewer "Focus on session expiry."
@@ -54,6 +55,36 @@ idle_after_secs = 600
 [kind.codex.env]
 INITIAL_AGENT_MODE = "read-only"
 ```
+
+Infinity connects to an already running `infinity daemon`. Add a kind with its
+absolute Unix socket path. The model uses `provider/model` syntax. `spawn --model`
+overrides the configured model for a new thread.
+
+```toml
+[kind.infinity]
+wire = "infinity"
+socket = "/home/me/.infinity/daemon.sock"
+model = "local/qwen3-coder"
+```
+
+Each Infinity agent owns one root thread, saved in its opaque resume token.
+Missing or archived roots and refused resumes enter `NeedsRecovery` without
+creating a replacement thread. EOF reconnects with a new incarnation. Unconsumed
+mail is re-offered. Peer dedup uses `peer-{MessageId}` in Infinity. Human inputs
+have no stable dedup ID, so a reconnect before their receipt can repeat them.
+Only `InputCommitted` receipts consume mail. Output and echoes are not receipts.
+Model agents never idle-suspend. Peer mail can enter a busy model session unless
+an approval is pending. Human inputs enter individually at turn boundaries so
+the adapter can correlate each echo with its receipt.
+
+Infinity's daemon owns sandbox and RAP tool configuration. The socket API cannot
+apply agentd's per-agent sandbox launch flags or MCP entries. The adapter rejects
+launch settings in Infinity kind config. `UserChoiceRequired` becomes an
+incarnation-tagged approval under `infinity.user_choice`. Options use zero-based
+index keys and preserve the daemon's labels. Infinity does not supply tool names
+or authorization effects, so allow/deny rules cannot auto-select these choices.
+A timeout interrupts the turn instead of guessing an answer. The inbound adapter
+does not install `send_message`. That requires a separate authenticated RAP toolset.
 
 Each kind can also provide `[kind.<name>.sandbox_args]` with `read_only`,
 `workspace_write`, and `full_access` argument arrays. `--sandbox` selects the

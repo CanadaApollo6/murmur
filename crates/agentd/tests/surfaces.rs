@@ -837,3 +837,78 @@ async fn cli_sandbox_and_model_select_acp_modes_and_launch_arguments() {
     assert_eq!(wire[0]["args"][1], "--fake-workspace");
     d.stop(nix::sys::signal::Signal::SIGTERM).await;
 }
+
+#[path = "support/fake_infinity.rs"]
+mod fake_infinity;
+
+#[tokio::test]
+async fn agentctl_spawns_an_infinity_kind_and_relays_approval() {
+    use infinity_protocol::{ClientMessage, DaemonMessage};
+    let mut d = Daemon::new(None).await;
+    d.stop(nix::sys::signal::Signal::SIGTERM).await;
+    let socket = d.root.path().join("infinity.sock");
+    let mut infinity = fake_infinity::FakeDaemon::bind(&socket);
+    let path = d.root.path().join("kinds.toml");
+    let mut config = std::fs::read_to_string(&path).expect("config");
+    config.push_str(&format!(
+        "\n[kind.infinity]\nwire = 'infinity'\nsocket = {}\nmodel = 'fake/small'\n",
+        json!(socket)
+    ));
+    std::fs::write(path, config).expect("Infinity config");
+    d.child = Daemon::start(&d.root);
+    d.ready().await;
+    d.spawn("a", "infinity", Some("hello model")).await;
+    let create = infinity.next().await;
+    assert!(infinity.state.lock().expect("state").created);
+    assert!(
+        matches!(create.message, ClientMessage::CreateSession { model: Some(m), .. } if m.provider_id == "fake" && m.model_id == "small")
+    );
+    let input = infinity.next().await;
+    assert!(
+        matches!(&input.message, ClientMessage::UserInput { text, .. } if text == "hello model")
+    );
+    input.emit(DaemonMessage::UserInputEcho {
+        thread_id: fake_infinity::thread(),
+        text: "hello model".into(),
+    });
+    input.emit(fake_infinity::start());
+    input.emit(DaemonMessage::UserChoiceRequired {
+        thread_id: fake_infinity::thread(),
+        id: "choice".into(),
+        prompt: "Choose".into(),
+        choices: vec!["Allow".into(), "Deny".into()],
+        default: 1,
+    });
+    let approvals = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let approvals = d.ctl(&["approvals"]).await;
+            if !approvals.as_array().expect("approvals").is_empty() {
+                break approvals;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("approvals timeout");
+    let id = approvals[0]["id"].as_str().expect("permission id");
+    d.ctl(&["approve", id, "0"]).await;
+    assert!(matches!(
+        infinity.next().await.message,
+        ClientMessage::UserChoiceAnswered { selected: 0, .. }
+    ));
+    input.emit(fake_infinity::receipt("human-id".into()));
+    input.emit(fake_infinity::done());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let agents = d.ctl(&["ls"]).await;
+            if agents[0]["phase"] == "idle" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("idle timeout");
+    input.die();
+    d.stop(nix::sys::signal::Signal::SIGTERM).await;
+}

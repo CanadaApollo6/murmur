@@ -446,6 +446,16 @@ impl Mailroom {
         ended: Incarnation,
         turn_started: bool,
     ) -> Result<SessionEndOutcome> {
+        self.settle_session(agent, ended, turn_started, false).await
+    }
+
+    pub(crate) async fn settle_session(
+        &self,
+        agent: AgentId,
+        ended: Incarnation,
+        turn_started: bool,
+        retry_started: bool,
+    ) -> Result<SessionEndOutcome> {
         self.call(move |s| {
             let tx = s.db.transaction()?;
             let ids = {
@@ -456,7 +466,7 @@ impl Mailroom {
             for id in ids {
                 let mut d = delivery(&tx, id)?;
                 let DeliveryState::Offered { incarnation } = d.state else { return Err(Error::Transition(d.state)); };
-                if turn_started || d.turn_started {
+                if !retry_started && (turn_started || d.turn_started) {
                     d.state = DeliveryState::Uncertain { incarnation };
                     result.uncertain.push(id);
                 } else {

@@ -263,6 +263,8 @@ pub struct PermissionOption {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionEffect {
+    /// An arbitrary daemon choice with no inferred authorization effect.
+    UserChoice,
     AllowOnce,
     AllowAlways,
     RejectOnce,
