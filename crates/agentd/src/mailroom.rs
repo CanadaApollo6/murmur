@@ -469,6 +469,10 @@ impl Mailroom {
                 if !retry_started && (turn_started || d.turn_started) {
                     d.state = DeliveryState::Uncertain { incarnation };
                     result.uncertain.push(id);
+                } else if d.attempts >= s.config.max_attempts {
+                    d.state = DeliveryState::Held {
+                        reason: "maximum delivery attempts reached".into(),
+                    };
                 } else {
                     d.state = DeliveryState::Queued;
                     result.requeued += 1;

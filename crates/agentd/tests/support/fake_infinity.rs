@@ -35,6 +35,7 @@ impl Request {
 #[derive(Default)]
 pub struct State {
     pub created: bool,
+    pub manual_replay: bool,
     pub fail_resume: bool,
     pub missing: bool,
     pub durable: HashSet<String>,
@@ -90,7 +91,12 @@ impl FakeDaemon {
                                             ClientMessage::Connect { .. } => {
                                                 if state.lock().expect("state").fail_resume {
                                                     Some(DaemonMessage::Error { thread_id: thread(), text: "resume refused".into() })
-                                                } else { Some(connected()) }
+                                                } else {
+                                                    if !state.lock().expect("state").manual_replay {
+                                                        reply.send(Some(replay())).expect("replay");
+                                                    }
+                                                    Some(connected())
+                                                }
                                             }
                                             ClientMessage::DeliverPeerMessage { message_id, .. }
                                                 if state.lock().expect("state").durable.contains(message_id) => {
@@ -159,5 +165,14 @@ pub fn done() -> DaemonMessage {
     DaemonMessage::ResponseDone {
         thread_id: thread(),
         token_usage: None,
+    }
+}
+
+fn replay() -> DaemonMessage {
+    DaemonMessage::Replay {
+        history: vec![],
+        pending_choices: vec![],
+        views: Default::default(),
+        in_progress: false,
     }
 }

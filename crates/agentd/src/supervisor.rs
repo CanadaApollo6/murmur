@@ -449,12 +449,13 @@ impl AgentActor {
             .await
         {
             Ok(session) => {
+                let busy = session.busy();
                 let token = session.resume_token();
                 self.session = Some(session);
                 self.mailroom.save_resume(self.id, token.clone()).await?;
                 self.resume = Some(token);
                 self.idle_since = Instant::now();
-                self.phase(Phase::Idle);
+                self.phase(if busy { Phase::Busy } else { Phase::Idle });
             }
             Err(error @ (AdapterError::ResumeFailed(_) | AdapterError::ResumeUnsupported)) => self
                 .phase(Phase::NeedsRecovery {
@@ -660,7 +661,13 @@ impl AgentActor {
                 .await
                 .map_err(|e| Error::Rejected(e.to_string()))?;
         }
-        self.clear_pending();
+        if self.model_agent {
+            for (_, deadline) in self.pending.values_mut() {
+                *deadline = None;
+            }
+        } else {
+            self.clear_pending();
+        }
         Ok(())
     }
     fn clear_pending(&mut self) {

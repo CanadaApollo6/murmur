@@ -332,8 +332,10 @@ async fn held_cli_reads_more_than_one_mib_of_mail() {
     mail.session_ended(b, Incarnation(1), false)
         .await
         .expect("requeue");
-    let outcome = mail.mark_offered(&ids, Incarnation(2)).await.expect("hold");
-    assert_eq!(outcome.held.len(), ids.len());
+    assert_eq!(
+        mail.held(Some(b)).await.expect("held at settlement").len(),
+        ids.len()
+    );
     let expected =
         serde_json::to_value(mail.held(Some(b)).await.expect("held mail")).expect("held JSON");
     assert!(expected.to_string().len() > 1024 * 1024);
@@ -778,12 +780,26 @@ async fn live_claude_sends_through_broker_mcp() {
 #[tokio::test]
 async fn private_socket_reclaims_stale_paths_and_preserves_live_or_regular_paths() {
     use agentd::surfaces::Socket;
+    if let Some(path) = std::env::var_os("AGENTD_STALE_SOCKET_FIXTURE") {
+        let _listener = std::os::unix::net::UnixListener::bind(path).expect("stale socket");
+        return;
+    }
     let root = tempfile::tempdir().expect("root");
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
         .expect("private root");
     let path = root.path().join("control.sock");
-    let stale = std::os::unix::net::UnixListener::bind(&path).expect("stale socket");
-    drop(stale);
+    // Concurrent subprocess forks can briefly inherit a listener even with
+    // CLOEXEC. Waiting for its creating process to exit makes it truly stale.
+    let status = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "private_socket_reclaims_stale_paths_and_preserves_live_or_regular_paths",
+        ])
+        .env("AGENTD_STALE_SOCKET_FIXTURE", &path)
+        .status()
+        .await
+        .expect("create stale socket in child");
+    assert!(status.success());
     let socket = Socket::bind(&path).expect("reclaim stale socket");
     assert_eq!(
         std::fs::metadata(&path).expect("metadata").mode() & 0o777,

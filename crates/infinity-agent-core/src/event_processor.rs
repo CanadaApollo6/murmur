@@ -341,7 +341,7 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
     /// If the last history entry is an unanswered tool call, inject a
     /// synthetic "interrupted" result. (A tool call at the tail is unanswered
     /// by construction: its result would have been appended after it.)
-    fn interrupt_pending_tool_call(&self) {
+    pub(crate) fn interrupt_pending_tool_call(&self) {
         let last_call = self.history.borrow().last().and_then(|m| {
             if let InfinityMessage::ToolCall { call, .. } = m {
                 Some(call.clone())

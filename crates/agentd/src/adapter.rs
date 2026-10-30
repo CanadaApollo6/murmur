@@ -118,6 +118,9 @@ pub(crate) struct OpenRequest<'a> {
 pub(crate) trait Session: Send {
     fn resume_token(&self) -> ResumeToken;
     fn resumable(&self) -> bool;
+    fn busy(&self) -> bool {
+        false
+    }
     /// Busy delivery must not overtake buffered turn-end evidence.
     fn accepts_peer_mail(&self) -> bool {
         false

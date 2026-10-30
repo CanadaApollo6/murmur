@@ -339,3 +339,80 @@ async fn protocol_interrupt_cancels_in_flight_completion() {
         assert!(h.ctrl.try_next_request().is_none());
     }).await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn broker_permission_timeout_durably_cancels_waiting_choice() {
+    use agentd::mailroom::{Mailroom, NewMessage};
+    use agentd::model::*;
+    use agentd::supervisor::{AgentSpec, Broker, Event, Phase, TurnOutcome};
+    use infinity_agent_core::message::{InputMessage, InputMessageContent, UserChoiceRequired};
+
+    tokio::task::LocalSet::new().run_until(async {
+        let mut h = start_harness().await.expect("harness");
+        let socket = h.cwd.path().join("broker-infinity.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("socket");
+        let manager = h.manager.clone();
+        let accept = tokio::task::spawn_local(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                tokio::task::spawn_local(infinity_daemon::client_handler::handle_client(stream, manager.clone()));
+            }
+        });
+        let mailroom = Arc::new(Mailroom::open(h.cwd.path().join("broker.db"), Default::default()).await.expect("mailroom"));
+        let mut kind = agentd::KindConfig::infinity(socket);
+        kind.cancel_timeout = Duration::from_millis(200);
+        let broker = Broker::new(mailroom.clone(), vec![kind], Default::default()).expect("broker");
+        let mut events = broker.events();
+        let spec = AgentSpec {
+            name: AgentName::parse("model").expect("name"), kind: "infinity".into(), cwd: h.cwd.path().into(), model: None,
+            permissions: PermissionPolicy { timeout: Some(Duration::from_millis(30)), ..Default::default() }, idle_after: None,
+        };
+        let agent = broker.spawn(spec.clone()).await.expect("spawn");
+        let mut phases = agent.phases();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *phases.borrow_and_update() != Phase::Idle { phases.changed().await.expect("phase"); }
+        }).await.expect("initial idle");
+        let root = h.manager.lock().await.list_sessions(None).await.into_keys().next().expect("root");
+        broker.send(NewMessage {
+            from: Sender::Human, to: agent.id, body: Body::new("wait for a choice").expect("body"), reply_to: None,
+            client_key: ClientKey("choice-input".into()), act: agentd::swarm::Act::Inform, task: None,
+        }).await.expect("send");
+        h.ctrl.next_request().await;
+        h.ctrl.send_tool_call("waiting", "sleep_until_event_or_input", serde_json::json!({})); h.ctrl.finish();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(events.recv().await.expect("event"), Event::Consumed { .. }) {}
+        }).await.expect("receipt");
+        assert!(h.manager.lock().await.send_input((InputMessage {
+            content: InputMessageContent::UserChoice(UserChoiceRequired {
+                content_type: "user_choice_required".into(), id: "waiting".into(), call_id: None,
+                prompt: "Choose".into(), choices: vec!["A".into(), "B".into()], default: 0,
+                response_url: "http://example.test/choice".into(),
+            }), group_id: root.id.clone(), metadata: None, synthetic: None, display_as: None, subscription: false,
+        }, None)).await);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(events.recv().await.expect("event"), Event::PermissionPending(_)) {}
+            loop {
+                match events.recv().await.expect("event") {
+                    Event::TurnEnded { outcome: TurnOutcome::Cancelled, .. } => break,
+                    Event::PhaseChanged { phase: Phase::Crashed { .. } | Phase::Failed { .. }, .. } => panic!("timeout failed to cancel persisted choice"),
+                    _ => {}
+                }
+            }
+        }).await.expect("durable cancellation");
+        agent.stop().await.expect("stop");
+        let resumed = broker.spawn(spec).await.expect("resume");
+        let mut phases = resumed.phases();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *phases.borrow_and_update() != Phase::Idle { phases.changed().await.expect("phase"); }
+        }).await.expect("resumed idle without pending work");
+        assert!(resumed.pending_permissions().await.expect("approvals").is_empty());
+        assert!(h.ctrl.try_next_request().is_none(), "cancellation must not start inference");
+        h.client_tx.send(ClientMessage::Connect { root_thread_id: root, thread_id: None, keeps_session_alive: true }).expect("inspect replay");
+        let replay = wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
+        assert!(matches!(replay, DaemonMessage::Replay { pending_choices, history, in_progress: false, .. }
+            if pending_choices.is_empty() && matches!(history.last(), Some(DaemonMessage::ToolResult { .. }))));
+        broker.shutdown().await.expect("shutdown"); drop(broker);
+        Arc::try_unwrap(mailroom).ok().expect("sole owner").close().await.expect("close");
+        accept.abort();
+    }).await;
+}
