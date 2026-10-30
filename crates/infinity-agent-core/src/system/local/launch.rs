@@ -116,6 +116,13 @@ where
     M: InputSender + 'static,
     H: HttpClient + 'static,
 {
+    async fn restart_notifier(
+        &self,
+        thread_id: &ThreadId<str>,
+    ) -> Result<Option<rap_client::notifier::RapNotifier<H>>, BoxError> {
+        self.inner.restart_notifier(thread_id).await
+    }
+
     async fn resolve(&self, thread_id: &ThreadId<str>) -> Result<ThreadConfig<M, H>, BoxError> {
         let mut config = self.inner.resolve(thread_id).await?;
         let root_id = root_thread_id(&self.conversation_store, thread_id).await?;
