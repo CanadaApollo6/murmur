@@ -72,6 +72,8 @@ dependencies = [
 name = "agentd"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "nix",
  "rusqlite",
  "serde",
  "serde_json",

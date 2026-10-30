@@ -132,6 +132,30 @@ pub struct Mailroom {
     worker: thread::JoinHandle<Result<()>>,
 }
 
+pub(crate) struct ActorLease {
+    agent: AgentId,
+    owner: ulid::Ulid,
+    jobs: mpsc::Sender<Job>,
+}
+
+impl Drop for ActorLease {
+    fn drop(&mut self) {
+        let agent = self.agent;
+        let owner = self.owner;
+        if self
+            .jobs
+            .send(Box::new(move |store| {
+                if store.actors.get(&agent) == Some(&owner) {
+                    store.actors.remove(&agent);
+                }
+            }))
+            .is_err()
+        {
+            tracing::debug!("actor lease released after mailroom close");
+        }
+    }
+}
+
 impl Mailroom {
     pub async fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         let path = path.as_ref().to_owned();
@@ -170,6 +194,95 @@ impl Mailroom {
         drop(self.jobs);
         tokio::task::spawn_blocking(move || self.worker.join().map_err(|_| Error::Panicked)?)
             .await?
+    }
+
+    pub(crate) async fn claim_actor(
+        &self,
+        agent: AgentId,
+        kind: String,
+    ) -> Result<(ActorLease, Incarnation, Option<crate::adapter::ResumeToken>)> {
+        let owner = ulid::Ulid::new();
+        let lease = ActorLease {
+            agent,
+            owner,
+            jobs: self.jobs.clone(),
+        };
+        let (incarnation, resume) = self.allocate_incarnation(agent, kind, Some(owner)).await?;
+        Ok((lease, incarnation, resume))
+    }
+
+    pub(crate) async fn next_incarnation(
+        &self,
+        agent: AgentId,
+        kind: String,
+    ) -> Result<(Incarnation, Option<crate::adapter::ResumeToken>)> {
+        self.allocate_incarnation(agent, kind, None).await
+    }
+
+    async fn allocate_incarnation(
+        &self,
+        agent: AgentId,
+        kind: String,
+        claim: Option<ulid::Ulid>,
+    ) -> Result<(Incarnation, Option<crate::adapter::ResumeToken>)> {
+        self.call(move |s| {
+            active(&s.db, agent)?;
+            if claim.is_some() && s.actors.contains_key(&agent) {
+                return Err(Error::Rejected("agent already supervised".into()));
+            }
+            if claim.is_none() && !s.actors.contains_key(&agent) {
+                return Err(Error::Rejected("actor lease missing".into()));
+            }
+            let tx = s.db.transaction()?;
+            tx.execute(
+                "INSERT OR IGNORE INTO actor_state(agent,incarnation,kind) VALUES (?,0,?)",
+                params![json(&agent)?, kind],
+            )?;
+            let (previous, resume, saved_kind): (u64, Option<String>, String) = tx.query_row(
+                "SELECT incarnation,resume,kind FROM actor_state WHERE agent=?",
+                [json(&agent)?],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            if saved_kind != kind {
+                return Err(Error::Rejected("agent kind cannot change".into()));
+            }
+            let next = previous
+                .checked_add(1)
+                .filter(|n| *n <= i64::MAX as u64)
+                .ok_or_else(|| Error::Rejected("incarnation overflow".into()))?;
+            tx.execute(
+                "UPDATE actor_state SET incarnation=? WHERE agent=?",
+                params![next, json(&agent)?],
+            )?;
+            tx.commit()?;
+            if let Some(owner) = claim {
+                s.actors.insert(agent, owner);
+            }
+            Ok((
+                Incarnation(next),
+                resume.map(|s| serde_json::from_str(&s)).transpose()?,
+            ))
+        })
+        .await
+    }
+
+    pub(crate) async fn save_resume(
+        &self,
+        agent: AgentId,
+        token: crate::adapter::ResumeToken,
+    ) -> Result<()> {
+        self.call(move |s| {
+            s.db.execute(
+                "UPDATE actor_state SET resume=? WHERE agent=?",
+                params![json(&token)?, json(&agent)?],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn sender_label(&self, agent: AgentId) -> Result<(String, String)> {
+        self.call(move |s| Ok(s.db.query_row("SELECT a.name,COALESCE(s.kind,'unknown') FROM agents a LEFT JOIN actor_state s ON s.agent=a.id WHERE a.id=?", [json(&agent)?], |r| Ok((r.get(0)?,r.get(1)?)))?)).await
     }
 
     pub async fn register(&self, name: AgentName) -> Result<AgentId> {
@@ -445,6 +558,7 @@ impl Mailroom {
 struct Store {
     db: Connection,
     config: Config,
+    actors: HashMap<AgentId, ulid::Ulid>,
 }
 
 impl Store {
@@ -468,7 +582,11 @@ impl Store {
             )));
         }
         db.execute_batch(include_str!("schema.sql"))?;
-        Ok(Self { db, config })
+        Ok(Self {
+            db,
+            config,
+            actors: HashMap::new(),
+        })
     }
 
     fn accept(&mut self, msg: NewMessage) -> Result<(SendOutcome, Envelope)> {
@@ -875,4 +993,55 @@ fn validate_outcome(outcome: &Outcome) -> Result<()> {
 }
 fn valid_evidence(e: &Evidence) -> bool {
     !e.tried.trim().is_empty() && !e.obstacle.trim().is_empty()
+}
+
+#[cfg(test)]
+mod actor_tests {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_claim_releases_its_lease_after_transaction() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let room = Mailroom::open(root.path().join("mail.db"), Config::default())
+            .await
+            .expect("mailroom");
+        let agent = room
+            .register(AgentName::parse("worker").expect("name"))
+            .await
+            .expect("register");
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = mpsc::channel();
+        room.jobs
+            .send(Box::new(move |_| {
+                entered.send(()).expect("worker entered");
+                blocked.recv().expect("release worker");
+            }))
+            .expect("submit blocker");
+        ready.await.expect("worker ready");
+        let mut claim = Box::pin(room.claim_actor(agent, "claude".into()));
+        poll_fn(|cx| {
+            assert!(claim.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(claim);
+        release.send(()).expect("release");
+        let (lease, incarnation, _) = room
+            .claim_actor(agent, "claude".into())
+            .await
+            .expect("cancelled claim must release");
+        assert_eq!(incarnation, Incarnation(2));
+        assert!(room.claim_actor(agent, "claude".into()).await.is_err());
+        drop(lease);
+        let (lease, incarnation, _) = room
+            .claim_actor(agent, "claude".into())
+            .await
+            .expect("failed claimant cannot release another owner");
+        assert_eq!(incarnation, Incarnation(3));
+        drop(lease);
+        room.close().await.expect("close");
+    }
 }

@@ -7,12 +7,13 @@ license = "Apache-2.0"
 repository = { workspace = true }
 
 [dependencies]
+async-trait = { workspace = true }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { version = "0.3", features = ["serde"] }
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "process", "io-util", "time"] }
 tracing = { workspace = true }
 ulid = { version = "1", features = ["serde"] }
 
@@ -22,3 +23,10 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [lints]
 workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["signal"] }
+
+[[bin]]
+name = "agentd-fake-acp"
+path = "tests/support/fake_acp.rs"
