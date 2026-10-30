@@ -387,6 +387,12 @@ impl InfinitySession {
                 if self.root_event(&thread_id) =>
             {
                 self.thread_busy = true;
+                // Attachment idle can precede this newer completion in the socket.
+                // Receipt recovery applies at idle, never during valid inference.
+                if let Some(flight) = &mut self.flight {
+                    flight.receipt_deadline = None;
+                }
+                self.peer_deadline = None;
                 self.started()
             }
             DaemonMessage::ToolResult { thread_id, .. } if self.root_event(&thread_id) => {

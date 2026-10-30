@@ -286,6 +286,7 @@ impl Broker {
             incarnation,
             resume,
             session: None,
+            cancelling: false,
             offered: Vec::new(),
             pending: HashMap::new(),
             crashes: VecDeque::new(),
@@ -336,6 +337,7 @@ struct AgentActor {
     incarnation: Incarnation,
     resume: Option<ResumeToken>,
     session: Option<Box<dyn Session>>,
+    cancelling: bool,
     offered: Vec<MessageId>,
     pending: HashMap<PermissionId, (PermissionRequest, Option<Instant>)>,
     crashes: VecDeque<Instant>,
@@ -448,8 +450,20 @@ impl AgentActor {
             })
             .await
         {
-            Ok(session) => {
+            Ok(mut session) => {
                 let busy = session.busy();
+                if self.cancelling {
+                    if busy {
+                        // Session deadlines die with the socket. Reissue cancellation
+                        // so a busy replay cannot strand recovery without a deadline.
+                        session
+                            .cancel()
+                            .await
+                            .map_err(|e| Error::Rejected(e.to_string()))?;
+                    } else {
+                        self.cancelling = false;
+                    }
+                }
                 let token = session.resume_token();
                 self.session = Some(session);
                 self.mailroom.save_resume(self.id, token.clone()).await?;
@@ -555,6 +569,7 @@ impl AgentActor {
                 if !self.offered.is_empty() {
                     self.end("turn ended without receipt".into()).await?;
                 } else {
+                    self.cancelling = false;
                     self.clear_pending();
                     self.emit(Event::TurnEnded {
                         agent: self.id,
@@ -655,6 +670,9 @@ impl AgentActor {
         Ok(())
     }
     async fn cancel(&mut self) -> Result<()> {
+        if self.model_agent {
+            self.cancelling = true;
+        }
         if let Some(session) = &mut self.session {
             session
                 .cancel()

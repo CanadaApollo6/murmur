@@ -13,8 +13,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 use crate::message::{InputMessage, InputMessageContent, SyntheticKind, TaggedSyntheticKind};
 use crate::traits::{ConversationStore, StateStore};
@@ -149,8 +151,41 @@ pub(crate) async fn drive_thread<C, S, H, O>(
     let mut subscribe_closed = false;
 
     let mut in_flight: Option<InFlightStep<'_>> = None;
+    let mut interrupt_at = None;
 
     'driver: loop {
+        if let Some(deadline) = interrupt_at {
+            // Keep the only copy of accepted results until settlement persists.
+            // Inputs wait, but subscribers can reconnect during a storage outage.
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(deadline) => {
+                    match thread.interrupt(&observer).await {
+                        Ok(()) => interrupt_at = None,
+                        Err(error) => {
+                            observer.on_event(&thread_id, &AgentEvent::Info {
+                                text: format!("Interrupt failed: {error}"),
+                            });
+                            interrupt_at = Some(Instant::now() + Duration::from_millis(100));
+                        }
+                    }
+                }
+                Some(input) = rx.recv() => pending_batch.push(input),
+                Some(()) = interrupt_rx.recv() => {},
+                req = subscribe_rx.recv(), if !subscribe_closed => {
+                    match req {
+                        Some((req, ack)) => {
+                            let mut snapshot = thread.replay_snapshot();
+                            snapshot.idle = false;
+                            observer.on_subscribe(&thread_id, req, snapshot);
+                            let _ = ack.send(());
+                        }
+                        None => subscribe_closed = true,
+                    }
+                }
+            }
+            continue;
+        }
         let new_inputs: Vec<(InputMessage, String)> = if let Some(flight) = in_flight.as_mut() {
             tokio::select! {
                 biased;
@@ -226,10 +261,7 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                         res, &observer, &thread_id, &mut total_tokens,
                         &mut compaction_triggered, &mut pending_batch,
                     );
-                    if let Err(error) = thread.interrupt(&observer).await {
-                        observer.on_event(&thread_id, &AgentEvent::Info { text: format!("Interrupt failed: {error}") });
-                        return;
-                    }
+                    interrupt_at = Some(Instant::now());
                     continue;
                 },
                 req = subscribe_rx.recv(), if !subscribe_closed => {
@@ -246,16 +278,9 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                 }
             }
         } else {
-            if interrupt_rx.try_recv().is_ok()
-                && let Err(error) = thread.interrupt(&observer).await
-            {
-                observer.on_event(
-                    &thread_id,
-                    &AgentEvent::Info {
-                        text: format!("Interrupt failed: {error}"),
-                    },
-                );
-                return;
+            if interrupt_rx.try_recv().is_ok() {
+                interrupt_at = Some(Instant::now());
+                continue;
             }
             let mut batch: Vec<(InputMessage, String)> = std::mem::take(&mut pending_batch);
             while let Ok(item) = rx.try_recv() {
@@ -299,10 +324,7 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                                     }
                                 }
                                 Some(()) = interrupt_rx.recv() => {
-                                    if let Err(error) = thread.interrupt(&observer).await {
-                                        observer.on_event(&thread_id, &AgentEvent::Info { text: format!("Interrupt failed: {error}") });
-                                        return;
-                                    }
+                                    interrupt_at = Some(Instant::now());
                                     continue 'driver;
                                 }
                                 req = subscribe_rx.recv(), if !subscribe_closed => {
