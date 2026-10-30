@@ -423,6 +423,7 @@ enum ToolSettlementProbe {
     Image,
     Empty,
     CancelRealResult,
+    InterruptWriteFailure { permanent: bool },
 }
 
 async fn tool_settlement_probe(probe: ToolSettlementProbe) {
@@ -454,8 +455,16 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
     );
     let broker = Broker::new(
         mailroom.clone(),
-        vec![agentd::KindConfig::infinity(socket)],
-        Default::default(),
+        vec![{
+            let mut kind = agentd::KindConfig::infinity(socket);
+            kind.cancel_timeout = Duration::from_millis(100);
+            kind
+        }],
+        agentd::supervisor::Config {
+            backoff_initial: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(10),
+            ..Default::default()
+        },
     )
     .expect("broker");
     let mut events = broker.events();
@@ -507,7 +516,10 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
     };
     broker.send(human("run tool")).await.expect("send");
     h.ctrl.next_request().await;
-    if matches!(probe, ToolSettlementProbe::CancelRealResult) {
+    if matches!(
+        probe,
+        ToolSettlementProbe::CancelRealResult | ToolSettlementProbe::InterruptWriteFailure { .. }
+    ) {
         h.ctrl
             .send_tool_call("waiting", "sleep", serde_json::json!({"seconds": 0.05}));
     } else {
@@ -574,12 +586,74 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
                     .await
             );
         }
-        ToolSettlementProbe::CancelRealResult => {}
+        ToolSettlementProbe::CancelRealResult
+        | ToolSettlementProbe::InterruptWriteFailure { .. } => {}
     }
     tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request())
         .await
         .expect("tool followup");
-    if matches!(probe, ToolSettlementProbe::CancelRealResult) {
+    if let ToolSettlementProbe::InterruptWriteFailure { permanent } = probe {
+        // Exercise the same filesystem fault seam as memory_store's write-error tests.
+        let fault = ThreadWriteFault::new(h._state_dir.path(), &root);
+        agent.cancel().await.expect("cancel followup before output");
+        wait_for_message(&mut h.daemon_rx, |m| {
+            matches!(m,
+            DaemonMessage::Info { text, .. } if text.contains("Interrupt failed"))
+        })
+        .await;
+        broker
+            .send(human("human after write failure"))
+            .await
+            .expect("queue human");
+        let mut crashes = 0;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match events.recv().await.expect("event") {
+                    Event::PhaseChanged {
+                        phase: Phase::Crashed { .. },
+                        ..
+                    } => {
+                        crashes += 1;
+                        if !permanent && crashes == 2 {
+                            break;
+                        }
+                    }
+                    Event::PhaseChanged {
+                        phase: Phase::Failed { .. },
+                        ..
+                    } if permanent => break,
+                    Event::TurnEnded {
+                        outcome: TurnOutcome::Cancelled,
+                        ..
+                    } => panic!("failed writes must not acknowledge cancellation"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("cancellation recovery must remain bounded after reconnect");
+        assert!(
+            h.ctrl.try_next_request().is_none(),
+            "settlement retries must not run inference"
+        );
+        if permanent {
+            assert_eq!(crashes, 4, "fifth failed cancellation must reach Failed");
+            agent.stop().await.expect("stop failed actor");
+        }
+        drop(fault);
+        if permanent {
+            agent = broker
+                .spawn(spec.clone())
+                .await
+                .expect("resume after storage recovery");
+            phases = agent.phases();
+        }
+        tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request())
+            .await
+            .expect("queued human must progress after storage recovery");
+        h.ctrl.send_text("recovered human answer");
+        h.ctrl.finish();
+    } else if matches!(probe, ToolSettlementProbe::CancelRealResult) {
         agent.cancel().await.expect("cancel followup before output");
         tokio::time::timeout(Duration::from_secs(5), async {
             while !matches!(
@@ -649,7 +723,7 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
     );
     h.client_tx
         .send(ClientMessage::Connect {
-            root_thread_id: root,
+            root_thread_id: root.clone(),
             thread_id: None,
             keeps_session_alive: true,
         })
@@ -681,7 +755,8 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
         "replay must include exactly one tool settlement"
     );
     match probe {
-        ToolSettlementProbe::CancelRealResult => assert!(
+        ToolSettlementProbe::CancelRealResult
+        | ToolSettlementProbe::InterruptWriteFailure { .. } => assert!(
             format!("{:?}", results[0]).contains("Slept for 0.05 seconds"),
             "preserve real result rather than substitute interruption"
         ),
@@ -689,6 +764,20 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
             assert!(format!("{:?}", results[0]).contains("interrupted"))
         }
         _ => assert!(results[0].is_empty()),
+    }
+    if matches!(probe, ToolSettlementProbe::InterruptWriteFailure { .. }) {
+        let persisted = std::fs::read_to_string(
+            h._state_dir
+                .path()
+                .join("threads")
+                .join(format!("{}.json", root.id)),
+        )
+        .expect("read durable thread");
+        assert_eq!(
+            persisted.matches("Slept for 0.05 seconds").count(),
+            1,
+            "accepted real result must be written exactly once"
+        );
     }
     broker.shutdown().await.expect("shutdown");
     drop(broker);
@@ -726,5 +815,189 @@ async fn review_empty_tool_result() {
 async fn review_real_result_racing_interrupt() {
     tokio::task::LocalSet::new()
         .run_until(tool_settlement_probe(ToolSettlementProbe::CancelRealResult))
+        .await;
+}
+
+/// Block actual thread payload writes without changing store caches or state writes.
+/// Restoring the old file also ensures a retry must append the accepted result.
+struct ThreadWriteFault {
+    path: std::path::PathBuf,
+    saved: std::path::PathBuf,
+}
+
+impl ThreadWriteFault {
+    fn new(state_dir: &std::path::Path, root: &infinity_protocol::ThreadRef) -> Self {
+        let path = state_dir.join("threads").join(format!("{}.json", root.id));
+        let saved = path.with_extension("json.saved");
+        std::fs::rename(&path, &saved).expect("save durable thread");
+        std::fs::create_dir(&path).expect("inject write failure");
+        Self { path, saved }
+    }
+}
+
+impl Drop for ThreadWriteFault {
+    fn drop(&mut self) {
+        std::fs::remove_dir(&self.path).expect("remove write fault");
+        std::fs::rename(&self.saved, &self.path).expect("restore writable thread");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn interrupt_write_failure_retries_settlement_across_reconnects() {
+    tokio::task::LocalSet::new()
+        .run_until(tool_settlement_probe(
+            ToolSettlementProbe::InterruptWriteFailure { permanent: false },
+        ))
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn interrupt_write_failure_exhausts_broker_recovery_without_losing_result() {
+    tokio::task::LocalSet::new()
+        .run_until(tool_settlement_probe(
+            ToolSettlementProbe::InterruptWriteFailure { permanent: true },
+        ))
+        .await;
+}
+
+async fn queued_attachment_mail_probe(resume: bool) {
+    use agentd::mailroom::{Mailroom, NewMessage};
+    use agentd::model::*;
+    use agentd::supervisor::{AgentSpec, Broker, Event, Phase};
+    let mut h = start_harness().await.expect("harness");
+    let socket = h.cwd.path().join("broker-infinity.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("socket");
+    let manager = h.manager.clone();
+    let accept = tokio::task::spawn_local(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            tokio::task::spawn_local(infinity_daemon::client_handler::handle_client(
+                stream,
+                manager.clone(),
+            ));
+        }
+    });
+    let mailroom = Arc::new(
+        Mailroom::open(h.cwd.path().join("broker.db"), Default::default())
+            .await
+            .expect("mailroom"),
+    );
+    let broker = Broker::new(
+        mailroom.clone(),
+        vec![{
+            let mut kind = agentd::KindConfig::infinity(socket);
+            kind.request_timeout = Duration::from_millis(100);
+            kind
+        }],
+        agentd::supervisor::Config {
+            backoff_initial: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .expect("broker");
+    let mut events = broker.events();
+    let spec = AgentSpec {
+        name: AgentName::parse("model").expect("name"),
+        kind: "infinity".into(),
+        cwd: h.cwd.path().into(),
+        model: None,
+        permissions: PermissionPolicy::default(),
+        idle_after: None,
+    };
+
+    if resume {
+        let agent = broker.spawn(spec.clone()).await.expect("initial spawn");
+        let mut phases = agent.phases();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *phases.borrow_and_update() != Phase::Idle {
+                phases.changed().await.expect("phase");
+            }
+        })
+        .await
+        .expect("initial idle");
+        agent.stop().await.expect("stop before queued resume");
+    }
+    let id = mailroom
+        .register(spec.name.clone())
+        .await
+        .expect("register");
+    let (_, envelope) = mailroom
+        .accept(NewMessage {
+            from: Sender::Human,
+            to: id,
+            body: Body::new("initial slow request").expect("body"),
+            reply_to: None,
+            client_key: ClientKey("attachment".into()),
+            act: agentd::swarm::Act::Inform,
+            task: None,
+        })
+        .await
+        .expect("prequeue");
+    let agent = broker.spawn(spec).await.expect("spawn with queued mail");
+    tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request())
+        .await
+        .expect("inference starts");
+    // The provider has accepted the request but intentionally sends no output or receipt.
+    let crashed = tokio::time::timeout(Duration::from_millis(350), async {
+        loop {
+            if matches!(
+                events.recv().await.expect("event"),
+                Event::PhaseChanged {
+                    phase: Phase::Crashed { .. } | Phase::Failed { .. },
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        !crashed,
+        "attachment idle must not time out a later streaming turn"
+    );
+    assert_eq!(agent.phase(), Phase::Busy);
+    h.ctrl.send_text("done");
+    h.ctrl.finish();
+    let mut phases = agent.phases();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *phases.borrow_and_update() != Phase::Idle {
+            phases.changed().await.expect("phase");
+        }
+    })
+    .await
+    .expect("turn settles");
+    assert!(matches!(
+        mailroom
+            .delivery(envelope.id())
+            .await
+            .expect("delivery")
+            .state,
+        DeliveryState::Consumed
+    ));
+    broker.shutdown().await.expect("shutdown");
+    drop(broker);
+    Arc::try_unwrap(mailroom)
+        .ok()
+        .expect("sole owner")
+        .close()
+        .await
+        .expect("close");
+    accept.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn queued_startup_mail_outlives_attachment_idle_receipt_timeout() {
+    tokio::task::LocalSet::new()
+        .run_until(queued_attachment_mail_probe(false))
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn queued_resume_mail_outlives_attachment_idle_receipt_timeout() {
+    tokio::task::LocalSet::new()
+        .run_until(queued_attachment_mail_probe(true))
         .await;
 }

@@ -73,6 +73,16 @@ creating a replacement thread. EOF reconnects with a new incarnation. Unconsumed
 mail is re-offered. Peer dedup uses `peer-{MessageId}` in Infinity. Human inputs
 have no stable dedup ID, so a reconnect before their receipt can repeat them.
 Only `InputCommitted` receipts consume mail. Output and echoes are not receipts.
+If an Infinity cancellation deadline expires, the actor reconnects and reissues
+`Interrupt` when replay is busy, with a fresh cancellation deadline. Repeated
+failures reach the existing crash limit. Core retains accepted tool results and
+retries failed interrupt writes every 100 ms without running inference. It
+reports busy on attachment until settlement persists. This recovery requires
+the daemon to remain alive while storage is unavailable.
+
+An idle-derived receipt deadline is cleared when a later root completion starts,
+including the first turn after attachment. Inference may outlast the receipt
+timeout; a new core idle event arms receipt recovery again if a receipt is missing.
 Model agents never idle-suspend. Peer mail can enter a busy model session unless
 an approval is pending. Human inputs enter individually at turn boundaries so
 the adapter can correlate each echo with its receipt.
