@@ -222,7 +222,14 @@ async fn handle_invoke(
     request: CompletionRequest,
     framed: &mut JsonLines,
 ) -> std::io::Result<()> {
-    let mut stream = match provider.invoke_model(model_id, request).await {
+    // A client that hangs up is otherwise noticed only on the next write, so a
+    // cancelled completion would keep its place in a provider's queue until its
+    // first chunk. Dropping the invoke future or the stream is the cancellation.
+    let invoked = tokio::select! {
+        invoked = provider.invoke_model(model_id, request) => invoked,
+        () = client_gone(framed) => return Ok(()),
+    };
+    let mut stream = match invoked {
         Ok(stream) => stream,
         Err(e) => {
             send_json(framed, &ProviderResponse::Error(WireError::from(&e))).await?;
@@ -230,11 +237,23 @@ async fn handle_invoke(
         }
     };
     send_json(framed, &ProviderResponse::InvokeStarted).await?;
-    while let Some(item) = stream.next().await {
+    loop {
+        let item = tokio::select! {
+            item = stream.next() => item,
+            () = client_gone(framed) => return Ok(()),
+        };
+        let Some(item) = item else { break };
         let wire = item.map_err(|e| WireError::from(&e));
         send_json(framed, &ProviderResponse::Chunk(wire)).await?;
     }
     send_json(framed, &ProviderResponse::StreamEnd).await
+}
+
+/// Resolve once the client has closed the connection. The client sends nothing
+/// after its request, so EOF (or a read error) means it is gone; stray lines are
+/// ignored. Cancel-safe: `Framed` keeps partial reads in its own buffer.
+async fn client_gone(framed: &mut JsonLines) {
+    while let Some(Ok(_)) = framed.next().await {}
 }
 
 // ── Client ──
@@ -469,5 +488,99 @@ mod tests {
         assert!(item.to_string().contains("input is too long"));
 
         std::fs::remove_file(&path).ok();
+    }
+    /// Reports through `dropped` when it goes out of scope.
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    /// Where a [`HangingProvider`] stalls.
+    #[derive(Clone, Copy)]
+    enum Stall {
+        /// Inside `invoke_model`, as a queued request would.
+        Invoke,
+        /// Between stream items, after `InvokeStarted`.
+        Stream,
+    }
+
+    /// A provider that never finishes and signals when the server drops its work.
+    struct HangingProvider {
+        stall: Stall,
+        dropped: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for HangingProvider {
+        async fn list_models(&self) -> Result<Vec<ModelEntry>, BoxError> {
+            Ok(vec![test_entry()])
+        }
+
+        async fn invoke_model(
+            &self,
+            _model_id: &str,
+            _request: CompletionRequest,
+        ) -> Result<ModelStream, CompletionError> {
+            let signal = DropSignal(self.dropped.lock().expect("drop signal lock").take());
+            match self.stall {
+                Stall::Invoke => {
+                    let _signal = signal;
+                    std::future::pending().await
+                }
+                Stall::Stream => Ok(Box::pin(async_stream::stream! {
+                    let _signal = signal;
+                    std::future::pending::<()>().await;
+                    yield Err(CompletionError::ResponseError("unreachable".to_owned()));
+                })),
+            }
+        }
+    }
+
+    async fn assert_hang_up_cancels(stall: Stall) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let provider = Arc::new(HangingProvider {
+            stall,
+            dropped: std::sync::Mutex::new(Some(tx)),
+        });
+        let (path, server) = serve_provider(provider).expect("bind provider socket");
+        tokio::spawn(server);
+
+        let remote = RemoteModelProvider::new(&path);
+        match stall {
+            Stall::Invoke => {
+                let invoke = remote.invoke_model("mock", test_request("hello"));
+                // Give the request time to reach the provider, then hang up.
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(100), invoke).await;
+            }
+            Stall::Stream => {
+                let response = remote
+                    .invoke_model("mock", test_request("hello"))
+                    .await
+                    .expect("invoke model");
+                drop(response);
+            }
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("server should drop the provider's work once the client hangs up")
+            .expect("drop signal");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn hang_up_while_queued_cancels_the_invocation() {
+        assert_hang_up_cancels(Stall::Invoke).await;
+    }
+
+    #[tokio::test]
+    async fn hang_up_mid_stream_cancels_the_stream() {
+        assert_hang_up_cancels(Stall::Stream).await;
     }
 }
