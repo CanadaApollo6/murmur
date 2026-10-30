@@ -219,6 +219,9 @@ fn strip_client_message(msg: ClientMessage, remote_name: &RemoteName) -> ClientM
             thread_id: thread_id.strip(remote_name),
             text,
         },
+        ClientMessage::Interrupt { thread_id } => ClientMessage::Interrupt {
+            thread_id: thread_id.strip(remote_name),
+        },
         ClientMessage::DeliverPeerMessage {
             thread_id,
             message_id,
@@ -540,6 +543,15 @@ pub async fn handle_client_channels(
                                 thread_id: Some(thread_id),
                                 text: "failed to send input".into(),
                             });
+                        }
+                    }
+                    ClientMessage::Interrupt { thread_id } => {
+                        if thread_id.remote.is_some() {
+                            let _ = daemon_tx.send(DaemonMessage::Error { thread_id: Some(thread_id), text: "remote is not connected".into() });
+                            continue;
+                        }
+                        if !session_manager.lock().await.interrupt(&thread_id.id) {
+                            let _ = daemon_tx.send(DaemonMessage::Error { thread_id: Some(thread_id), text: "failed to interrupt thread".into() });
                         }
                     }
                     ClientMessage::DeliverPeerMessage { thread_id, message_id, from, text } => {

@@ -96,6 +96,7 @@ pub struct SessionManager {
     sender: ChannelSender,
     /// Attaches subscribers to threads (resolves once installed).
     subscribe: SubscribeHandle<SubscribeRequest>,
+    interrupt: infinity_agent_core::system::local::InterruptHandle,
     /// Threads that are live or waiting on subscription events (see
     /// [`ActiveThreadSet`]).
     active_threads: ActiveThreadSet,
@@ -272,6 +273,7 @@ impl SessionManager {
         let mut running = system.start_with_observer(make_observer);
         let sender = running.sender();
         let subscribe = running.subscribe_handle();
+        let interrupt = running.interrupt_handle();
 
         // ── Session activity watcher ──
         //
@@ -391,6 +393,7 @@ impl SessionManager {
             remote_daemons: None,
             sender,
             subscribe,
+            interrupt,
             active_threads,
             subscriber_map,
             rap_manager,
@@ -553,6 +556,10 @@ impl SessionManager {
             .send_to_input_queue(input, &dedup_id)
             .await
             .is_ok()
+    }
+
+    pub fn interrupt(&self, thread_id: &ThreadId<str>) -> bool {
+        self.interrupt.interrupt(thread_id)
     }
 
     /// The agent system's input sender, used by the RAP callback bridge to

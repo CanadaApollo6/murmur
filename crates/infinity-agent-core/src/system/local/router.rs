@@ -17,7 +17,7 @@ use crate::message::InputMessage;
 use crate::traits::{ConversationStore, InputSender, StateStore};
 use rap_client::http::HttpClient;
 
-use super::driver::{ActiveThreads, ThreadLifecycleEvent, drive_thread};
+use super::driver::{ActiveThreads, ThreadLifecycleEvent, WorkerReceivers, drive_thread};
 use super::sender::ChannelSender;
 use crate::system::builder::{LocalAgentSystem, SystemInner};
 use crate::system::observer::ThreadObserver;
@@ -67,6 +67,17 @@ impl<Sub: Send + 'static> SubscribeHandle<Sub> {
     }
 }
 
+#[derive(Clone)]
+pub struct InterruptHandle {
+    tx: mpsc::UnboundedSender<ThreadId>,
+}
+
+impl InterruptHandle {
+    pub fn interrupt(&self, thread_id: &ThreadId<str>) -> bool {
+        self.tx.send(thread_id.to_owned()).is_ok()
+    }
+}
+
 /// A running local agent system: the router task plus handles for feeding it
 /// input, attaching subscribers, and observing thread lifecycle.
 ///
@@ -78,6 +89,7 @@ impl<Sub: Send + 'static> SubscribeHandle<Sub> {
 /// [`SubscribeRequest`](ThreadObserver::SubscribeRequest) type.
 pub struct RunningSystem<Sub: Send + 'static> {
     sender: ChannelSender,
+    interrupt_tx: mpsc::UnboundedSender<ThreadId>,
     subscribe_tx: mpsc::UnboundedSender<SubscribeMessage<Sub>>,
     active_threads: ActiveThreads,
     lifecycle_rx: mpsc::UnboundedReceiver<ThreadLifecycleEvent>,
@@ -121,6 +133,12 @@ impl<Sub: Send + 'static> RunningSystem<Sub> {
     pub fn subscribe_handle(&self) -> SubscribeHandle<Sub> {
         SubscribeHandle {
             tx: self.subscribe_tx.clone(),
+        }
+    }
+
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        InterruptHandle {
+            tx: self.interrupt_tx.clone(),
         }
     }
 
@@ -201,14 +219,18 @@ where
     {
         let sender = self.system.inner.sender.clone();
         let (subscribe_tx, subscribe_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
         let (lifecycle_tx, thread_lifecycle) = mpsc::unbounded_channel();
         let active_threads: ActiveThreads = Default::default();
         let shutdown = CancellationToken::new();
 
         let task = tokio::task::spawn_local(route_loop(
             self.system.inner,
-            self.input_rx,
-            subscribe_rx,
+            RouterReceivers {
+                input: self.input_rx,
+                subscribe: subscribe_rx,
+                interrupt: interrupt_rx,
+            },
             make_observer,
             active_threads.clone(),
             lifecycle_tx,
@@ -217,6 +239,7 @@ where
 
         RunningSystem {
             sender,
+            interrupt_tx,
             subscribe_tx,
             active_threads,
             lifecycle_rx: thread_lifecycle,
@@ -227,19 +250,26 @@ where
 }
 
 struct WorkerChannels<Sub> {
+    interrupt_tx: mpsc::UnboundedSender<()>,
     input_tx: mpsc::UnboundedSender<(InputMessage, String)>,
     subscribe_tx: mpsc::UnboundedSender<(Sub, oneshot::Sender<()>)>,
 }
 
 enum RoutedMessage<Sub> {
+    Interrupt(ThreadId),
     Input(Box<InputMessage>, String),
     Subscribe(ThreadId, Sub, oneshot::Sender<()>),
 }
 
+struct RouterReceivers<Sub> {
+    input: mpsc::UnboundedReceiver<(InputMessage, String)>,
+    subscribe: mpsc::UnboundedReceiver<SubscribeMessage<Sub>>,
+    interrupt: mpsc::UnboundedReceiver<ThreadId>,
+}
+
 async fn route_loop<C, S, H, O, F>(
     inner: Rc<SystemInner<C, S, ChannelSender, H>>,
-    mut input_rx: mpsc::UnboundedReceiver<(InputMessage, String)>,
-    mut subscribe_rx: mpsc::UnboundedReceiver<SubscribeMessage<O::SubscribeRequest>>,
+    channels: RouterReceivers<O::SubscribeRequest>,
     make_observer: F,
     active_threads: ActiveThreads,
     lifecycle_tx: mpsc::UnboundedSender<ThreadLifecycleEvent>,
@@ -251,6 +281,11 @@ async fn route_loop<C, S, H, O, F>(
     O: ThreadObserver + 'static,
     F: Fn(&ThreadId<str>) -> O + 'static,
 {
+    let RouterReceivers {
+        input: mut input_rx,
+        subscribe: mut subscribe_rx,
+        interrupt: mut interrupt_rx,
+    } = channels;
     let mut workers: HashMap<ThreadId, WorkerChannels<O::SubscribeRequest>> = HashMap::new();
     let mut subscribe_closed = false;
     // The router owns the driver futures directly (instead of spawning each
@@ -273,6 +308,7 @@ async fn route_loop<C, S, H, O, F>(
                 }
                 continue;
             }
+            Some(thread_id) = interrupt_rx.recv() => Some(RoutedMessage::Interrupt(thread_id)),
             msg = input_rx.recv() => msg.map(|(m, id)| RoutedMessage::Input(Box::new(m), id)),
             req = subscribe_rx.recv(), if !subscribe_closed => {
                 match req {
@@ -288,13 +324,18 @@ async fn route_loop<C, S, H, O, F>(
 
         let thread_id = match &msg {
             RoutedMessage::Input(input, _) => input.group_id.clone(),
-            RoutedMessage::Subscribe(thread_id, _, _) => thread_id.clone(),
+            RoutedMessage::Subscribe(thread_id, _, _) | RoutedMessage::Interrupt(thread_id) => {
+                thread_id.clone()
+            }
         };
 
         // Reuse a live driver if one exists.
         if let Some(w) = workers.get(&thread_id) {
             if !w.input_tx.is_closed() {
                 match msg {
+                    RoutedMessage::Interrupt(_) => {
+                        let _ = w.interrupt_tx.send(());
+                    }
                     RoutedMessage::Input(input, id) => {
                         let _ = w.input_tx.send((*input, id));
                     }
@@ -305,6 +346,10 @@ async fn route_loop<C, S, H, O, F>(
                 continue;
             }
             workers.remove(&thread_id);
+        }
+
+        if matches!(msg, RoutedMessage::Interrupt(_)) {
+            continue;
         }
 
         // Admission: event-style input cannot create or resume a thread. User
@@ -357,6 +402,7 @@ async fn route_loop<C, S, H, O, F>(
 
         // Spawn a new driver.
         let (input_tx, input_rx_worker) = mpsc::unbounded_channel();
+        let (worker_interrupt_tx, worker_interrupt_rx) = mpsc::unbounded_channel();
         let (worker_subscribe_tx, worker_subscribe_rx) = mpsc::unbounded_channel();
         let observer = make_observer(&thread_id);
 
@@ -365,8 +411,11 @@ async fn route_loop<C, S, H, O, F>(
             let driver = drive_thread(
                 inner.clone(),
                 thread_id.clone(),
-                input_rx_worker,
-                worker_subscribe_rx,
+                WorkerReceivers {
+                    input: input_rx_worker,
+                    subscribe: worker_subscribe_rx,
+                    interrupt: worker_interrupt_rx,
+                },
                 observer,
                 active_threads.clone(),
                 lifecycle_tx.clone(),
@@ -380,6 +429,7 @@ async fn route_loop<C, S, H, O, F>(
         });
 
         match msg {
+            RoutedMessage::Interrupt(_) => unreachable!("bug: interrupt spawned a driver"),
             RoutedMessage::Input(input, id) => {
                 let _ = input_tx.send((*input, id));
             }
@@ -391,6 +441,7 @@ async fn route_loop<C, S, H, O, F>(
             thread_id,
             WorkerChannels {
                 input_tx,
+                interrupt_tx: worker_interrupt_tx,
                 subscribe_tx: worker_subscribe_tx,
             },
         );
