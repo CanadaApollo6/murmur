@@ -91,13 +91,23 @@ The delivery class is derived from the sender (`Envelope::class`), so no call si
 - **Model agent.** A peer event goes out as `ClientMessage::DeliverPeerMessage { thread_id, message_id, from, text }`. The daemon builds an `InputMessage` with `TaggedSyntheticKind::PeerMessage` and dedup ID `peer-{MessageId}`. Core inlines it as a self-contained `receive_event__injected` pair whose call ID is **derived from `MessageId`** (stable across replays). It is deferrable, so it waits behind a non-passive tool call, and the patched `filter_deferrable` processes a settling tool result **before** any peer in the same batch. It wakes a passive `sleep`.
 - **Delivery receipt.** The mailroom marks a peer message `Consumed` only on `SessionEvent::Committed`, which the Infinity adapter derives from a new `DaemonMessage::InputCommitted { thread_id, dedup_id }`. Core emits it after `sync()` has persisted that input, and also when dedup absorbs a re-offered input that is already durable (otherwise that delivery would stay `Offered` forever). An echo or `ResponseDone` is not a receipt: core emits `CompletionFinished` even when inference fails before output, and unvalidated input is not persisted. Human mail to an Infinity agent travels as `UserInput`, which has no dedup ID; its receipt is the first non-peer `InputCommitted` after its echo, which holds because core persists inputs together and in order.
 - **CLI agent.** Delivery is gated to turn boundaries (`DeliveryGate::AtTurnBoundary`), and all queued mail is batched into one turn. The adapter reports `SessionEvent::TurnStarted` on its first evidence that the turn began (ACP `session/update` or the native equivalent), which the mailroom records durably, and `SessionEvent::Committed` when the turn ends, which marks the mail `Consumed`. If the session dies after `Offered` and before `TurnStarted`, the delivery is re-offered. If it dies after `TurnStarted` and before `Committed`, the delivery becomes `Uncertain` and is **held for the human** (`agentctl held`, `release`, `drop`), because the turn may have had side effects.
+- **What a receipt guarantees.** `InputCommitted` for an ID means the input's full payload and its dedup ID were written to the store without error. It does not mean the write was flushed to disk with fsync. A failed write sends no receipt, and the thread keeps running. Overflow recovery never replaces a peer's text with a placeholder: if recovery cannot keep the peer, the peer leaves without a receipt and its dedup ID is released. In every such case the broker re-offers. After `max_attempts` (default 5) the mailroom moves the delivery to `Held { reason }` for the human, so a message that can never fit does not loop.
 - **Durability.** The mailroom is the only durable copy. Infinity's channels and defer queue are caches. Guarantees: at-least-once with idempotent receive on Infinity; at-least-once on CLI agents with a human decision on uncertain turns.
 
 ### 3. CLI adapters
 
 `Adapter::open → Session { submit, cancel, answer_permission, next_event, suspend }`. Domain types only; `SessionEvent` normalizes every wire.
 
-- ACP is the default wire where it is proven. Prime speaks it natively. Claude, Codex and Pi have shims (`claude-agent-acp@0.90.0`, `codex-acp@2.2.2`, `pi-acp@0.0.34`), each **spike-gated**: a shim must pass `session/load`, MCP server injection at `session/new`, and faithful `request_permission` relay on this machine. A shim that fails gets its native adapter (Claude stream-json, Codex app-server, Pi RPC) behind the same `Session` trait.
+- ACP is the wire for Claude and Codex. On 2026-10-29 a spike ran four ACP agents on this machine against three gates: an MCP server injected at `session/new` is usable, `session/load` resumes the conversation, and `request_permission` is relayed and obeyed. Results:
+
+  | Agent | MCP injection | `session/load` | Permission relay | Wire |
+  |---|---|---|---|---|
+  | `claude-agent-acp@0.90.0` | pass | pass | pass | ACP, with `session/set_mode default` (its `auto` default writes without asking) |
+  | `codex-acp@2.2.2` | pass | pass | pass | ACP, with `session/set_mode read-only` (`workspace-write` never asks for in-workspace writes) |
+  | Prime 0.10.0 `--mode acp` | pass | fail (method not found) | fail (never asks) | native: Prime `--mode rpc` or `--mode daemon` |
+  | `pi-acp@0.0.34` | fail (ignores `mcpServers`) | pass | fail (never asks) | native: Pi RPC |
+
+  Prime appears to be a Pi fork, so one RPC adapter may serve both. That is a guess until Prime's RPC is checked. All four honoured `session/cancel`.
 - Muse has no ACP: native MSP adapter. Infinity has its own adapter over the daemon socket (not `infinity acp`, which delivers only interrupting user text).
 - The broker advertises `fs: false, terminal: false` in ACP `initialize`, so agents use their own tools.
 - A failed resume is `NeedsRecovery`, never a silently fresh session. `agentctl restart` is the only way out of `NeedsRecovery`.
@@ -134,8 +144,8 @@ New `infinity-provider-local` binary, registered in `providers.json`, hand-writt
 
 | | |
 |---|---|
-| **Untouched** | stores and JSON persistence, `rap-protocol`, `rap-client`, `infinity-rap-bridge`, `infinity-mcp-bridge`, `infinity-provider-{bedrock,rig}`, `sandbox-*`. `infinity-agent-cli` needs only one match arm for the new `DaemonMessage` (`daemon_client.rs:128`). |
-| **Patched, est. ~230 non-test lines, additive, two commits** | Commit 1, peer messages (~205): `infinity-agent-core` (`TaggedSyntheticKind::PeerMessage`, deferral classification, settling-result-first ordering in `filter_deferrable`, anchorless prepare branch with `MessageId`-derived call ID, `AgentEvent::InputCommitted` after `sync()` and on dedup of a durable input, interrupt control path in router and driver, display), `infinity-protocol` (`ClientMessage::DeliverPeerMessage`, `ClientMessage::Interrupt`, `DaemonMessage::InputCommitted`), `infinity-daemon` (dispatch, remote strip, forwarding). Commit 2, provider cancellation (~22): `infinity-provider-protocol` (`handle_invoke` disconnect race). Line counts are the sketch's per-hunk estimates in `sketch/infinity_patch.rs`, not a measured diff. |
+| **Untouched** | stores other than the write-error fix below, `rap-protocol`, `rap-client`, `infinity-rap-bridge`, `infinity-mcp-bridge`, `infinity-provider-{bedrock,rig}`, `sandbox-*`. `infinity-agent-cli` needs only one match arm for the new `DaemonMessage` (`daemon_client.rs:128`). |
+| **Patched, two commits** | Commit 1, peer messages (measured: about +358/−83 non-test lines, net about +275, after review):  `infinity-agent-core` (`TaggedSyntheticKind::PeerMessage`, deferral classification, settling-result-first ordering in `filter_deferrable`, anchorless prepare branch with `MessageId`-derived call ID, `AgentEvent::InputCommitted` after `sync()` and on dedup of a durable input, interrupt control path in router and driver, display), `infinity-protocol` (`ClientMessage::DeliverPeerMessage`, `ClientMessage::Interrupt`, `DaemonMessage::InputCommitted`), `infinity-daemon` (dispatch, remote strip, forwarding; `PersistentConversationStore` and `PersistentStateStore` now return write errors instead of dropping them, and roll back their caches on a failed write). Commit 2, provider cancellation (~22): `infinity-provider-protocol` (`handle_invoke` disconnect race). Commit 2's count is the sketch's estimate in `sketch/infinity_patch.rs`, not a measured diff. |
 | **New crates in this workspace** | `agentd` (broker), `agentctl`, `infinity-provider-local`. They depend on the core only through `infinity-protocol`, `rap-protocol` and `infinity-provider-protocol`. |
 | **Config only** | `~/.infinity/rap.json`: one `toolset_server` entry for agentd. `~/.infinity/providers.json`: `local`. |
 
@@ -268,7 +278,7 @@ v1 (one machine, a handful of agents) builds the parts that change stored data, 
 
 ## Open questions and risks
 
-- Which ACP shims pass the spike (`session/load`, MCP injection, permission relay)? Each failure means a native adapter in v1.
+- Does Prime's `--mode rpc` match Pi's RPC closely enough for one adapter?
 - What are Muse's MSP messages for resume, approval and MCP registration? Port them from T3 Code's native `muse` driver.
 - Should peer messages also travel as a RAP-level event (`RapCallback::ThreadEvent`), so external RAP servers can use them too?
 - The daemon never respawns a dead provider process. Should agentd restart the whole daemon on provider death (re-offer makes that safe), or should the provider be crash-proof?
@@ -277,8 +287,8 @@ v1 (one machine, a handful of agents) builds the parts that change stored data, 
 - Where does screening run? Clef-Flash (9B) does not fit beside the 22 GB coder profile on the 24 GB 3090. The options are a smaller coder profile, a second GPU, or hosted screening on Workers AI, which sends message content off the machine.
 - Which third family completes the screening ensemble, given that Clef is Qwen-based?
 - What does `size_immune_team` optimize beyond queueing arithmetic, and how does it price a family that is accurate but slow?
-- History and processed IDs commit separately in core (`event_processor.rs:645`), and dedup write errors are ignored. A crash in that window can show a duplicate peer message with the same ID. Accept for v1, or fix in core?
+- History and processed IDs are two separate writes in core (`sync()` in `event_processor.rs`). Two paths reach the gap between them: a process crash between the writes, and a failed processed-ID write followed by the driver going idle, which drops the retry state. Either way a re-offer appends the peer message a second time. Neither path loses mail or sends a false receipt. Accepted for v1. One fix closes both: write history and processed IDs together, or rebuild processed IDs from history on load.
 
 ## Next implementation step
 
-Build commit 1 of the Infinity patch with core tests (a peer deferred behind a pending non-passive tool call; `[peer, result]` in one batch settling the result first; a re-offered peer absorbed as a duplicate; `InputCommitted` emitted only after `sync()`; a sleep woken by a peer), and in parallel spike the three ACP shims against Prime's native ACP. Before the first agentd release, add `act`, `task` and `exposure` to the mailroom schema and the `exposures` and `tasks` tables (`sketch/swarm.rs`), so history recorded from day one carries lineage.
+Commit 1 (peer messages) and the ACP spike are done. Next: commit 2 (provider cancellation), then the agentd mailroom with the ACP adapter for Claude and Codex. Before the first agentd release, add `act`, `task` and `exposure` to the mailroom schema and the `exposures` and `tasks` tables (`sketch/swarm.rs`), so history recorded from day one carries lineage.
