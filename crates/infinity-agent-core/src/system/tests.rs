@@ -2197,3 +2197,138 @@ async fn parent_message_reaches_child_after_child_compaction() {
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn event_before_result_in_batch_preserves_real_result() {
+    let (model, mut ctrl) = model_source(None);
+    let conv = crate::stores::InMemoryConversationStore::new();
+    let state = crate::stores::InMemoryStateStore::new();
+    let mut system =
+        super::AgentSystemBuilder::new(conv, state, model, ChannelSender::new_pair().0)
+            .tools(vec![Box::new(AsyncTool) as Box<dyn Tool<ChannelSender>>])
+            .build();
+    let observer = super::EventCollector::new();
+    let mut defer = super::InMemoryDeferQueue::new();
+    let first = system.step(vec![user_text_input("t1", "work")], &observer, &mut defer);
+    let respond = async {
+        ctrl.next_request().await;
+        ctrl.send_tool_call("tc-work", "async_tool", serde_json::json!({}));
+        ctrl.finish();
+    };
+    let (result, ()) = tokio::join!(first, respond);
+    result.expect("first step");
+    let second = system.step(
+        vec![
+            subscription_event_input("t1", "tc-work", "event data"),
+            tool_result_input("t1", "tc-work", "real result"),
+        ],
+        &observer,
+        &mut defer,
+    );
+    let respond = async {
+        let req = ctrl.next_request().await;
+        let texts = tool_result_texts(&req);
+        assert_eq!(texts, vec!["real result", "event data"]);
+        ctrl.send_text("done");
+        ctrl.finish();
+    };
+    let (result, ()) = tokio::join!(second, respond);
+    result.expect("second step");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn peer_deferred_until_real_result_and_peer_first_batch_settles() {
+    for same_batch in [false, true] {
+        let (model, mut ctrl) = model_source(None);
+        let conv = crate::stores::InMemoryConversationStore::new();
+        let mut system = super::AgentSystemBuilder::new(
+            conv,
+            crate::stores::InMemoryStateStore::new(),
+            model,
+            ChannelSender::new_pair().0,
+        )
+        .tools(vec![Box::new(AsyncTool) as Box<dyn Tool<ChannelSender>>])
+        .build();
+        let observer = super::EventCollector::new();
+        let mut defer = super::InMemoryDeferQueue::new();
+        let first = system.step(vec![user_text_input("t1", "work")], &observer, &mut defer);
+        let respond = async {
+            ctrl.next_request().await;
+            ctrl.send_tool_call("tc-work", "async_tool", serde_json::json!({}));
+            ctrl.finish();
+        };
+        let (result, ()) = tokio::join!(first, respond);
+        result.expect("first step");
+        let peer = peer_input("t1", "mail-1", "peer payload");
+        let mut batch = vec![];
+        if same_batch {
+            batch.push(peer);
+        } else {
+            system
+                .step(vec![peer], &observer, &mut defer)
+                .await
+                .expect("defer peer");
+            assert!(
+                ctrl.try_next_request().is_none(),
+                "peer must wait for real result"
+            );
+        }
+        batch.push(tool_result_input("t1", "tc-work", "real result"));
+        let second = system.step(batch, &observer, &mut defer);
+        let respond = async {
+            let req = ctrl.next_request().await;
+            assert_eq!(tool_result_texts(&req), vec!["real result", "peer payload"]);
+            let injected = req
+                .chat_history
+                .iter()
+                .find_map(|m| {
+                    if let infinity_provider_protocol::message::Message::Assistant { content } = m {
+                        content.iter().find_map(|c| match c {
+                            infinity_provider_protocol::message::AssistantContent::ToolCall(
+                                call,
+                            ) if call.function.name == "receive_event__injected" => Some(call),
+                            _ => None,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .expect("injected peer call");
+            assert_eq!(injected.id, "peer-mail-1");
+            assert_eq!(injected.function.arguments["from"], "@planner");
+            ctrl.send_text("done");
+            ctrl.finish();
+        };
+        let (result, ()) = tokio::join!(second, respond);
+        result.expect("second step");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn peer_wakes_passive_sleep() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (running, mut rx, mut ctrl, _) = start_system(vec![], None);
+            running
+                .send_user_text(ThreadId::from_ref("t1"), "sleep")
+                .await;
+            ctrl.next_request().await;
+            ctrl.send_tool_call(
+                "tc-sleep",
+                "sleep_until_event_or_input",
+                serde_json::json!({}),
+            );
+            ctrl.finish();
+            collect_until_finished(&mut rx).await;
+            let (peer, id) = peer_input("t1", "wake", "wake up");
+            running.send(peer, &id).await;
+            let req = tokio::time::timeout(std::time::Duration::from_secs(5), ctrl.next_request())
+                .await
+                .expect("peer must wake passive sleep");
+            assert!(tool_result_texts(&req).iter().any(|s| s == "wake up"));
+            ctrl.send_text("awake");
+            ctrl.finish();
+            collect_until_finished(&mut rx).await;
+        })
+        .await;
+}

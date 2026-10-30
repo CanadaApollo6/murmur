@@ -64,6 +64,8 @@ pub enum TaggedSyntheticKind {
     },
     #[serde(rename = "parent_message")]
     ParentMessage { tool_call_id: ToolCallId },
+    #[serde(rename = "peer_message")]
+    PeerMessage { from: String },
     #[serde(rename = "compaction")]
     Compaction,
     #[serde(rename = "compaction_complete")]
@@ -81,6 +83,9 @@ impl SyntheticKind {
             }
             SyntheticKind::Tagged(TaggedSyntheticKind::ParentMessage { tool_call_id }) => {
                 tool_call_id
+            }
+            SyntheticKind::Tagged(TaggedSyntheticKind::PeerMessage { .. }) => {
+                ToolCallId::from_ref("")
             }
             SyntheticKind::Tagged(TaggedSyntheticKind::Compaction) => ToolCallId::from_ref(""),
             SyntheticKind::Tagged(TaggedSyntheticKind::CompactionComplete) => {

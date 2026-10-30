@@ -1047,6 +1047,34 @@ where
         }
     };
 
+    if let Some(SyntheticKind::Tagged(TaggedSyntheticKind::PeerMessage { from })) =
+        &input_msg.synthetic
+    {
+        let UserContent::ToolResult(mut result) = user_content else {
+            return Err("peer message is not a tool result".into());
+        };
+        let invocation = infinity_provider_protocol::message::ToolCall {
+            id: message_id.clone(),
+            call_id: None,
+            function: infinity_provider_protocol::message::ToolFunction {
+                name: "receive_event__injected".to_owned(),
+                arguments: serde_json::json!({ "original_tool_name": "peer_message", "from": from }),
+            },
+        };
+        result.id = message_id.clone();
+        let msg = InfinityMessage::SubscriptionEvent {
+            result: Box::new(result),
+            tool_call_id: ToolCallId::from(""),
+            child_thread_id: None,
+            invocation: Some(Box::new(invocation)),
+        };
+        return if current_history.handle_content(msg, message_id)? {
+            Ok(PrepareResult::Ready)
+        } else {
+            Ok(PrepareResult::Handled)
+        };
+    }
+
     // Handle synthetic tool results (subscription events / thread reports)
     // Capture metadata for SubscriptionEvent variant before synthetic_kind is consumed.
     let subscription_event_meta: Option<(ToolCallId, Option<ThreadId>)> =
@@ -1330,6 +1358,8 @@ where
             }) = *synth
             {
                 format!("Report from child thread {}", child_thread_id)
+            } else if let SyntheticKind::Tagged(TaggedSyntheticKind::PeerMessage { from }) = synth {
+                format!("message from {from}")
             } else {
                 let orig_call = current_history.get_history(true).into_iter().find(|h| {
                     if let Message::Assistant { content, .. } = h
