@@ -8,6 +8,8 @@ use crate::supervisor::AgentSpec;
 
 #[derive(Clone, Debug)]
 pub struct KindConfig {
+    pub wire: Wire,
+    pub model: Option<String>,
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
@@ -24,7 +26,21 @@ pub struct KindConfig {
     pub cancel_timeout: Duration,
 }
 
+#[derive(Clone, Debug)]
+pub enum Wire {
+    Acp,
+    Infinity { socket: std::path::PathBuf },
+}
+
 impl KindConfig {
+    pub fn infinity(socket: impl Into<std::path::PathBuf>) -> Self {
+        let mut kind = Self::new("infinity", String::new(), "default");
+        kind.wire = Wire::Infinity {
+            socket: socket.into(),
+        };
+        kind.idle_after = None;
+        kind
+    }
     pub fn claude(command: impl Into<String>) -> Self {
         Self::new("claude", command.into(), "default")
     }
@@ -33,6 +49,8 @@ impl KindConfig {
     }
     fn new(name: &str, command: String, mode: &str) -> Self {
         Self {
+            wire: Wire::Acp,
+            model: None,
             name: name.into(),
             command,
             args: Vec::new(),
@@ -100,6 +118,10 @@ pub(crate) struct OpenRequest<'a> {
 pub(crate) trait Session: Send {
     fn resume_token(&self) -> ResumeToken;
     fn resumable(&self) -> bool;
+    /// Busy delivery must not overtake buffered turn-end evidence.
+    fn accepts_peer_mail(&self) -> bool {
+        false
+    }
     async fn submit(&mut self, turn: Turn) -> Result<(), AdapterError>;
     async fn cancel(&mut self) -> Result<(), AdapterError>;
     async fn answer_permission(&mut self, id: PermissionId, key: &str) -> Result<(), AdapterError>;

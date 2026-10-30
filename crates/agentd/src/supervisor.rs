@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::adapter::*;
-use crate::adapters::acp::AcpAdapter;
+use crate::adapters::AdapterSet;
 use crate::mailroom::{Mailroom, NewMessage, SendOutcome};
 use crate::model::*;
 
@@ -192,7 +192,7 @@ impl Broker {
         let (events, _) = broadcast::channel(1024);
         let mut by_kind = HashMap::new();
         for kind in kinds {
-            if kind.command.is_empty()
+            if (matches!(kind.wire, Wire::Acp) && kind.command.is_empty())
                 || kind.mode.is_empty()
                 || kind
                     .workspace_write_mode
@@ -246,6 +246,11 @@ impl Broker {
             .get(&spec.kind)
             .ok_or_else(|| Error::Rejected("unknown kind".into()))?
             .clone();
+        let model_agent = matches!(kind.wire, Wire::Infinity { .. });
+        let mut spec = spec;
+        if spec.model.is_none() {
+            spec.model = kind.model.clone();
+        }
         let mut agents = self.agents.lock().await;
         let id = self.mailroom.register(spec.name.clone()).await?;
         if agents.get(&id).is_some_and(|h| !h.commands.is_closed()) {
@@ -264,9 +269,14 @@ impl Broker {
             _lease: lease,
             mcp: self.mcp.clone(),
             id,
-            idle_after: spec.idle_after.or(kind.idle_after),
+            idle_after: if model_agent {
+                None
+            } else {
+                spec.idle_after.or(kind.idle_after)
+            },
+            model_agent,
             spec,
-            adapter: Arc::new(AcpAdapter(kind)),
+            adapter: AdapterSet::build(kind),
             mailroom: Arc::clone(&self.mailroom),
             events: self.events.clone(),
             config: self.config.clone(),
@@ -318,6 +328,7 @@ struct AgentActor {
     mailroom: Arc<Mailroom>,
     config: Config,
     idle_after: Option<Duration>,
+    model_agent: bool,
     events: broadcast::Sender<Event>,
     commands: mpsc::Receiver<Command>,
     phase_tx: watch::Sender<Phase>,
@@ -364,7 +375,7 @@ impl AgentActor {
         }
         if let Err(error) = self
             .mailroom
-            .session_ended(self.id, self.incarnation, false)
+            .settle_session(self.id, self.incarnation, false, self.model_agent)
             .await
         {
             tracing::error!(%error,"session cleanup failed");
@@ -377,7 +388,12 @@ impl AgentActor {
     }
     async fn drive(&mut self) -> Result<()> {
         self.mailroom
-            .session_ended(self.id, Incarnation(self.incarnation.0 - 1), false)
+            .settle_session(
+                self.id,
+                Incarnation(self.incarnation.0 - 1),
+                false,
+                self.model_agent,
+            )
             .await?;
         self.start().await?;
         loop {
@@ -463,10 +479,16 @@ impl AgentActor {
         self.start().await
     }
     async fn pump(&mut self) -> Result<()> {
-        if !matches!(self.phase, Phase::Idle | Phase::Dormant) {
+        let busy_peer_delivery = self.phase == Phase::Busy
+            && self.pending.is_empty()
+            && self.session.as_ref().is_some_and(|s| s.accepts_peer_mail());
+        if !matches!(self.phase, Phase::Idle | Phase::Dormant) && !busy_peer_delivery {
             return Ok(());
         }
-        let mail = self.mailroom.pending_for(self.id).await?;
+        let mut mail = self.mailroom.pending_for(self.id).await?;
+        if busy_peer_delivery {
+            mail.retain(|envelope| envelope.class() == DeliveryClass::PeerEvent);
+        }
         if mail.is_empty() {
             return Ok(());
         }
@@ -498,10 +520,10 @@ impl AgentActor {
         if items.is_empty() {
             return Ok(());
         }
-        self.offered = outcome.offered;
+        self.offered.extend(&outcome.offered);
         self.emit(Event::Offered {
             agent: self.id,
-            ids: self.offered.clone(),
+            ids: outcome.offered,
         });
         self.phase(Phase::Busy);
         if let Err(error) = self.session()?.submit(Turn { items }).await {
@@ -545,7 +567,12 @@ impl AgentActor {
                 agent: self.id,
                 text,
             }),
-            SessionEvent::PermissionRequested(request) => self.permission(request).await?,
+            SessionEvent::PermissionRequested(request) => {
+                if self.model_agent && self.phase == Phase::Idle {
+                    self.phase(Phase::Busy);
+                }
+                self.permission(request).await?;
+            }
             SessionEvent::Ended { reason } => self.end(reason).await?,
         }
         Ok(())
@@ -652,7 +679,7 @@ impl AgentActor {
                 .map_err(|e| Error::Rejected(e.to_string()))?;
         }
         self.mailroom
-            .session_ended(self.id, self.incarnation, false)
+            .settle_session(self.id, self.incarnation, false, self.model_agent)
             .await?;
         self.offered.clear();
         self.clear_pending();
@@ -662,7 +689,7 @@ impl AgentActor {
         let idle = self.phase == Phase::Idle;
         self.phase(Phase::Ended);
         self.stop_session().await?;
-        if idle {
+        if idle && !self.model_agent {
             self.phase(Phase::Dormant);
         } else {
             self.crash(reason);
@@ -670,6 +697,7 @@ impl AgentActor {
         Ok(())
     }
     fn crash(&mut self, reason: String) {
+        tracing::warn!(agent=%self.id, %reason, "agent session ended");
         let now = Instant::now();
         while self
             .crashes

@@ -45,7 +45,10 @@ pub struct ListenConfig {
 #[serde(deny_unknown_fields)]
 struct KindFile {
     wire: Option<String>,
+    #[serde(default)]
     command: Vec<String>,
+    socket: Option<PathBuf>,
+    model: Option<String>,
     mode: Option<String>,
     workspace_write_mode: Option<String>,
     full_access_mode: Option<String>,
@@ -65,15 +68,42 @@ impl FileConfig {
             ("codex".to_owned(), KindConfig::codex("codex-acp")),
         ]);
         for (name, entry) in self.kind {
-            if !matches!(entry.wire.as_deref(), None | Some("acp")) {
-                return Err("only ACP kinds are supported".into());
-            }
-            let mut kind = kinds
-                .remove(&name)
-                .ok_or("only claude and codex ACP kinds are supported")?;
-            let (command, args) = entry.command.split_first().ok_or("empty kind command")?;
-            kind.command = command.clone();
-            kind.args = args.to_vec();
+            let mut kind = match entry.wire.as_deref() {
+                Some("infinity") => {
+                    if !entry.command.is_empty()
+                        || !entry.env.is_empty()
+                        || entry.mode.is_some()
+                        || entry.workspace_write_mode.is_some()
+                        || entry.full_access_mode.is_some()
+                        || !entry.sandbox_args.read_only.is_empty()
+                        || !entry.sandbox_args.workspace_write.is_empty()
+                        || !entry.sandbox_args.full_access.is_empty()
+                    {
+                        return Err("Infinity uses daemon configuration, not launch flags".into());
+                    }
+                    let socket = entry.socket.ok_or("Infinity kind needs a socket path")?;
+                    if !socket.is_absolute() {
+                        return Err("Infinity socket must be absolute".into());
+                    }
+                    KindConfig::infinity(socket)
+                }
+                None | Some("acp") => {
+                    if entry.socket.is_some() {
+                        return Err("ACP kind cannot have an Infinity socket".into());
+                    }
+                    let mut kind = kinds
+                        .remove(&name)
+                        .ok_or("only claude and codex ACP kinds are supported")?;
+                    let (command, args) =
+                        entry.command.split_first().ok_or("empty kind command")?;
+                    kind.command = command.clone();
+                    kind.args = args.to_vec();
+                    kind
+                }
+                Some(_) => return Err("unknown adapter wire".into()),
+            };
+            kind.name = name.clone();
+            kind.model = entry.model;
             kind.env = entry.env;
             if let Some(mode) = entry.mode {
                 kind.mode = mode;

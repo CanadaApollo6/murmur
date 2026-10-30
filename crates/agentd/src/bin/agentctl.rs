@@ -59,6 +59,7 @@ enum Command {
 }
 #[derive(Clone, ValueEnum)]
 enum Kind {
+    Infinity,
     Claude,
     Codex,
 }
@@ -89,6 +90,7 @@ async fn run(args: Args) -> Result<()> {
             spec: AgentSpec {
                 name: AgentName::parse(&name)?,
                 kind: match kind {
+                    Kind::Infinity => "infinity",
                     Kind::Claude => "claude",
                     Kind::Codex => "codex",
                 }
