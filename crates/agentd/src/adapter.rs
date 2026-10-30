@@ -18,6 +18,8 @@ pub struct KindConfig {
     pub sandbox_args: SandboxArgs,
     pub idle_after: Option<Duration>,
     pub request_timeout: Duration,
+    /// Maximum wait for prompt completion after cancel, before crashing the session.
+    pub cancel_timeout: Duration,
 }
 
 impl KindConfig {
@@ -38,6 +40,7 @@ impl KindConfig {
             sandbox_args: SandboxArgs::default(),
             idle_after: Some(Duration::from_secs(600)),
             request_timeout: Duration::from_secs(60),
+            cancel_timeout: Duration::from_secs(2),
         }
     }
 }

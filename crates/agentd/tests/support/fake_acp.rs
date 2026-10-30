@@ -20,6 +20,17 @@ fn update(session: &str, text: &str) {
         "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}}}),
     );
 }
+fn permission(session: &str, id: &str, reject: bool) {
+    let mut options = vec![json!({"optionId":"yes","name":"Allow once","kind":"allow_once"})];
+    if reject {
+        options.push(json!({"optionId":"no","name":"Reject once","kind":"reject_once"}));
+    }
+    emit(
+        json!({"jsonrpc":"2.0","id":id,"method":"session/request_permission",
+        "params":{"sessionId":session,"toolCall":{"toolCallId":id,"title":"Write file","kind":"edit"},
+        "options":options}}),
+    );
+}
 fn main() {
     let root = PathBuf::from(std::env::var_os("FAKE_ROOT").expect("FAKE_ROOT"));
     let mut log = OpenOptions::new()
@@ -48,12 +59,20 @@ fn main() {
     let mut flight: Option<Value> = None;
     let mut held = false;
     let mut count = 0;
+    let mut late_permissions = 0;
+    let mut ignore_cancel = false;
+    let mut permission_responses_remaining = None;
     loop {
         if held && root.join("release").exists() {
             std::fs::remove_file(root.join("release")).expect("release file");
             held = false;
             if let Some(id) = flight.take() {
                 reply(&id, json!({"stopReason":"end_turn"}));
+                if let Ok(bytes) = std::fs::read(root.join("tail-update.json")) {
+                    let value: Value = serde_json::from_slice(&bytes).expect("tail update");
+                    emit(json!({"jsonrpc":"2.0","method":"session/update",
+                        "params":{"sessionId":session,"update":value}}));
+                }
             }
         }
         let msg = match rx.recv_timeout(Duration::from_millis(2)) {
@@ -118,17 +137,23 @@ fn main() {
                     reply(id, json!({"stopReason":"end_turn"}));
                     continue;
                 }
-                update(session, "started");
-                if text.contains("die-after") {
-                    std::process::exit(18);
+                if !text.contains("silent") {
+                    update(session, "started");
                 }
-                if text.contains("permission") {
+                if text.contains("ignore-cancel") || text.contains("late-permissions") {
+                    ignore_cancel = text.contains("ignore-cancel");
+                    late_permissions = usize::from(text.contains("late-permissions"));
                     flight = Some(id.clone());
-                    emit(
-                        json!({"jsonrpc":"2.0","id":"permission-1","method":"session/request_permission",
-                        "params":{"sessionId":session,"toolCall":{"toolCallId":"call-1","title":"Write file","kind":"edit"},
-                        "options":[{"optionId":"yes","name":"Allow once","kind":"allow_once"},{"optionId":"no","name":"Reject once","kind":"reject_once"}]}}),
-                    );
+                } else if text.contains("two-permissions") {
+                    flight = Some(id.clone());
+                    permission_responses_remaining = Some(2);
+                    permission(session, "permission-1", false);
+                    permission(session, "permission-2", false);
+                } else if text.contains("die-after") {
+                    std::process::exit(18);
+                } else if text.contains("permission") {
+                    flight = Some(id.clone());
+                    permission(session, "permission-1", true);
                 } else if text.contains("hold") {
                     flight = Some(id.clone());
                     held = true;
@@ -138,12 +163,40 @@ fn main() {
             }
             Some("session/cancel") => {
                 held = false;
-                if let Some(id) = flight.take() {
+                if let Some(remaining) = permission_responses_remaining.take() {
+                    assert_eq!(remaining, 0, "cancel must answer every pending permission");
+                }
+                if late_permissions > 0 {
+                    permission(session, "permission-late-1", true);
+                } else if !ignore_cancel && let Some(id) = flight.take() {
                     reply(&id, json!({"stopReason":"cancelled"}));
                 }
             }
-            None if *id == "permission-1" => {
-                if let Some(id) = flight.take() {
+            None if id
+                .as_str()
+                .is_some_and(|id| id.starts_with("permission-late-")) =>
+            {
+                assert_eq!(
+                    msg["result"]["outcome"],
+                    json!({"outcome":"cancelled"}),
+                    "permission after cancel must be cancelled"
+                );
+                if late_permissions == 1 {
+                    late_permissions = 2;
+                    permission(session, "permission-late-2", true);
+                } else {
+                    late_permissions = 0;
+                    reply(
+                        &flight.take().expect("cancelled flight"),
+                        json!({"stopReason":"cancelled"}),
+                    );
+                }
+            }
+            None if *id == "permission-1" || *id == "permission-2" => {
+                if let Some(remaining) = &mut permission_responses_remaining {
+                    assert_eq!(msg["result"]["outcome"], json!({"outcome":"cancelled"}));
+                    *remaining -= 1;
+                } else if let Some(id) = flight.take() {
                     reply(&id, json!({"stopReason":"end_turn"}));
                 }
             }

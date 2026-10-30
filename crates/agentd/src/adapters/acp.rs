@@ -8,6 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::adapter::*;
 use crate::model::*;
@@ -24,6 +25,7 @@ struct Flight {
     request: u64,
     ids: Vec<MessageId>,
     started: bool,
+    cancel_deadline: Option<Instant>,
 }
 struct Pending {
     wire_id: Value,
@@ -269,11 +271,23 @@ impl AcpSession {
                 if method == "session/request_permission" && self.flight.is_none() {
                     return Err(protocol("permission outside a turn"));
                 }
-                self.started();
             }
             match method {
                 "session/update" => {
                     let update = &msg["params"]["update"];
+                    // Session metadata and user echoes can arrive between turns.
+                    if matches!(
+                        update["sessionUpdate"].as_str(),
+                        Some(
+                            "agent_message_chunk"
+                                | "agent_thought_chunk"
+                                | "plan"
+                                | "tool_call"
+                                | "tool_call_update"
+                        )
+                    ) {
+                        self.started();
+                    }
                     let text = match update["sessionUpdate"].as_str() {
                         Some("agent_message_chunk" | "agent_thought_chunk") => {
                             update["content"]["text"].as_str()
@@ -286,6 +300,15 @@ impl AcpSession {
                     }
                 }
                 "session/request_permission" => {
+                    self.started();
+                    if self
+                        .flight
+                        .as_ref()
+                        .is_some_and(|f| f.cancel_deadline.is_some())
+                    {
+                        self.write(json!({"jsonrpc":"2.0","id":msg["id"],"result":{"outcome":{"outcome":"cancelled"}}})).await?;
+                        return Ok(());
+                    }
                     let params = &msg["params"];
                     let options = params["options"]
                         .as_array()
@@ -439,6 +462,7 @@ impl Session for AcpSession {
             request,
             ids,
             started: false,
+            cancel_deadline: None,
         });
         self.write(
             json!({"jsonrpc":"2.0","id":request,"method":"session/prompt",
@@ -447,7 +471,12 @@ impl Session for AcpSession {
         .await
     }
     async fn cancel(&mut self) -> Result<(), AdapterError> {
-        if self.flight.is_some() {
+        if let Some(flight) = &mut self.flight
+            && flight.cancel_deadline.is_none()
+        {
+            flight.cancel_deadline = Some(Instant::now() + self.kind.cancel_timeout);
+            self.events
+                .retain(|event| !matches!(event, SessionEvent::PermissionRequested(_)));
             for (_, pending) in std::mem::take(&mut self.pending) {
                 self.write(json!({"jsonrpc":"2.0","id":pending.wire_id,"result":{"outcome":{"outcome":"cancelled"}}})).await?;
             }
@@ -477,8 +506,15 @@ impl Session for AcpSession {
             if self.ended {
                 return None;
             }
+            let cancel_deadline = self.flight.as_ref().and_then(|f| f.cancel_deadline);
             let incoming = tokio::select! {
                 biased;
+                () = async {
+                    match cancel_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => Err("ACP cancel completion deadline exceeded".into()),
                 msg = self.rx.recv() => msg.unwrap_or_else(|| Err("ACP stdout closed".into())),
                 status = self.child.wait() => Err(format!("ACP exited: {status:?}")),
             };

@@ -11,6 +11,8 @@ Infinity adapter, services, or graph UI is included.
   `KindConfig::claude(path)` selects `default`; `KindConfig::codex(path)` selects
   `read-only`. Both set the mode after new and loaded sessions, before prompting.
   Arguments, environment, MCP server entries and sandbox arguments are configurable.
+  `KindConfig::cancel_timeout` bounds prompt completion after cancel (default two
+  seconds). Expiry crashes and reaps the session, settling mail by start evidence.
 - `spawn(AgentSpec)` registers an agent and returns an `AgentHandle`. A second
   actor for that ID is rejected, including through another broker sharing storage.
   Specs and kind definitions are supplied again when reopening the broker.
@@ -38,8 +40,10 @@ kind's timeout; `None` on the kind disables idle suspension.
 The private adapter contract opens or resumes a session, submits turns, cancels,
 answers permissions, receives normalized events and suspends. Resume tokens are
 opaque persisted data. Prompt completion produces Committed, the only event
-that consumes mail. A first update, permission request or prompt completion
-records turn-start evidence. Protocol errors produce no receipt.
+that consumes mail. A first execution update, permission request or prompt completion
+records turn-start evidence. Only agent message/thought chunks, plans and tool
+calls/updates count as execution updates; metadata and user echoes do not.
+Protocol errors produce no receipt.
 
 ## Mailroom API
 
