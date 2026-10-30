@@ -531,9 +531,11 @@ impl Session for AcpSession {
                     .iter()
                     .copied()
                     .collect::<Vec<_>>();
-                return Some(SessionEvent::Ended {
+                // Deliver evidence queued before the failure (e.g. TurnStarted) first.
+                self.events.push_back(SessionEvent::Ended {
                     reason: format!("{e}; {}", String::from_utf8_lossy(&tail)),
                 });
+                self.ended = true;
             }
         }
     }
