@@ -2949,3 +2949,331 @@ async fn restart_settles_orphaned_active_tool() {
         })
         .await;
 }
+
+fn r6_spawn_before_restart(
+    conv: &crate::stores::InMemoryConversationStore,
+    state: &crate::stores::InMemoryStateStore,
+    compaction: bool,
+) -> ThreadId {
+    use crate::message::InfinityMessage;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        let (model, mut ctrl) = model_source(None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let running = super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
+            .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+        running
+            .send_user_text(ThreadId::from_ref("root"), "spawn work")
+            .await;
+        ctrl.next_request().await;
+        if compaction {
+            ctrl.send_text("root ready");
+            ctrl.finish();
+            running
+                .send(
+                    InputMessage {
+                        content: InputMessageContent::User(UserContent::text("")),
+                        group_id: "root".into(),
+                        metadata: None,
+                        synthetic: Some(SyntheticKind::Tagged(TaggedSyntheticKind::Compaction)),
+                        display_as: None,
+                        subscription: false,
+                    },
+                    "r6-compact",
+                )
+                .await;
+            let request = ctrl.next_request().await;
+            assert!(is_compaction_req(&request));
+            return find_compaction_child_id(&request).into();
+        }
+        ctrl.send_tool_call(
+            "spawn1",
+            "spawn_thread",
+            serde_json::json!({
+                "instructions":"child work", "child_of":["root"]
+            }),
+        );
+        ctrl.finish();
+        let followup = ctrl.next_request().await;
+        let child: ThreadId = tool_result_texts(&followup)
+            .iter()
+            .find_map(|text| {
+                text.strip_prefix("Child thread is successfully spawned and has ID: ")?
+                    .split('.')
+                    .next()
+                    .map(Into::into)
+            })
+            .expect("child ID in synchronous spawn result");
+        ctrl.next_request().await;
+        for id in [ThreadId::from_ref("root"), &child] {
+            let messages = conv.thread_messages(id).expect("durable history");
+            assert!(matches!(&messages.last().expect("tail").0,
+                InfinityMessage::ToolCall { call, .. } if call.id == "spawn1"));
+        }
+        child
+    }))
+}
+
+#[test]
+fn r6_restart_after_parent_spawn_must_not_strand_mail() {
+    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
+    use crate::traits::{ConversationStore, StateStore};
+    use std::time::Duration;
+
+    let conv = InMemoryConversationStore::new();
+    let state = InMemoryStateStore::new();
+    let child = r6_spawn_before_restart(&conv, &state, false);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("replacement runtime");
+    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        state
+            .add_pending_user_choice(
+                ThreadId::from_ref("root"),
+                super::UserChoice {
+                    id: "spawn-choice".into(),
+                    prompt: "obsolete".into(),
+                    choices: vec!["yes".into()],
+                    default: 0,
+                    response_url: "http://unused.test".into(),
+                },
+            )
+            .await
+            .expect("pending choice");
+        let (model, mut ctrl) = model_source(None);
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let running = super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
+            .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+        let (tx, mut replay) = mpsc::unbounded_channel();
+        running.subscribe(ThreadId::from_ref("root"), tx).await;
+        let Evt::Replay(snapshot) = next_evt(&mut replay).await else {
+            panic!("replay")
+        };
+        let peer = peer_input("root", "r6-after-spawn", "mail after restart");
+        running.send(peer.0, &peer.1).await;
+        let request = tokio::time::timeout(Duration::from_millis(500), ctrl.next_request())
+            .await
+            .expect("restart must not strand mail behind parent spawn_thread");
+        assert!(snapshot.idle && snapshot.pending_choices.is_empty());
+        assert!(
+            state
+                .get_pending_user_choices(ThreadId::from_ref("root"))
+                .await
+                .expect("choices")
+                .is_empty()
+        );
+        assert!(format!("{:?}", request.chat_history).contains("mail after restart"));
+        assert_eq!(
+            persisted(&conv, "root")
+                .matches("interrupted: daemon restarted")
+                .count(),
+            1
+        );
+        assert!(!conv.is_thread_closed(&child).await.expect("child status"));
+        ctrl.send_text("received");
+        ctrl.finish();
+        loop {
+            if matches!(next_evt(&mut events).await, Evt::E(AgentEvent::InputCommitted { dedup_id })
+                if dedup_id == peer.1)
+            {
+                break;
+            }
+        }
+        collect_until_finished(&mut events).await;
+
+        let seed = tool_result_input(child.as_str(), "spawn1", "child instructions resumed");
+        running.send(seed.0, &seed.1).await;
+        let request = ctrl.next_request().await;
+        assert!(
+            tool_result_texts(&request)
+                .iter()
+                .any(|s| s == "child instructions resumed")
+        );
+        ctrl.send_tool_call(
+            "child-close",
+            "close_thread",
+            serde_json::json!({
+                "thread_id": child, "report_to_parent": "child survived parent settlement"
+            }),
+        );
+        ctrl.finish();
+        let report = ctrl.next_request().await;
+        assert!(
+            tool_result_texts(&report)
+                .iter()
+                .any(|s| s.contains("child survived parent settlement"))
+        );
+        assert!(conv.is_thread_closed(&child).await.expect("child closed"));
+        ctrl.send_text("report received");
+        ctrl.finish();
+        running.shutdown().await;
+        assert_eq!(
+            persisted(&conv, "root")
+                .matches("interrupted: daemon restarted")
+                .count(),
+            1
+        );
+    }));
+}
+
+#[test]
+fn r6_restart_preserves_real_child_seed() {
+    r6_restart_preserves_seed(false);
+}
+
+#[test]
+fn r6_restart_preserves_real_compaction_seed() {
+    r6_restart_preserves_seed(true);
+}
+
+fn r6_restart_preserves_seed(compaction: bool) {
+    use crate::message::InfinityMessage;
+    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
+
+    let conv = InMemoryConversationStore::new();
+    let state = InMemoryStateStore::new();
+    let child = r6_spawn_before_restart(&conv, &state, compaction);
+    let seed_call_id = conv
+        .thread_info(&child)
+        .expect("child metadata")
+        .spawn_tool_call_id
+        .expect("seed call ID");
+    let before = persisted(&conv, child.as_str());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("replacement runtime");
+    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        let (model, mut ctrl) = model_source(None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let running = super::AgentSystemBuilder::new_local(conv.clone(), state, model)
+            .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+        let (tx, mut replay) = mpsc::unbounded_channel();
+        running.subscribe(&child, tx).await;
+        let Evt::Replay(snapshot) = next_evt(&mut replay).await else {
+            panic!("replay")
+        };
+        assert!(!snapshot.idle, "child seed still awaits its instructions");
+        assert!(
+            matches!(snapshot.history.last(), Some(InfinityMessage::ToolCall { call, .. })
+            if call.id == seed_call_id.as_str() && call.function.name ==
+                    if compaction { "__harness_begin_compaction__" } else { "spawn_thread" })
+        );
+        assert_eq!(persisted(&conv, child.as_str()), before);
+        assert!(
+            ctrl.try_next_request().is_none(),
+            "attachment must not infer"
+        );
+        let seed = tool_result_input(
+            child.as_str(),
+            seed_call_id.as_str(),
+            "child instructions resumed",
+        );
+        running.send(seed.0, &seed.1).await;
+        let request = ctrl.next_request().await;
+        let history = format!("{:?}", request.chat_history);
+        assert!(history.contains("child instructions resumed"));
+        assert!(!history.contains("interrupted: daemon restarted"));
+        ctrl.send_text("child resumed");
+        ctrl.finish();
+        running.shutdown().await;
+    }));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r6_restart_bounds_notifier_lookup_and_cleans_choices() {
+    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
+    use crate::traits::StateStore;
+    use rap_client::http::SimpleHttpClient;
+    use std::time::Duration;
+
+    struct StalledConfig;
+    #[async_trait(?Send)]
+    impl super::ThreadConfigSource<ChannelSender, SimpleHttpClient> for StalledConfig {
+        async fn resolve(
+            &self,
+            _: &ThreadId<str>,
+        ) -> Result<
+            super::ThreadConfig<ChannelSender, SimpleHttpClient>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            panic!("restart must not resolve the toolset");
+        }
+        async fn restart_notifier(
+            &self,
+            _: &ThreadId<str>,
+        ) -> Result<
+            Option<rap_client::notifier::RapNotifier<SimpleHttpClient>>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            std::future::pending().await
+        }
+    }
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let conv = InMemoryConversationStore::new();
+            let state = InMemoryStateStore::new();
+            let (model, mut ctrl) = model_source(None);
+            let (tx, mut events) = mpsc::unbounded_channel();
+            let running = super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
+                .tools(vec![Box::new(AsyncTool) as Box<dyn Tool<ChannelSender>>])
+                .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+            running
+                .send_user_text(ThreadId::from_ref("root"), "work")
+                .await;
+            ctrl.next_request().await;
+            ctrl.send_tool_call("orphan", "async_tool", serde_json::json!({}));
+            ctrl.finish();
+            collect_until_finished(&mut events).await;
+            running.shutdown().await;
+            state
+                .add_pending_user_choice(
+                    ThreadId::from_ref("root"),
+                    super::UserChoice {
+                        id: "orphan".into(),
+                        prompt: "obsolete".into(),
+                        choices: vec!["yes".into()],
+                        default: 0,
+                        response_url: "http://unused.test".into(),
+                    },
+                )
+                .await
+                .expect("pending choice");
+            let (model, mut ctrl) = model_source(None);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let running = super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
+                .thread_config(StalledConfig)
+                .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+            let (tx, mut replay) = mpsc::unbounded_channel();
+            running.subscribe(ThreadId::from_ref("root"), tx).await;
+            let event = tokio::time::timeout(Duration::from_secs(3), replay.recv())
+                .await
+                .expect("restart attachment must bound notifier lookup")
+                .expect("replay");
+            let Evt::Replay(snapshot) = event else {
+                panic!("replay")
+            };
+            assert!(snapshot.idle && snapshot.pending_choices.is_empty());
+            assert!(
+                state
+                    .get_pending_user_choices(ThreadId::from_ref("root"))
+                    .await
+                    .expect("durable choices")
+                    .is_empty()
+            );
+            assert_eq!(
+                persisted(&conv, "root")
+                    .matches("interrupted: daemon restarted")
+                    .count(),
+                1
+            );
+            assert!(ctrl.try_next_request().is_none(), "recovery must not infer");
+            running.shutdown().await;
+        })
+        .await;
+}
