@@ -17,6 +17,124 @@ use tokio::sync::mpsc;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+#[test]
+fn r5_restart_settles_external_executor_and_rejects_late_result() {
+    let external = tokio::runtime::Runtime::new().expect("external runtime");
+    let (inv_tx, mut inv_rx) = mpsc::unbounded_channel::<rap_protocol::RapInvocation>();
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let port = external.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("external listener");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let tx = inv_tx.clone();
+                let cancel_tx = cancel_tx.clone();
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let tx = tx.clone();
+                        let cancel_tx = cancel_tx.clone();
+                        async move {
+                            use http_body_util::BodyExt;
+                            let response = if req.uri().path() == "/.well-known/rap-toolset" {
+                                serde_json::json!({"name":"external", "endpoint":format!("http://127.0.0.1:{port}/invoke"), "tools":[{"name":"external_work","description":"work","inputSchema":{"type":"object"}}]}).to_string()
+                            } else if req.uri().path() == "/cancel_tool_call" {
+                                let body = req.into_body().collect().await.expect("cancellation body").to_bytes();
+                                cancel_tx.send(serde_json::from_slice(&body).expect("cancellation")).expect("observe cancellation");
+                                // The executor stays alive and never acknowledges cancellation.
+                                std::future::pending::<String>().await
+                            } else {
+                                let body = req.into_body().collect().await.expect("invocation body").to_bytes();
+                                tx.send(serde_json::from_slice(&body).expect("invocation")).expect("observe invocation");
+                                "{}".into()
+                            };
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from(response))))
+                        }
+                    });
+                    if let Err(error) = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), service).await {
+                        eprintln!("external RAP connection ended: {error}");
+                    }
+                });
+            }
+        });
+        port
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (state, cwd, root, inv) = runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        let mut h = start_harness().await.expect("harness");
+        rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
+        let root = create_session_and_chat(&mut h).await;
+        h.client_tx
+            .send(ClientMessage::UserInput {
+                thread_id: root.clone(),
+                text: "run external work".into(),
+            })
+            .expect("input");
+        h.ctrl.next_request().await;
+        h.ctrl
+            .send_tool_call("external-call", "external_work", serde_json::json!({}));
+        h.ctrl.finish();
+        let inv = tokio::time::timeout(Duration::from_secs(3), inv_rx.recv())
+            .await
+            .expect("invocation timeout")
+            .expect("invocation");
+        wait_for_message(&mut h.daemon_rx, |m| {
+            matches!(m, DaemonMessage::ResponseDone { .. })
+        })
+        .await;
+        (h._state_dir, h.cwd, root, inv)
+    }));
+    drop(runtime);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("replacement");
+    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        let mut h = start_harness_at(state, cwd).await.expect("replacement harness");
+        assert_ne!(h.callback_url, inv.callback_url);
+        h.client_tx.send(ClientMessage::Connect { root_thread_id: root.clone(), thread_id:None, keeps_session_alive:true }).expect("connect");
+        let replay = wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
+        let callback = rap_protocol::RapCallback::ToolResult(rap_protocol::RapToolResult {
+            group_id:inv.group_id.clone(), id:inv.id.clone(), call_id:inv.call_id.clone(), text:Some("external work finished".into()), content:None, display_as:None, subscription:None,
+        });
+        let delivery = reqwest::Client::new().post(&inv.callback_url).header("content-type", "application/json").body(serde_json::to_vec(&callback).expect("callback")).timeout(Duration::from_millis(300)).send().await;
+        assert!(delivery.is_err(), "old callback destination must be gone");
+        eprintln!("R5 external executor survived, but callback {} is gone; replacement is {}", inv.callback_url, h.callback_url);
+        h.client_tx.send(ClientMessage::DeliverPeerMessage { thread_id:root.clone(), message_id:"human-after-restart".into(), from:"human".into(), text:"human after restart".into() }).expect("mail");
+        let request = tokio::time::timeout(Duration::from_secs(3), h.ctrl.next_request()).await.expect("external tool recovery must not strand human mail indefinitely");
+        assert!(matches!(replay, DaemonMessage::Replay { idle:true, .. }), "restart must settle before replay");
+        let cancelled = tokio::time::timeout(Duration::from_secs(1), cancel_rx.recv()).await.expect("bounded restart notification").expect("cancellation");
+        assert_eq!(cancelled["thread_id"], inv.group_id.as_str());
+        assert_eq!(cancelled["tool_call_id"], inv.id.as_str());
+        let history = format!("{:?}", request.chat_history);
+        assert!(history.contains("human after restart") && history.contains("interrupted: daemon restarted"));
+        h.ctrl.send_text("recovered");
+        h.ctrl.finish();
+        wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::InputCommitted { dedup_id, .. } if dedup_id == "peer-human-after-restart")).await;
+        wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::ThreadIdle { .. })).await;
+
+        let status = reqwest_post(&h.callback_url, &serde_json::to_string(&callback).expect("late callback")).await;
+        assert_eq!(status, 200);
+        h.client_tx.send(ClientMessage::DeliverPeerMessage { thread_id:root.clone(), message_id:"after-late-result".into(), from:"human".into(), text:"check late result".into() }).expect("mail after late result");
+        let request = tokio::time::timeout(Duration::from_secs(3), h.ctrl.next_request()).await.expect("mail after late result");
+        let history = format!("{:?}", request.chat_history);
+        assert!(history.contains("check late result"), "late result must not start its own inference");
+        assert_eq!(history.matches("interrupted: daemon restarted").count(), 1);
+        assert!(!history.contains("external work finished"));
+        h.ctrl.send_text("still settled");
+        h.ctrl.finish();
+        wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::ThreadIdle { .. })).await;
+        let payloads = std::fs::read_dir(h._state_dir.path().join("threads")).expect("threads")
+            .map(|entry| std::fs::read_to_string(entry.expect("entry").path()).expect("thread payload")).collect::<String>();
+        assert_eq!(payloads.matches("interrupted: daemon restarted").count(), 1);
+        assert!(!payloads.contains("external work finished"), "late callback cannot append a second result");
+        assert!(inv_rx.try_recv().is_err(), "restart must not re-invoke the executor");
+    }));
+}
+
 struct TestHarness {
     manager: SharedSessionManager,
     callback_url: String,

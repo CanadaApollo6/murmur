@@ -93,7 +93,7 @@ struct ResolvedConfig<M: InputSender, H: HttpClient> {
 ///
 /// The thread's configuration (tools, prompt, notifier) is resolved lazily
 /// on the first step. A resident system also resolves configuration when
-/// loading an unanswered executor call, to decide whether it survived restart.
+/// loading an unanswered executor call, to notify its server of cancellation.
 pub struct Thread<C: ConversationStore, S: StateStore, M: InputSender, H: HttpClient> {
     inner: Rc<SystemInner<C, S, M, H>>,
     history: HistoryManager<C, S>,
@@ -151,20 +151,22 @@ where
                     CLOSE_THREAD_TOOL | "spawn_thread" | "__harness_begin_compaction__"
                 )
             {
+                // A tool call does not outlive the daemon that dispatched it.
+                // Even external executors retain the old ephemeral callback URL.
+                thread
+                    .history
+                    .interrupt_pending_tool_call_with_text("interrupted: daemon restarted");
+                thread.history.settle_tool_results_on_interrupt().await?;
+                let interrupted = thread.history.take_interrupted_tool_calls();
                 let config = thread.resolved_config().await?;
-                let survives = config
-                    .tools
-                    .iter()
-                    .find(|tool| tool.name() == name)
-                    .is_some_and(|tool| tool.survives_restart());
-                if !survives {
-                    thread
-                        .history
-                        .interrupt_pending_tool_call_with_text("interrupted: daemon restarted");
-                    thread.history.settle_tool_results_on_interrupt().await?;
-                    thread.history.take_interrupted_tool_calls();
-                    orphaned = true;
+                if let Some(notifier) = &config.rap_notifier {
+                    for call_id in interrupted {
+                        notifier
+                            .notify_tool_cancelled(&thread.history.thread_id, &call_id)
+                            .await;
+                    }
                 }
+                orphaned = true;
             }
             if orphaned {
                 let choices = thread.pending_choices.borrow().clone();
@@ -304,15 +306,7 @@ where
             let config = self.resolved_config().await?;
             if let Some(notifier) = &config.rap_notifier {
                 for call_id in interrupted {
-                    if tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        notifier.notify_tool_cancelled(thread_id, &call_id),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        tracing::warn!(%thread_id, %call_id, "RAP cancellation notification timed out");
-                    }
+                    notifier.notify_tool_cancelled(thread_id, &call_id).await;
                 }
             }
         }
