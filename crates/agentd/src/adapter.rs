@@ -24,6 +24,8 @@ pub struct KindConfig {
     pub request_timeout: Duration,
     /// Maximum wait for prompt completion after cancel, before crashing the session.
     pub cancel_timeout: Duration,
+    /// Busy inactivity limit while mail waits. Zero disables cancellation.
+    pub stall_timeout: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +79,7 @@ impl KindConfig {
             idle_after: Some(Duration::from_secs(600)),
             request_timeout: Duration::from_secs(60),
             cancel_timeout: Duration::from_secs(2),
+            stall_timeout: Duration::from_secs(600),
         }
     }
 }

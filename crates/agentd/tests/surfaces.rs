@@ -933,3 +933,50 @@ async fn agentctl_spawns_an_infinity_kind_and_relays_approval() {
     input.die();
     d.stop(nix::sys::signal::Signal::SIGTERM).await;
 }
+
+#[test]
+fn stall_timeout_config_is_per_kind_and_zero_disables() {
+    let dir = tempfile::tempdir().expect("config dir");
+    let path = dir.path().join("kinds.toml");
+    std::fs::write(
+        &path,
+        r#"
+[kind.claude]
+command = ["claude-agent-acp"]
+stall_timeout_secs = 0
+[kind.infinity]
+wire = "infinity"
+socket = "/tmp/infinity-test.sock"
+stall_timeout_secs = 27
+"#,
+    )
+    .expect("config");
+    let kinds = agentd::surfaces::FileConfig::load(&path)
+        .expect("load")
+        .kinds()
+        .expect("kinds");
+    assert_eq!(
+        kinds
+            .iter()
+            .find(|k| k.name == "claude")
+            .expect("claude")
+            .stall_timeout,
+        Duration::ZERO
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .find(|k| k.name == "infinity")
+            .expect("infinity")
+            .stall_timeout,
+        Duration::from_secs(27)
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .find(|k| k.name == "codex")
+            .expect("codex")
+            .stall_timeout,
+        Duration::from_secs(600)
+    );
+}

@@ -123,10 +123,11 @@ One actor per agent, one state machine for every kind: `Dormant → Starting →
 - Model agents never suspend: an idle Infinity thread has no driver and costs nothing.
 - CLI agents suspend after `idle_after` (default 10 min): kill the process, keep the session ID. Mail wakes it with a resume.
 - Cancel uses ACP `session/cancel` or Infinity `Interrupt`. Core persists the tool settlement and choice removal before idle acknowledgment. Accepted real results survive provider failure and interruption. Before idle or after a step error, a leading tool result that answers a pending call is persisted without promoting unrelated unvalidated mail.
-- Settlement write failures retry every 100 ms for three seconds, then enter Held. Held retains the result, runs no inference, and retries on input, interrupt, and a five-second timer. A failed choice write enters this same bounded path. RAP cancellation notifications have a two-second bound. Receipt deadlines and exhausted or held settlement errors reconnect without spending the crash budget. Interrupt deadlines retry separately. After `crash_limit` interrupt expiries without progress, the actor enters `NeedsRecovery`. Committed input, a completed turn, or cancellation acknowledgment resets the interrupt count and Unavailable backoff. Successful attachment does not reset either. The mailroom bounds unreceipted delivery with `max_attempts` and moves exhausted mail to Held. Storage repair permits automatic recovery until the interrupt retry limit is reached.
-- `ThreadIdle` and `Replay.idle` describe phase and cancellation completion. They do not gate mail delivery. `Welcome` includes a random daemon boot ID, saved in the adapter's opaque resume token. On reopen, agentd sends one `Interrupt` when the boot ID changed and replay is busy. A driver-failure protocol error from any thread on the connection uses the same recovery within one daemon. A root `SessionsUpdated` status of Stopped records `needs_interrupt` and ends the attachment without spending a crash. Connect clears and persists shutdown even for a live driver. Shutdown kills RAP servers but leaves model completions alive, so recovery skips Interrupt when `Replay.in_progress` is true. Busy replay waiting on a non-passive tool still receives Interrupt. An orphaned pending choice also starts a driver to settle the interruption. An Archived root enters `NeedsRecovery`. The actor saves the resume token at start and on `ResumeUpdated`, before handling other events from that message. Idle or a new completion can clear the marker. Actor shutdown also saves the suspend token. The interrupt settles durably without re-executing tools. A later completion start also acknowledges an outstanding cancellation.
-- Recovery belongs to the broker. Core has no dispatch journal, runtime registry, epochs, or recovery on load. Only agentd-attached threads auto-recover after a daemon restart. An executor lost inside a running daemon needs `agentctl cancel` unless a driver failure or session shutdown signals the loss. Detached sleep executors catch panics and deliver terminal tool errors. Sleep durations are validated before spawning. Existing child threads keep their own history and seeds when the attached parent's orphaned spawn call settles. Late callbacks are rejected after settlement unless the provider reused the call ID for a newer occurrence, which remains follow-up work.
-- Daemon EOF reconnects under a new incarnation and re-offers unconsumed mail. Unreachable-daemon spawn failures do not consume model agents' crash limit. Retry backoff is capped at 60 seconds. Other connected-session failures count as crashes. A daemon-reported missing or archived Infinity thread enters `NeedsRecovery`; transient resume errors use normal backoff. ACP behavior is unchanged.
+- Settlement write failures retry every 100 ms for three seconds, then enter Held. Held retains the result, runs no inference, and retries on input, interrupt, and a five-second timer. A failed choice write enters this same bounded path. RAP cancellation notifications have a two-second bound. Receipt deadlines and exhausted or held settlement errors reconnect without spending the crash budget. Repeated interrupt expiry for ten minutes without committed input, a completed turn, or cancellation acknowledgment enters `NeedsRecovery`. Successful attachment does not reset the bound or Unavailable backoff.
+- Every kind uses one supervisor mail-starvation timer. A Busy agent with Offered mail or queued mail deferred behind work or a permission is cancelled through the existing path after `stall_timeout` without activity. Chunks, tool starts and results, completion boundaries, choices, receipts, and turn ends reset the clock. Reconnects and additional mail do not. No waiting mail means no stall deadline. Per-kind TOML `stall_timeout_secs` defaults to 600; `0` disables it. The Rust setting is `KindConfig::stall_timeout`. Ten minutes leaves room for ordinary long tools and provider pauses. The cost is deliberate: a tool that runs silently longer than the limit while mail waits gets cancelled. Operators can raise or disable it for such tools. Cancellation that never acknowledges still reaches the existing ten-minute no-progress bound.
+- `Welcome` includes a random daemon boot ID, saved in the adapter's opaque resume token. On reopen, agentd sends one `Interrupt` when the boot ID changed and replay is busy. A driver-failure protocol error from any thread uses the same recovery within one daemon. Stopped reconnects without spending a crash or requesting Interrupt. Connect reopens non-archived shutdown admission. The marker is persisted when it changes. Shutdown preserves live streams, external calls, MCP calls, and their choices. Unknown or stale choice answers receive errors. Command server shutdown settles its pending calls with terminal errors. Command invocations have independent callback scopes, so reused model call IDs cannot collide in deduplication. Callback and shutdown settlement compete for the same invocation; the first locally received terminal result wins. A shutdown error does not prove side effects did not occur, so a non-idempotent tool requires checking before retry. Core terminal acceptance and cancellation retire the registry entries. External and MCP calls are not registered for shutdown.
+- Archive closes new input admission before shutting servers down. A resident driver may persist terminal results for existing calls, but may not start a new model completion or dispatch a new tool. Retained RAP handles also check archive state before boot and dispatch. Migration freezes its source this way before cleanup and serialization. An Archived root enters `NeedsRecovery`; Interrupt and Connect cannot reopen it.
+- Restart recovery belongs to the broker. Core has no dispatch persistence or recovery on load. Only agentd-attached threads auto-recover after a daemon restart. Detached sleep executors catch panics and deliver terminal errors. Existing children retain their histories and seeds. Invocation-scoped callbacks fix late reused-ID callbacks for command-backed servers. External and MCP late callbacks with reused IDs remain follow-up work.
 - `Service`s (the inference server, `infinity daemon`) start in dependency order and restart with backoff. The inference server starts first because `list_models` runs once at daemon start.
 - **Watchdog:** an `Interceptor` at `Mailroom::accept`, a pure function of an envelope and its conversation view that can deliver, hold or reject. v1 ships `HopLimit`. Activity-based detectors subscribe to the event bus.
 - **Graph UI:** `/events` serves a snapshot at cursor N, then `AgentChanged`, `MessageAccepted/Offered/Consumed/Held`, `PermissionPending` and display-only `Activity`. Every message crosses one choke point, so the graph is complete by construction.
@@ -147,7 +148,7 @@ New `infinity-provider-local` binary, registered in `providers.json`, hand-writt
 
 | | |
 |---|---|
-| **Untouched** | `rap-protocol`, `infinity-rap-bridge`, `infinity-mcp-bridge`, `infinity-provider-{bedrock,rig}`, and `sandbox-*`. `rap-client` bounds cancellation notifications. `infinity-agent-cli` accepts the additive idle event. Stores retain the write-error fixes below and add no recovery API or dispatch persistence. |
+| **Untouched** | `rap-protocol`, `infinity-mcp-bridge`, `infinity-provider-{bedrock,rig}`, and `sandbox-*`. `rap-client` retains callback request paths for invocation scopes and bounds cancellation notifications. `infinity-rap-bridge` scopes callback dedup IDs. `infinity-agent-cli` accepts the additive idle event. Stores retain the write-error fixes below and add no recovery API or dispatch persistence. |
 | **Patched, two commits** | Commit 1, peer messages (measured: about +358/−83 non-test lines, net about +275, after review):  `infinity-agent-core` (`TaggedSyntheticKind::PeerMessage`, deferral classification, settling-result-first ordering in `filter_deferrable`, anchorless prepare branch with `MessageId`-derived call ID, `AgentEvent::InputCommitted` after `sync()` and on dedup of a durable input, interrupt control path in router and driver, display), `infinity-protocol` (`ClientMessage::DeliverPeerMessage`, `ClientMessage::Interrupt`, `DaemonMessage::InputCommitted`), `infinity-daemon` (dispatch, remote strip, forwarding; `PersistentConversationStore` and `PersistentStateStore` now return write errors instead of dropping them, and roll back their caches on a failed write). Commit 2, provider cancellation (measured: +20/−2 non-test lines): `infinity-provider-protocol` (`handle_invoke` races the invoke future and each stream item against EOF on the socket, so a client that hangs up frees its provider queue place or slot at once). |
 | **New crates in this workspace** | `agentd` (broker), `agentctl`, `infinity-provider-local`. They depend on the core only through `infinity-protocol`, `rap-protocol` and `infinity-provider-protocol`. |
 | **Config only** | `~/.infinity/rap.json`: one `toolset_server` entry for agentd. `~/.infinity/providers.json`: `local`. |
@@ -157,18 +158,20 @@ reports driver panics as protocol errors. Core keeps durable interrupt settlemen
 leading-result persistence, bounded cancellation notification, and idle/display
 events. It does not infer executor liveness or repair calls during load. Only
 agentd-attached threads auto-recover after a daemon restart. On ShutdownSession or ArchiveSession, the daemon returns a terminal tool error
-for each outstanding call from a killed command-backed RAP server. Its live
-driver continues normally. External servers and MCP proxies stay running, so
-their calls survive. agentd only reconnects a Stopped root to reopen mail
-admission. Shutdown does not arm an Interrupt or cancel a model stream.
-Other executor loss inside a running daemon needs `agentctl cancel` unless a
-driver failure signals it. Detached sleep tasks return terminal errors
-on panic. Receipt and settlement timeouts retry without spending the crash
-budget. Repeated interrupt deadline expiry for ten minutes without progress enters
+for each outstanding call from a killed command-backed RAP server. A stopped
+live driver can continue. An archived driver only records existing results;
+it cannot start a completion, admit broker input, or reboot RAP servers.
+External servers and MCP proxies stay running, preserving calls and choices.
+agentd reconnects a Stopped root to reopen mail admission without Interrupt.
+The shared mail-starvation timer bounds silent Busy work when mail waits,
+including streams that never finish and external calls that never return.
+`[kind.NAME].stall_timeout_secs` defaults to 600, and `0` disables it. Any session
+activity resets the clock. A silent tool longer than the timeout is cancelled
+while mail waits. This cost favors eventual mail delivery; workloads with
+long silent tools can raise or disable the setting.
+Receipt, settlement, and interrupt timeouts keep their existing recovery
+policy. Repeated interrupt expiry for ten minutes without progress enters
 `NeedsRecovery`. Successful attachment does not reset backoff.
-Stopped roots reconnect without spending a crash and preserve surviving model
-streams. Archived roots need human recovery. Interrupt and Connect cannot clear their
-shutdown flag, and event admission also checks archive state.
 
 murmur is detached from upstream, so both commits land directly. They stay small and additive anyway: a small core diff keeps upstream fixes easy to port by hand.
 
@@ -303,15 +306,14 @@ v1 (one machine, a handful of agents) builds the parts that change stored data, 
 - What are Muse's MSP messages for resume, approval and MCP registration? Port them from T3 Code's native `muse` driver.
 - Should peer messages also travel as a RAP-level event (`RapCallback::ThreadEvent`), so external RAP servers can use them too?
 - The daemon never respawns a dead provider process. Should agentd restart the whole daemon on provider death (re-offer makes that safe), or should the provider be crash-proof?
-- How long may a CLI turn delay its mail before the watchdog flags it, and should the human be able to force cancel-and-deliver?
 - Local surfaces trust localhost. Is a per-agent MCP token plus a 0600 control socket enough until Tailscale federation needs real peer authentication between brokers?
 - Where does screening run? Clef-Flash (9B) does not fit beside the 22 GB coder profile on the 24 GB 3090. The options are a smaller coder profile, a second GPU, or hosted screening on Workers AI, which sends message content off the machine.
 - Which third family completes the screening ensemble, given that Clef is Qwen-based?
 - What does `size_immune_team` optimize beyond queueing arithmetic, and how does it price a family that is accurate but slow?
 - History and processed IDs are two separate writes in core (`sync()` in `event_processor.rs`). Two paths reach the gap between them: a process crash between the writes, and a failed processed-ID write followed by the driver going idle, which drops the retry state. Either way a re-offer appends the peer message a second time. Neither path loses mail or sends a false receipt. Accepted for v1. One fix closes both: write history and processed IDs together, or rebuild processed IDs from history on load.
 
-An inference watchdog for model streams that stall without a shutdown remains
-a follow-up. The adapter currently has no inference deadline.
+The mail-starvation stall timer also covers model streams that stall without
+a shutdown when mail is waiting.
 
 ## Next implementation step
 

@@ -30,6 +30,18 @@ where
     F: Fn(RapCallback) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    start_callback_server_on_with_path(listener, move |callback, _path| handler(callback))
+}
+
+/// Like [`start_callback_server_on`], retaining the callback request path.
+pub fn start_callback_server_on_with_path<F, Fut>(
+    listener: TcpListener,
+    handler: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn(RapCallback, String) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     let handler = Arc::new(handler);
     tracing::info!(
         "RAP callback server listening on {:?}",
@@ -103,13 +115,14 @@ fn ok_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
 
 async fn handle<F, Fut>(req: Request<Incoming>, handler: Arc<F>) -> Response<Full<Bytes>>
 where
-    F: Fn(RapCallback) -> Fut + Send + Sync,
+    F: Fn(RapCallback, String) -> Fut + Send + Sync,
     Fut: Future<Output = ()> + Send,
 {
     if req.method() != hyper::Method::POST {
         return ok_response(StatusCode::METHOD_NOT_ALLOWED, "POST only");
     }
 
+    let path = req.uri().path().to_owned();
     let body = match req.into_body().collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) => {
@@ -127,6 +140,6 @@ where
         }
     };
 
-    handler(cb).await;
+    handler(cb, path).await;
     ok_response(StatusCode::OK, "OK")
 }

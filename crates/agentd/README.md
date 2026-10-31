@@ -65,6 +65,7 @@ overrides the configured model for a new thread.
 wire = "infinity"
 socket = "/home/me/.infinity/daemon.sock"
 model = "local/qwen3-coder"
+stall_timeout_secs = 600 # 0 disables mail-starvation cancellation
 ```
 
 Each Infinity agent owns one root thread, saved in its opaque resume token.
@@ -84,21 +85,46 @@ in the resume token. When a reopened root has a different boot ID and
 a driver-failure protocol error from the root or any child on the connection.
 The daemon settles outstanding calls from command-backed RAP servers when
 ShutdownSession or ArchiveSession kills those servers. Each call receives a
-terminal tool error, so its live driver continues without agentd detecting the
-loss. Calls to external servers and MCP proxies survive because those servers
-stay running. Model streams also continue after a CLI quit.
+terminal tool error. A stopped live driver can continue without agentd detecting
+the loss. An archived driver records terminal results but starts no new model
+completion or tool dispatch. Archive closes admission before stopping servers. Calls to external servers and MCP proxies survive because those servers
+stay running. Their outstanding choices remain answerable after quit. Unknown
+or stale choice answers receive a daemon error. Model streams also continue
+after a CLI quit.
 A stopped root reconnects without spending the crash budget or requesting an
 Interrupt. Connect clears and persists shutdown so the router admits mail again.
 An archived root requires human recovery and remains closed to event input,
 including after Interrupt or Connect starts a driver.
 Daemon boot changes and driver failures still mark busy replay for Interrupt.
 Only agentd-attached threads auto-recover after a daemon restart. Other executor
-loss inside a running daemon needs `agentctl cancel` unless a driver failure
-signals it. Detached sleep tasks catch panics and return
+loss is bounded by the mail-starvation timer while mail waits, or can be
+interrupted with `agentctl cancel`. Detached sleep tasks catch panics and return
 a terminal tool error. Invalid or unrepresentable sleep durations return an error
 before a task starts. The adapter persists its recovery marker when it changes,
 including when idle or a new completion clears it, so an unclean agentd exit
 does not restore a cleared marker.
+
+Every kind has a mail-starvation stall timer in the supervisor. While a Busy
+agent has Offered mail or queued mail deferred behind its work or a permission,
+`stall_timeout_secs` seconds without session activity invokes the existing cancel
+path. Stream chunks, tool starts and results, completion boundaries, choices,
+receipts, and turn ends reset the clock. Reconnects and new mail do not reset it.
+With no waiting mail, there is no stall deadline. Each `[kind.NAME]` can set
+`stall_timeout_secs`; `0` disables it. `KindConfig::stall_timeout` uses a Duration.
+The default is 600 seconds for every kind, giving ordinary tool calls and pauses
+ten minutes before cancelling work to release waiting mail. A tool that runs
+silently longer than this limit while mail waits gets cancelled. Raise the value
+or disable it for such tools. Cancellation uses the existing acknowledgment
+policy, including Infinity's ten-minute no-progress bound to `NeedsRecovery`.
+
+Command-backed RAP calls use an opaque invocation scope in their callback URL.
+A real callback and shutdown error share one dedup ID; a later call with a reused
+model ID has a different scope. Core settlement and cancellation retire registry
+entries. External servers and MCP proxies need no shutdown registry entry.
+Shutdown records the first terminal result received locally. A shutdown error
+means the tool's outcome may be unknown; check side effects before retrying a
+non-idempotent operation. A real result received during server termination wins
+if it retires the entry before shutdown drains it.
 
 An Interrupt starts a driver even for an orphaned pending choice. Cancellation
 has a deadline. Reconnects reissue an outstanding cancellation when
@@ -129,7 +155,7 @@ idle event rearms it for outstanding mail. A silent daemon cannot leave offered
 mail waiting forever. Model agents never idle-suspend. An unreachable daemon
 uses backoff capped at 60 seconds without consuming the model agent crash limit.
 Other connected-session failures count as crashes. A model stream that stalls
-without finishing has no inference watchdog.
+without finishing is bounded by the mail-starvation timer when mail waits.
 ACP spawn failures keep their existing crash policy.
 
 Infinity's daemon owns sandbox and RAP tool configuration. The socket API cannot

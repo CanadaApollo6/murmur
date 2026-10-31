@@ -619,12 +619,13 @@ pub async fn handle_client_channels(
                     ClientMessage::ArchiveSession { root_thread_id } => {
                         let session_id = root_thread_id.id;
                         let mgr = session_manager.lock().await;
-                        mgr.cleanup_session(&session_id).await;
                         let mut store = mgr.session_store.lock().await;
                         store.mark_archived(&session_id);
                         if let Err(e) = store.save() {
                             tracing::error!("Failed to save session store after archiving {session_id}: {e}");
                         }
+                        drop(store);
+                        mgr.cleanup_session(&session_id).await;
                         attached_session_id = None;
                         attached_thread_id = None;
                     }
@@ -674,7 +675,17 @@ pub async fn handle_client_channels(
                                         .send()
                                         .await;
                                 }));
+                            } else {
+                                let _ = daemon_tx.send(DaemonMessage::Error {
+                                    thread_id: Some(ThreadRef::local(thread_id.clone())),
+                                    text: format!("Unknown or stale choice: {choice_id}"),
+                                });
                             }
+                        } else {
+                            let _ = daemon_tx.send(DaemonMessage::Error {
+                                thread_id: None,
+                                text: format!("Unknown or stale choice: {choice_id}; no attached thread"),
+                            });
                         }
                     }
                     ClientMessage::RequestMigrate { root_thread_id, to, dest_cwd } => {

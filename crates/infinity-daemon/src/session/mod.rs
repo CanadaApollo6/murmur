@@ -670,7 +670,7 @@ impl SessionManager {
     }
 
     /// Shut down a session: stop its RAP servers, drop its cached toolset
-    /// (so a later restart re-reads the RAP config), clear pending choices,
+    /// (so a later restart re-reads the RAP config), preserve surviving choices,
     /// and mark it shut down in the store.
     ///
     /// The agent system keeps running — a thread that is mid-completion
@@ -681,10 +681,10 @@ impl SessionManager {
     pub async fn cleanup_session(&self, session_id: &ThreadId<str>) {
         if let Err(error) = self
             .state_store
-            .clear_pending_choices_for_session(session_id)
+            .clear_orphaned_choices_for_session(session_id)
             .await
         {
-            tracing::error!(%error, "failed to clear pending choices for {session_id}");
+            tracing::error!(%error, "failed to clear orphaned choices for {session_id}");
         }
         self.rap_manager.evict_session(session_id).await;
         let mut store = self.session_store.lock().await;

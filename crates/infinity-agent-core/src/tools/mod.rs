@@ -97,6 +97,14 @@ pub trait Tool<M: InputSender>: Send + Sync {
         context: &ToolContext<M>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+    /// Release embedding resources when core accepts a terminal result or cancels a call.
+    fn retire_call(
+        &self,
+        _thread: &rap_protocol::ThreadId<str>,
+        _id: &rap_protocol::ToolCallId<str>,
+    ) {
+    }
+
     fn supports_sync(&self) -> bool {
         false
     }

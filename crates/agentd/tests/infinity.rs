@@ -36,6 +36,9 @@ impl Test {
         Self::with_policy(Default::default()).await
     }
     async fn with_policy(policy: PermissionPolicy) -> Self {
+        Self::with_stall(policy, Duration::from_secs(600)).await
+    }
+    async fn with_stall(policy: PermissionPolicy, stall: Duration) -> Self {
         let root = tempfile::tempdir().expect("tempdir");
         let socket = root.path().join("daemon.sock");
         let daemon = fake::FakeDaemon::bind(&socket);
@@ -48,6 +51,7 @@ impl Test {
         kind.model = Some("fake/small".into());
         kind.request_timeout = Duration::from_millis(200);
         kind.cancel_timeout = Duration::from_millis(200);
+        kind.stall_timeout = stall;
         let broker = Broker::new(
             mailroom.clone(),
             vec![kind],
@@ -1389,13 +1393,13 @@ async fn r11_cleared_recovery_marker_survives_unclean_exit() {
 
 #[tokio::test]
 async fn r12_repeated_interrupt_expiry_is_bounded_without_receipts() {
-    let mut t = Test::new().await;
+    let mut t = Test::with_stall(Default::default(), Duration::from_millis(250)).await;
     let id = t.send(false, "stuck work").await;
     let input = t.daemon.next().await;
     input.emit(fake::start());
     t.event(|e| matches!(e, Event::Started { .. })).await;
     t.daemon.state.lock().expect("state").manual_replay = true;
-    t.agent.cancel().await.expect("cancel");
+    t.event(|e| matches!(e, Event::Activity { text, .. } if text.contains("mail-starvation stall timeout"))).await;
     assert!(matches!(
         t.daemon.next().await.message,
         ClientMessage::Interrupt { .. }
@@ -1497,4 +1501,70 @@ async fn r11a_failure_marker_clears_and_rearms() {
         }
         t.finish().await;
     }
+}
+
+#[tokio::test]
+async fn stall_timer_only_cancels_waiting_mail_and_activity_resets_it() {
+    let mut t = Test::with_stall(Default::default(), Duration::from_millis(250)).await;
+    let first = t.send(false, "first").await;
+    let active = t.daemon.next().await;
+    active.emit(fake::start());
+    active.emit(fake::receipt(format!("peer-{first}")));
+    t.consumed(first).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(350), t.daemon.next())
+            .await
+            .is_err(),
+        "no mail waiting, no stall deadline"
+    );
+    active.emit(DaemonMessage::TextChunk {
+        thread_id: fake::thread(),
+        chunk: "resumed work".into(),
+    });
+    t.event(|e| matches!(e, Event::Activity { text, .. } if text == "resumed work"))
+        .await;
+    let waiting = t.send(true, "waiting").await;
+    let offer = t.daemon.next().await;
+    for _ in 0..4 {
+        active.emit(DaemonMessage::TextChunk {
+            thread_id: fake::thread(),
+            chunk: "still working".into(),
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), t.daemon.next())
+                .await
+                .is_err(),
+            "activity resets the deadline"
+        );
+    }
+    active.emit(DaemonMessage::ToolResult {
+        thread_id: fake::thread(),
+        segments: vec![],
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), t.daemon.next())
+            .await
+            .is_err(),
+        "tool end resets the deadline too"
+    );
+    let cancel = t.daemon.next().await;
+    assert!(matches!(cancel.message, ClientMessage::Interrupt { .. }));
+    offer.emit(fake::receipt(format!("peer-{waiting}")));
+    offer.emit(fake::idle());
+    t.consumed(waiting).await;
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn zero_stall_timeout_disables_cancellation() {
+    let mut t = Test::with_stall(Default::default(), Duration::ZERO).await;
+    t.send(false, "silently busy").await;
+    let active = t.daemon.next().await;
+    active.emit(fake::start());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(350), t.daemon.next())
+            .await
+            .is_err()
+    );
+    t.finish().await;
 }

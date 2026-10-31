@@ -329,6 +329,25 @@ async fn route_loop<C, S, H, O, F>(
             }
         };
 
+        if let RoutedMessage::Input(input, _) = &msg
+            && (input.synthetic.is_some()
+                || !matches!(
+                    input.content,
+                    crate::message::InputMessageContent::User(
+                        infinity_provider_protocol::message::UserContent::ToolResult(_)
+                    )
+                ))
+        {
+            match inner.state_store.is_thread_archived(&thread_id).await {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(error) => {
+                    tracing::warn!(%thread_id, %error, "archive admission check failed");
+                    continue;
+                }
+            }
+        }
+
         // Reuse a live driver if one exists.
         if let Some(w) = workers.get(&thread_id) {
             if !w.input_tx.is_closed() {

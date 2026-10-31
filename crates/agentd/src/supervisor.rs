@@ -275,6 +275,9 @@ impl Broker {
                 spec.idle_after.or(kind.idle_after)
             },
             model_agent,
+            stall_timeout: kind.stall_timeout,
+            last_activity: Instant::now(),
+            deferred_mail: false,
             spec,
             adapter: AdapterSet::build(kind),
             mailroom: Arc::clone(&self.mailroom),
@@ -332,6 +335,9 @@ struct AgentActor {
     config: Config,
     idle_after: Option<Duration>,
     model_agent: bool,
+    stall_timeout: Duration,
+    last_activity: Instant,
+    deferred_mail: bool,
     events: broadcast::Sender<Event>,
     commands: mpsc::Receiver<Command>,
     phase_tx: watch::Sender<Phase>,
@@ -412,7 +418,11 @@ impl AgentActor {
             self.pump().await?;
             let deadline = self.deadline();
             tokio::select! {
-                command = self.commands.recv() => match command {
+                command = self.commands.recv() => {
+                    // A full command queue can coalesce a nudge. Observe queued mail
+                    // on every command without adding database reads per stream chunk.
+                    self.deferred_mail = !self.mailroom.pending_for(self.id).await?.is_empty();
+                    match command {
                     None => return Ok(()),
                     Some(Command::Stop(reply)) => {
                         let result = self.stop_session().await;
@@ -431,6 +441,7 @@ impl AgentActor {
                         let result = self.answer(id,incarnation,answer).await;
                         respond(reply,result);
                     },
+                    }
                 },
                 event = async { match &mut self.session { Some(s) => s.next_event().await, None => std::future::pending().await } } => {
                     self.on_event(event.unwrap_or(SessionEvent::Ended { reason: "session event stream closed".into() })).await?;
@@ -479,6 +490,7 @@ impl AgentActor {
                 self.mailroom.save_resume(self.id, token.clone()).await?;
                 self.resume = Some(token);
                 self.idle_since = Instant::now();
+                self.deferred_mail = !self.mailroom.pending_for(self.id).await?.is_empty();
                 self.phase(if busy { Phase::Busy } else { Phase::Idle });
             }
             Err(error @ (AdapterError::ResumeFailed(_) | AdapterError::ResumeUnsupported)) => self
@@ -516,6 +528,7 @@ impl AgentActor {
             return Ok(());
         }
         let mail = self.mailroom.pending_for(self.id).await?;
+        self.deferred_mail = false;
         if mail.is_empty() {
             return Ok(());
         }
@@ -552,6 +565,9 @@ impl AgentActor {
             agent: self.id,
             ids: outcome.offered,
         });
+        if self.phase != Phase::Busy {
+            self.last_activity = Instant::now();
+        }
         self.phase(Phase::Busy);
         if let Err(error) = self.session()?.submit(Turn { items }).await {
             self.end(error.to_string()).await?;
@@ -559,6 +575,17 @@ impl AgentActor {
         Ok(())
     }
     async fn on_event(&mut self, event: SessionEvent) -> Result<()> {
+        if matches!(
+            event,
+            SessionEvent::Activity(_)
+                | SessionEvent::TurnStarted { .. }
+                | SessionEvent::Committed { .. }
+                | SessionEvent::TurnEnded { .. }
+                | SessionEvent::PermissionRequested(_)
+                | SessionEvent::CancelComplete
+        ) {
+            self.last_activity = Instant::now();
+        }
         match event {
             SessionEvent::TurnStarted { ids } => {
                 self.validate_ids(&ids)?;
@@ -733,9 +760,7 @@ impl AgentActor {
         Ok(())
     }
     async fn cancel(&mut self) -> Result<()> {
-        if self.model_agent {
-            self.cancelling = true;
-        }
+        self.cancelling = true;
         if let Some(session) = &mut self.session {
             session
                 .cancel()
@@ -821,6 +846,13 @@ impl AgentActor {
             retry_at: Instant::now() + delay,
         });
     }
+    fn stall_deadline(&self) -> Option<Instant> {
+        (self.phase == Phase::Busy
+            && (!self.offered.is_empty() || self.deferred_mail)
+            && !self.cancelling
+            && !self.stall_timeout.is_zero())
+        .then(|| self.last_activity + self.stall_timeout)
+    }
     fn deadline(&self) -> Option<Instant> {
         let mut deadline = match self.phase {
             Phase::Crashed { retry_at, .. } => Some(retry_at),
@@ -834,10 +866,22 @@ impl AgentActor {
                 deadline = Some(deadline.map_or(*t, |d| d.min(*t)));
             }
         }
+        if let Some(stall) = self.stall_deadline() {
+            deadline = Some(deadline.map_or(stall, |d| d.min(stall)));
+        }
         deadline
     }
     async fn timer(&mut self) -> Result<()> {
         let now = Instant::now();
+        if self.stall_deadline().is_some_and(|d| d <= now) {
+            self.emit(Event::Activity {
+                agent: self.id,
+                text: "mail-starvation stall timeout; cancelling turn".into(),
+            });
+            if let Err(error) = self.cancel().await {
+                self.end(error.to_string()).await?;
+            }
+        }
         let expired = self
             .pending
             .iter()

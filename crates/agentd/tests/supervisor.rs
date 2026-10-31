@@ -1194,3 +1194,35 @@ for line in sys.stdin:
         "received a permission before failure but lost start evidence: {state:?}, {event:?}"
     );
 }
+
+#[tokio::test]
+async fn stall_timer_cancels_acp_to_deliver_deferred_mail() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mailroom = Arc::new(
+        Mailroom::open(root.path().join("mail.db"), Default::default())
+            .await
+            .expect("mailroom"),
+    );
+    let mut kind = kind(root.path(), false);
+    kind.stall_timeout = Duration::from_millis(250);
+    let broker = Broker::new(mailroom.clone(), vec![kind], config()).expect("broker");
+    let events = broker.events();
+    let agent = broker
+        .spawn(spec(root.path(), "claude", Default::default()))
+        .await
+        .expect("spawn");
+    let mut t = Test {
+        root,
+        mailroom,
+        broker,
+        events,
+        agent,
+    };
+    let first = t.send("hold").await;
+    t.started(first).await;
+    let waiting = t.send("response-only").await;
+    t.event(|e| matches!(e, Event::Activity { text, .. } if text.contains("mail-starvation stall timeout"))).await;
+    t.consumed(waiting).await;
+    assert!(t.wire().iter().any(|m| m["method"] == "session/cancel"));
+    t.finish().await;
+}

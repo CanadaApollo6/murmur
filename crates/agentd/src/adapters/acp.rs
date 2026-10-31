@@ -330,7 +330,10 @@ impl AcpSession {
                         Some("agent_message_chunk" | "agent_thought_chunk") => {
                             update["content"]["text"].as_str()
                         }
-                        Some("tool_call" | "tool_call_update") => update["title"].as_str(),
+                        Some("tool_call" | "tool_call_update") => {
+                            Some(update["title"].as_str().unwrap_or("tool activity"))
+                        }
+                        Some("plan") => Some("plan updated"),
                         _ => None,
                     };
                     if let Some(text) = text {
