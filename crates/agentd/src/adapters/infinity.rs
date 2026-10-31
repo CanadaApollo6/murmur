@@ -508,6 +508,9 @@ impl Session for InfinitySession {
     fn accepts_busy_mail(&self) -> bool {
         self.events.is_empty() && self.cancel_deadline.is_none()
     }
+    fn permission_key(&self, id: PermissionId) -> Option<&str> {
+        self.choices.get(&id).map(|choice| choice.wire_id.as_str())
+    }
     async fn submit(&mut self, turn: Turn) -> Result<(), AdapterError> {
         if self.ended {
             return Err(AdapterError::Ended);

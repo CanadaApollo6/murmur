@@ -1316,31 +1316,22 @@ mod r15o {
         );
     }
     #[tokio::test]
-    async fn r15_acp_queued_mail_waits_for_human_by_design() {
+    async fn r15_acp_queued_mail_bounds_human_wait() {
         let mut t = acp_with_stall(Duration::from_millis(250)).await;
         let first = t.send("permission").await;
-        let permission = t.pending().await;
+        t.pending().await;
         let waiting = t.send("response-only").await;
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        assert!(!t.wire().iter().any(|m| m["method"] == "session/cancel"));
-        assert_eq!(
-            t.mailroom.delivery(waiting).await.expect("waiting").state,
-            DeliveryState::Queued
-        );
-        assert_eq!(
-            t.agent.pending_permissions().await.expect("pending").len(),
-            1
-        );
-        t.agent
-            .answer_permission(
-                permission.id,
-                permission.incarnation,
-                PermissionAnswer::Choose("yes".into()),
-            )
-            .await
-            .expect("answer");
+        t.event(|e| matches!(e, Event::Activity { text, .. } if text.contains("mail-starvation stall timeout"))).await;
         t.consumed(first).await;
         t.consumed(waiting).await;
+        assert!(t.wire().iter().any(|m| m["method"] == "session/cancel"));
+        assert!(
+            t.agent
+                .pending_permissions()
+                .await
+                .expect("pending")
+                .is_empty()
+        );
         t.finish().await;
     }
 }

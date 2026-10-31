@@ -3688,7 +3688,7 @@ mod r14 {
     }
 
     #[test]
-    fn r14o_quit_with_external_choice_exits_via_permission_timeout() {
+    fn r14o_quit_with_external_choice_exits_via_stall_timeout() {
         let server = choice_server();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3697,7 +3697,7 @@ mod r14 {
         runtime.block_on(tokio::task::LocalSet::new().run_until(async {
             let mut h = start_harness().await.expect("harness");
             rap_test_servers::write_rap_config(h.cwd.path(), server.port).expect("config");
-            let r = r12o::rig_with_stall(&h, Duration::from_millis(300), Duration::from_millis(300), agentd::supervisor::Config::default(), Some(Duration::from_millis(600)), Duration::from_millis(300)).await;
+            let r = r12o::rig_with_stall(&h, Duration::from_millis(300), Duration::from_millis(300), agentd::supervisor::Config::default(), None, Duration::from_millis(300)).await;
             let agent = r.agent.clone(); let root = r.root.clone(); let broker = &r.broker;
             r11_send(broker, agent.id, "ask the external choice").await;
             h.ctrl.next_request().await;
@@ -3711,7 +3711,7 @@ mod r14 {
             let request = tokio::time::timeout(Duration::from_secs(8), h.ctrl.next_request()).await;
             eprintln!("r14o after answer+8s: phase={:?} server_answers={:?} inference={}", agent.phase(), server.answers.lock().expect("lock"), request.is_ok());
             let recovered = request.is_ok();
-            assert!(!r.log.borrow().iter().any(|event| matches!(event, agentd::supervisor::Event::Activity { text, .. } if text.contains("mail-starvation stall timeout"))), "permission timeout owns human waits");
+            assert!(r.log.borrow().iter().any(|event| matches!(event, agentd::supervisor::Event::Activity { text, .. } if text.contains("mail-starvation stall timeout"))), "waiting mail bounds human waits even without a permission timeout");
             assert!(server.answers.lock().expect("answers").is_empty());
             if let Ok(request) = &request { eprintln!("r14o history has real result: {}", format!("{:?}", request.chat_history).contains("chose 1")); h.ctrl.send_text("done"); h.ctrl.finish(); }
             assert!(recovered, "a quit must not leave an answered external choice stranded: phase={:?}", agent.phase());
@@ -3820,322 +3820,6 @@ async fn command_invocation_scope_rejects_late_callback_with_reused_id() {
         h.ctrl.send_text("event handled"); h.ctrl.finish();
         broker.shutdown().await.expect("shutdown");
     }).await;
-}
-
-mod r15o {
-    use super::*;
-
-    /// Before 549e8e9 a failed migration left the source shut down and resumable.
-    /// The early freeze now archives it first, and nothing un-archives on failure.
-    #[tokio::test(flavor = "current_thread")]
-    async fn r15o_failed_migration_leaves_source_resumable() {
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                let mut h = start_harness().await.expect("harness");
-                let root = create_session_and_chat(&mut h).await;
-                wait_for_message(&mut h.daemon_rx, |m| {
-                    matches!(m, DaemonMessage::ThreadIdle { .. })
-                })
-                .await;
-                let nowhere: infinity_protocol::RemoteName =
-                    serde_json::from_value(serde_json::json!("nowhere")).expect("remote name");
-                h.client_tx
-                    .send(ClientMessage::RequestMigrate {
-                        root_thread_id: root.clone(),
-                        to: Some(nowhere),
-                        dest_cwd: h.cwd.path().to_path_buf(),
-                    })
-                    .expect("migrate");
-                let outcome = wait_for_message(&mut h.daemon_rx, |m| {
-                    matches!(
-                        m,
-                        DaemonMessage::MigrateError { .. } | DaemonMessage::MigrateComplete { .. }
-                    )
-                })
-                .await;
-                let status = h
-                    .manager
-                    .lock()
-                    .await
-                    .list_sessions(None)
-                    .await
-                    .get(&root)
-                    .map(|s| s.status.clone());
-                h.client_tx
-                    .send(ClientMessage::Connect {
-                        root_thread_id: root.clone(),
-                        thread_id: None,
-                        keeps_session_alive: true,
-                    })
-                    .expect("connect");
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                h.client_tx
-                    .send(ClientMessage::UserInput {
-                        thread_id: root.clone(),
-                        text: "continue after failed migration".into(),
-                    })
-                    .expect("input");
-                let resumed = tokio::time::timeout(Duration::from_secs(2), h.ctrl.next_request())
-                    .await
-                    .is_ok();
-                if resumed {
-                    h.ctrl.send_text("resumed");
-                    h.ctrl.finish();
-                }
-                eprintln!(
-                    "r15o failed migration: outcome={} status_after={status:?} resumed={resumed}",
-                    match &outcome {
-                        DaemonMessage::MigrateError { error, .. } =>
-                            format!("MigrateError({error})"),
-                        _ => "MigrateComplete".into(),
-                    }
-                );
-                assert!(matches!(outcome, DaemonMessage::MigrateError { .. }));
-                assert!(
-                    resumed && status != Some(SessionStatus::Archived),
-                    "a failed migration must not brick its source"
-                );
-            })
-            .await;
-    }
-}
-
-mod r15_migration {
-    use super::*;
-
-    async fn migrate(
-        h: &mut TestHarness,
-        root: &infinity_protocol::ThreadRef,
-        local: bool,
-    ) -> Result<(), String> {
-        if local {
-            let (tx, mut rx) = mpsc::unbounded_channel();
-            infinity_daemon::migrate::orchestrate_migration(
-                root.clone(),
-                Some(serde_json::from_value(serde_json::json!("nowhere")).expect("remote")),
-                h.cwd.path().to_path_buf(),
-                h.manager.clone(),
-                tx,
-            )
-            .await;
-            while let Some(message) = rx.recv().await {
-                match message {
-                    DaemonMessage::MigrateError { error, .. } => return Err(error),
-                    DaemonMessage::MigrateComplete { .. } => return Ok(()),
-                    _ => {}
-                }
-            }
-            panic!("migration produced no outcome");
-        }
-        infinity_daemon::migrate::handle_emigrate(&root.id, Default::default(), &h.manager)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    }
-
-    async fn outstanding(local: bool, choice: bool) {
-        let mut h = start_harness().await.expect("harness");
-        let port = r10a_waiting_server().await.expect("external server");
-        rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
-        let root = create_session_and_chat(&mut h).await;
-        wait_for_message(&mut h.daemon_rx, |m| {
-            matches!(m, DaemonMessage::ThreadIdle { .. })
-        })
-        .await;
-        h.client_tx
-            .send(ClientMessage::UserInput {
-                thread_id: root.clone(),
-                text: "external work".into(),
-            })
-            .expect("input");
-        h.ctrl.next_request().await;
-        h.ctrl
-            .send_tool_call("migration-call", "waiting_choice", serde_json::json!({}));
-        h.ctrl.finish();
-        wait_for_message(&mut h.daemon_rx, |m| {
-            matches!(m, DaemonMessage::ToolCall { .. })
-        })
-        .await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if choice {
-            let callback = serde_json::json!({"type":"user_choice", "group_id":root.id, "id":"migration-call", "prompt":"Choose", "choices":["A","B"], "default":0, "response_url":"http://127.0.0.1:9/choice"});
-            assert_eq!(
-                reqwest_post(&h.callback_url, &callback.to_string()).await,
-                200
-            );
-            wait_for_message(&mut h.daemon_rx, |m| {
-                matches!(m, DaemonMessage::UserChoiceRequired { .. })
-            })
-            .await;
-        }
-        let result = migrate(&mut h, &root, local).await;
-        let flags = {
-            let manager = h.manager.lock().await;
-            let store = manager.session_store.lock().await;
-            let entry = &store.sessions[&root.id];
-            (entry.archived, entry.shut_down)
-        };
-        let callback = serde_json::json!({"type":"tool_result", "group_id":root.id, "id":"migration-call", "text":"migration terminal result"});
-        assert_eq!(
-            reqwest_post(&h.callback_url, &callback.to_string()).await,
-            200
-        );
-        let resumed = tokio::time::timeout(Duration::from_secs(2), h.ctrl.next_request()).await;
-        let has_result = resumed.as_ref().is_ok_and(|request| {
-            format!("{:?}", request.chat_history).contains("migration terminal result")
-        });
-        if resumed.is_ok() {
-            h.ctrl.send_text("resumed");
-            h.ctrl.finish();
-        }
-        assert!(
-            matches!(result, Err(ref error) if error.contains("settled source")),
-            "migration must refuse outstanding work: {result:?}"
-        );
-        assert_eq!(flags, (false, false), "refusal restores source flags");
-        assert!(
-            has_result,
-            "late external result must resume the source after refusal"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn r15a_emigration_refuses_inflight_result_and_preserves_source() {
-        tokio::task::LocalSet::new()
-            .run_until(outstanding(false, false))
-            .await;
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn r15_local_migration_refuses_inflight_result_and_preserves_source() {
-        tokio::task::LocalSet::new()
-            .run_until(outstanding(true, false))
-            .await;
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn r15_emigration_refuses_pending_choice() {
-        tokio::task::LocalSet::new()
-            .run_until(outstanding(false, true))
-            .await;
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn r15_local_migration_refuses_pending_choice() {
-        tokio::task::LocalSet::new()
-            .run_until(outstanding(true, true))
-            .await;
-    }
-
-    async fn busy(local: bool) {
-        let mut h = start_harness().await.expect("harness");
-        let root = create_session_and_chat(&mut h).await;
-        wait_for_message(&mut h.daemon_rx, |m| {
-            matches!(m, DaemonMessage::ThreadIdle { .. })
-        })
-        .await;
-        h.client_tx
-            .send(ClientMessage::UserInput {
-                thread_id: root.clone(),
-                text: "stream".into(),
-            })
-            .expect("input");
-        h.ctrl.next_request().await;
-        let result = migrate(&mut h, &root, local).await;
-        h.ctrl.send_text("stream finished");
-        h.ctrl.finish();
-        wait_for_message(&mut h.daemon_rx, |m| {
-            matches!(m, DaemonMessage::ThreadIdle { .. })
-        })
-        .await;
-        let manager = h.manager.lock().await;
-        let store = manager.session_store.lock().await;
-        let entry = &store.sessions[&root.id];
-        assert!(
-            matches!(result, Err(ref e) if e.contains("settled source")),
-            "busy migration refused: {result:?}"
-        );
-        assert!(!entry.archived && !entry.shut_down);
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn r15_emigration_refuses_busy_stream() {
-        tokio::task::LocalSet::new().run_until(busy(false)).await;
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn r15_local_migration_refuses_busy_stream() {
-        tokio::task::LocalSet::new().run_until(busy(true)).await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn r15_failed_emigration_restores_previous_shutdown_state() {
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                for shut_down in [false, true] {
-                    let mut h = start_harness().await.expect("harness");
-                    let root = create_session_and_chat(&mut h).await;
-                    wait_for_message(&mut h.daemon_rx, |m| {
-                        matches!(m, DaemonMessage::ThreadIdle { .. })
-                    })
-                    .await;
-                    if shut_down {
-                        h.manager.lock().await.cleanup_session(&root.id).await;
-                    }
-                    std::fs::create_dir_all(h.cwd.path().join(".infinity")).expect("config dir");
-                    let path = h.cwd.path().join(".infinity/rap.json");
-                    std::fs::write(&path, "invalid JSON").expect("broken config");
-                    assert!(migrate(&mut h, &root, false).await.is_err());
-                    {
-                        let manager = h.manager.lock().await;
-                        let store = manager.session_store.lock().await;
-                        let entry = &store.sessions[&root.id];
-                        assert_eq!((entry.archived, entry.shut_down), (false, shut_down));
-                    }
-                    std::fs::remove_file(path).expect("repair config");
-                    h.client_tx
-                        .send(ClientMessage::UserInput {
-                            thread_id: root.clone(),
-                            text: "resume after failure".into(),
-                        })
-                        .expect("input");
-                    tokio::time::timeout(Duration::from_secs(2), h.ctrl.next_request())
-                        .await
-                        .expect("source resumable");
-                    h.ctrl.send_text("resumed");
-                    h.ctrl.finish();
-                }
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn r15_emigration_disconnect_restores_source_before_import() {
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                let mut h = start_harness().await.expect("harness");
-                let root = create_session_and_chat(&mut h).await;
-                wait_for_message(&mut h.daemon_rx, |m| {
-                    matches!(m, DaemonMessage::ThreadIdle { .. })
-                })
-                .await;
-                let (tx, rx) = mpsc::unbounded_channel();
-                let (out, mut received) = mpsc::unbounded_channel();
-                let handler =
-                    tokio::task::spawn_local(handle_client_channels(rx, out, h.manager.clone()));
-                tx.send(ClientMessage::Emigrate {
-                    root_thread_id: root.id.clone(),
-                    dest_rap_urls: Default::default(),
-                })
-                .expect("emigrate");
-                wait_for_message(&mut received, |m| {
-                    matches!(m, DaemonMessage::EmigrateResult { .. })
-                })
-                .await;
-                drop(tx);
-                handler.await.expect("disconnect rolls back");
-                let manager = h.manager.lock().await;
-                let store = manager.session_store.lock().await;
-                let entry = &store.sessions[&root.id];
-                assert_eq!((entry.archived, entry.shut_down), (false, false));
-            })
-            .await;
-    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -4253,4 +3937,195 @@ async fn settled_emigration_commits_snapshot_and_keeps_source_archived() {
             );
         })
         .await;
+}
+
+mod r16o {
+    use super::*;
+    use agentd::model::PermissionAnswer;
+    use agentd::supervisor::{Config, Event, Phase};
+
+    fn fast() -> Config {
+        Config {
+            backoff_initial: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(20),
+            ..Default::default()
+        }
+    }
+
+    fn stalled(r: &r12o::Rig) -> bool {
+        r.log.borrow().iter().any(|e| {
+            matches!(e, Event::Activity { text, .. } if text.contains("mail-starvation stall timeout"))
+        })
+    }
+
+    async fn wait_log(r: &r12o::Rig, f: impl Fn(&Event) -> bool, d: Duration) -> bool {
+        let end = tokio::time::Instant::now() + d;
+        while tokio::time::Instant::now() < end {
+            if r.log.borrow().iter().any(&f) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// External RAP server that asks the human a choice, records the answer, and then
+    /// keeps working without ever returning a result.
+    async fn choice_then_silent_server() -> (u16, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let answers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = answers.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let answers = recorded.clone();
+                tokio::task::spawn_local(async move {
+                    let service = hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let answers = answers.clone();
+                            async move {
+                                use http_body_util::BodyExt;
+                                let path = req.uri().path().to_owned();
+                                let body =
+                                    req.into_body().collect().await.expect("body").to_bytes();
+                                let response = if path == "/.well-known/rap-toolset" {
+                                    serde_json::json!({"name":"external", "endpoint":format!("http://127.0.0.1:{port}/invoke"), "tools":[{"name":"choose_then_work","description":"ask then work","inputSchema":{"type":"object"}}]}).to_string()
+                                } else if path == "/invoke" {
+                                    let inv: serde_json::Value =
+                                        serde_json::from_slice(&body).expect("invocation");
+                                    tokio::task::spawn_local(async move {
+                                        let choice = serde_json::json!({"type":"user_choice","group_id":inv["group_id"],"id":inv["id"],"call_id":inv["call_id"],"prompt":"Pick","choices":["A","B"],"default":0,"response_url":format!("http://127.0.0.1:{port}/choice")});
+                                        let _ = reqwest::Client::new()
+                                            .post(inv["callback_url"].as_str().expect("callback"))
+                                            .json(&choice)
+                                            .send()
+                                            .await;
+                                    });
+                                    "{}".into()
+                                } else {
+                                    if path == "/choice" {
+                                        answers
+                                            .lock()
+                                            .expect("lock")
+                                            .push(serde_json::from_slice(&body).expect("answer"));
+                                    }
+                                    "{}".into()
+                                };
+                                Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                    http_body_util::Full::new(bytes::Bytes::from(response)),
+                                ))
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        (port, answers)
+    }
+
+    async fn wait_answer(answers: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>) -> bool {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while answers.lock().expect("lock").is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// A CLI user starts a turn on the agentd root while agentd is Idle. The turn calls an
+    /// external tool that never returns. agentd mail is offered from Idle, so it is not a
+    /// "waiting offer", yet it queues behind the CLI work in the daemon.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r16o_cli_turn_starves_agentd_mail_without_stall() {
+        tokio::task::LocalSet::new().run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let port = r10a_waiting_server().await.expect("external server");
+            rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
+            let r = r12o::rig_with_stall(&h, Duration::from_millis(300), Duration::from_millis(300), fast(), None, Duration::from_millis(500)).await;
+            h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: true }).expect("cli attaches");
+            wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
+            h.client_tx.send(ClientMessage::UserInput { thread_id: r.root.clone(), text: "cli: run the long external job".into() }).expect("cli input");
+            h.ctrl.next_request().await;
+            h.ctrl.send_tool_call("cli-call", "waiting_choice", serde_json::json!({}));
+            h.ctrl.finish();
+            assert!(wait_log(&r, |e| matches!(e, Event::Activity { text, .. } if text == "waiting_choice"), Duration::from_secs(3)).await, "agentd observes the CLI tool call");
+            let phase_before = r.agent.phase();
+            let mail = r12o::send(&r, "agentd mail behind cli work").await;
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            let stall = stalled(&r);
+            let state = r.mailroom.delivery(mail).await.expect("delivery").state;
+            eprintln!("r16o cli turn: phase_before_mail={phase_before:?} stall_event_after_2.5s={stall} phase={:?} mail={state:?} {}", r.agent.phase(), r12o::summary(&r));
+            let result = serde_json::json!({"type":"tool_result", "group_id":r.root.id, "id":"cli-call", "text":"cli job finished"});
+            assert_eq!(reqwest_post(&h.callback_url, &result.to_string()).await, 200);
+            r12o::drain(&mut h, Duration::from_secs(2)).await;
+            r.broker.shutdown().await.expect("shutdown");
+            assert_eq!(phase_before, Phase::Idle, "probe precondition");
+            assert!(stall, "agentd mail waiting behind CLI work must arm the stall timer");
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r16o_cli_answered_choice_keeps_stall_suspended() {
+        tokio::task::LocalSet::new().run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let (port, answers) = choice_then_silent_server().await;
+            rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
+            let r = r12o::rig_with_stall(&h, Duration::from_millis(300), Duration::from_millis(300), fast(), None, Duration::from_millis(500)).await;
+            r12o::send(&r, "ask the human then work").await;
+            h.ctrl.next_request().await;
+            h.ctrl.send_tool_call("cli-choice", "choose_then_work", serde_json::json!({}));
+            h.ctrl.finish();
+            assert!(r14::wait_permission(&r.agent, 5).await.is_some(), "choice reaches agentd");
+            let mail = r12o::send(&r, "mail waiting behind the external job").await;
+            h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: true }).expect("cli attaches");
+            wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
+            h.client_tx.send(ClientMessage::UserChoiceAnswered { choice_id: "cli-choice".into(), selected: 0 }).expect("cli answers");
+            let answered = wait_answer(&answers).await;
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            let stall = stalled(&r);
+            let pending = r.agent.pending_permissions().await.expect("pending").len();
+            let store_has_choice = h.manager.lock().await.state_store().has_pending_choices(&r.root.id);
+            let state = r.mailroom.delivery(mail).await.expect("delivery").state;
+            eprintln!("r16o cli answered choice: server_got_answer={answered} stall_event_after_2.5s={stall} agentd_pending={pending} daemon_still_pending={store_has_choice} phase={:?} mail={state:?}", r.agent.phase());
+            r.broker.shutdown().await.expect("shutdown");
+            assert!(answered, "probe precondition: the human answered");
+            assert!(stall, "once the human has answered, the external job is running work and the stall timer must bound it");
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r16o_answered_choice_replayed_after_quit_resuspends_stall() {
+        tokio::task::LocalSet::new().run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let (port, answers) = choice_then_silent_server().await;
+            rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
+            let r = r12o::rig_with_stall(&h, Duration::from_millis(300), Duration::from_millis(300), fast(), None, Duration::from_millis(1500)).await;
+            r12o::send(&r, "ask the human then work").await;
+            h.ctrl.next_request().await;
+            h.ctrl.send_tool_call("own-choice", "choose_then_work", serde_json::json!({}));
+            h.ctrl.finish();
+            let first = r14::wait_permission(&r.agent, 5).await.expect("choice reaches agentd");
+            let mail = r12o::send(&r, "mail waiting behind the external job").await;
+            r.agent.answer_permission(first.id, first.incarnation, PermissionAnswer::Choose("0".into())).await.expect("agentd answers");
+            let answered = wait_answer(&answers).await;
+            h.client_tx.send(ClientMessage::ShutdownSession { root_thread_id: r.root.clone() }).expect("cli quit");
+            let again = r14::wait_permission(&r.agent, 5).await;
+            let replayed = again.as_ref().is_some_and(|p| p.id != first.id);
+            tokio::time::sleep(Duration::from_millis(4000)).await;
+            let stall = stalled(&r);
+            let pending = r.agent.pending_permissions().await.expect("pending").len();
+            let state = r.mailroom.delivery(mail).await.expect("delivery").state;
+            eprintln!("r16o answered then quit: server_got_answer={answered} answers={} reoffered_answered_choice={replayed} stall_event_after_4s={stall} agentd_pending={pending} phase={:?} mail={state:?}", answers.lock().expect("lock").len(), r.agent.phase());
+            r.broker.shutdown().await.expect("shutdown");
+            assert!(answered, "probe precondition: agentd answered");
+            assert!(stall, "a replayed, already-answered choice must not suspend the stall timer");
+        }).await;
+    }
 }
