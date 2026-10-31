@@ -326,6 +326,8 @@ pub async fn handle_client_channels(
     let mut active_remote_name: Option<RemoteName> = None;
     let mut _booted_rap_servers: Vec<crate::rap_servers::MigrationServer> = Vec::new(); // prevents shutdown until close
 
+    let mut emigrations = std::collections::HashMap::new();
+
     // Send Welcome immediately
     {
         let mgr = session_manager.lock().await;
@@ -676,14 +678,14 @@ pub async fn handle_client_channels(
                                         .await;
                                 }));
                             } else {
-                                let _ = daemon_tx.send(DaemonMessage::Error {
-                                    thread_id: Some(ThreadRef::local(thread_id.clone())),
+                                let _ = daemon_tx.send(DaemonMessage::UserChoiceError {
+                                    choice_id: choice_id.clone(),
                                     text: format!("Unknown or stale choice: {choice_id}"),
                                 });
                             }
                         } else {
-                            let _ = daemon_tx.send(DaemonMessage::Error {
-                                thread_id: None,
+                            let _ = daemon_tx.send(DaemonMessage::UserChoiceError {
+                                choice_id: choice_id.clone(),
                                 text: format!("Unknown or stale choice: {choice_id}; no attached thread"),
                             });
                         }
@@ -698,8 +700,9 @@ pub async fn handle_client_channels(
                     ClientMessage::Emigrate { root_thread_id, dest_rap_urls } => {
                         // Daemon-to-daemon: shut down session, migrate RAP servers, serialize, return data
                         let mgr = session_manager.clone();
-                        match crate::migrate::handle_emigrate(&root_thread_id, dest_rap_urls, &mgr).await {
-                            Ok(data) => {
+                        match crate::migrate::prepare_emigration(&root_thread_id, dest_rap_urls, &mgr).await {
+                            Ok((data, frozen)) => {
+                                emigrations.insert(root_thread_id.clone(), frozen);
                                 let _ = daemon_tx.send(DaemonMessage::EmigrateResult {
                                     root_thread_id,
                                     session_data: data,
@@ -719,7 +722,10 @@ pub async fn handle_client_channels(
                         let mgr = session_manager.lock().await;
                         let mut store = mgr.session_store.lock().await;
                         store.mark_archived(&session_id);
-                        let _ = store.save();
+                        match store.save() {
+                            Ok(()) => { emigrations.remove(&session_id); }
+                            Err(error) => { tracing::error!(%error, "failed to commit emigration"); }
+                        }
                     }
                     ClientMessage::ImportSession { root_thread_id, cwd, session_data } => {
                         // Daemon-to-daemon: import a serialized session
@@ -814,6 +820,15 @@ pub async fn handle_client_channels(
                     }
                 }
             }
+        }
+    }
+
+    for (_, frozen) in emigrations {
+        if let Err(error) = frozen
+            .finish::<()>(Err("emigration connection closed before completion".into()))
+            .await
+        {
+            tracing::warn!(%error, "emigration rolled back");
         }
     }
 

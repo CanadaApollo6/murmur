@@ -156,6 +156,8 @@ pub(crate) enum SessionEvent {
     Committed { ids: Vec<MessageId> },
     Activity(String),
     PermissionRequested(PermissionRequest),
+    PermissionsRestored(Vec<PermissionRequest>),
+    PermissionSettled(PermissionId),
     TurnEnded { outcome: TurnOutcome },
     Ended { reason: String },
     ResumeFailed { reason: String },

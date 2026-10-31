@@ -278,6 +278,8 @@ impl Broker {
             stall_timeout: kind.stall_timeout,
             last_activity: Instant::now(),
             deferred_mail: false,
+            waiting_offers: Vec::new(),
+            permission_pause: None,
             spec,
             adapter: AdapterSet::build(kind),
             mailroom: Arc::clone(&self.mailroom),
@@ -338,6 +340,8 @@ struct AgentActor {
     stall_timeout: Duration,
     last_activity: Instant,
     deferred_mail: bool,
+    waiting_offers: Vec<MessageId>,
+    permission_pause: Option<Instant>,
     events: broadcast::Sender<Event>,
     commands: mpsc::Receiver<Command>,
     phase_tx: watch::Sender<Phase>,
@@ -560,12 +564,16 @@ impl AgentActor {
         if items.is_empty() {
             return Ok(());
         }
+        if self.phase == Phase::Busy {
+            self.waiting_offers.extend(&outcome.offered);
+        }
         self.offered.extend(&outcome.offered);
         self.emit(Event::Offered {
             agent: self.id,
             ids: outcome.offered,
         });
         if self.phase != Phase::Busy {
+            self.permission_pause = None;
             self.last_activity = Instant::now();
         }
         self.phase(Phase::Busy);
@@ -585,6 +593,9 @@ impl AgentActor {
                 | SessionEvent::CancelComplete
         ) {
             self.last_activity = Instant::now();
+            if self.permission_pause.is_some() {
+                self.permission_pause = Some(self.last_activity);
+            }
         }
         match event {
             SessionEvent::TurnStarted { ids } => {
@@ -601,6 +612,7 @@ impl AgentActor {
                 self.interrupt_since = None;
                 self.mailroom.mark_consumed(&ids, self.incarnation).await?;
                 self.offered.retain(|id| !ids.contains(id));
+                self.waiting_offers.retain(|id| !ids.contains(id));
                 self.emit(Event::Consumed {
                     agent: self.id,
                     ids,
@@ -611,6 +623,7 @@ impl AgentActor {
                 self.interrupt_since = None;
                 self.cancelling = false;
                 self.clear_pending();
+                self.resume_stall_clock();
                 self.emit(Event::TurnEnded {
                     agent: self.id,
                     outcome: TurnOutcome::Cancelled,
@@ -625,6 +638,7 @@ impl AgentActor {
                     self.interrupt_since = None;
                     self.cancelling = false;
                     self.clear_pending();
+                    self.resume_stall_clock();
                     self.emit(Event::TurnEnded {
                         agent: self.id,
                         outcome,
@@ -642,6 +656,21 @@ impl AgentActor {
                     self.phase(Phase::Busy);
                 }
                 self.permission(request).await?;
+            }
+            SessionEvent::PermissionsRestored(requests) => {
+                for request in requests {
+                    if self.phase == Phase::Idle {
+                        self.phase(Phase::Busy);
+                    }
+                    self.permission(request).await?;
+                }
+                self.resume_stall_clock();
+            }
+            SessionEvent::PermissionSettled(id) => {
+                if self.pending.remove(&id).is_some() {
+                    self.emit(Event::PermissionAnswered { agent: self.id, id });
+                }
+                self.resume_stall_clock();
             }
             SessionEvent::ResumeUpdated => {
                 if let Some(session) = &self.session {
@@ -715,6 +744,7 @@ impl AgentActor {
                 self.end(error.to_string()).await?;
             }
         } else {
+            self.permission_pause.get_or_insert_with(Instant::now);
             let deadline = self.spec.permissions.timeout.map(|d| Instant::now() + d);
             self.pending.insert(request.id, (request.clone(), deadline));
             self.emit(Event::PermissionPending(request));
@@ -749,6 +779,7 @@ impl AgentActor {
         if let Err(error) = result {
             if matches!(error, AdapterError::StaleChoice) {
                 self.pending.remove(&id);
+                self.resume_stall_clock();
                 self.emit(Event::PermissionAnswered { agent: self.id, id });
                 return Err(Error::StalePermission);
             }
@@ -756,6 +787,7 @@ impl AgentActor {
             return Err(Error::Closed);
         }
         self.pending.remove(&id);
+        self.resume_stall_clock();
         self.emit(Event::PermissionAnswered { agent: self.id, id });
         Ok(())
     }
@@ -775,6 +807,13 @@ impl AgentActor {
             self.clear_pending();
         }
         Ok(())
+    }
+    fn resume_stall_clock(&mut self) {
+        if self.pending.is_empty()
+            && let Some(paused) = self.permission_pause.take()
+        {
+            self.last_activity += paused.elapsed();
+        }
     }
     fn clear_pending(&mut self) {
         for (id, _) in self.pending.drain().collect::<Vec<_>>() {
@@ -799,6 +838,7 @@ impl AgentActor {
             .settle_session(self.id, self.incarnation, false, self.model_agent)
             .await?;
         self.offered.clear();
+        self.waiting_offers.clear();
         self.clear_pending();
         Ok(())
     }
@@ -848,7 +888,8 @@ impl AgentActor {
     }
     fn stall_deadline(&self) -> Option<Instant> {
         (self.phase == Phase::Busy
-            && (!self.offered.is_empty() || self.deferred_mail)
+            && (!self.waiting_offers.is_empty() || self.deferred_mail)
+            && self.permission_pause.is_none()
             && !self.cancelling
             && !self.stall_timeout.is_zero())
         .then(|| self.last_activity + self.stall_timeout)

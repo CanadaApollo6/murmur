@@ -89,7 +89,7 @@ terminal tool error. A stopped live driver can continue without agentd detecting
 the loss. An archived driver records terminal results but starts no new model
 completion or tool dispatch. Archive closes admission before stopping servers. Calls to external servers and MCP proxies survive because those servers
 stay running. Their outstanding choices remain answerable after quit. Unknown
-or stale choice answers receive a daemon error. Model streams also continue
+or stale choice answers receive a separate `UserChoiceError` without crashing agentd. Model streams also continue
 after a CLI quit.
 A stopped root reconnects without spending the crash budget or requesting an
 Interrupt. Connect clears and persists shutdown so the router admits mail again.
@@ -104,18 +104,32 @@ before a task starts. The adapter persists its recovery marker when it changes,
 including when idle or a new completion clears it, so an unclean agentd exit
 does not restore a cleared marker.
 
-Every kind has a mail-starvation stall timer in the supervisor. While a Busy
-agent has Offered mail or queued mail deferred behind its work or a permission,
-`stall_timeout_secs` seconds without session activity invokes the existing cancel
-path. Stream chunks, tool starts and results, completion boundaries, choices,
-receipts, and turn ends reset the clock. Reconnects and new mail do not reset it.
+Every kind has a mail-starvation stall timer in the supervisor. It bounds mail
+queued or deferred behind running work, including mail offered to a busy Infinity
+thread. The running turn's own mail does not arm it. An initial uncommitted
+Infinity delivery uses the adapter's receipt deadline instead.
+`stall_timeout_secs` seconds without real session activity invokes the existing
+cancel path. Stream chunks, tool starts and results, completion boundaries,
+new choices, receipts, and turn ends reset the clock. Reconnects, restored or
+replayed choices, and new mail never reset it. Pending permissions and choices
+suspend the clock, including across reconnects. When they settle, the clock
+resumes with its remaining time. `permissions.timeout` governs the human wait.
+With `permissions.timeout = None`, mail queued behind a choice waits for the
+human by design.
 With no waiting mail, there is no stall deadline. Each `[kind.NAME]` can set
 `stall_timeout_secs`; `0` disables it. `KindConfig::stall_timeout` uses a Duration.
-The default is 600 seconds for every kind, giving ordinary tool calls and pauses
-ten minutes before cancelling work to release waiting mail. A tool that runs
-silently longer than this limit while mail waits gets cancelled. Raise the value
-or disable it for such tools. Cancellation uses the existing acknowledgment
-policy, including Infinity's ten-minute no-progress bound to `NeedsRecovery`.
+The default is 600 seconds for every kind. A tool that runs silently longer than
+this limit while other mail waits gets cancelled. Raise the value or disable it
+for such tools. Cancellation uses the existing acknowledgment policy, including
+Infinity's ten-minute no-progress bound to `NeedsRecovery`.
+
+Migration closes source admission, then requires a settled source. A busy
+driver, pending call, or pending choice causes an immediate error. Migration
+neither waits for that work nor transfers it. Only a settled source is serialized.
+Any failure after freezing restores the previous archive and shutdown flags.
+A remote emigration connection stays open through destination import. Closing
+it before `EmigrateDone` also restores the source. Successful migration leaves
+the source archived. Migration of in-flight calls is follow-up work.
 
 Command-backed RAP calls use an opaque invocation scope in their callback URL.
 A real callback and shutdown error share one dedup ID; a later call with a reused

@@ -418,7 +418,15 @@ impl InfinitySession {
                     }));
             }
             DaemonMessage::UserChoiceComplete { choice_id } => {
-                self.choices.retain(|_, choice| choice.wire_id != choice_id);
+                let settled = self
+                    .choices
+                    .iter()
+                    .filter_map(|(id, choice)| (choice.wire_id == choice_id).then_some(*id))
+                    .collect::<Vec<_>>();
+                for id in settled {
+                    self.choices.remove(&id);
+                    self.events.push_back(SessionEvent::PermissionSettled(id));
+                }
             }
             DaemonMessage::Replay {
                 pending_choices,
@@ -427,9 +435,19 @@ impl InfinitySession {
             } => {
                 // Replay restores core liveness, never delivery evidence.
                 self.thread_busy = !idle;
+                let mut restored = Vec::new();
                 for choice in pending_choices {
+                    let start = self.events.len();
                     self.receive(choice)?;
+                    for event in self.events.split_off(start) {
+                        match event {
+                            SessionEvent::PermissionRequested(request) => restored.push(request),
+                            other => self.events.push_back(other),
+                        }
+                    }
                 }
+                self.events
+                    .push_back(SessionEvent::PermissionsRestored(restored));
             }
             DaemonMessage::SessionsUpdated { sessions } => {
                 if let Some(session) = sessions.get(&self.root) {
@@ -532,8 +550,12 @@ impl Session for InfinitySession {
     }
     async fn cancel(&mut self) -> Result<(), AdapterError> {
         let active = self.busy() || !self.pending.is_empty();
-        self.events
-            .retain(|e| !matches!(e, SessionEvent::PermissionRequested(_)));
+        self.events.retain(|e| {
+            !matches!(
+                e,
+                SessionEvent::PermissionRequested(_) | SessionEvent::PermissionsRestored(_)
+            )
+        });
         if self.cancel_deadline.is_none() {
             let deadline = Instant::now() + self.kind.cancel_timeout;
             if active {

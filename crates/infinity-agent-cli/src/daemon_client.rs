@@ -107,6 +107,9 @@ fn daemon_msg_to_display(msg: DaemonMessage) -> Option<(Option<ThreadRef>, Displ
         DaemonMessage::CompactionApplied { thread_id } => {
             (thread_id, DisplayEvent::CompactionApplied)
         }
+        DaemonMessage::UserChoiceError { text, .. } => {
+            (None, DisplayEvent::Info(format!("Error: {text}")))
+        }
         DaemonMessage::Error { thread_id, text } => {
             (thread_id, DisplayEvent::Info(format!("Error: {text}")))
         }
