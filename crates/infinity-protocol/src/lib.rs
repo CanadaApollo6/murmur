@@ -406,6 +406,10 @@ pub enum DaemonMessage {
         choices: Vec<String>,
         default: usize,
     },
+    UserChoiceError {
+        choice_id: ChoiceId,
+        text: String,
+    },
     UserChoiceComplete {
         choice_id: ChoiceId,
     },

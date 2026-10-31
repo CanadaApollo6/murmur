@@ -1226,3 +1226,121 @@ async fn stall_timer_cancels_acp_to_deliver_deferred_mail() {
     assert!(t.wire().iter().any(|m| m["method"] == "session/cancel"));
     t.finish().await;
 }
+
+mod r15o {
+    use super::*;
+
+    async fn acp_with_stall(stall: Duration) -> Test {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mailroom = Arc::new(
+            Mailroom::open(root.path().join("mail.db"), Default::default())
+                .await
+                .expect("mailroom"),
+        );
+        let mut kind = kind(root.path(), false);
+        kind.stall_timeout = stall;
+        let broker = Broker::new(mailroom.clone(), vec![kind], config()).expect("broker");
+        let events = broker.events();
+        let agent = broker
+            .spawn(spec(root.path(), "claude", Default::default()))
+            .await
+            .expect("spawn");
+        Test {
+            root,
+            mailroom,
+            broker,
+            events,
+            agent,
+        }
+    }
+
+    /// A human permission prompt with no other mail waiting. permissions.timeout is None,
+    /// so before the stall timer this prompt waited for the human indefinitely.
+    #[tokio::test]
+    async fn r15o_acp_permission_without_waiting_mail_is_not_withdrawn() {
+        let mut t = acp_with_stall(Duration::from_millis(300)).await;
+        let only = t.send("permission").await;
+        let request = t.pending().await;
+        let queued = t.mailroom.pending_for(t.agent.id).await.expect("pending");
+        let mut withdrawn = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1200);
+        while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, t.events.recv()).await {
+            if matches!(&event, Event::PermissionAnswered { id, .. } if *id == request.id) {
+                withdrawn = true;
+            }
+        }
+        let cancelled = t.wire().iter().any(|m| m["method"] == "session/cancel");
+        let state = t.mailroom.delivery(only).await.expect("delivery").state;
+        eprintln!(
+            "r15o acp permission: queued_other_mail={} withdrawn={withdrawn} session_cancel_sent={cancelled} delivery={state:?} phase={:?}",
+            queued.len(),
+            t.agent.phase()
+        );
+        t.finish().await;
+        assert!(queued.is_empty(), "probe precondition: no other mail waits");
+        assert!(
+            !withdrawn && !cancelled,
+            "an unanswered permission with no waiting mail must not be cancelled"
+        );
+    }
+
+    /// One ACP turn, nothing else queued. The design says no waiting mail means
+    /// no stall deadline, so a silent tool longer than the timeout must survive.
+    #[tokio::test]
+    async fn r15o_acp_single_turn_without_waiting_mail_is_not_cancelled() {
+        let mut t = acp_with_stall(Duration::from_millis(300)).await;
+        let only = t.send("hold").await;
+        t.started(only).await;
+        let queued = t.mailroom.pending_for(t.agent.id).await.expect("pending");
+        let mut stall = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1200);
+        while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, t.events.recv()).await {
+            if matches!(&event, Event::Activity { text, .. } if text.contains("mail-starvation stall timeout"))
+            {
+                stall = true;
+            }
+        }
+        let cancelled = t.wire().iter().any(|m| m["method"] == "session/cancel");
+        let state = t.mailroom.delivery(only).await.expect("delivery").state;
+        eprintln!(
+            "r15o acp single turn: queued_other_mail={} stall_event={stall} session_cancel_sent={cancelled} delivery={state:?} phase={:?}",
+            queued.len(),
+            t.agent.phase()
+        );
+        t.release();
+        t.finish().await;
+        assert!(queued.is_empty(), "probe precondition: no other mail waits");
+        assert!(
+            !stall && !cancelled,
+            "no waiting mail must mean no stall deadline, but the turn's own offered mail armed it"
+        );
+    }
+    #[tokio::test]
+    async fn r15_acp_queued_mail_waits_for_human_by_design() {
+        let mut t = acp_with_stall(Duration::from_millis(250)).await;
+        let first = t.send("permission").await;
+        let permission = t.pending().await;
+        let waiting = t.send("response-only").await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!t.wire().iter().any(|m| m["method"] == "session/cancel"));
+        assert_eq!(
+            t.mailroom.delivery(waiting).await.expect("waiting").state,
+            DeliveryState::Queued
+        );
+        assert_eq!(
+            t.agent.pending_permissions().await.expect("pending").len(),
+            1
+        );
+        t.agent
+            .answer_permission(
+                permission.id,
+                permission.incarnation,
+                PermissionAnswer::Choose("yes".into()),
+            )
+            .await
+            .expect("answer");
+        t.consumed(first).await;
+        t.consumed(waiting).await;
+        t.finish().await;
+    }
+}

@@ -604,7 +604,8 @@ impl Tool<ChannelSender> for ManagedRapTool {
         .await;
         if let Err(error) = result {
             tracing::warn!(%error, "RAP invocation failed");
-            // Use the invocation's result identity for transport failures too.
+            let failure_id = id.to_string();
+            // Command failures share the invocation scope with callbacks and shutdown.
             let infinity_rap_bridge::CallbackDelivery::Input { message, dedup_id } =
                 infinity_rap_bridge::prepare_callback(rap_protocol::RapCallback::ToolResult(
                     rap_protocol::RapToolResult {
@@ -622,7 +623,14 @@ impl Tool<ChannelSender> for ManagedRapTool {
             };
             tracked_context
                 .message_sender
-                .send_to_input_queue(*message, &dedup_id)
+                .send_to_input_queue(
+                    *message,
+                    if invocation.is_some() {
+                        &dedup_id
+                    } else {
+                        &failure_id
+                    },
+                )
                 .await?;
         }
         Ok(())
