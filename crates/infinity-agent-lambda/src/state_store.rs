@@ -30,6 +30,57 @@ impl DynamoDbStateStore {
 impl StateStore for DynamoDbStateStore {
     type Error = DynamoError;
 
+    async fn get_tool_dispatch(
+        &self,
+        thread_id: &ThreadId<str>,
+    ) -> Result<Option<infinity_agent_core::traits::ToolDispatch>, DynamoError> {
+        let result = self
+            .client
+            .get_item()
+            .table_name(&self.table_name)
+            .key("session", AttributeValue::S(thread_id.as_str().to_owned()))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| DynamoError(format!("Failed to get tool dispatch: {e}")))?;
+        result
+            .item
+            .as_ref()
+            .and_then(|item| item.get("tool_dispatch"))
+            .and_then(|value| value.as_s().ok())
+            .map(|json| {
+                serde_json::from_str(json)
+                    .map_err(|e| DynamoError(format!("Failed to deserialize tool dispatch: {e}")))
+            })
+            .transpose()
+    }
+
+    async fn set_tool_dispatch(
+        &self,
+        thread_id: &ThreadId<str>,
+        dispatch: Option<infinity_agent_core::traits::ToolDispatch>,
+    ) -> Result<(), DynamoError> {
+        let request = self
+            .client
+            .update_item()
+            .table_name(&self.table_name)
+            .key("session", AttributeValue::S(thread_id.as_str().to_owned()));
+        let request = if let Some(dispatch) = dispatch {
+            let json = serde_json::to_string(&dispatch)
+                .map_err(|e| DynamoError(format!("Failed to serialize tool dispatch: {e}")))?;
+            request
+                .update_expression("SET tool_dispatch = :dispatch")
+                .expression_attribute_values(":dispatch", AttributeValue::S(json))
+        } else {
+            request.update_expression("REMOVE tool_dispatch")
+        };
+        request
+            .send()
+            .await
+            .map_err(|e| DynamoError(format!("Failed to set tool dispatch: {e}")))?;
+        Ok(())
+    }
+
     async fn get_processed_ids(
         &self,
         thread_id: &ThreadId<str>,
