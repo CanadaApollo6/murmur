@@ -305,7 +305,7 @@ async fn reoffer_after_daemon_death_is_deduplicated_and_receipted() {
 async fn no_receipt_never_consumes_and_exhausted_retries_are_held() {
     let mut t = Test::new().await;
     let id = t.send(true, "never durable").await;
-    for attempt in 1..=5 {
+    for _ in 1..=5 {
         let request = t.daemon.next().await;
         assert!(matches!(
             request.message,
@@ -314,24 +314,23 @@ async fn no_receipt_never_consumes_and_exhausted_retries_are_held() {
         request.emit(fake::start());
         request.emit(fake::round_done());
         request.emit(fake::idle());
-        if attempt < 5 {
-            t.event(|e| matches!(e, Event::PhaseChanged { phase: Phase::Crashed { attempt: n, .. }, .. } if *n == attempt)).await;
-            assert!(matches!(
-                t.daemon.next().await.message,
-                ClientMessage::Connect { .. }
-            ));
-        }
+        t.event(|e| {
+            matches!(
+                e,
+                Event::PhaseChanged {
+                    phase: Phase::Crashed { .. },
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(matches!(
+            t.daemon.next().await.message,
+            ClientMessage::Connect { .. }
+        ));
     }
-    t.event(|e| {
-        matches!(
-            e,
-            Event::PhaseChanged {
-                phase: Phase::Failed { .. },
-                ..
-            }
-        )
-    })
-    .await;
+    t.idle().await;
+    assert!(!matches!(*t.agent.phases().borrow(), Phase::Failed { .. }));
     assert!(matches!(
         t.mailroom.delivery(id).await.expect("delivery").state,
         DeliveryState::Held { .. }
@@ -1206,4 +1205,184 @@ async fn boot_recovery_survives_disconnect_before_settlement() {
     reoffer.emit(fake::idle());
     t.consumed(id).await;
     t.finish().await;
+}
+
+#[tokio::test]
+async fn r11_child_driver_failure_recovers_parent() {
+    let mut t = Test::new().await;
+    let id = t.send(false, "parent waiting on child").await;
+    let input = t.daemon.next().await;
+    t.daemon.state.lock().expect("state").manual_replay = true;
+    input.emit(DaemonMessage::Error {
+        thread_id: Some(infinity_protocol::ThreadRef::local("child".into())),
+        text: "Thread driver failed: child panic".into(),
+    });
+    let connect = t.daemon.next().await;
+    assert!(matches!(connect.message, ClientMessage::Connect { .. }));
+    connect.emit(DaemonMessage::Replay {
+        history: vec![],
+        pending_choices: vec![],
+        views: Default::default(),
+        in_progress: false,
+        idle: false,
+    });
+    let interrupt = t.daemon.next().await;
+    assert!(matches!(interrupt.message, ClientMessage::Interrupt { .. }));
+    interrupt.emit(fake::idle());
+    let mail = t.daemon.next().await;
+    mail.emit(fake::receipt(format!("peer-{id}")));
+    mail.emit(fake::idle());
+    t.consumed(id).await;
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn r11_receipt_expiry_holds_mail_without_failing_agent() {
+    let mut t = Test::new().await;
+    let id = t.send(false, "provider keeps failing before output").await;
+    for attempt in 0..5 {
+        let input = t.daemon.next().await;
+        assert!(matches!(
+            input.message,
+            ClientMessage::DeliverPeerMessage { .. }
+        ));
+        // A responsive daemon reports idle after the provider fails without a receipt.
+        input.emit(fake::idle());
+        let connect = t.daemon.next().await;
+        assert!(
+            matches!(connect.message, ClientMessage::Connect { .. }),
+            "attempt {attempt}"
+        );
+    }
+    t.event(|e| {
+        matches!(
+            e,
+            Event::PhaseChanged {
+                phase: Phase::Idle,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(matches!(
+        t.mailroom.delivery(id).await.expect("delivery").state,
+        DeliveryState::Held { .. }
+    ));
+    let fresh = t.send(false, "provider repaired").await;
+    let input = t.daemon.next().await;
+    assert!(matches!(
+        input.message,
+        ClientMessage::DeliverPeerMessage { .. }
+    ));
+    input.emit(fake::receipt(format!("peer-{fresh}")));
+    input.emit(fake::idle());
+    t.consumed(fresh).await;
+    assert!(!matches!(*t.agent.phases().borrow(), Phase::Failed { .. }));
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn r11_settlement_outage_does_not_spend_crash_budget() {
+    let mut t = Test::new().await;
+    let id = t.send(false, "awaiting storage repair").await;
+    let mut input = t.daemon.next().await;
+    t.daemon.state.lock().expect("state").manual_replay = true;
+    for _ in 0..6 {
+        input.emit(DaemonMessage::Error {
+            thread_id: fake::thread(),
+            text: "Interrupt settlement held; will retry on input or timer after storage repair"
+                .into(),
+        });
+        let connect = t.daemon.next().await;
+        assert!(matches!(connect.message, ClientMessage::Connect { .. }));
+        connect.emit(DaemonMessage::Replay {
+            history: vec![],
+            pending_choices: vec![],
+            views: Default::default(),
+            in_progress: false,
+            idle: false,
+        });
+        input = t.daemon.next().await;
+        assert!(matches!(input.message, ClientMessage::Interrupt { .. }));
+    }
+    input.emit(fake::idle());
+    // Repeated unreceipted offers can be Held independently of session recovery.
+    let fresh = t.send(false, "storage repaired").await;
+    loop {
+        let mail = t.daemon.next().await;
+        let ClientMessage::DeliverPeerMessage { message_id, .. } = &mail.message else {
+            panic!("mail")
+        };
+        mail.emit(fake::receipt(format!("peer-{message_id}")));
+        mail.emit(fake::idle());
+        if message_id == &fresh.to_string() {
+            break;
+        }
+    }
+    t.consumed(fresh).await;
+    assert!(!matches!(*t.agent.phases().borrow(), Phase::Failed { .. }));
+    assert!(!matches!(
+        t.mailroom.delivery(id).await.expect("delivery").state,
+        DeliveryState::Offered { .. }
+    ));
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn r11_cleared_recovery_marker_survives_unclean_exit() {
+    const CHILD: &str = "R11_MARKER_CHILD";
+    if let Ok(path_file) = std::env::var(CHILD) {
+        let mut t = Test::new().await;
+        let id = t.send(false, "old work").await;
+        let input = t.daemon.next().await;
+        {
+            let mut state = t.daemon.state.lock().expect("state");
+            state.boot_id = "new-boot".into();
+            state.manual_replay = true;
+        }
+        input.die();
+        let connect = t.daemon.next().await;
+        connect.emit(DaemonMessage::Replay {
+            history: vec![],
+            pending_choices: vec![],
+            views: Default::default(),
+            in_progress: false,
+            idle: false,
+        });
+        let interrupt = t.daemon.next().await;
+        assert!(matches!(interrupt.message, ClientMessage::Interrupt { .. }));
+        interrupt.emit(fake::idle());
+        let input = t.daemon.next().await;
+        input.emit(fake::receipt(format!("peer-{id}")));
+        input.emit(fake::idle());
+        t.consumed(id).await;
+        t.idle().await;
+        std::fs::write(path_file, t.root.path().to_str().expect("path")).expect("path file");
+        // Skip every destructor, including the actor's suspend/stop cleanup.
+        std::process::exit(0);
+    }
+    let dir = tempfile::tempdir().expect("parent tempdir");
+    let path_file = dir.path().join("child-path");
+    let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "r11_cleared_recovery_marker_survives_unclean_exit",
+            "--nocapture",
+        ])
+        .env(CHILD, &path_file)
+        .status()
+        .expect("child");
+    assert!(status.success());
+    let root = std::path::PathBuf::from(std::fs::read_to_string(path_file).expect("child path"));
+    let db = rusqlite::Connection::open(root.join("mail.db")).expect("database");
+    let token: String = db
+        .query_row("SELECT resume FROM actor_state", [], |row| row.get(0))
+        .expect("token");
+    let encoded: String = serde_json::from_str(&token).expect("opaque token");
+    let token: serde_json::Value = serde_json::from_str(&encoded).expect("Infinity token");
+    std::fs::remove_dir_all(root).expect("child cleanup");
+    assert_eq!(
+        token["needs_interrupt"], false,
+        "a settled recovery must not interrupt newer CLI work after agentd dies"
+    );
 }

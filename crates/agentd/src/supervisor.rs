@@ -372,10 +372,16 @@ impl AgentActor {
         if let Some(mcp) = &self.mcp {
             mcp.revoke(self.id).await;
         }
-        if let Some(session) = self.session.take()
-            && let Err(error) = session.suspend().await
-        {
-            tracing::error!(%error,"session shutdown failed");
+        if let Some(session) = self.session.take() {
+            match session.suspend().await {
+                Ok(token) if self.model_agent => {
+                    if let Err(error) = self.mailroom.save_resume(self.id, token).await {
+                        tracing::error!(%error,"session resume save failed");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error,"session shutdown failed"),
+            }
         }
         if let Err(error) = self
             .mailroom
@@ -425,6 +431,13 @@ impl AgentActor {
                     },
                 },
                 event = async { match &mut self.session { Some(s) => s.next_event().await, None => std::future::pending().await } } => {
+                    if self.model_agent && let Some(session) = &self.session {
+                        let token = session.resume_token();
+                        if self.resume.as_ref() != Some(&token) {
+                            self.mailroom.save_resume(self.id, token.clone()).await?;
+                            self.resume = Some(token);
+                        }
+                    }
                     self.on_event(event.unwrap_or(SessionEvent::Ended { reason: "session event stream closed".into() })).await?;
                 },
                 () = async { match deadline { Some(d) => tokio::time::sleep_until(d).await, None => std::future::pending().await } } => self.timer().await?,
@@ -603,7 +616,18 @@ impl AgentActor {
                 }
                 self.permission(request).await?;
             }
+            SessionEvent::ResumeUpdated => {}
             SessionEvent::Ended { reason } => self.end(reason).await?,
+            SessionEvent::ResumeFailed { reason } => {
+                self.stop_session().await?;
+                self.phase(Phase::NeedsRecovery { reason });
+            }
+            SessionEvent::Unavailable { reason } => {
+                tracing::warn!(agent=%self.id, %reason, "waiting for session recovery");
+                self.stop_session().await?;
+                self.unavailable_attempts = self.unavailable_attempts.saturating_add(1);
+                self.retry(self.unavailable_attempts);
+            }
         }
         Ok(())
     }

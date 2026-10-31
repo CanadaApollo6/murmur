@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use infinity_provider_protocol::message::{Text, ToolResult, ToolResultContent, UserContent};
 use tracing;
 
-use super::{Tool, ToolContext};
+use super::{Tool, ToolContext, spawn_tool_task};
 use crate::message::{InputMessage, InputMessageContent};
 use crate::traits::InputSender;
 
@@ -91,14 +91,19 @@ impl<M: InputSender + 'static> Tool<M> for TokioSleepTool {
         call_id: Option<rap_protocol::ProviderCallId>,
         context: &ToolContext<M>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let seconds = args["seconds"].as_f64().unwrap_or(0.0);
+        let seconds = args["seconds"]
+            .as_f64()
+            .ok_or("sleep requires numeric seconds")?;
+        let duration = std::time::Duration::try_from_secs_f64(seconds)
+            .map_err(|_| "sleep seconds must be finite, nonnegative, and representable")?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(duration)
+            .ok_or("sleep seconds exceed the timer range")?;
         let group_id = context.group_id.clone();
         let sender = context.message_sender.clone();
 
-        tokio::spawn(rap_protocol::log_panic("sleep_tool", async move {
-            if seconds > 0.0 {
-                tokio::time::sleep(std::time::Duration::from_secs_f64(seconds)).await;
-            }
+        spawn_tool_task(context.clone(), id.clone(), call_id.clone(), async move {
+            tokio::time::sleep_until(deadline).await;
             let msg = InputMessage {
                 content: InputMessageContent::User(UserContent::ToolResult(ToolResult {
                     id: id.clone().into_inner(),
@@ -113,10 +118,9 @@ impl<M: InputSender + 'static> Tool<M> for TokioSleepTool {
                 display_as: None,
                 subscription: false,
             };
-            if let Err(e) = sender.send_to_input_queue(msg, id.as_str()).await {
-                tracing::error!("Failed to deliver sleep result: {}", e);
-            }
-        }));
+            sender.send_to_input_queue(msg, id.as_str()).await?;
+            Ok(())
+        });
 
         tracing::info!("Sleep scheduled for {} seconds", seconds);
         Ok(())
@@ -201,7 +205,7 @@ impl<M: InputSender + 'static> Tool<M> for TokioSleepUntilTool {
         let group_id = context.group_id.clone();
         let sender = context.message_sender.clone();
 
-        tokio::spawn(rap_protocol::log_panic("sleep_until_tool", async move {
+        spawn_tool_task(context.clone(), id.clone(), call_id.clone(), async move {
             if !is_past {
                 let duration = (target_utc - now).to_std().unwrap_or_default();
                 tokio::time::sleep(duration).await;
@@ -218,11 +222,82 @@ impl<M: InputSender + 'static> Tool<M> for TokioSleepUntilTool {
                 display_as: None,
                 subscription: false,
             };
-            if let Err(e) = sender.send_to_input_queue(msg, id.as_str()).await {
-                tracing::error!("Failed to deliver sleep_until result: {}", e);
-            }
-        }));
+            sender.send_to_input_queue(msg, id.as_str()).await?;
+            Ok(())
+        });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[derive(Clone)]
+    struct PanicOnceSender {
+        first: Arc<AtomicBool>,
+        tx: tokio::sync::mpsc::UnboundedSender<InputMessage>,
+    }
+    #[async_trait]
+    impl InputSender for PanicOnceSender {
+        type Error = std::io::Error;
+        async fn send_to_input_queue(&self, msg: InputMessage, _: &str) -> Result<(), Self::Error> {
+            assert!(
+                !self.first.swap(false, Ordering::SeqCst),
+                "executor result construction/delivery panic"
+            );
+            self.tx.send(msg).expect("observe terminal result");
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn r11_detached_sleep_task_panic_delivers_terminal_error() {
+        for until in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let context = ToolContext {
+                message_sender: PanicOnceSender {
+                    first: Arc::new(AtomicBool::new(true)),
+                    tx,
+                },
+                group_id: "root".into(),
+                callback_url: String::new(),
+                user_id: None,
+                thread_stack: vec!["root".into()],
+                safe_spawn_point: None,
+            };
+            let tool: Box<dyn Tool<PanicOnceSender>> = if until {
+                Box::new(TokioSleepUntilTool)
+            } else {
+                Box::new(TokioSleepTool)
+            };
+            let args = if until {
+                serde_json::json!({"date":"2000-01-01","time":"00:00"})
+            } else {
+                serde_json::json!({"seconds":0})
+            };
+            tool.execute(
+                args,
+                "panic-call".into(),
+                Some("provider-call".into()),
+                &context,
+            )
+            .await
+            .expect("schedule");
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("panic must produce a terminal tool error")
+                .expect("result");
+            let InputMessageContent::User(UserContent::ToolResult(result)) = result.content else {
+                panic!("tool result")
+            };
+            assert_eq!(result.id, "panic-call");
+            assert_eq!(result.call_id.as_deref(), Some("provider-call"));
+            assert!(format!("{:?}", result.content).contains("Error: tool executor panicked"));
+        }
     }
 }

@@ -89,7 +89,7 @@ pub struct SandboxArgs {
     pub full_access: Vec<String>,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ResumeToken(String);
 
 impl ResumeToken {
@@ -146,6 +146,7 @@ pub(crate) enum TurnItem {
 
 #[derive(Clone, Debug)]
 pub(crate) enum SessionEvent {
+    ResumeUpdated,
     CancelComplete,
     TurnStarted { ids: Vec<MessageId> },
     Committed { ids: Vec<MessageId> },
@@ -153,6 +154,8 @@ pub(crate) enum SessionEvent {
     PermissionRequested(PermissionRequest),
     TurnEnded { outcome: TurnOutcome },
     Ended { reason: String },
+    ResumeFailed { reason: String },
+    Unavailable { reason: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
