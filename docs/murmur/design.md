@@ -124,9 +124,9 @@ One actor per agent, one state machine for every kind: `Dormant → Starting →
 - CLI agents suspend after `idle_after` (default 10 min): kill the process, keep the session ID. Mail wakes it with a resume.
 - Cancel uses ACP `session/cancel` or Infinity `Interrupt`. Core persists the tool settlement and choice removal before idle acknowledgment. Accepted real results survive provider failure and interruption. Before idle or after a step error, a leading tool result that answers a pending call is persisted without promoting unrelated unvalidated mail.
 - Settlement write failures retry every 100 ms for three seconds, then enter Held. Held retains the result, runs no inference, and retries on input, interrupt, and a five-second timer. A failed choice write enters this same bounded path. RAP cancellation notifications have a two-second bound. Receipt deadlines and exhausted or held settlement errors reconnect without spending the crash budget. Repeated interrupt expiry for ten minutes without committed input, a completed turn, or cancellation acknowledgment enters `NeedsRecovery`. Successful attachment does not reset the bound or Unavailable backoff.
-- Every kind uses one supervisor mail-starvation timer. It arms for mail queued or deferred behind running work, including mail offered to an already busy Infinity thread. The running turn's own mail does not arm it. An initial uncommitted Infinity delivery uses the adapter's receipt deadline. After `stall_timeout` without real activity, the supervisor cancels through the existing path. Chunks, tool starts and results, completion boundaries, new choices, receipts, and turn ends reset the clock. Reconnects, restored or replayed choices, and additional mail do not. Pending permissions and choices suspend the clock across reconnects. Settlement resumes the remaining time. `permissions.timeout` governs the human wait. With `permissions.timeout = None`, mail queued behind a choice waits for the human by design. No waiting mail means no stall deadline. Per-kind TOML `stall_timeout_secs` defaults to 600; `0` disables it. The Rust setting is `KindConfig::stall_timeout`. A tool that runs silently longer than the limit while other mail waits gets cancelled. Operators can raise or disable the limit. Cancellation that never acknowledges still reaches the existing ten-minute no-progress bound.
+- Every kind uses one supervisor mail-starvation timer. It arms for mail queued or deferred behind running work, including mail offered to an already busy Infinity thread. The running turn's own mail does not arm it. An initial uncommitted Infinity delivery uses the adapter's receipt deadline. After `stall_timeout` without real activity, the supervisor cancels through the existing path. Chunks, tool starts and results, completion boundaries, new choices, receipts, and turn ends reset the clock. Reconnects, restored or replayed choices, and additional mail do not. Pending permissions and choices keep the timer running, including with `permissions.timeout = None`. If other mail waits, a human wait past `stall_timeout` cancels the turn. Long human waits with mail flowing require raising `stall_timeout` or setting it to `0`. Without other waiting mail, a pending choice still waits indefinitely with `permissions.timeout = None`. Finite permission deadlines stay keyed to the original wire choice ID in supervisor state across reconnects. No waiting mail means no stall deadline. Per-kind TOML `stall_timeout_secs` defaults to 600; `0` disables it. The Rust setting is `KindConfig::stall_timeout`. A tool that runs silently longer than the limit while other mail waits gets cancelled. Operators can raise or disable the limit. Cancellation that never acknowledges still reaches the existing ten-minute no-progress bound.
 - `Welcome` includes a random daemon boot ID, saved in the adapter's opaque resume token. On reopen, agentd sends one `Interrupt` when the boot ID changed and replay is busy. A driver-failure protocol error from any thread uses the same recovery within one daemon. Stopped reconnects without spending a crash or requesting Interrupt. Connect reopens non-archived shutdown admission. The marker is persisted when it changes. Shutdown preserves live streams, external calls, MCP calls, and their choices. Unknown or stale choice answers receive `UserChoiceError`, which agentd does not treat as a protocol failure. Command server shutdown settles its pending calls with terminal errors. Command invocations have independent callback scopes, so reused model call IDs cannot collide in deduplication. Callback and shutdown settlement compete for the same invocation; the first locally received terminal result wins. A shutdown error does not prove side effects did not occur, so a non-idempotent tool requires checking before retry. Core terminal acceptance and cancellation retire the registry entries. External and MCP calls are not registered for shutdown.
-- Archive closes new input admission before shutting servers down. A resident driver may persist terminal results for existing calls, but may not start a new model completion or dispatch a new tool. Retained RAP handles also check archive state before boot and dispatch. Migration freezes admission, then rejects a busy driver, pending call, or pending choice with a clear error. It neither waits for outstanding work nor transfers it. Only a settled source reaches cleanup and serialization. Every failure after the freeze restores the previous archive and shutdown flags. Remote emigration retains its connection through destination import; disconnect before `EmigrateDone` restores the source as well. Successful migration leaves the source archived. Migration of in-flight calls is follow-up work. An Archived root enters `NeedsRecovery`; Interrupt and Connect cannot reopen it.
+- Archive closes new input admission before shutting servers down. A resident driver may persist terminal results for existing calls, but may not start a new model completion or dispatch a new tool. Retained RAP handles also check archive state before boot and dispatch. Migrating agentd-hosted sessions is unsupported. agentd never migrates its hosted sessions. Daemon migration retains main's behavior without a freeze or rollback guarantee. An Archived root enters `NeedsRecovery`; Interrupt and Connect cannot reopen it.
 - Restart recovery belongs to the broker. Core has no dispatch persistence or recovery on load. Only agentd-attached threads auto-recover after a daemon restart. Detached sleep executors catch panics and deliver terminal errors. Existing children retain their histories and seeds. Invocation-scoped callbacks fix late reused-ID callbacks for command-backed servers. External and MCP late callbacks with reused IDs remain follow-up work.
 - `Service`s (the inference server, `infinity daemon`) start in dependency order and restart with backoff. The inference server starts first because `list_models` runs once at daemon start.
 - **Watchdog:** an `Interceptor` at `Mailroom::accept`, a pure function of an envelope and its conversation view that can deliver, hold or reject. v1 ships `HopLimit`. Activity-based detectors subscribe to the event bus.
@@ -167,10 +167,13 @@ The shared mail-starvation timer bounds silent Busy work when mail waits,
 including streams that never finish and external calls that never return.
 `[kind.NAME].stall_timeout_secs` defaults to 600, and `0` disables it. Real session
 activity resets the clock. Reconnects and replayed choices never reset it.
-Pending choices suspend it; `permissions.timeout` governs their wait. With
-`permissions.timeout = None`, queued mail waits for the human by design. A silent tool longer than the timeout is cancelled
-while mail waits. This cost favors eventual mail delivery; workloads with
-long silent tools can raise or disable the setting.
+Pending permissions and choices do not pause it, even with
+`permissions.timeout = None`. A human wait or silent tool past the limit is
+cancelled while other mail waits. Raise `stall_timeout` or set it to `0` for
+long human waits with mail flowing. Without other waiting mail, a choice with
+`permissions.timeout = None` still waits indefinitely. Finite permission
+deadlines survive reconnects under the original wire choice ID in supervisor
+state; restored choices do not get a fresh deadline.
 Receipt, settlement, and interrupt timeouts keep their existing recovery
 policy. Repeated interrupt expiry for ten minutes without progress enters
 `NeedsRecovery`. Successful attachment does not reset backoff.
@@ -316,6 +319,20 @@ v1 (one machine, a handful of agents) builds the parts that change stored data, 
 
 The mail-starvation stall timer also covers model streams that stall without
 a shutdown when mail is waiting.
+
+Migration of agentd-hosted sessions is unsupported. The follow-up is
+"migration handoff protocol: freeze, settle or transfer in-flight calls,
+transfer processed-ID dedup state, commit/reconcile, crash/cancel-safe rollback,
+notify attached brokers". Astra r16 P2 #2 through #4 demonstrates ambiguous post-import
+disconnects, dropped-future rollback failure, and missing processed-ID transfer.
+Opus r16 P2-1 demonstrates the freeze stranding attached brokers. The r14
+migration admission race and r15 Astra P2 stranded result and Opus P2 #2 failed
+migration findings belong to the same protocol work. Archive admission gating
+is independent of this deferred protocol.
+
+Answered-choice dismissal must clear persistence and the live driver's choice,
+then notify attached clients. Until then Replay can re-offer an answered choice.
+This does not pause the stall timer.
 
 ## Next implementation step
 

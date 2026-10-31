@@ -1601,57 +1601,17 @@ async fn r15a_replayed_choice_must_not_refresh_stall_clock() {
         in_progress: false,
         idle: false,
     });
-    let Event::PermissionPending(mut permission) =
-        t.event(|e| matches!(e, Event::PermissionPending(_))).await
-    else {
-        unreachable!()
-    };
-    for _ in 0..8 {
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(250)).await;
-        tokio::time::resume();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), t.daemon.next())
-                .await
-                .is_err(),
-            "human wait suspends stall timer"
-        );
-        connection.die();
-        connection = t.daemon.next().await;
-        assert!(matches!(connection.message, ClientMessage::Connect { .. }));
-        connection.emit(DaemonMessage::Replay {
-            history: vec![],
-            pending_choices: vec![choice()],
-            views: Default::default(),
-            in_progress: false,
-            idle: false,
-        });
-        permission = match t.event(|e| matches!(e, Event::PermissionPending(_))).await {
-            Event::PermissionPending(p) => p,
-            _ => unreachable!(),
-        };
-    }
-    t.agent
-        .answer_permission(
-            permission.id,
-            permission.incarnation,
-            PermissionAnswer::Choose("0".into()),
-        )
-        .await
-        .expect("answer");
-    assert!(matches!(
-        t.daemon.next().await.message,
-        ClientMessage::UserChoiceAnswered { .. }
-    ));
-    let _offer = t.daemon.next().await;
+    t.event(|e| matches!(e, Event::PermissionPending(_))).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(349)).await;
+    tokio::time::resume();
     assert!(
         tokio::time::timeout(Duration::from_millis(30), t.daemon.next())
             .await
-            .is_err(),
-        "human wait is excluded from elapsed inactivity"
+            .is_err()
     );
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(351)).await;
+    tokio::time::advance(Duration::from_secs(2)).await;
     tokio::time::resume();
     let cancel = tokio::time::timeout(Duration::from_millis(150), t.daemon.next()).await;
     assert!(
@@ -1729,6 +1689,264 @@ async fn stale_choice_error_does_not_crash_root_session() {
         tokio::time::timeout(Duration::from_millis(100), t.daemon.next())
             .await
             .is_err()
+    );
+    t.finish().await;
+}
+
+mod r16o {
+    use super::*;
+
+    /// agentd is Idle when the daemon starts root work agentd did not submit: a CLI
+    /// turn on the same root, or a subscription event respawning the driver. Mail
+    /// offered from Idle then queues behind that work inside the daemon. The adapter
+    /// sets no receipt deadline because the thread is busy. Nothing commits it.
+    #[tokio::test]
+    async fn r16o_mail_offered_from_idle_behind_daemon_work_arms_stall() {
+        let mut t = Test::with_stall(Default::default(), Duration::from_millis(300)).await;
+        let first = t.send(false, "first turn").await;
+        let connection = t.daemon.next().await;
+        connection.emit(fake::start());
+        connection.emit(fake::receipt(format!("peer-{first}")));
+        t.consumed(first).await;
+        connection.emit(fake::idle());
+        t.idle().await;
+        connection.emit(fake::start());
+        connection.emit(DaemonMessage::ToolCall {
+            thread_id: fake::thread(),
+            name: "cli_long_tool".into(),
+            args: "{}".into(),
+            display_as: None,
+        });
+        t.event(|e| matches!(e, Event::Activity { text, .. } if text == "cli_long_tool"))
+            .await;
+        let phase_before = t.agent.phase();
+        let waiting = t.send(true, "mail behind daemon work").await;
+        let offer = t.daemon.next().await;
+        assert!(matches!(
+            offer.message,
+            ClientMessage::DeliverPeerMessage { .. }
+        ));
+        let next = tokio::time::timeout(Duration::from_secs(2), t.daemon.next()).await;
+        let interrupted = next
+            .as_ref()
+            .is_ok_and(|r| matches!(r.message, ClientMessage::Interrupt { .. }));
+        let state = t.mailroom.delivery(waiting).await.expect("delivery").state;
+        eprintln!(
+            "r16o idle-offer behind daemon work: phase_before_offer={phase_before:?} interrupted_within_2s={interrupted} phase={:?} mail={state:?}",
+            t.agent.phase()
+        );
+        offer.emit(fake::receipt(format!("peer-{waiting}")));
+        offer.emit(fake::idle());
+        t.finish().await;
+        assert_eq!(phase_before, Phase::Idle, "probe precondition");
+        assert!(
+            interrupted,
+            "mail waiting behind daemon work must arm the stall timer"
+        );
+    }
+
+    #[tokio::test]
+    async fn r16o_replayed_answered_choice_must_not_suspend_stall() {
+        let mut t = Test::with_stall(Default::default(), Duration::from_millis(1500)).await;
+        t.daemon.state.lock().expect("state").manual_replay = true;
+        let first = t.send(false, "start choice").await;
+        let connection = t.daemon.next().await;
+        connection.emit(fake::start());
+        connection.emit(fake::receipt(format!("peer-{first}")));
+        t.consumed(first).await;
+        let choice = || DaemonMessage::UserChoiceRequired {
+            thread_id: fake::thread(),
+            id: "answered-choice".into(),
+            prompt: "choose".into(),
+            choices: vec!["yes".into(), "no".into()],
+            default: 1,
+        };
+        connection.emit(choice());
+        let Event::PermissionPending(request) =
+            t.event(|e| matches!(e, Event::PermissionPending(_))).await
+        else {
+            unreachable!()
+        };
+        let waiting = t.send(true, "waiting behind answered choice").await;
+        t.agent
+            .answer_permission(
+                request.id,
+                request.incarnation,
+                PermissionAnswer::Choose("0".into()),
+            )
+            .await
+            .expect("human answers");
+        let answered = t.daemon.next().await;
+        assert!(matches!(
+            answered.message,
+            ClientMessage::UserChoiceAnswered { .. }
+        ));
+        let offer = t.daemon.next().await;
+        assert!(matches!(
+            offer.message,
+            ClientMessage::DeliverPeerMessage { .. }
+        ));
+        offer.die();
+        let connect = t.daemon.next().await;
+        assert!(matches!(connect.message, ClientMessage::Connect { .. }));
+        connect.emit(DaemonMessage::Replay {
+            history: vec![],
+            pending_choices: vec![choice()],
+            views: Default::default(),
+            in_progress: false,
+            idle: false,
+        });
+        let replayed = t.event(|e| matches!(e, Event::PermissionPending(_))).await;
+        let mut next = None;
+        let end = tokio::time::Instant::now() + Duration::from_secs(4);
+        while let Ok(request) = tokio::time::timeout_at(end, t.daemon.next()).await {
+            if matches!(request.message, ClientMessage::Interrupt { .. }) {
+                next = Some(request);
+                break;
+            }
+        }
+        let pending = t.agent.pending_permissions().await.expect("pending");
+        eprintln!(
+            "r16o replayed answered choice: replayed={} interrupted_within_4s={} pending_after={} phase={:?} mail={:?}",
+            matches!(replayed, Event::PermissionPending(_)),
+            next.is_some(),
+            pending.len(),
+            t.agent.phase(),
+            t.mailroom.delivery(waiting).await.expect("delivery").state
+        );
+        t.finish().await;
+        assert!(
+            next.is_some(),
+            "an already-answered choice must not suspend the stall timer after replay"
+        );
+    }
+}
+
+#[tokio::test]
+async fn r16a_finite_human_timeout_survives_reconnects() {
+    let policy = PermissionPolicy {
+        timeout: Some(Duration::from_secs(600)),
+        ..Default::default()
+    };
+    // Disable starvation cancellation to isolate the human deadline.
+    let mut t = Test::with_stall(policy, Duration::ZERO).await;
+    t.daemon.state.lock().expect("state").manual_replay = true;
+    let first = t.send(false, "start choice").await;
+    let mut connection = t.daemon.next().await;
+    connection.emit(fake::start());
+    connection.emit(fake::receipt(format!("peer-{first}")));
+    t.consumed(first).await;
+    let choice = || DaemonMessage::UserChoiceRequired {
+        thread_id: fake::thread(),
+        id: "finite-choice".into(),
+        prompt: "choose".into(),
+        choices: vec!["yes".into(), "no".into()],
+        default: 1,
+    };
+    connection.emit(choice());
+    t.event(|e| matches!(e, Event::PermissionPending(_))).await;
+    let started = tokio::time::Instant::now();
+    for _ in 0..2 {
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(250)).await;
+        tokio::time::resume();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), t.daemon.next())
+                .await
+                .is_err()
+        );
+        connection.die();
+        connection = t.daemon.next().await;
+        connection.emit(DaemonMessage::Replay {
+            history: vec![],
+            pending_choices: vec![choice()],
+            views: Default::default(),
+            in_progress: false,
+            idle: false,
+        });
+        t.event(|e| matches!(e, Event::PermissionPending(_))).await;
+    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(99)).await;
+    tokio::time::resume();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), t.daemon.next())
+            .await
+            .is_err()
+    );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::resume();
+    let cancel = tokio::time::timeout(Duration::from_millis(150), t.daemon.next()).await;
+    eprintln!(
+        "r16 finite human deadline: elapsed={:?} expired={}",
+        started.elapsed(),
+        cancel.is_ok()
+    );
+    assert!(matches!(
+        cancel.map(|r| r.message),
+        Ok(ClientMessage::Interrupt { .. })
+    ));
+    assert!(started.elapsed() < Duration::from_secs(603));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), t.daemon.next())
+            .await
+            .is_err(),
+        "expires once"
+    );
+    connection.emit(fake::start());
+    connection.emit(fake::idle());
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn r16_pending_choice_with_queued_mail_has_starvation_bound() {
+    let mut t = Test::with_stall(Default::default(), Duration::from_secs(600)).await;
+    let first = t.send(false, "start choice").await;
+    let connection = t.daemon.next().await;
+    connection.emit(fake::start());
+    connection.emit(fake::receipt(format!("peer-{first}")));
+    t.consumed(first).await;
+    connection.emit(DaemonMessage::UserChoiceRequired {
+        thread_id: fake::thread(),
+        id: "unanswered-choice".into(),
+        prompt: "choose".into(),
+        choices: vec!["yes".into()],
+        default: 0,
+    });
+    t.event(|e| matches!(e, Event::PermissionPending(_))).await;
+    // A choice without other mail does not arm the stall timer.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(100)).await;
+    tokio::time::resume();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), t.daemon.next())
+            .await
+            .is_err()
+    );
+    let waiting = t.send(true, "waiting behind human").await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(499)).await;
+    tokio::time::resume();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), t.daemon.next())
+            .await
+            .is_err()
+    );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::resume();
+    let cancel = tokio::time::timeout(Duration::from_millis(150), t.daemon.next()).await;
+    assert!(
+        matches!(
+            cancel.map(|r| r.message),
+            Ok(ClientMessage::Interrupt { .. })
+        ),
+        "human wait counts toward stall_timeout once mail waits"
+    );
+    assert_eq!(
+        t.mailroom.delivery(waiting).await.expect("mail").state,
+        DeliveryState::Queued
     );
     t.finish().await;
 }

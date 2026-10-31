@@ -3,7 +3,7 @@
 //! Handles migrating a session between local and remote daemons.
 //! The local daemon always acts as the orchestrator.
 
-use infinity_agent_core::{ThreadId, message::InfinityMessage, traits::ConversationStore};
+use infinity_agent_core::ThreadId;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -15,81 +15,6 @@ use crate::remote::{RemoteDaemons, SshPortForward};
 use crate::session::SharedSessionManager;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
-pub(crate) struct FrozenSource {
-    session_id: ThreadId,
-    previous: crate::session_store::SessionEntry,
-    store: crate::session::SessionStoreHandle,
-}
-
-impl FrozenSource {
-    pub(crate) async fn finish<T>(&self, result: Result<T, BoxError>) -> Result<T, BoxError> {
-        if let Err(error) = &result {
-            let mut store = self.store.lock().await;
-            if let Some(entry) = store.sessions.get_mut(&self.session_id) {
-                entry.archived = self.previous.archived;
-                entry.shut_down = self.previous.shut_down;
-            }
-            store.notify(&self.session_id);
-            store.save().map_err(|restore| {
-                format!("{error}; restoring migration source failed: {restore}")
-            })?;
-        }
-        result
-    }
-}
-
-async fn freeze_source(
-    session_id: &ThreadId<str>,
-    session_manager: &SharedSessionManager,
-) -> Result<FrozenSource, BoxError> {
-    let mgr = session_manager.lock().await;
-    let frozen = {
-        let mut store = mgr.session_store.lock().await;
-        let previous = store
-            .sessions
-            .get(session_id)
-            .ok_or("migration source not found")?
-            .clone();
-        if previous.archived {
-            return Err("migration source is already archived or migrating".into());
-        }
-        let frozen = FrozenSource {
-            session_id: session_id.to_owned(),
-            previous,
-            store: mgr.session_store.clone(),
-        };
-        store.mark_archived(session_id);
-        frozen
-    };
-    let result = async {
-        mgr.session_store.lock().await.save()?;
-        if !mgr.is_session_idle(session_id)
-            || mgr
-                .state_store()
-                .has_pending_choices_for_session(session_id)
-        {
-            return Err(
-                "migration requires a settled source: busy driver or pending call or choice".into(),
-            );
-        }
-        for thread in mgr.conversation_store().get_session_thread_ids(session_id) {
-            let history = mgr
-                .conversation_store()
-                .load_history_up_to(&thread, None, None)
-                .await?;
-            if matches!(history.last(), Some(InfinityMessage::ToolCall { .. })) {
-                return Err("migration requires a settled source: pending call".into());
-            }
-        }
-        mgr.cleanup_session(session_id).await;
-        mgr.session_store.lock().await.save()?;
-        Ok(())
-    }
-    .await;
-    frozen.finish(result).await?;
-    Ok(frozen)
-}
 
 /// Run the full migration flow for a `RequestMigrate` message.
 /// This is spawned as a task from the client handler.
@@ -131,38 +56,22 @@ async fn run_migration(
     dest_cwd: &Path,
     session_manager: &SharedSessionManager,
 ) -> Result<(), BoxError> {
-    let frozen = if session_ref.remote.is_none() {
-        Some(freeze_source(&session_ref.id, session_manager).await?)
-    } else {
-        None
-    };
-    let result = run_frozen_migration(session_ref, to, dest_cwd, session_manager).await;
-    match frozen {
-        Some(frozen) => frozen.finish(result).await,
-        None => result,
-    }
-}
-
-async fn run_frozen_migration(
-    session_ref: &ThreadRef,
-    to: Option<&RemoteName>,
-    dest_cwd: &Path,
-    session_manager: &SharedSessionManager,
-) -> Result<(), BoxError> {
     let source_is_local = session_ref.remote.is_none();
     let source_remote = session_ref.remote.clone();
     let real_session_id = session_ref.id.clone();
     let dest_is_local = to.is_none();
 
+    // Shut down the source session first (kills agent + original RAP servers)
     let source_cwd = if source_is_local {
         let mgr = session_manager.lock().await;
-        Some(
-            mgr.session_store
-                .lock()
-                .await
-                .get_cwd(&real_session_id)
-                .clone(),
-        )
+        let cwd = mgr
+            .session_store
+            .lock()
+            .await
+            .get_cwd(&real_session_id)
+            .clone();
+        mgr.cleanup_session(&real_session_id).await;
+        Some(cwd)
     } else {
         None
     };
@@ -195,7 +104,6 @@ async fn run_frozen_migration(
     }
 
     // Serialize session data from source
-    let mut source_connection = None;
     let session_data = if source_is_local {
         let mgr = session_manager.lock().await;
         mgr.conversation_store().serialize_session(&real_session_id)
@@ -206,7 +114,7 @@ async fn run_frozen_migration(
         };
         let rd = rd.ok_or("no remote daemons configured")?;
 
-        let (data, connection) = emigrate_from_remote(
+        emigrate_from_remote(
             &rd,
             source_remote
                 .as_ref()
@@ -214,9 +122,7 @@ async fn run_frozen_migration(
             &real_session_id,
             dest_rap_urls,
         )
-        .await?;
-        source_connection = Some(connection);
-        data
+        .await?
     };
 
     // Kill temporary destination RAP servers
@@ -254,10 +160,22 @@ async fn run_frozen_migration(
         let mut store = mgr.session_store.lock().await;
         store.mark_archived(&real_session_id);
         store.save()?;
-    } else if let Some(connection) = source_connection {
-        connection.send(ClientMessage::EmigrateDone {
-            root_thread_id: real_session_id,
-        })?;
+    } else {
+        let rd = {
+            let mgr = session_manager.lock().await;
+            mgr.remote_daemons.clone()
+        };
+
+        if let Some(rd) = rd {
+            send_emigrate_done(
+                &rd,
+                source_remote
+                    .as_ref()
+                    .expect("bug: source remote but no name"),
+                &real_session_id,
+            )
+            .await?;
+        }
     }
 
     // _tunnel_guards dropped here, cleaning up SSH forwards
@@ -292,38 +210,18 @@ pub async fn handle_emigrate(
     dest_rap_urls: HashMap<String, String>,
     session_manager: &SharedSessionManager,
 ) -> Result<String, BoxError> {
-    Ok(
-        prepare_emigration(session_id, dest_rap_urls, session_manager)
-            .await?
-            .0,
-    )
-}
+    // Get cwd and shut down the session first
+    let cwd = {
+        let mgr = session_manager.lock().await;
+        mgr.session_store.lock().await.get_cwd(session_id).clone()
+    };
+    {
+        let mgr = session_manager.lock().await;
+        mgr.cleanup_session(session_id).await;
+    }
 
-pub(crate) async fn prepare_emigration(
-    session_id: &ThreadId<str>,
-    dest_rap_urls: HashMap<String, String>,
-    session_manager: &SharedSessionManager,
-) -> Result<(String, FrozenSource), BoxError> {
-    let frozen = freeze_source(session_id, session_manager).await?;
-    let result = emigrate_frozen(
-        session_id,
-        dest_rap_urls,
-        &frozen.previous.cwd,
-        session_manager,
-    )
-    .await;
-    let data = frozen.finish(result).await?;
-    Ok((data, frozen))
-}
-
-async fn emigrate_frozen(
-    session_id: &ThreadId<str>,
-    dest_rap_urls: HashMap<String, String>,
-    cwd: &Path,
-    session_manager: &SharedSessionManager,
-) -> Result<String, BoxError> {
     // Boot fresh RAP servers and perform migration
-    let (migration_servers, _spawned) = boot_source_rap_servers(cwd, &dest_rap_urls).await?;
+    let (migration_servers, _spawned) = boot_source_rap_servers(&cwd, &dest_rap_urls).await?;
     if !migration_servers.is_empty() {
         let notifier = rap_client::notifier::RapNotifier::new(
             migration_servers
@@ -478,7 +376,7 @@ async fn emigrate_from_remote(
     remote_name: &RemoteName,
     session_id: &ThreadId<str>,
     dest_rap_urls: HashMap<String, String>,
-) -> Result<(String, UnboundedSender<ClientMessage>), BoxError> {
+) -> Result<String, BoxError> {
     let (tx, mut rx) = rd.open_raw_connection(remote_name).await?;
 
     tx.send(ClientMessage::Emigrate {
@@ -487,7 +385,7 @@ async fn emigrate_from_remote(
     })?;
 
     match rx.recv().await {
-        Some(DaemonMessage::EmigrateResult { session_data, .. }) => Ok((session_data, tx)),
+        Some(DaemonMessage::EmigrateResult { session_data, .. }) => Ok(session_data),
         Some(msg) => Err(format!("remote sent unxpected response {:?}", msg).into()),
         None => Err("remote closed without sending EmigrateResult".into()),
     }
@@ -514,4 +412,17 @@ async fn immigrate_to_remote(
         Some(msg) => Err(format!("remote sent unxpected response {:?}", msg).into()),
         None => Err("remote closed without sending EmigrateResult".into()),
     }
+}
+
+/// Send EmigrateDone to a remote daemon so it can clean up.
+async fn send_emigrate_done(
+    rd: &RemoteDaemons,
+    remote_name: &RemoteName,
+    session_id: &ThreadId<str>,
+) -> Result<(), BoxError> {
+    let (tx, _rx) = rd.open_raw_connection(remote_name).await?;
+    tx.send(ClientMessage::EmigrateDone {
+        root_thread_id: session_id.to_owned(),
+    })
+    .map_err(|e| e.into())
 }

@@ -112,10 +112,12 @@ Infinity delivery uses the adapter's receipt deadline instead.
 cancel path. Stream chunks, tool starts and results, completion boundaries,
 new choices, receipts, and turn ends reset the clock. Reconnects, restored or
 replayed choices, and new mail never reset it. Pending permissions and choices
-suspend the clock, including across reconnects. When they settle, the clock
-resumes with its remaining time. `permissions.timeout` governs the human wait.
-With `permissions.timeout = None`, mail queued behind a choice waits for the
-human by design.
+keep the timer running, even with `permissions.timeout = None`. If other mail
+waits and the human takes longer than `stall_timeout_secs`, the turn is cancelled.
+Raise the limit or set it to `0` for long human waits with mail flowing.
+A pending choice with no other mail waiting still waits indefinitely when
+`permissions.timeout = None`. A finite permission deadline stays tied to the
+original wire choice ID across reconnects; replay does not renew it.
 With no waiting mail, there is no stall deadline. Each `[kind.NAME]` can set
 `stall_timeout_secs`; `0` disables it. `KindConfig::stall_timeout` uses a Duration.
 The default is 600 seconds for every kind. A tool that runs silently longer than
@@ -123,13 +125,18 @@ this limit while other mail waits gets cancelled. Raise the value or disable it
 for such tools. Cancellation uses the existing acknowledgment policy, including
 Infinity's ten-minute no-progress bound to `NeedsRecovery`.
 
-Migration closes source admission, then requires a settled source. A busy
-driver, pending call, or pending choice causes an immediate error. Migration
-neither waits for that work nor transfers it. Only a settled source is serialized.
-Any failure after freezing restores the previous archive and shutdown flags.
-A remote emigration connection stays open through destination import. Closing
-it before `EmigrateDone` also restores the source. Successful migration leaves
-the source archived. Migration of in-flight calls is follow-up work.
+Migrating agentd-hosted sessions is unsupported. agentd never migrates the
+sessions it hosts. Daemon migration retains main's behavior without a migration
+freeze or rollback guarantee. Archive admission gates apply independently.
+
+Follow-up: migration handoff protocol: freeze, settle or transfer in-flight calls,
+transfer processed-ID dedup state, commit/reconcile, crash/cancel-safe rollback,
+notify attached brokers. This covers Astra r16 P2 #2 through #4, Opus r16 P2-1, and the
+r14/r15 migration findings about admission races, stranded results, and failed
+migration archiving the source. Answered-choice dismissal is also deferred:
+the daemon retains a choice until its tool returns, so removing it on answer
+must update the live driver and notify attached clients as well as persistence.
+The stall timer bounds a hung tool after an answer while other mail waits.
 
 Command-backed RAP calls use an opaque invocation scope in their callback URL.
 A real callback and shutdown error share one dedup ID; a later call with a reused

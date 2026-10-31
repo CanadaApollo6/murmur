@@ -128,6 +128,9 @@ pub(crate) trait Session: Send {
     fn accepts_busy_mail(&self) -> bool {
         false
     }
+    fn permission_key(&self, _id: PermissionId) -> Option<&str> {
+        None
+    }
     async fn submit(&mut self, turn: Turn) -> Result<(), AdapterError>;
     async fn cancel(&mut self) -> Result<(), AdapterError>;
     async fn answer_permission(&mut self, id: PermissionId, key: &str) -> Result<(), AdapterError>;
