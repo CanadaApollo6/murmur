@@ -2293,6 +2293,7 @@ async fn peer_deferred_until_real_result_and_peer_first_batch_settles() {
         };
         let (result, ()) = tokio::join!(first, respond);
         result.expect("first step");
+        observer.take();
         let peer = peer_input("t1", "mail-1", "peer payload");
         let mut batch = vec![];
         if same_batch {
@@ -2307,10 +2308,28 @@ async fn peer_deferred_until_real_result_and_peer_first_batch_settles() {
                 "peer must wait for real result"
             );
         }
+        assert!(
+            observer.take().iter().all(|(_, event)| !matches!(
+                event,
+                AgentEvent::InputAdmitted { .. } | AgentEvent::InputCommitted { .. }
+            )),
+            "deferred mail is neither admitted nor committed"
+        );
         batch.push(tool_result_input("t1", "tc-work", "real result"));
         let second = system.step(batch, &observer, &mut defer);
         let respond = async {
             let req = ctrl.next_request().await;
+            let events = observer.take();
+            assert!(
+                events.iter().any(|(_, event)| matches!(event,
+                AgentEvent::InputAdmitted { dedup_id } if dedup_id == "peer-mail-1")),
+                "mail is admitted when it reaches the provider"
+            );
+            assert!(
+                !events.iter().any(|(_, event)| matches!(event,
+                AgentEvent::InputCommitted { dedup_id } if dedup_id == "peer-mail-1")),
+                "admission is not a durable receipt"
+            );
             assert_eq!(tool_result_texts(&req), vec!["real result", "peer payload"]);
             let injected = req
                 .chat_history

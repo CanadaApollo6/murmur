@@ -116,6 +116,7 @@ fn daemon_msg_to_display(msg: DaemonMessage) -> Option<(Option<ThreadRef>, Displ
         DaemonMessage::Connected { .. }
         | DaemonMessage::ThreadIdle { .. }
         | DaemonMessage::InputCommitted { .. }
+        | DaemonMessage::InputAdmitted { .. }
         | DaemonMessage::Welcome { .. }
         | DaemonMessage::Replay { .. }
         | DaemonMessage::SessionsUpdated { .. }

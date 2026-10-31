@@ -14,6 +14,10 @@ pub(crate) fn agent_event_to_daemon(thread_id: &ThreadId<str>, evt: &AgentEvent)
             }
         }
         AgentEvent::ThreadIdle => DaemonMessage::ThreadIdle { thread_id: tid },
+        AgentEvent::InputAdmitted { dedup_id } => DaemonMessage::InputAdmitted {
+            thread_id: tid,
+            dedup_id: dedup_id.clone(),
+        },
         AgentEvent::InputCommitted { dedup_id } => DaemonMessage::InputCommitted {
             thread_id: tid,
             dedup_id: dedup_id.clone(),

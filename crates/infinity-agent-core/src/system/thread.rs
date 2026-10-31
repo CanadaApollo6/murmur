@@ -552,14 +552,14 @@ where
         let config = self.resolved_config().await?;
 
         // ── Prepare phase: fold each input into history ──
-        let mut any_ready = false;
+        let mut admitted = Vec::new();
         let mut last_message_id = String::new();
         for (input_msg, message_id) in inputs {
             if self
                 .prepare_one(input_msg, message_id.clone(), observer)
                 .await?
             {
-                any_ready = true;
+                admitted.push(message_id.clone());
                 last_message_id = message_id;
             }
         }
@@ -599,7 +599,7 @@ where
             }
         }
 
-        if !any_ready {
+        if admitted.is_empty() {
             // Commit anything already known-safe (e.g. processed IDs from
             // deduped inputs). Interruption results and other fresh inputs
             // stay unvalidated — and unpersisted — until a completion
@@ -662,6 +662,9 @@ where
         {
             self.persist_tool_results(observer).await?;
             return Ok(StepOutcome::Skipped);
+        }
+        for dedup_id in admitted {
+            observer.on_event(&thread_id, &AgentEvent::InputAdmitted { dedup_id });
         }
         observer.on_event(&thread_id, &AgentEvent::CompletionStarted);
         self.in_flight.set(true);

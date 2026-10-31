@@ -184,7 +184,7 @@ impl AgentHandle {
 pub struct Broker {
     mailroom: Arc<Mailroom>,
     kinds: HashMap<String, KindConfig>,
-    agents: Mutex<HashMap<AgentId, AgentHandle>>,
+    agents: Arc<Mutex<HashMap<AgentId, AgentHandle>>>,
     events: broadcast::Sender<Event>,
     config: Config,
     mcp: Option<Arc<crate::surfaces::Bindings>>,
@@ -221,7 +221,7 @@ impl Broker {
         Ok(Self {
             mailroom,
             kinds: by_kind,
-            agents: Mutex::new(HashMap::new()),
+            agents: Arc::new(Mutex::new(HashMap::new())),
             events,
             config,
             mcp: None,
@@ -308,18 +308,19 @@ impl Broker {
     }
     /// Trusted in-process API. External callers are authenticated by surfaces.
     pub async fn send(&self, message: NewMessage) -> Result<(SendOutcome, Envelope)> {
-        let handle = self.handle(message.to).await;
+        let agents = Arc::clone(&self.agents);
+        let to = message.to;
         let mailroom = Arc::clone(&self.mailroom);
         // A dropped caller must not separate a durable accept from its wakeup.
         tokio::spawn(async move {
             let outcome = mailroom.accept(message).await;
             match &outcome {
                 Ok(_) => {
-                    if let Some(handle) = handle {
+                    if let Some(handle) = agents.lock().await.get(&to) {
                         handle.nudge();
                     }
                 }
-                Err(error) => tracing::warn!(%error, "broker send failed"),
+                Err(error) => tracing::debug!(%error, "broker send failed"),
             }
             outcome.map_err(Error::from)
         })
@@ -605,6 +606,7 @@ impl AgentActor {
             event,
             SessionEvent::Activity(_)
                 | SessionEvent::TurnStarted { .. }
+                | SessionEvent::Admitted { .. }
                 | SessionEvent::Committed { .. }
                 | SessionEvent::TurnEnded { .. }
                 | SessionEvent::PermissionRequested(_)
@@ -620,6 +622,10 @@ impl AgentActor {
                     agent: self.id,
                     ids,
                 });
+            }
+            SessionEvent::Admitted { ids } => {
+                self.validate_ids(&ids)?;
+                self.waiting_offers.retain(|id| !ids.contains(id));
             }
             SessionEvent::Waiting { ids } => {
                 self.validate_ids(&ids)?;
