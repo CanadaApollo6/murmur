@@ -1507,14 +1507,14 @@ async fn r11a_failure_marker_clears_and_rearms() {
 
 #[tokio::test]
 async fn stall_timer_only_cancels_waiting_mail_and_activity_resets_it() {
-    let mut t = Test::with_stall(Default::default(), Duration::from_millis(250)).await;
+    let mut t = Test::with_stall(Default::default(), Duration::from_millis(1000)).await;
     let first = t.send(false, "first").await;
     let active = t.daemon.next().await;
     active.emit(fake::start());
     active.emit(fake::receipt(format!("peer-{first}")));
     t.consumed(first).await;
     assert!(
-        tokio::time::timeout(Duration::from_millis(350), t.daemon.next())
+        tokio::time::timeout(Duration::from_millis(1400), t.daemon.next())
             .await
             .is_err(),
         "no mail waiting, no stall deadline"
@@ -1533,7 +1533,7 @@ async fn stall_timer_only_cancels_waiting_mail_and_activity_resets_it() {
             chunk: "still working".into(),
         });
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), t.daemon.next())
+            tokio::time::timeout(Duration::from_millis(400), t.daemon.next())
                 .await
                 .is_err(),
             "activity resets the deadline"
@@ -1544,7 +1544,7 @@ async fn stall_timer_only_cancels_waiting_mail_and_activity_resets_it() {
         segments: vec![],
     });
     assert!(
-        tokio::time::timeout(Duration::from_millis(150), t.daemon.next())
+        tokio::time::timeout(Duration::from_millis(600), t.daemon.next())
             .await
             .is_err(),
         "tool end resets the deadline too"
