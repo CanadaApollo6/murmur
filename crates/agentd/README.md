@@ -77,6 +77,10 @@ peer mail both use `DeliverPeerMessage`, with stable dedup ID `peer-{MessageId}`
 Human mail sets `from` to `human` and identifies the human operator in its body.
 Mail waits behind an active tool and wakes passive sleep. Only exact root
 `InputCommitted` receipts consume mail. Output and replay are not receipts.
+The adapter opts in to `InputAdmitted` events on create and reconnect. An exact
+admission retires the mail's Waiting deadline without consuming it. Older daemons
+ignore the opt-in field and never send admission events. Waiting then stays armed
+until `InputCommitted`, the conservative behavior used before admission support.
 Separate history and dedup-ID writes retain a window that can duplicate mail.
 
 The daemon includes a random process boot ID in `Welcome`. The adapter saves it

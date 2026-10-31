@@ -116,6 +116,7 @@ fn start_daemon_system(
         Arc::new(std::sync::Mutex::new(vec![Subscriber {
             tx: client_tx,
             keeps_session_alive: true,
+            input_admitted: false,
         }])),
     );
 
@@ -561,6 +562,7 @@ async fn answered_user_choice_emits_complete_and_disappears_from_replay() {
                         tx: replay_tx,
                         wants_replay: true,
                         keeps_session_alive: true,
+                        input_admitted: false,
                     },
                 )
                 .await;

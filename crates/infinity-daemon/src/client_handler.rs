@@ -441,7 +441,7 @@ pub async fn handle_client_channels(
                 }
 
                     match msg {
-                        ClientMessage::CreateSession { cwd, location, model, keeps_session_alive } => {
+                        ClientMessage::CreateSession { cwd, location, model, keeps_session_alive, input_admitted } => {
                             if let Some(rname) = location {
                                 let rd = {
                                     let mgr = session_manager.lock().await;
@@ -450,7 +450,7 @@ pub async fn handle_client_channels(
                                 if let Some(rd) = rd {
                                     match rd.open_raw_connection(&rname).await {
                                         Ok((tx, rx)) => {
-                                            let _ = tx.send(ClientMessage::CreateSession { cwd, location: None, model, keeps_session_alive });
+                                            let _ = tx.send(ClientMessage::CreateSession { cwd, location: None, model, keeps_session_alive, input_admitted });
                                             remote_proxy_tx = Some(tx);
                                             remote_proxy_rx = Some(rx);
                                             active_remote_name = Some(rname);
@@ -478,7 +478,7 @@ pub async fn handle_client_channels(
                                 let model = model.unwrap_or_else(|| mgr.catalog.default_ref().clone());
                                 match mgr.create_session(&cwd, model, &mut emit).await {
                                     Ok(sid) => {
-                                        mgr.attach_client(&sid, client_tx.clone(), false, keeps_session_alive).await;
+                                        mgr.attach_client(&sid, client_tx.clone(), false, keeps_session_alive, input_admitted).await;
                                         attached_thread_id = Some(sid.clone());
                                         attached_session_id = Some(sid);
                                     }
@@ -486,7 +486,7 @@ pub async fn handle_client_channels(
                                 }
                             }
                         }
-                    ClientMessage::Connect { root_thread_id, thread_id, keeps_session_alive } => {
+                    ClientMessage::Connect { root_thread_id, thread_id, keeps_session_alive, input_admitted } => {
                         if let Some(rname) = root_thread_id.remote.clone() {
                             let real_session_id = root_thread_id.id.clone();
                             let real_thread_id = thread_id.clone().map(|t| t.strip(&rname).id);
@@ -495,7 +495,7 @@ pub async fn handle_client_channels(
                                 mgr.remote_daemons.clone()
                             };
                             if let Some(rd) = rd {
-                                match rd.connect_remote_session(&rname, &real_session_id, real_thread_id.as_deref()).await {
+                                match rd.connect_remote_session(&rname, &real_session_id, real_thread_id.as_deref(), input_admitted).await {
                                     Ok((tx, rx)) => {
                                         remote_proxy_tx = Some(tx);
                                         remote_proxy_rx = Some(rx);
@@ -524,7 +524,7 @@ pub async fn handle_client_channels(
                             let target = thread_id.map(|t| t.id).unwrap_or_else(|| session_tid.clone());
                             match mgr.resume_session(&session_tid, &target, &mut emit).await {
                                 Ok(()) => {
-                                    mgr.attach_client(&target, client_tx.clone(), true, keeps_session_alive).await;
+                                    mgr.attach_client(&target, client_tx.clone(), true, keeps_session_alive, input_admitted).await;
                                     attached_thread_id = Some(target);
                                     attached_session_id = Some(session_tid);
                                 }

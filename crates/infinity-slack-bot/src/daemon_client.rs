@@ -72,6 +72,7 @@ impl DaemonClient {
                 location: None,
                 model,
                 keeps_session_alive: false,
+                input_admitted: false,
             })
             .await?;
         Ok(())
@@ -101,6 +102,7 @@ impl DaemonClient {
                 root_thread_id: session_id.clone(),
                 thread_id,
                 keeps_session_alive: false,
+                input_admitted: false,
             })
             .await?;
         Ok(())

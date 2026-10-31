@@ -1013,6 +1013,7 @@ mod r14a_registry {
                 location: None,
                 model: None,
                 keeps_session_alive: true,
+                input_admitted: false,
             })
             .expect("send CreateSession");
 

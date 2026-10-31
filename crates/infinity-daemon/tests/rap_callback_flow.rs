@@ -106,6 +106,7 @@ async fn create_session_and_chat(h: &mut TestHarness) -> infinity_protocol::Thre
             location: None,
             model: None,
             keeps_session_alive: true,
+            input_admitted: false,
         })
         .expect("send CreateSession");
 
@@ -185,6 +186,7 @@ async fn session_status_follows_thread_activity() {
                     location: None,
                     model: None,
                     keeps_session_alive: true,
+                    input_admitted: false,
                 })
                 .expect("send CreateSession");
             let connected = wait_for_message(&mut h.daemon_rx, |m| {
@@ -315,7 +317,7 @@ async fn peer_message_over_socket_reaches_thread_and_replays_with_receipts() {
             }
         }
         assert!(h.ctrl.try_next_request().is_none(), "duplicate must not run inference");
-        h.client_tx.send(ClientMessage::Connect { root_thread_id: thread_id, thread_id: None, keeps_session_alive: true }).expect("reconnect for replay");
+        h.client_tx.send(ClientMessage::Connect { root_thread_id: thread_id, thread_id: None, keeps_session_alive: true, input_admitted: false }).expect("reconnect for replay");
         let replay = wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
         let DaemonMessage::Replay { history, .. } = replay else { unreachable!() };
         let peers: Vec<_> = history.iter().filter(|m| matches!(m, DaemonMessage::SubscriptionEvent { .. })).collect();
@@ -365,10 +367,97 @@ async fn r10_driver_failure_is_a_protocol_error() {
         let (client, rx) = mpsc::unbounded_channel();
         let (tx, mut daemon) = mpsc::unbounded_channel();
         tokio::task::spawn_local(handle_client_channels(rx, tx, manager));
-        client.send(ClientMessage::CreateSession { cwd:state.path().into(), location:None, model:None, keeps_session_alive:true }).expect("create");
+        client.send(ClientMessage::CreateSession { cwd:state.path().into(), location:None, model:None, keeps_session_alive:true, input_admitted: false }).expect("create");
         let DaemonMessage::Connected { root_thread_id, .. } = wait_for_message(&mut daemon, |m| matches!(m, DaemonMessage::Connected { .. })).await else { panic!("connected"); };
         client.send(ClientMessage::UserInput { thread_id:root_thread_id.clone(), text:"trigger failure".into() }).expect("input");
         let failure = wait_for_message(&mut daemon, |m| matches!(m, DaemonMessage::Error { text, .. } if text.starts_with("Thread driver failed:"))).await;
         assert!(matches!(failure, DaemonMessage::Error { thread_id:Some(thread), .. } if thread == root_thread_id));
     }).await;
+}
+
+async fn admission_subscription_probe(creator_opted_in: bool, connector_opted_in: bool) {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut h = start_harness().await.expect("start harness");
+            let mut create = serde_json::json!({"CreateSession": {
+                "cwd": h.cwd.path(), "location": null, "model": null,
+                "keeps_session_alive": true
+            }});
+            if creator_opted_in {
+                create["CreateSession"]["input_admitted"] = true.into();
+            }
+            h.client_tx
+                .send(serde_json::from_value(create).expect("decode create"))
+                .expect("create session");
+            let DaemonMessage::Connected {
+                root_thread_id: root,
+                ..
+            } = wait_for_message(&mut h.daemon_rx, |m| {
+                matches!(m, DaemonMessage::Connected { .. })
+            })
+            .await
+            else {
+                unreachable!()
+            };
+            let (tx, rx) = mpsc::unbounded_channel();
+            let (out, mut opted_rx) = mpsc::unbounded_channel();
+            tokio::task::spawn_local(handle_client_channels(rx, out, h.manager.clone()));
+            let mut connect = serde_json::json!({"Connect": {
+                "root_thread_id": root, "thread_id": null
+            }});
+            if connector_opted_in {
+                connect["Connect"]["input_admitted"] = true.into();
+            }
+            tx.send(serde_json::from_value(connect).expect("decode connect"))
+                .expect("connect");
+            wait_for_message(&mut opted_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
+            h.client_tx
+                .send(ClientMessage::UserInput {
+                    thread_id: root,
+                    text: "hello".into(),
+                })
+                .expect("send input");
+            for (rx, expected) in [
+                (&mut h.daemon_rx, creator_opted_in),
+                (&mut opted_rx, connector_opted_in),
+            ] {
+                let mut admissions = 0;
+                loop {
+                    let msg = wait_for_message(rx, |_| true).await;
+                    match msg {
+                        DaemonMessage::InputAdmitted { .. } => admissions += 1,
+                        DaemonMessage::StartOutput { .. } => break,
+                        _ => {}
+                    }
+                }
+                assert_eq!(
+                    admissions,
+                    usize::from(expected),
+                    "InputAdmitted requires subscriber opt-in"
+                );
+            }
+            let _req = h.ctrl.next_request().await;
+            h.ctrl.send_text("done");
+            h.ctrl.finish();
+            wait_for_message(&mut h.daemon_rx, |m| {
+                matches!(m, DaemonMessage::ResponseDone { .. })
+            })
+            .await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r19_old_reader_never_receives_admission() {
+    admission_subscription_probe(false, true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r19_opted_in_create_and_connect_receive_admission() {
+    admission_subscription_probe(true, true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r19_legacy_connect_never_receives_admission() {
+    admission_subscription_probe(true, false).await;
 }

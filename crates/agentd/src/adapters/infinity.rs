@@ -182,6 +182,7 @@ impl InfinitySession {
                 root_thread_id: saved.root.clone(),
                 thread_id: None,
                 keeps_session_alive: true,
+                input_admitted: true,
             })?;
         } else {
             let model = req
@@ -204,6 +205,7 @@ impl InfinitySession {
                 location: None,
                 model,
                 keeps_session_alive: true,
+                input_admitted: true,
             })?;
         }
         loop {

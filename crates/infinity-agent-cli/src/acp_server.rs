@@ -474,6 +474,7 @@ async fn run_session_connection(
                 root_thread_id: daemon_id.clone(),
                 thread_id: None,
                 keeps_session_alive: true,
+                input_admitted: false,
             };
             send(&mut framed, &msg).await?;
             conn.daemon_id = Some(daemon_id);
@@ -520,6 +521,7 @@ async fn run_session_connection(
                 location: None,
                 model: None,
                 keeps_session_alive: true,
+                input_admitted: false,
             };
             send(&mut framed, &msg).await?;
             // Wait for Connected to get daemon ID, then send input.
@@ -578,6 +580,7 @@ async fn run_session_connection(
                 root_thread_id: daemon_id.clone(),
                 thread_id: None,
                 keeps_session_alive: true,
+                input_admitted: false,
             };
             send(&mut framed, &msg).await?;
             conn.daemon_id = Some(daemon_id.clone());

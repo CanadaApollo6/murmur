@@ -95,7 +95,7 @@ fn r5_restart_settles_external_executor_and_rejects_late_result() {
     runtime.block_on(tokio::task::LocalSet::new().run_until(async {
         let mut h = start_harness_at(state, cwd).await.expect("replacement harness");
         assert_ne!(h.callback_url, inv.callback_url);
-        h.client_tx.send(ClientMessage::Connect { root_thread_id: root.clone(), thread_id:None, keeps_session_alive:true }).expect("connect");
+        h.client_tx.send(ClientMessage::Connect { root_thread_id: root.clone(), thread_id:None, keeps_session_alive:true, input_admitted: false }).expect("connect");
         let replay = wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
         assert!(matches!(replay, DaemonMessage::Replay { idle:false, .. }), "ordinary core load preserves upstream pending-call behavior");
         let (broker, _agent) = broker_for_root(&h, &root, "previous-boot").await;
@@ -233,6 +233,7 @@ async fn create_session_and_chat(h: &mut TestHarness) -> infinity_protocol::Thre
             location: None,
             model: None,
             keeps_session_alive: true,
+            input_admitted: false,
         })
         .expect("send CreateSession");
 
@@ -312,6 +313,7 @@ async fn session_status_follows_thread_activity() {
                     location: None,
                     model: None,
                     keeps_session_alive: true,
+                    input_admitted: false,
                 })
                 .expect("send CreateSession");
             let connected = wait_for_message(&mut h.daemon_rx, |m| {
@@ -442,7 +444,7 @@ async fn peer_message_over_socket_reaches_thread_and_replays_with_receipts() {
             }
         }
         assert!(h.ctrl.try_next_request().is_none(), "duplicate must not run inference");
-        h.client_tx.send(ClientMessage::Connect { root_thread_id: thread_id, thread_id: None, keeps_session_alive: true }).expect("reconnect for replay");
+        h.client_tx.send(ClientMessage::Connect { root_thread_id: thread_id, thread_id: None, keeps_session_alive: true, input_admitted: false }).expect("reconnect for replay");
         let replay = wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
         let DaemonMessage::Replay { history, .. } = replay else { unreachable!() };
         let peers: Vec<_> = history.iter().filter(|m| matches!(m, DaemonMessage::SubscriptionEvent { .. })).collect();
@@ -534,7 +536,7 @@ async fn broker_permission_timeout_durably_cancels_waiting_choice() {
         }).await.expect("resumed idle without pending work");
         assert!(resumed.pending_permissions().await.expect("approvals").is_empty());
         assert!(h.ctrl.try_next_request().is_none(), "cancellation must not start inference");
-        h.client_tx.send(ClientMessage::Connect { root_thread_id: root, thread_id: None, keeps_session_alive: true }).expect("inspect replay");
+        h.client_tx.send(ClientMessage::Connect { root_thread_id: root, thread_id: None, keeps_session_alive: true, input_admitted: false }).expect("inspect replay");
         let replay = wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
         assert!(matches!(replay, DaemonMessage::Replay { pending_choices, history, in_progress: false, .. }
             if pending_choices.is_empty() && matches!(history.last(), Some(DaemonMessage::ToolResult { .. }))));
@@ -631,6 +633,7 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
             root_thread_id: root.clone(),
             thread_id: None,
             keeps_session_alive: true,
+            input_admitted: false,
         })
         .expect("connect observer");
     wait_for_message(&mut h.daemon_rx, |m| {
@@ -864,6 +867,7 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
             root_thread_id: root.clone(),
             thread_id: None,
             keeps_session_alive: true,
+            input_admitted: false,
         })
         .expect("inspect durable replay");
     let replay = wait_for_message(&mut h.daemon_rx, |m| {
@@ -1209,6 +1213,7 @@ async fn r4_human_sleep_probe() {
             root_thread_id: root.clone(),
             thread_id: None,
             keeps_session_alive: true,
+            input_admitted: false,
         })
         .expect("connect observer");
     wait_for_message(&mut h.daemon_rx, |m| {
@@ -1336,6 +1341,7 @@ async fn r4_before_restart() -> (tempfile::TempDir, tempfile::TempDir) {
             root_thread_id: root.clone(),
             thread_id: None,
             keeps_session_alive: true,
+            input_admitted: false,
         })
         .expect("connect observer");
     wait_for_message(&mut h.daemon_rx, |m| {
@@ -1552,6 +1558,7 @@ async fn r9_broker_mail_after_completed_rap_tool_and_provider_failure() {
                     root_thread_id: root.clone(),
                     thread_id: None,
                     keeps_session_alive: true,
+                    input_admitted: false,
                 })
                 .expect("connect observer");
             wait_for_message(&mut h.daemon_rx, |m| {
@@ -1702,6 +1709,7 @@ async fn r10a_driver_panic_has_bounded_broker_recovery() {
                     root_thread_id: root.clone(),
                     thread_id: None,
                     keeps_session_alive: true,
+                    input_admitted: false,
                 })
                 .expect("connect observer");
             wait_for_message(&mut h.daemon_rx, |m| {
@@ -1831,6 +1839,7 @@ async fn r10a_choice_write_failure_has_bounded_recovery() {
                     root_thread_id: root.clone(),
                     thread_id: None,
                     keeps_session_alive: true,
+                    input_admitted: false,
                 })
                 .expect("connect observer");
             wait_for_message(&mut h.daemon_rx, |m| {
@@ -2010,7 +2019,7 @@ fn broker_boot_rule_recovers_parent_spawn_without_recreating_child() {
         let mut h = start_harness_at(state, cwd).await.expect("restart");
         let (broker, _agent) = broker_for_root(&h, &root, "previous-boot").await;
         assert!(h.ctrl.try_next_request().is_none(), "recovery runs no inference");
-        h.client_tx.send(ClientMessage::Connect { root_thread_id:root.clone(), thread_id:None, keeps_session_alive:true }).expect("observe");
+        h.client_tx.send(ClientMessage::Connect { root_thread_id:root.clone(), thread_id:None, keeps_session_alive:true, input_admitted: false }).expect("observe");
         wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
         for (name, bytes) in child_payloads { assert_eq!(std::fs::read(h._state_dir.path().join("threads").join(name)).expect("child payload"), bytes); }
         h.client_tx.send(ClientMessage::DeliverPeerMessage { thread_id:root.clone(), message_id:"after-parent-spawn".into(), from:"human".into(), text:"mail after parent spawn restart".into() }).expect("mail");
@@ -2053,7 +2062,7 @@ fn broker_boot_rule_preserves_subscription_payload() {
     runtime.block_on(tokio::task::LocalSet::new().run_until(async {
         let mut h = start_harness_at(state, cwd).await.expect("restart");
         let (broker, _agent) = broker_for_root(&h, &root, "previous-boot").await;
-        h.client_tx.send(ClientMessage::Connect { root_thread_id:root.clone(), thread_id:None, keeps_session_alive:true }).expect("observe");
+        h.client_tx.send(ClientMessage::Connect { root_thread_id:root.clone(), thread_id:None, keeps_session_alive:true, input_admitted: false }).expect("observe");
         wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
         h.client_tx.send(ClientMessage::DeliverPeerMessage { thread_id:root, message_id:"after-subscription".into(), from:"human".into(), text:"after restart".into() }).expect("mail");
         let request = tokio::time::timeout(Duration::from_secs(3), h.ctrl.next_request()).await.expect("mail after recovery");
@@ -2172,6 +2181,7 @@ async fn r11_shutdown_command_tool(archive: bool) {
             root_thread_id: root.clone(),
             thread_id: None,
             keeps_session_alive: true,
+            input_admitted: false,
         })
         .expect("observer connect");
     wait_for_message(&mut h.daemon_rx, |m| {
@@ -2341,6 +2351,7 @@ async fn r12a_shutdown_recovery_usage_case(report_usage: bool) {
                     root_thread_id: root.clone(),
                     thread_id: None,
                     keeps_session_alive: true,
+                    input_admitted: false,
                 })
                 .expect("observer connect");
             wait_for_message(&mut h.daemon_rx, |m| {
@@ -2704,7 +2715,7 @@ async fn r12o_dangling_choice_cancel_loop() {
         let after = r12o::send(&r, "mail after choice").await;
         let reqs = r12o::drain(&mut h, Duration::from_secs(4)).await;
         eprintln!("R12O dangling choice after 10s: {} after={:?} inference_requests={}", r12o::summary(&r), r.mailroom.delivery(after).await.expect("after"), reqs.len());
-        h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: false }).expect("inspect");
+        h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: false, input_admitted: false }).expect("inspect");
         let replay = wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
         if let DaemonMessage::Replay { pending_choices, idle, in_progress, .. } = replay {
             eprintln!("R12O dangling choice replay: pending_choices={} idle={idle} in_progress={in_progress}", pending_choices.len());
@@ -2943,6 +2954,7 @@ async fn r13a_quick_reconnect_must_not_hide_executor_shutdown() {
                     root_thread_id: r.root.clone(),
                     thread_id: None,
                     keeps_session_alive: true,
+                    input_admitted: false,
                 })
                 .expect("immediate connect");
             r12o::port_dead(port).await;
@@ -3108,7 +3120,7 @@ async fn r13o_shutdown_while_agentd_detached_recovers_tool() {
             }]}).to_string()).expect("config");
             let (broker, agent, root) = r11_broker(&h).await;
             h.client_tx
-                .send(ClientMessage::Connect { root_thread_id: root.clone(), thread_id: None, keeps_session_alive: true })
+                .send(ClientMessage::Connect { root_thread_id: root.clone(), thread_id: None, keeps_session_alive: true, input_admitted: false })
                 .expect("observer connect");
             wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
             r11_send(&broker, agent.id, "start delayed work").await;
@@ -3226,7 +3238,7 @@ async fn r13o_connect_on_archived_root_reopens_stopped_gate() {
             };
             assert!(shut(&h).await, "archive marks the session shut down");
             h.client_tx
-                .send(ClientMessage::Connect { root_thread_id: root.clone(), thread_id: None, keeps_session_alive: false })
+                .send(ClientMessage::Connect { root_thread_id: root.clone(), thread_id: None, keeps_session_alive: false, input_admitted: false })
                 .expect("connect");
             wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Connected { .. } | DaemonMessage::Error { .. })).await;
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3394,6 +3406,7 @@ mod r14 {
                         root_thread_id: root.clone(),
                         thread_id: None,
                         keeps_session_alive: true,
+                        input_admitted: false,
                     })
                     .expect("connect observer");
                 wait_for_message(&mut h.daemon_rx, |m| {
@@ -3782,7 +3795,7 @@ async fn command_invocation_scope_rejects_late_callback_with_reused_id() {
         let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/delayed_rap.py");
         std::fs::write(h.cwd.path().join(".infinity/rap.json"), serde_json::json!({"tool_sets":[{"type":"toolset_command", "command":format!("python3 '{}' '{}' '{}'", script.display(), marker.display(), captures.display())}]}).to_string()).expect("config");
         let (broker, agent, root) = r11_broker(&h).await;
-        h.client_tx.send(ClientMessage::Connect { root_thread_id: root.clone(), thread_id: None, keeps_session_alive: true }).expect("observer");
+        h.client_tx.send(ClientMessage::Connect { root_thread_id: root.clone(), thread_id: None, keeps_session_alive: true, input_admitted: false }).expect("observer");
         wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
         r11_send(&broker, agent.id, "two calls reusing one id").await;
         h.ctrl.next_request().await;
@@ -4049,7 +4062,7 @@ mod r16o {
             let port = r10a_waiting_server().await.expect("external server");
             rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
             let r = r12o::rig_with_stall(&h, Duration::from_millis(300), Duration::from_millis(300), fast(), None, Duration::from_millis(500)).await;
-            h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: true }).expect("cli attaches");
+            h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: true, input_admitted: false }).expect("cli attaches");
             wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
             h.client_tx.send(ClientMessage::UserInput { thread_id: r.root.clone(), text: "cli: run the long external job".into() }).expect("cli input");
             h.ctrl.next_request().await;
@@ -4084,7 +4097,7 @@ mod r16o {
             h.ctrl.finish();
             assert!(r14::wait_permission(&r.agent, 5).await.is_some(), "choice reaches agentd");
             let mail = r12o::send(&r, "mail waiting behind the external job").await;
-            h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: true }).expect("cli attaches");
+            h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: true, input_admitted: false }).expect("cli attaches");
             wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
             h.client_tx.send(ClientMessage::UserChoiceAnswered { choice_id: "cli-choice".into(), selected: 0 }).expect("cli answers");
             let answered = wait_answer(&answers).await;
@@ -4262,7 +4275,7 @@ mod r17o {
             let (port, fetches) = slow_manifest_server(Duration::from_millis(1500)).await;
             rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
             let r = r12o::rig_with_stall(&h, Duration::from_secs(10), Duration::from_millis(300), fast(), None, Duration::from_millis(500)).await;
-            h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: true }).expect("cli attaches");
+            h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: true, input_admitted: false }).expect("cli attaches");
             wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
             let fetches_before = fetches.load(Ordering::SeqCst);
             let activity_before = activity(&r);
@@ -4309,7 +4322,7 @@ mod r17o {
             let (port, _fetches) = slow_manifest_server(Duration::from_millis(1500)).await;
             rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
             let r = r12o::rig_with_stall(&h, Duration::from_secs(10), Duration::from_millis(300), fast(), None, Duration::from_millis(500)).await;
-            h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: true }).expect("cli attaches");
+            h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: true, input_admitted: false }).expect("cli attaches");
             wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
             h.client_tx.send(ClientMessage::UserInput { thread_id: r.root.clone(), text: "cli: run the slow job".into() }).expect("cli input");
             tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request()).await.expect("cli completion request");
@@ -4344,7 +4357,7 @@ mod r17o {
                 DaemonMessage::MigrateError { .. } | DaemonMessage::MigrateComplete { .. })).await;
             let status = h.manager.lock().await.list_sessions(None).await.get(&root).map(|s| s.status.clone());
             h.client_tx.send(ClientMessage::Connect {
-                root_thread_id: root.clone(), thread_id: None, keeps_session_alive: true,
+                root_thread_id: root.clone(), thread_id: None, keeps_session_alive: true, input_admitted: false,
             }).expect("connect");
             tokio::time::sleep(Duration::from_millis(200)).await;
             h.client_tx.send(ClientMessage::UserInput {
@@ -4366,7 +4379,7 @@ mod r17o {
             let (port, fetches) = slow_manifest_server(Duration::from_millis(1000)).await;
             rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
             let r = r12o::rig_with_stall(&h, Duration::from_secs(10), Duration::from_millis(300), fast(), None, Duration::from_millis(500)).await;
-            h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: true }).expect("attach");
+            h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: true, input_admitted: false }).expect("attach");
             wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
             if with_foreign_turn {
                 h.client_tx.send(ClientMessage::UserInput { thread_id: r.root.clone(), text: "short CLI turn".into() }).expect("cli input");
