@@ -253,11 +253,16 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                         // Interrupt the in-flight step and wait for it to wind
                         // down so pending history items are synced to the
                         // store.
-                        let _ = in_flight
+                        let res = in_flight
                             .take()
                             .expect("bug: in-flight step missing during shutdown")
                             .cancel()
                             .await;
+                        handle_step_result(res, &observer, &thread_id, &mut total_tokens,
+                            &mut compaction_triggered, &mut pending_batch);
+                        if thread.needs_dispatch_settlement() {
+                            continue;
+                        }
                         return;
                     };
                     let mut batch = vec![first];

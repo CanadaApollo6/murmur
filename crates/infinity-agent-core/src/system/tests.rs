@@ -566,13 +566,10 @@ async fn shutdown_persists_model_validated_tool_result() {
         .await;
 }
 
-/// Shutting down while the model has produced *no* output for a freshly
-/// arrived tool result must not persist that result: the model never
-/// validated it, and it could be the oversized input that permanently
-/// wedges the thread. The durable state keeps the tool call unanswered
-/// (a later user input settles it with a synthetic "interrupted" result).
+/// Orderly shutdown settles an accepted recorded result even before provider
+/// validation. Unrelated mail still requires validation before persistence.
 #[tokio::test(flavor = "current_thread")]
-async fn shutdown_does_not_persist_unvalidated_tool_result() {
+async fn shutdown_settles_accepted_recorded_tool_result() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -604,8 +601,8 @@ async fn shutdown_does_not_persist_unvalidated_tool_result() {
                 "the tool call itself is model output and must be persisted; history: {stored}"
             );
             assert!(
-                !stored.contains("tool execution result"),
-                "an unvalidated tool result must not be persisted on shutdown; history: {stored}"
+                stored.contains("tool execution result"),
+                "an accepted recorded result must settle before shutdown; history: {stored}"
             );
         })
         .await;
@@ -1384,13 +1381,10 @@ async fn oversized_tool_result_never_wedges_the_thread() {
         .await;
 }
 
-/// Reboot recovery: a session dies while a tool result was still
-/// unvalidated, so the durable store ends on the unanswered tool *call*.
-/// When a fresh session boots from that store and user input arrives, the
-/// stranded call must be settled with a synthetic "interrupted" result and
-/// the thread must keep working.
+/// An orderly shutdown retains the accepted result. Reload must preserve it
+/// without adding a synthetic interruption, and later mail must flow.
 #[tokio::test(flavor = "current_thread")]
-async fn rebooted_session_settles_persisted_unanswered_tool_call() {
+async fn reloaded_session_preserves_shutdown_settled_tool_result() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1400,9 +1394,7 @@ async fn rebooted_session_settles_persisted_unanswered_tool_call() {
             let conv = InMemoryConversationStore::new();
             let state = InMemoryStateStore::new();
 
-            // ── Session 1: the model calls a tool; its (oversized) result
-            // arrives but the session shuts down before the model produces
-            // any output for it. ──
+            // Shut down before provider validation.
             let (model1, mut ctrl1) = model_source(None);
             let (tx1, mut rx1) = mpsc::unbounded_channel();
             let running1 = AgentSystemBuilder::new_local(conv.clone(), state.clone(), model1)
@@ -1425,12 +1417,11 @@ async fn rebooted_session_settles_persisted_unanswered_tool_call() {
             let _req2 = ctrl1.next_request().await;
             running1.shutdown().await;
 
-            // Durable state ends on the unanswered tool call; the
-            // unvalidated result was not persisted.
+            // The recorded exchange settles before driver teardown.
             let stored = persisted(&conv, "t1");
             assert!(
-                stored.contains("tc-1") && !stored.contains("HUGE TOOL RESULT"),
-                "store must end on the unanswered call; store: {stored}"
+                stored.contains("tc-1") && stored.contains("HUGE TOOL RESULT"),
+                "shutdown must retain the accepted result; store: {stored}"
             );
 
             // ── Session 2: boots from the same stores. ──
@@ -1443,13 +1434,12 @@ async fn rebooted_session_settles_persisted_unanswered_tool_call() {
                 .send_user_text(ThreadId::from_ref("t1"), "hello again")
                 .await;
 
-            // The stranded call is settled before the new input reaches the
-            // model.
+            // Reload sees the settled real result before processing new mail.
             let req = ctrl2.next_request().await;
             let history = format!("{:?}", req.chat_history);
             assert!(
-                history.contains("interrupted: daemon restarted"),
-                "reboot + user input must settle the stranded call; history: {history}"
+                history.contains("HUGE TOOL RESULT") && !history.contains("interrupted:"),
+                "reload must preserve the real result; history: {history}"
             );
             assert!(history.contains("hello again"), "history: {history}");
 
@@ -1462,7 +1452,7 @@ async fn rebooted_session_settles_persisted_unanswered_tool_call() {
             // Everything from the recovered round is validated + persisted.
             let stored = persisted(&conv, "t1");
             assert!(
-                stored.contains("interrupted: daemon restarted")
+                stored.contains("HUGE TOOL RESULT")
                     && stored.contains("hello again")
                     && stored.contains("back online"),
                 "recovered round must persist; store: {stored}"
@@ -1874,16 +1864,9 @@ async fn parent_message_after_fatal_error_still_reaches_sleeping_child() {
 /// driver exits every later parent message defers forever against a tool
 /// result that can never arrive again.
 ///
-/// Unlike the sleeping-child case above (where the pending call is passive
-/// and the waiting state is re-derivable from the store), recovering here
-/// needs the driver to stay resident while it holds consumed-but-unpersisted
-/// inputs, or a deferral policy that eventually gives up on a dangling call.
-///
-/// Expected-failure marker: `should_panic` pins the broken behavior. When
-/// the wedge is fixed, this test starts failing — remove the attribute (the
-/// body already asserts the desired behavior).
+/// The accepted result must survive the provider failure. The unrelated
+/// unvalidated parent message has no receipt and must not be promoted with it.
 #[tokio::test(flavor = "current_thread")]
-#[should_panic(expected = "the child must receive parent messages after the provider recovers")]
 async fn parent_message_after_fatal_error_during_active_tool_call() {
     let local = tokio::task::LocalSet::new();
     local
@@ -1967,9 +1950,8 @@ async fn parent_message_after_fatal_error_during_active_tool_call() {
                 "auth expired",
             ));
             ctrl.drop_stream();
-            // The child driver idles out after the failed round, dropping the
-            // consumed tool result and parent message; the store keeps the
-            // dangling tc-work call.
+            // The driver settles the accepted result before idling. The
+            // unrelated unvalidated parent message has no durable receipt.
             wait_idle(&mut running).await;
 
             // ── Provider "recovers"; parent sends another message ──
@@ -2002,15 +1984,9 @@ async fn parent_message_after_fatal_error_during_active_tool_call() {
                 };
                 let history = format!("{:?}", req.chat_history);
                 if history.contains("Message from parent thread: hello again") {
-                    // The tool result and the deferred first message were
-                    // consumed during the fatal round; they must have been
-                    // retained and retried rather than silently lost (a lost
-                    // tool result would leave tc-work dangling forever).
-                    assert!(
-                        history.contains("work finished")
-                            && history.contains("Message from parent thread: hello child"),
-                        "inputs consumed during the fatal error must be retried, not lost; got {history}"
-                    );
+                    assert!(history.contains("work finished"), "accepted result must survive: {history}");
+                    assert!(!history.contains("Message from parent thread: hello child"),
+                        "unrelated unvalidated mail must not be promoted: {history}");
                     child_got_message = true;
                     ctrl.send_text("got it");
                     ctrl.finish();
@@ -3510,10 +3486,12 @@ async fn r7_first_lazy_load_preserves_same_epoch_dispatch() {
             .await
             .expect("dispatcher history");
     dispatcher.dispatch_epoch = system.inner.dispatch_epoch.clone();
+    dispatcher.dispatches = Some(system.inner.dispatches.clone());
     dispatcher
         .record_tool_dispatch(rap_protocol::ToolCallId::from_ref("active"))
         .await
         .expect("write-ahead record");
+    let guard = dispatcher.start_tool_dispatch().expect("resident dispatch");
     let tool = AsyncTool;
     let registry = HashMap::from([("async_tool".into(), &tool as &dyn Tool<ChannelSender>)]);
     crate::event_processor::execute_action_with_error_result(
@@ -3533,6 +3511,7 @@ async fn r7_first_lazy_load_preserves_same_epoch_dispatch() {
             thread_stack: vec![tid.to_owned()],
             safe_spawn_point: None,
         },
+        Some(guard),
     )
     .await
     .expect("dispatch in this runtime");
@@ -3937,6 +3916,63 @@ mod r8_review {
         }
     }
 
+    async fn r9_result_then_provider_failure(sync: bool) {
+        tokio::task::LocalSet::new().run_until(async {
+            let conv = InMemoryConversationStore::new();
+            conv.ensure_root_thread(ThreadId::from_ref("r9")).await.expect("root");
+            let state = InMemoryStateStore::new();
+            let invoked = Arc::new(AtomicUsize::new(0));
+            let (model, mut ctrl) = model_source(None);
+            let (tx, mut events) = mpsc::unbounded_channel();
+            let running = AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
+                .tool(Box::new(ProbeTool { sync, invoked: invoked.clone() }))
+                .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+            let peer = peer_input("r9", "first", "first broker mail");
+            running.send(peer.0, &peer.1).await;
+            ctrl.next_request().await;
+            ctrl.send_tool_call("completed-call", "probe", serde_json::json!({}));
+            ctrl.finish();
+            if !sync {
+                collect_until_finished(&mut events).await;
+                let unrelated = peer_input("r9", "unvalidated", "unrelated unvalidated mail");
+                running.send(unrelated.0, &unrelated.1).await;
+                let result = tool_result_input("r9", "completed-call", "probe completed");
+                running.send(result.0, &result.1).await;
+            }
+            let request = ctrl.next_request().await;
+            assert!(format!("{:?}", request.chat_history).contains("probe completed"));
+            assert_eq!(invoked.load(Ordering::SeqCst), 1);
+            ctrl.send_error(infinity_provider_protocol::CompletionError::provider(
+                infinity_provider_protocol::ErrorClass::Fatal, "single provider failure"));
+            ctrl.drop_stream();
+            wait_idle(&mut events).await;
+            let stored = persisted(&conv, "r9");
+            eprintln!("sync={sync}, durable result={}, dispatch retained={}",
+                stored.contains("probe completed"),
+                state.get_tool_dispatch(ThreadId::from_ref("r9")).await.expect("record").is_some());
+            let peer = peer_input("r9", "after", "human broker mail after recovery");
+            running.send(peer.0, &peer.1).await;
+            let request = tokio::time::timeout(Duration::from_secs(4), ctrl.next_request()).await
+                .expect("completed tool must not permanently block later broker mail after one provider failure");
+            assert!(format!("{:?}", request.chat_history).contains("human broker mail after recovery"));
+            assert_eq!(stored.matches("probe completed").count(), 1);
+            assert!(!stored.contains("interrupted:"));
+            assert!(!stored.contains("unrelated unvalidated mail"));
+            assert!(state.get_tool_dispatch(ThreadId::from_ref("r9")).await.expect("record").is_none());
+            ctrl.send_text("recovered"); ctrl.finish();
+            running.shutdown().await;
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9_sync_result_provider_failure() {
+        r9_result_then_provider_failure(true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9_async_result_provider_failure() {
+        r9_result_then_provider_failure(false).await;
+    }
+
     async fn wait_idle(events: &mut mpsc::UnboundedReceiver<Evt>) {
         loop {
             if matches!(next_evt(events).await, Evt::E(AgentEvent::ThreadIdle)) {
@@ -4325,5 +4361,270 @@ async fn r8_dispatch_positions_and_durable_result_matrix() {
                 assert!(ctrl.try_next_request().is_none());
             }
         }
+    }
+}
+
+mod r9_lifecycle {
+    use super::*;
+    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
+    use crate::traits::{ConversationStore, StateStore};
+    use infinity_provider_protocol::message::{ToolResult, ToolResultContent};
+    use rap_protocol::{ProviderCallId, ToolCallId};
+    use std::{sync::Arc, time::Duration};
+
+    struct StalledTool {
+        sync: bool,
+        entered: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl Tool<ChannelSender> for StalledTool {
+        fn name(&self) -> &str {
+            "stalled"
+        }
+        fn description(&self) -> &str {
+            "stalled executor"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        fn supports_sync(&self) -> bool {
+            self.sync
+        }
+        async fn execute(
+            &self,
+            _: serde_json::Value,
+            _: ToolCallId,
+            _: Option<ProviderCallId>,
+            _: &ToolContext<ChannelSender>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+        async fn execute_synchronous(
+            &self,
+            _: &serde_json::Value,
+            _: &ToolCallId<str>,
+            _: Option<&ProviderCallId<str>>,
+            _: &ToolContext<ChannelSender>,
+        ) -> Option<ToolResult> {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9_same_epoch_dropped_executor_settles_and_releases_mail() {
+        for sync in [false, true] {
+            let conv = InMemoryConversationStore::new();
+            let state = InMemoryStateStore::new();
+            let tid = ThreadId::from_ref("dropped");
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let (model, mut ctrl) = model_source(None);
+            let system =
+                super::super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
+                    .tool(Box::new(StalledTool {
+                        sync,
+                        entered: entered.clone(),
+                    }))
+                    .build();
+            let thread = super::super::thread::Thread::load(system.inner.clone(), tid.to_owned())
+                .await
+                .expect("load");
+            let observer = super::super::EventCollector::new();
+            let (_cancel, cancel) = tokio::sync::oneshot::channel();
+            let mut step = Box::pin(thread.step_no_defer(
+                vec![user_text_input("dropped", "run")],
+                &observer,
+                cancel,
+            ));
+            tokio::time::timeout(Duration::from_secs(4), async {
+                tokio::select! {
+                    res = &mut step => panic!("executor must remain in flight: {res:?}"),
+                    () = async {
+                        ctrl.next_request().await;
+                        ctrl.send_tool_call("gone", "stalled", serde_json::json!({}));
+                        ctrl.finish();
+                        entered.notified().await;
+                    } => {}
+                }
+            })
+            .await
+            .expect("entered executor");
+            let record = state
+                .get_tool_dispatch(tid)
+                .await
+                .expect("record")
+                .expect("recorded");
+            assert!(system.inner.dispatches.awaiting(&tid.to_owned(), &record));
+            let live_load =
+                super::super::thread::Thread::load(system.inner.clone(), tid.to_owned())
+                    .await
+                    .expect("load while executor is live");
+            assert_eq!(live_load.pending_tool_call().expect("live call").0, "gone");
+            assert!(!persisted(&conv, "dropped").contains("interrupted:"));
+            drop(live_load);
+            drop(step);
+            drop(thread);
+            assert!(!system.inner.dispatches.awaiting(&tid.to_owned(), &record));
+            assert_eq!(Some(&record.epoch), system.inner.dispatch_epoch.as_ref());
+            let loaded = super::super::thread::Thread::load(system.inner.clone(), tid.to_owned())
+                .await
+                .expect("recover same epoch");
+            assert!(loaded.pending_tool_call().is_none());
+            assert_eq!(
+                persisted(&conv, "dropped")
+                    .matches("interrupted: result lost")
+                    .count(),
+                1
+            );
+            assert!(state.get_tool_dispatch(tid).await.expect("clear").is_none());
+            let (_cancel, cancel) = tokio::sync::oneshot::channel();
+            let late = tool_result_input("dropped", "gone", "late result");
+            let outcome = loaded
+                .step_no_defer(vec![late], &observer, cancel)
+                .await
+                .expect("late callback");
+            assert!(matches!(outcome, super::super::StepOutcome::Skipped));
+            assert!(!persisted(&conv, "dropped").contains("late result"));
+            let mut defer = super::super::defer::InMemoryDeferQueue::new();
+            let batch = loaded
+                .filter_deferrable(
+                    vec![peer_input(
+                        "dropped",
+                        "later",
+                        "mail after dropped executor",
+                    )],
+                    &mut defer,
+                )
+                .await
+                .expect("mail");
+            assert_eq!(batch.len(), 1);
+            let (_cancel, cancel) = tokio::sync::oneshot::channel();
+            let respond = async {
+                let req = ctrl.next_request().await;
+                assert!(format!("{:?}", req.chat_history).contains("mail after dropped executor"));
+                ctrl.send_text("done");
+                ctrl.finish();
+            };
+            let (result, ()) =
+                tokio::join!(loaded.step_no_defer(batch, &observer, cancel), respond);
+            result.expect("mail progresses");
+            assert!(persisted(&conv, "dropped").contains("mail after dropped executor"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9_same_epoch_reload_retains_received_real_result() {
+        use crate::event_processor::HistoryManager;
+        use crate::message::InfinityMessage;
+        use infinity_provider_protocol::message::{ToolCall, ToolFunction};
+        let conv = InMemoryConversationStore::new();
+        let state = InMemoryStateStore::new();
+        let tid = ThreadId::from_ref("received");
+        conv.ensure_root_thread(tid).await.expect("root");
+        conv.append_messages(
+            tid,
+            vec![(
+                InfinityMessage::ToolCall {
+                    call: ToolCall {
+                        id: "real".into(),
+                        call_id: None,
+                        function: ToolFunction {
+                            name: "async_tool".into(),
+                            arguments: serde_json::json!({}),
+                        },
+                    },
+                    display_as: None,
+                },
+                "call".into(),
+            )],
+        )
+        .await
+        .expect("history");
+        let (model, mut ctrl) = model_source(None);
+        let system =
+            super::super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model).build();
+        let mut history =
+            HistoryManager::new_with_history(conv.clone(), state.clone(), tid.to_owned())
+                .await
+                .expect("history");
+        history.dispatch_epoch = system.inner.dispatch_epoch.clone();
+        history.dispatches = Some(system.inner.dispatches.clone());
+        history
+            .record_tool_dispatch(ToolCallId::from_ref("real"))
+            .await
+            .expect("record");
+        history
+            .start_tool_dispatch()
+            .expect("dispatch")
+            .await_callback();
+        history
+            .handle_content(
+                InfinityMessage::ToolResult {
+                    result: ToolResult {
+                        id: "real".into(),
+                        call_id: None,
+                        content: vec![ToolResultContent::text("retained actual result")],
+                    },
+                    display_segments: None,
+                },
+                "result".into(),
+            )
+            .expect("accept result");
+        assert!(!persisted(&conv, "received").contains("retained actual result"));
+        drop(history);
+        for _ in 0..2 {
+            let loaded = super::super::thread::Thread::load(system.inner.clone(), tid.to_owned())
+                .await
+                .expect("load");
+            assert!(loaded.pending_tool_call().is_none());
+        }
+        let stored = persisted(&conv, "received");
+        assert_eq!(stored.matches("retained actual result").count(), 1);
+        assert!(!stored.contains("interrupted:"));
+        assert!(
+            state
+                .get_tool_dispatch(tid)
+                .await
+                .expect("record")
+                .is_none()
+        );
+        assert!(ctrl.try_next_request().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9_attach_preserves_async_call_awaiting_callback() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (running, mut events, mut ctrl, conv) =
+                    start_system(vec![Box::new(AsyncTool)], None);
+                running
+                    .send_user_text(ThreadId::from_ref("live"), "run async")
+                    .await;
+                ctrl.next_request().await;
+                ctrl.send_tool_call("still-running", "async_tool", serde_json::json!({}));
+                ctrl.finish();
+                collect_until_finished(&mut events).await;
+                let before = persisted(&conv, "live");
+                let (subscriber, mut replay) = mpsc::unbounded_channel();
+                running
+                    .subscribe(ThreadId::from_ref("live"), subscriber)
+                    .await;
+                let Evt::Replay(snapshot) = next_evt(&mut replay).await else {
+                    panic!("replay");
+                };
+                assert!(!snapshot.idle);
+                assert_eq!(persisted(&conv, "live"), before);
+                assert!(!before.contains("interrupted:"));
+                assert!(ctrl.try_next_request().is_none());
+                let result = tool_result_input("live", "still-running", "real async callback");
+                running.send(result.0, &result.1).await;
+                let request = ctrl.next_request().await;
+                assert!(format!("{:?}", request.chat_history).contains("real async callback"));
+                ctrl.send_text("done");
+                ctrl.finish();
+                running.shutdown().await;
+            })
+            .await;
     }
 }

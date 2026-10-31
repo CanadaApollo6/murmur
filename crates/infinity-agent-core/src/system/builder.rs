@@ -76,6 +76,7 @@ where
     pub tokio_sleep_tools: bool,
     // Only resident systems own their executors. Step-mode transports own recovery.
     pub dispatch_epoch: Option<String>,
+    pub dispatches: Rc<crate::dispatch::RuntimeDispatches>,
 }
 
 /// Builder for an [`AgentSystem`].
@@ -290,6 +291,7 @@ where
                 callback_url: self.callback_url,
                 builtin_tools: self.builtin_tools,
                 tokio_sleep_tools: self.tokio_sleep_tools,
+                dispatches: Rc::default(),
                 dispatch_epoch: self
                     .local_rx
                     .as_ref()

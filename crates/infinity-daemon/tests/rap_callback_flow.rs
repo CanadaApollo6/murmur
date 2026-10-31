@@ -1651,3 +1651,150 @@ fn r6_restart_with_stalled_manifest() {
         assert!(inv_rx.try_recv().is_err(), "restart must not re-invoke the executor");
     }));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn r9_broker_mail_after_completed_rap_tool_and_provider_failure() {
+    use agentd::mailroom::{Mailroom, NewMessage};
+    use agentd::model::*;
+    use agentd::supervisor::{AgentSpec, Broker, Phase};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let port = rap_test_servers::start_stub_diff_server()
+                .await
+                .expect("RAP tool");
+            rap_test_servers::write_rap_config(h.cwd.path(), port).expect("RAP config");
+            let socket = h.cwd.path().join("broker-infinity.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).expect("socket");
+            let manager = h.manager.clone();
+            let accept = tokio::task::spawn_local(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    tokio::task::spawn_local(infinity_daemon::client_handler::handle_client(
+                        stream,
+                        manager.clone(),
+                    ));
+                }
+            });
+            let mailroom = Arc::new(
+                Mailroom::open(h.cwd.path().join("broker.db"), Default::default())
+                    .await
+                    .expect("mailroom"),
+            );
+            let broker = Broker::new(
+                mailroom.clone(),
+                vec![{
+                    let mut kind = agentd::KindConfig::infinity(socket);
+                    kind.cancel_timeout = Duration::from_millis(100);
+                    kind.request_timeout = Duration::from_millis(200);
+                    kind
+                }],
+                agentd::supervisor::Config {
+                    backoff_initial: Duration::from_millis(10),
+                    backoff_max: Duration::from_millis(10),
+                    ..Default::default()
+                },
+            )
+            .expect("broker");
+            let spec = AgentSpec {
+                name: AgentName::parse("model").expect("name"),
+                kind: "infinity".into(),
+                cwd: h.cwd.path().into(),
+                model: None,
+                permissions: PermissionPolicy::default(),
+                idle_after: None,
+            };
+            let agent = broker.spawn(spec.clone()).await.expect("spawn");
+            let mut phases = agent.phases();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while *phases.borrow_and_update() != Phase::Idle {
+                    phases.changed().await.expect("phase");
+                }
+            })
+            .await
+            .expect("initial idle");
+            let root = h
+                .manager
+                .lock()
+                .await
+                .list_sessions(None)
+                .await
+                .into_keys()
+                .next()
+                .expect("root");
+            h.client_tx
+                .send(ClientMessage::Connect {
+                    root_thread_id: root.clone(),
+                    thread_id: None,
+                    keeps_session_alive: true,
+                })
+                .expect("connect observer");
+            wait_for_message(&mut h.daemon_rx, |m| {
+                matches!(m, DaemonMessage::Replay { .. })
+            })
+            .await;
+            let human = |body: &str| NewMessage {
+                from: Sender::Human,
+                to: agent.id,
+                body: Body::new(body).expect("body"),
+                reply_to: None,
+                client_key: ClientKey(body.into()),
+                act: agentd::swarm::Act::Inform,
+                task: None,
+            };
+
+            broker.send(human("run tool")).await.expect("send");
+            h.ctrl.next_request().await;
+            h.ctrl.send_tool_call(
+                "completed",
+                "edit_file",
+                serde_json::json!({"path":"demo.rs"}),
+            );
+            h.ctrl.finish();
+            let followup = tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request())
+                .await
+                .expect("RAP callback followup");
+            assert!(format!("{:?}", followup.chat_history).contains("Replaced text in demo.rs"));
+            h.ctrl
+                .send_error(infinity_provider_protocol::CompletionError::provider(
+                    infinity_provider_protocol::ErrorClass::Fatal,
+                    "one failed provider request",
+                ));
+            h.ctrl.drop_stream();
+            wait_for_message(&mut h.daemon_rx, |m| {
+                matches!(m, DaemonMessage::ThreadIdle { .. })
+            })
+            .await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while *phases.borrow_and_update() != Phase::Idle {
+                    phases.changed().await.expect("idle phase");
+                }
+            })
+            .await
+            .expect("idle after failed model round");
+            let stored = std::fs::read_to_string(
+                h._state_dir
+                    .path()
+                    .join("threads")
+                    .join(format!("{}.json", root.id)),
+            )
+            .expect("history");
+            broker
+                .send(human("human after provider recovery"))
+                .await
+                .expect("later human mail");
+            let next = tokio::time::timeout(Duration::from_secs(4), h.ctrl.next_request()).await;
+            let next = next.expect(
+                "completed RAP tool must not strand broker Busy after one provider failure",
+            );
+            assert!(format!("{:?}", next.chat_history).contains("human after provider recovery"));
+            assert_eq!(stored.matches("Replaced text in demo.rs").count(), 1);
+            assert!(!stored.contains("interrupted:"));
+            assert!(format!("{:?}", next.chat_history).contains("Replaced text in demo.rs"));
+            h.ctrl.send_text("done");
+            h.ctrl.finish();
+            broker.shutdown().await.expect("shutdown");
+            accept.abort();
+        })
+        .await;
+}

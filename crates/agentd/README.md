@@ -90,14 +90,26 @@ accepted result through a storage outage requires the daemon to remain alive.
 RAP cancellation notifications have a two-second timeout and cannot block
 settlement forever.
 
-Each resident runtime has a fresh epoch. Before persisting a tool call or
-invoking its executor, core writes a dispatch record with the call ID, epoch,
-and absolute history position. On load, a pending call receives
-`interrupted: daemon restarted` only if its record matches that occurrence
-and belongs to an older epoch. This includes external RAP calls and structural
-tools. Current-epoch calls remain pending. A record without a matching pending
-call is cleared without settlement. Recovery never re-executes tools or starts
-inference.
+Each resident runtime has a fresh epoch and an in-memory registry of dispatched
+calls. Before persisting a tool call or invoking its executor, core writes a
+dispatch record with the call ID, epoch, and absolute history position. The
+registry marks that exact occurrence as awaiting a result when execution starts.
+Async RAP calls remain live after dispatch returns, until their callback arrives
+or the call is interrupted. Dropping an executor invocation future removes its
+live claim. Accepting a result replaces the claim with the retained result.
+
+Before a driver exits, accepted results of recorded calls enter bounded
+settlement, even if the follow-up provider request failed before any output.
+Settlement preserves the real result without validating unrelated mail. On load
+or attachment, a recorded pending call is orphaned if its exact occurrence is
+absent from the runtime's awaiting set. Recovery persists its retained result
+when available. Otherwise it uses `interrupted: result lost` for a same-epoch
+orphan and `interrupted: daemon restarted` for an older epoch. Epochs remain an
+explicit runtime boundary and retain the existing store format. An epoch match
+alone never proves a call is live. Late callbacks cannot add a second result.
+
+A record without a matching pending call is cleared without another result.
+Recovery never re-executes tools or starts inference.
 
 Seeds and legacy calls without dispatch records remain untouched. Existing
 stores cannot recover orphaned calls from before this policy. Those calls need
