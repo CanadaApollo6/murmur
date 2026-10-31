@@ -68,8 +68,9 @@ model = "local/qwen3-coder"
 ```
 
 Each Infinity agent owns one root thread, saved in its opaque resume token.
-Only a daemon-reported missing root enters `NeedsRecovery`. Timeouts and transient
-resume errors use normal crash backoff without creating a replacement thread.
+A daemon-reported missing or archived root enters `NeedsRecovery`. Open timeouts
+and transient resume errors use normal crash backoff without creating a
+replacement thread.
 EOF reconnects with a new incarnation. Unconsumed mail is re-offered. Human and
 peer mail both use `DeliverPeerMessage`, with stable dedup ID `peer-{MessageId}`.
 Human mail sets `from` to `human` and identifies the human operator in its body.
@@ -80,10 +81,19 @@ Separate history and dedup-ID writes retain a window that can duplicate mail.
 The daemon includes a random process boot ID in `Welcome`. The adapter saves it
 in the resume token. When a reopened root has a different boot ID and
 `Replay.idle` is false, agentd sends one `Interrupt`. It uses the same rule after
-a driver-failure protocol error within the same daemon. Core settles the call
+a driver-failure protocol error from the root or any child on the connection.
+A stopped root also ends the attachment and records that it needs an interrupt.
+Reconnect clears shutdown and interrupts busy replay. This can interrupt a plain
+completion running when the CLI user quits. Its unconsumed mail is re-queued.
+An archived root requires recovery instead of reconnecting. Core settles the call
 durably and removes pending choices. Recovery never invokes the tool again.
 Only agentd-attached threads auto-recover after a daemon restart. An executor
-lost inside a running daemon needs `agentctl cancel` unless it panicked.
+lost inside a running daemon needs `agentctl cancel` unless a driver failure or
+session shutdown signals the loss. Detached sleep tasks catch panics and return
+a terminal tool error. Invalid or unrepresentable sleep durations return an error
+before a task starts. The adapter persists its recovery marker when it changes,
+including when idle or a new completion clears it, so an unclean agentd exit
+does not restore a cleared marker.
 
 Cancellation has a deadline. Reconnects reissue an outstanding cancellation when
 replay is busy. A later `StartOutput` or `ThinkingStart` acknowledges cancellation
@@ -98,14 +108,17 @@ interrupt, and a five-second timer. Closed channels release a Held driver during
 shutdown. A failed choice write enters this same bounded settlement path, so a
 call cannot wait forever for a prompt that was never saved. RAP cancellation
 notifications have a two-second bound. Retaining accepted results during a
-storage outage requires the daemon to remain alive.
+storage outage requires the daemon to remain alive. Receipt and interrupt
+deadlines, and exhausted or held settlement errors, reconnect without spending
+the crash budget. Mailroom `max_attempts` still bounds unreceipted delivery and
+moves exhausted mail to Held. Repairing storage permits automatic recovery.
 
 The receipt deadline starts when submission begins on an idle root. A later
 completion start clears it, so inference may outlast the receipt timeout. A new
 idle event rearms it for outstanding mail. A silent daemon cannot leave offered
 mail waiting forever. Model agents never idle-suspend. An unreachable daemon
 uses backoff capped at 60 seconds without consuming the model agent crash limit.
-A session that connected successfully and then failed does count as a crash.
+Other connected-session failures count as crashes.
 ACP spawn failures keep their existing crash policy.
 
 Infinity's daemon owns sandbox and RAP tool configuration. The socket API cannot

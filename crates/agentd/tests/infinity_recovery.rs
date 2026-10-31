@@ -748,14 +748,14 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
                         ..
                     } => {
                         crashes += 1;
-                        if !permanent && crashes == 2 {
+                        if crashes == if permanent { 6 } else { 2 } {
                             break;
                         }
                     }
                     Event::PhaseChanged {
                         phase: Phase::Failed { .. },
                         ..
-                    } if permanent => break,
+                    } => panic!("storage outage exhausted crash budget"),
                     Event::TurnEnded {
                         outcome: TurnOutcome::Cancelled,
                         ..
@@ -771,38 +771,12 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
             "settlement retries must not run inference"
         );
         if permanent {
-            assert_eq!(crashes, 4, "fifth failed cancellation must reach Failed");
-            agent.stop().await.expect("stop failed actor");
             wait_for_message(&mut h.daemon_rx, |m| {
                 matches!(m, DaemonMessage::Error { text, .. } if text.contains("settlement exhausted"))
             }).await;
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            while let Ok(message) = h.daemon_rx.try_recv() {
-                assert!(
-                    !matches!(message, DaemonMessage::Info { text, .. } if text.contains("Interrupt failed")),
-                    "held settlement must stop automatic write retries"
-                );
-            }
+            assert!(!matches!(*phases.borrow(), Phase::Failed { .. }));
         }
         drop(fault);
-        if permanent {
-            h.client_tx
-                .send(ClientMessage::Interrupt {
-                    thread_id: root.clone(),
-                })
-                .expect("retry settlement after repair");
-            wait_for_message(&mut h.daemon_rx, |m| {
-                matches!(m, DaemonMessage::ThreadIdle { .. })
-            })
-            .await;
-        }
-        if permanent {
-            agent = broker
-                .spawn(spec.clone())
-                .await
-                .expect("resume after storage recovery");
-            phases = agent.phases();
-        }
         tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request())
             .await
             .expect("queued human must progress after storage recovery");
@@ -1007,7 +981,7 @@ async fn interrupt_write_failure_retries_settlement_across_reconnects() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn interrupt_write_failure_exhausts_broker_recovery_without_losing_result() {
+async fn r11_storage_repair_recovers_without_restarting_failed_agent() {
     tokio::task::LocalSet::new()
         .run_until(tool_settlement_probe(
             ToolSettlementProbe::InterruptWriteFailure { permanent: true },
@@ -2080,4 +2054,232 @@ fn broker_boot_rule_preserves_subscription_payload() {
         wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::InputCommitted { dedup_id, .. } if dedup_id == "peer-after-subscription")).await;
         broker.shutdown().await.expect("shutdown");
     }));
+}
+
+async fn r11_broker(
+    h: &TestHarness,
+) -> (
+    agentd::supervisor::Broker,
+    agentd::supervisor::AgentHandle,
+    infinity_protocol::ThreadRef,
+) {
+    use agentd::{
+        mailroom::Mailroom,
+        model::AgentName,
+        supervisor::{AgentSpec, Broker, Phase},
+    };
+    let socket = h.cwd.path().join("r11.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("socket");
+    let manager = h.manager.clone();
+    tokio::task::spawn_local(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            tokio::task::spawn_local(infinity_daemon::client_handler::handle_client(
+                stream,
+                manager.clone(),
+            ));
+        }
+    });
+    let mailroom = Arc::new(
+        Mailroom::open(h.cwd.path().join("r11.db"), Default::default())
+            .await
+            .expect("mailroom"),
+    );
+    let mut kind = agentd::KindConfig::infinity(socket);
+    kind.request_timeout = Duration::from_millis(300);
+    kind.cancel_timeout = Duration::from_millis(300);
+    let broker = Broker::new(
+        mailroom,
+        vec![kind],
+        agentd::supervisor::Config {
+            backoff_initial: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(20),
+            ..Default::default()
+        },
+    )
+    .expect("broker");
+    let agent = broker
+        .spawn(AgentSpec {
+            name: AgentName::parse("r11").expect("name"),
+            kind: "infinity".into(),
+            cwd: h.cwd.path().into(),
+            model: None,
+            permissions: Default::default(),
+            idle_after: None,
+        })
+        .await
+        .expect("spawn");
+    let mut phases = agent.phases();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *phases.borrow_and_update() != Phase::Idle {
+            phases.changed().await.expect("phase");
+        }
+    })
+    .await
+    .expect("initial idle");
+    let root = h
+        .manager
+        .lock()
+        .await
+        .list_sessions(None)
+        .await
+        .into_keys()
+        .next()
+        .expect("root");
+    (broker, agent, root)
+}
+
+async fn r11_send(broker: &agentd::supervisor::Broker, agent: agentd::model::AgentId, text: &str) {
+    use agentd::{mailroom::NewMessage, model::*};
+    broker
+        .send(NewMessage {
+            from: Sender::Human,
+            to: agent,
+            body: Body::new(text).expect("body"),
+            reply_to: None,
+            client_key: ClientKey(text.into()),
+            act: agentd::swarm::Act::Inform,
+            task: None,
+        })
+        .await
+        .expect("mail");
+}
+
+async fn r11_shutdown_command_tool(archive: bool) {
+    use agentd::supervisor::Phase;
+    let mut h = start_harness().await.expect("harness");
+    let config_dir = h.cwd.path().join(".infinity");
+    std::fs::create_dir(&config_dir).expect("config directory");
+    let started = h.cwd.path().join("tool-started");
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/delayed_rap.py");
+    std::fs::write(config_dir.join("rap.json"), serde_json::json!({"tool_sets":[{
+        "type":"toolset_command", "command":format!("python3 '{}' '{}'", script.display(), started.display())
+    }]}).to_string()).expect("config");
+    let (broker, agent, root) = r11_broker(&h).await;
+    let mut events = broker.events();
+    h.client_tx
+        .send(ClientMessage::Connect {
+            root_thread_id: root.clone(),
+            thread_id: None,
+            keeps_session_alive: true,
+        })
+        .expect("observer connect");
+    wait_for_message(&mut h.daemon_rx, |m| {
+        matches!(m, DaemonMessage::Replay { .. })
+    })
+    .await;
+    r11_send(&broker, agent.id, "start delayed work").await;
+    h.ctrl.next_request().await;
+    h.ctrl
+        .send_tool_call("delayed-call", "delayed_work", serde_json::json!({}));
+    h.ctrl.finish();
+    wait_for_message(&mut h.daemon_rx, |m| {
+        matches!(m, DaemonMessage::ResponseDone { .. })
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("command tool invoked");
+    let port: u16 = std::fs::read_to_string(&started)
+        .expect("port")
+        .parse()
+        .expect("port number");
+    h.client_tx
+        .send(if archive {
+            ClientMessage::ArchiveSession {
+                root_thread_id: root.clone(),
+            }
+        } else {
+            ClientMessage::ShutdownSession {
+                root_thread_id: root.clone(),
+            }
+        })
+        .expect("CLI quit/archive");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("shutdown kills command RAP server before callback");
+    r11_send(&broker, agent.id, "mail after CLI quit").await;
+    if archive {
+        let mut phases = agent.phases();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !matches!(*phases.borrow_and_update(), Phase::NeedsRecovery { .. }) {
+                phases.changed().await.expect("phase");
+            }
+        })
+        .await
+        .expect("archived root must require recovery");
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    agentd::supervisor::Event::PhaseChanged {
+                        phase: Phase::Crashed { .. } | Phase::Failed { .. },
+                        ..
+                    }
+                ),
+                "archive must enter NeedsRecovery directly"
+            );
+        }
+        assert!(h.ctrl.try_next_request().is_none());
+    } else {
+        let request = tokio::time::timeout(Duration::from_secs(8), h.ctrl.next_request())
+            .await
+            .expect("shutdown must not strand mail behind killed tool");
+        let history = format!("{:?}", request.chat_history);
+        assert!(
+            history.contains("mail after CLI quit")
+                && history.contains("Tool call interrupted by user")
+        );
+        h.ctrl.send_text("recovered");
+        h.ctrl.finish();
+    }
+    broker.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r11_shutdown_during_command_tool_recovers_mail() {
+    tokio::task::LocalSet::new()
+        .run_until(r11_shutdown_command_tool(false))
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r11_archive_during_command_tool_needs_recovery() {
+    tokio::task::LocalSet::new()
+        .run_until(r11_shutdown_command_tool(true))
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r11a_detached_executor_panic() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let (broker, agent, _) = r11_broker(&h).await;
+            r11_send(&broker, agent.id, "sleep invalid duration").await;
+            h.ctrl.next_request().await;
+            h.ctrl
+                .send_tool_call("panic-sleep", "sleep", serde_json::json!({"seconds":1e100}));
+            h.ctrl.finish();
+            let request = tokio::time::timeout(Duration::from_secs(4), h.ctrl.next_request())
+                .await
+                .expect("invalid duration must deliver a tool error and resume inference");
+            assert!(format!("{:?}", request.chat_history).contains("Error:"));
+            h.ctrl.send_text("invalid duration handled");
+            h.ctrl.finish();
+            broker.shutdown().await.expect("shutdown");
+        })
+        .await;
 }

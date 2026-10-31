@@ -169,10 +169,13 @@ impl InfinitySession {
                     "Infinity root thread does not exist".into(),
                 ));
             };
-            if session.status == infinity_protocol::SessionStatus::Archived
-                || session.remote.is_some()
-            {
-                return Err(protocol("Infinity root thread is archived or remote"));
+            if session.status == infinity_protocol::SessionStatus::Archived {
+                return Err(AdapterError::ResumeFailed(
+                    "Infinity root thread is archived".into(),
+                ));
+            }
+            if session.remote.is_some() {
+                return Err(protocol("Infinity root thread is remote"));
             }
             self.send(ClientMessage::Connect {
                 root_thread_id: saved.root.clone(),
@@ -417,10 +420,33 @@ impl InfinitySession {
                     self.receive(choice)?;
                 }
             }
+            DaemonMessage::SessionsUpdated { sessions } => {
+                if let Some(session) = sessions.get(&self.root) {
+                    match session.status {
+                        infinity_protocol::SessionStatus::Stopped => {
+                            self.needs_interrupt = true;
+                            return Err(protocol("Infinity root thread stopped"));
+                        }
+                        infinity_protocol::SessionStatus::Archived => {
+                            return Err(AdapterError::ResumeFailed(
+                                "Infinity root thread is archived".into(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            DaemonMessage::Error { text, .. } if text.starts_with("Thread driver failed:") => {
+                self.needs_interrupt = true;
+                return Err(protocol(text));
+            }
+            DaemonMessage::Error { text, .. } if text.starts_with("Interrupt settlement ") => {
+                self.needs_interrupt = true;
+                return Err(AdapterError::Unavailable(text));
+            }
             DaemonMessage::Error { thread_id, text }
                 if thread_id.is_none() || self.root_event(&thread_id) =>
             {
-                self.needs_interrupt |= text.starts_with("Thread driver failed:");
                 return Err(protocol(text));
             }
             _ => {}
@@ -534,14 +560,27 @@ impl Session for InfinitySession {
                 () = async { match deadline {
                     Some(d) => tokio::time::sleep_until(d).await,
                     None => std::future::pending().await,
-                } } => Err("Infinity receipt or interrupt deadline exceeded".into()),
+                } } => {
+                    self.ended = true;
+                    return Some(SessionEvent::Unavailable {
+                        reason: "Infinity receipt or interrupt deadline exceeded".into(),
+                    });
+                },
                 msg = self.rx.recv() => msg.unwrap_or_else(|| Err("Infinity daemon connection closed".into())),
             };
+            let needs_interrupt = self.needs_interrupt;
             let result = incoming.map_err(protocol).and_then(|msg| self.receive(msg));
+            if needs_interrupt != self.needs_interrupt {
+                self.events.push_back(SessionEvent::ResumeUpdated);
+            }
             if let Err(error) = result {
                 self.ended = true;
-                self.events.push_back(SessionEvent::Ended {
-                    reason: error.to_string(),
+                self.events.push_back(match error {
+                    AdapterError::ResumeFailed(reason) => SessionEvent::ResumeFailed { reason },
+                    AdapterError::Unavailable(reason) => SessionEvent::Unavailable { reason },
+                    _ => SessionEvent::Ended {
+                        reason: error.to_string(),
+                    },
                 });
             }
         }

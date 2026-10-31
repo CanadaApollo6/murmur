@@ -12,6 +12,26 @@ use infinity_provider_protocol::message::{ToolResult, ToolResultContent, UserCon
 
 pub(crate) type ToolError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Detached executors must report a terminal result even if their task panics.
+pub(crate) fn spawn_tool_task<M: InputSender + 'static>(
+    context: ToolContext<M>,
+    id: rap_protocol::ToolCallId,
+    call_id: Option<rap_protocol::ProviderCallId>,
+    task: impl Future<Output = Result<(), ToolError>> + Send + 'static,
+) {
+    use futures_util::FutureExt;
+    tokio::spawn(async move {
+        let error = match std::panic::AssertUnwindSafe(task).catch_unwind().await {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => "tool executor panicked".into(),
+        };
+        if let Err(error) = send_tool_error(&context, &id, call_id, error).await {
+            tracing::error!(%error, "failed to deliver executor error");
+        }
+    });
+}
+
 /// Enqueue an error as the result of a tool call so the agent can recover.
 pub(crate) async fn send_tool_error<M: InputSender>(
     context: &ToolContext<M>,
