@@ -9,7 +9,9 @@ use crate::{
     supervisor::AgentSpec,
     surfaces::{Result, private_dir},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -81,6 +83,12 @@ pub struct SandboxConfig {
     pub env: Vec<String>,
     #[serde(skip)]
     pub protected: Vec<PathBuf>,
+    #[serde(skip)]
+    binds: Vec<(PinnedPath, PathBuf, bool)>,
+    #[serde(skip)]
+    bind_error: Option<String>,
+    #[serde(skip)]
+    pub credential_paths: BTreeMap<PathBuf, PathBuf>,
 }
 impl Default for SandboxConfig {
     fn default() -> Self {
@@ -101,6 +109,9 @@ impl Default for SandboxConfig {
             rw_binds: vec![],
             env: vec!["LANG".into(), "LC_ALL".into(), "TZ".into()],
             protected: vec![],
+            binds: vec![],
+            bind_error: None,
+            credential_paths: BTreeMap::new(),
         }
     }
 }
@@ -159,6 +170,9 @@ fn resolved(path: &Path) -> Result<PathBuf> {
 }
 impl SandboxConfig {
     pub fn check_bind(&self, path: &Path, state: &Path) -> Result<()> {
+        if path.starts_with("/run") {
+            return Err(format!("sandbox bind exposes runtime paths: {}", path.display()).into());
+        }
         let path = resolved(path)?;
         let state = resolved(state)?;
         let home = resolved(&host_home())?;
@@ -166,7 +180,7 @@ impl SandboxConfig {
             || state.starts_with(&path)
             || home.starts_with(&path)
             || Path::new("/run").starts_with(&path)
-            || path.starts_with("/run/user")
+            || path.starts_with("/run")
             || self.protected.iter().any(|p| p.starts_with(&path))
         {
             return Err(format!("sandbox bind exposes protected paths: {}", path.display()).into());
@@ -180,6 +194,7 @@ impl SandboxConfig {
         shared: &Path,
         kinds: &mut [KindConfig],
     ) -> Result<()> {
+        self.credential_paths.clear();
         self.protected = [
             control,
             control.parent().ok_or("control socket needs parent")?,
@@ -188,24 +203,6 @@ impl SandboxConfig {
         .into_iter()
         .map(resolved)
         .collect::<Result<_>>()?;
-        let socket = AgentPaths::new(state, AgentId(ulid::Ulid::new()))
-            .io
-            .join("egress.sock");
-        use std::os::unix::ffi::OsStrExt;
-        let limit = if cfg!(target_os = "linux") { 107 } else { 103 };
-        if socket.as_os_str().as_bytes().len() > limit {
-            return Err(format!(
-                "per-agent socket path exceeds sun_path limit of {limit} bytes: {}",
-                socket.display()
-            )
-            .into());
-        }
-        for path in self.ro_binds.iter_mut().chain(&mut self.rw_binds) {
-            *path = expand(path);
-        }
-        for path in self.ro_binds.iter().chain(&self.rw_binds) {
-            self.check_bind(path, state)?;
-        }
         for name in &self.env {
             if forbidden_env(name) {
                 return Err(format!("unsafe forwarded environment variable: {name}").into());
@@ -222,15 +219,33 @@ impl SandboxConfig {
                     return Err("configure at most one credential file per kind".into());
                 }
                 for path in &sb.credentials {
-                    if path.strip_prefix(host_home()).is_err() {
-                        return Err("credentials must be files under HOME".into());
-                    }
-                    if path
-                        .components()
-                        .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+                    if path.strip_prefix(host_home()).is_err()
+                        || path
+                            .components()
+                            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
                     {
-                        return Err("unsafe credential path".into());
+                        return Err(format!(
+                            "kind {}: credentials must be files under HOME without traversal",
+                            kind.name
+                        )
+                        .into());
                     }
+                    let parent = path.parent().ok_or("credential needs parent")?;
+                    let parent = std::fs::canonicalize(parent).map_err(|e| {
+                        format!(
+                            "kind {} credential parent {}: {e}",
+                            kind.name,
+                            parent.display()
+                        )
+                    })?;
+                    let host = parent.join(path.file_name().ok_or("credential needs name")?);
+                    crate::private_fs::Dir::open(&parent, false)
+                        .and_then(|dir| dir.read(host.file_name().expect("credential name")))
+                        .map_err(|e| {
+                            format!("kind {} credential {}: {e}", kind.name, host.display())
+                        })?;
+                    self.protected.extend([parent, host.clone()]);
+                    self.credential_paths.insert(path.clone(), host);
                 }
                 for home in &sb.home {
                     if home.is_empty()
@@ -252,7 +267,61 @@ impl SandboxConfig {
                 }
             }
         }
+        self.validate_binds(state)?;
         Ok(())
+    }
+    fn validate_binds(&mut self, state: &Path) -> Result<()> {
+        let file = state.join("sandbox-binds.json");
+        let previous: BTreeMap<PathBuf, PinnedPath> = match std::fs::read(&file) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let mut current = BTreeMap::new();
+        self.binds.clear();
+        self.bind_error = None;
+        for (paths, readonly) in [(&self.ro_binds, true), (&self.rw_binds, false)] {
+            for path in paths {
+                let path = expand(path);
+                let pin = if let Some(pin) = previous.get(&path) {
+                    if let Err(error) = pin.open(self, state) {
+                        self.bind_error = Some(error.to_string());
+                        tracing::error!(%error, "configured sandbox bind unavailable");
+                    }
+                    pin.clone()
+                } else {
+                    PinnedPath::capture(&path, self, state)?
+                };
+                current.insert(path.clone(), pin.clone());
+                self.binds.push((pin, path.clone(), readonly));
+            }
+        }
+        let tmp = state.join("sandbox-binds.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&current)?)?;
+        std::fs::rename(tmp, file)?;
+        Ok(())
+    }
+    pub fn launch_mounts(&self, workspace: &PinnedPath, state: &Path) -> Result<Vec<PinnedMount>> {
+        if let Some(error) = &self.bind_error {
+            return Err(error.clone().into());
+        }
+        self.binds
+            .iter()
+            .map(|(pin, target, readonly)| {
+                Ok(PinnedMount {
+                    fd: Arc::new(pin.open(self, state)?),
+                    target: target.clone(),
+                    readonly: *readonly,
+                })
+            })
+            .chain(std::iter::once_with(|| {
+                Ok(PinnedMount {
+                    fd: Arc::new(workspace.open(self, state)?),
+                    target: workspace.path.clone(),
+                    readonly: false,
+                })
+            }))
+            .collect()
     }
     pub fn label(&self, isolation: &Isolation) -> &'static str {
         match isolation {
@@ -261,6 +330,72 @@ impl SandboxConfig {
             _ => "bwrap+host",
         }
     }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PinnedPath {
+    pub path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+impl PinnedPath {
+    fn resolved_fd(fd: &OwnedFd, path: &Path) -> Result<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = path;
+            Ok(std::fs::canonicalize(format!(
+                "/proc/self/fd/{}",
+                fd.as_raw_fd()
+            ))?)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = fd;
+            Ok(std::fs::canonicalize(path)?)
+        }
+    }
+    fn descriptor(path: &Path) -> Result<OwnedFd> {
+        #[cfg(target_os = "linux")]
+        let flags = nix::fcntl::OFlag::O_PATH;
+        #[cfg(not(target_os = "linux"))]
+        let flags = nix::fcntl::OFlag::O_RDONLY;
+        Ok(nix::fcntl::open(
+            path,
+            flags | nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )?)
+    }
+    pub fn capture(path: &Path, cfg: &SandboxConfig, state: &Path) -> Result<Self> {
+        cfg.check_bind(path, state)?;
+        let fd = Self::descriptor(path)
+            .map_err(|e| format!("sandbox source {}: {e}", path.display()))?;
+        let path = Self::resolved_fd(&fd, path)?;
+        cfg.check_bind(&path, state)?;
+        use std::os::unix::fs::MetadataExt;
+        let stat = std::fs::File::from(fd.try_clone()?).metadata()?;
+        Ok(Self {
+            path,
+            dev: stat.dev(),
+            ino: stat.ino(),
+        })
+    }
+    fn open(&self, cfg: &SandboxConfig, state: &Path) -> Result<OwnedFd> {
+        let fd = Self::descriptor(&self.path)
+            .map_err(|e| format!("sandbox source {}: {e}", self.path.display()))?;
+        use std::os::unix::fs::MetadataExt;
+        let stat = std::fs::File::from(fd.try_clone()?).metadata()?;
+        if (stat.dev(), stat.ino()) != (self.dev, self.ino) {
+            return Err(format!("sandbox source identity changed: {}", self.path.display()).into());
+        }
+        let resolved = Self::resolved_fd(&fd, &self.path)?;
+        cfg.check_bind(&resolved, state)?;
+        Ok(fd)
+    }
+}
+#[derive(Clone, Debug)]
+pub struct PinnedMount {
+    fd: Arc<OwnedFd>,
+    target: PathBuf,
+    readonly: bool,
 }
 #[derive(Clone, Debug)]
 pub struct AgentPaths {
@@ -287,6 +422,24 @@ pub struct Launch {
     pub args: Vec<OsString>,
     pub env: Env,
     pub mcp_server: Option<serde_json::Value>,
+    pub mount_fds: Vec<Arc<OwnedFd>>,
+}
+impl Launch {
+    pub fn inherit_mount_fds(&self, cmd: &mut tokio::process::Command) {
+        let fds = self.mount_fds.clone();
+        // Only the fork child clears CLOEXEC. bwrap consumes and closes these fds.
+        unsafe {
+            cmd.pre_exec(move || {
+                for fd in &fds {
+                    nix::fcntl::fcntl(
+                        fd.as_ref(),
+                        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+                    )?;
+                }
+                Ok(())
+            });
+        }
+    }
 }
 pub fn direct(kind: &KindConfig, spec: &AgentSpec) -> Launch {
     let mut args: Vec<OsString> = kind.args.iter().map(Into::into).collect();
@@ -296,6 +449,7 @@ pub fn direct(kind: &KindConfig, spec: &AgentSpec) -> Launch {
         args,
         env: Env::Inherit(kind.env.clone()),
         mcp_server: None,
+        mount_fds: vec![],
     }
 }
 fn sandbox_args<'a>(kind: &'a KindConfig, spec: &AgentSpec) -> &'a [String] {
@@ -319,6 +473,7 @@ pub struct Facts {
     exe: PathBuf,
     resolved_dns: bool,
     env: BTreeMap<String, String>,
+    pub pinned: Vec<PinnedMount>,
 }
 impl Facts {
     pub fn collect() -> Result<Self> {
@@ -330,6 +485,7 @@ impl Facts {
             exe: std::env::current_exe()?,
             resolved_dns: Path::new("/run/systemd/resolve").exists(),
             env: std::env::vars().collect(),
+            pinned: vec![],
         };
         for path in ["/bin", "/sbin", "/lib", "/lib64"] {
             if let Ok(target) = std::fs::read_link(path) {
@@ -415,11 +571,6 @@ pub fn plan(
         paths.home.as_os_str(),
         facts.home.as_os_str(),
     ]);
-    for (paths, flag) in [(&cfg.ro_binds, "--ro-bind"), (&cfg.rw_binds, "--bind")] {
-        for path in paths {
-            push(&[flag.as_ref(), path.as_os_str(), path.as_os_str()]);
-        }
-    }
     push(&[
         "--ro-bind".as_ref(),
         facts.exe.as_os_str(),
@@ -437,11 +588,18 @@ pub fn plan(
             m.target.as_os_str(),
         ]);
     }
-    push(&[
-        "--bind".as_ref(),
-        spec.cwd.as_os_str(),
-        spec.cwd.as_os_str(),
-    ]);
+    for mount in &facts.pinned {
+        push(&[
+            if mount.readonly {
+                "--ro-bind-fd"
+            } else {
+                "--bind-fd"
+            }
+            .as_ref(),
+            mount.fd.as_raw_fd().to_string().as_ref(),
+            mount.target.as_os_str(),
+        ]);
+    }
     push(&["--chdir".as_ref(), spec.cwd.as_os_str()]);
     if cfg.network == Network::Host && facts.resolved_dns {
         push(&[
@@ -496,12 +654,36 @@ pub fn plan(
         args: a,
         env: Env::Clear(env.into_iter().map(|(k, v)| (k.into(), v.into())).collect()),
         mcp_server: None,
+        mount_fds: facts.pinned.iter().map(|m| m.fd.clone()).collect(),
     }
 }
 
 pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) -> Result<()> {
+    if kinds
+        .iter()
+        .any(|k| matches!(k.isolation, Isolation::Bwrap(_)))
+    {
+        let out = tokio::process::Command::new(&cfg.path)
+            .arg("--help")
+            .output()
+            .await
+            .map_err(|e| {
+                format!(
+                    "bwrap preflight failed: {e}; install bwrap >= 0.10.0 or set sandbox = \"none\""
+                )
+            })?;
+        let help = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() || !help.contains("--bind-fd ") || !help.contains("--ro-bind-fd ")
+        {
+            return Err("bwrap preflight requires --bind-fd and --ro-bind-fd (bubblewrap >= 0.10.0); Ubuntu 24.04's 0.9.0 is too old".into());
+        }
+    }
     for kind in kinds {
         if let Isolation::Bwrap(sb) = &kind.isolation {
+            if let Some(error) = &cfg.bind_error {
+                tracing::error!(kind=%kind.name, %error, "sandbox launches disabled for configured bind");
+                continue;
+            }
             let tmp = state.join("preflight");
             private_dir(&tmp)?;
             let paths = AgentPaths {
@@ -512,13 +694,22 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
             seed(sb, &paths.home)?;
             let facts = Facts::collect()?;
             let spec = AgentSpec {
+                workspace: None,
                 name: AgentName::parse("preflight")?,
                 kind: kind.name.clone(),
-                cwd: paths.home.clone(),
+                cwd: host_home(),
                 model: None,
                 permissions: Default::default(),
                 idle_after: None,
             };
+            let mut facts = facts;
+            for (pin, target, readonly) in &cfg.binds {
+                facts.pinned.push(PinnedMount {
+                    fd: Arc::new(pin.open(cfg, state)?),
+                    target: target.clone(),
+                    readonly: *readonly,
+                });
+            }
             let mut launch = plan(cfg, kind, &spec, &paths, &facts);
             let pos = launch
                 .args
@@ -533,8 +724,9 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
                 OsString::from("preflight"),
                 kind.command.clone().into(),
             ]);
-            let mut cmd = tokio::process::Command::new(launch.program);
-            cmd.args(launch.args);
+            let mut cmd = tokio::process::Command::new(&launch.program);
+            cmd.args(&launch.args);
+            launch.inherit_mount_fds(&mut cmd);
             if let Env::Clear(env) = launch.env {
                 cmd.env_clear().envs(env);
             }
@@ -554,7 +746,7 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
 
 async fn relay(listener: tokio::net::TcpListener) -> Result<()> {
     use tokio::net::UnixStream;
-    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
+    let slots = Arc::new(tokio::sync::Semaphore::new(64));
     let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
@@ -638,6 +830,7 @@ mod tests {
                     home: "/home/person".into(),
                     exe: "/host/agentd".into(),
                     resolved_dns: false,
+                    pinned: vec![],
                     env: BTreeMap::from([
                         ("PATH".into(), "/usr/bin".into()),
                         ("AGENTD_MCP_TOKEN".into(), "do-not-forward".into()),
@@ -645,6 +838,7 @@ mod tests {
                     ]),
                 };
                 let spec = AgentSpec {
+                    workspace: None,
                     name: AgentName::parse("test").expect("name"),
                     kind: kind.name.clone(),
                     cwd: "/workspace".into(),
@@ -664,7 +858,7 @@ mod tests {
                     ""
                 };
                 let expected = format!(
-                    "--unshare-user\n--unshare-pid\n--unshare-ipc\n--unshare-uts\n--unshare-cgroup\n--die-with-parent\n--new-session\n{net}--ro-bind\n/usr\n/usr\n--ro-bind\n/etc\n/etc\n--symlink\nusr/bin\n/bin\n--proc\n/proc\n--dev\n/dev\n--tmpfs\n/tmp\n--tmpfs\n/run\n--bind\n/state/agents/id/home\n/home/person\n--ro-bind\n/toolchain/bin\n/toolchain/bin\n--ro-bind\n/host/agentd\n/run/agentd/bin/agentd\n--bind\n/state/agents/id/io\n/run/agentd/io\n--bind\n/state/agents/id/home/private\n/home/person/private\n--bind\n/workspace\n/workspace\n--chdir\n/workspace\n--\n/run/agentd/bin/agentd\nsandbox-init\n{host}--\n{}",
+                    "--unshare-user\n--unshare-pid\n--unshare-ipc\n--unshare-uts\n--unshare-cgroup\n--die-with-parent\n--new-session\n{net}--ro-bind\n/usr\n/usr\n--ro-bind\n/etc\n/etc\n--symlink\nusr/bin\n/bin\n--proc\n/proc\n--dev\n/dev\n--tmpfs\n/tmp\n--tmpfs\n/run\n--bind\n/state/agents/id/home\n/home/person\n--ro-bind\n/host/agentd\n/run/agentd/bin/agentd\n--bind\n/state/agents/id/io\n/run/agentd/io\n--bind\n/state/agents/id/home/private\n/home/person/private\n--chdir\n/workspace\n--\n/run/agentd/bin/agentd\nsandbox-init\n{host}--\n{}",
                     kind.command
                 );
                 assert_eq!(
@@ -778,7 +972,7 @@ mod tests {
         assert!(!root.path().join("config.toml").exists());
     }
     #[test]
-    fn custom_socket_ancestors_and_long_socket_paths_are_rejected() {
+    fn custom_socket_ancestors_and_runtime_paths_are_rejected() {
         let root = tempfile::tempdir().expect("root");
         let state = root.path().join("state");
         let work = root.path().join("work");
@@ -795,6 +989,7 @@ mod tests {
             work,
             "/".into(),
             "/run".into(),
+            "/run/dbus".into(),
             host_home().parent().expect("home parent").into(),
             state.clone(),
         ] {
@@ -802,12 +997,9 @@ mod tests {
         }
         assert!(cfg.check_bind(&host_home().join("code/x"), &state).is_ok());
         let long = state.join("x".repeat(100));
-        assert!(
-            cfg.validate(&long, &control, &long.join("mcp.sock"), &mut [])
-                .expect_err("sun_path")
-                .to_string()
-                .contains("sun_path")
-        );
+        std::fs::create_dir_all(&long).expect("long state");
+        cfg.validate(&long, &control, &long.join("mcp.sock"), &mut [])
+            .expect("fd sockets permit long state paths");
     }
     #[test]
     fn patterns_are_normalized_and_broad_wildcards_rejected() {
@@ -844,6 +1036,57 @@ mod tests {
         );
     }
     #[test]
+    fn pinned_workspace_and_binds_reject_replacement_across_restart() {
+        let root = tempfile::tempdir().expect("root");
+        let state = root.path().join("state");
+        let work = root.path().join("work");
+        std::fs::create_dir(&state).expect("state");
+        std::fs::create_dir(&work).expect("work");
+        let mut cfg = SandboxConfig {
+            ro_binds: vec![work.clone()],
+            ..Default::default()
+        };
+        cfg.validate(
+            &state,
+            &state.join("a.sock"),
+            &state.join("m.sock"),
+            &mut [],
+        )
+        .expect("validate");
+        let pin = PinnedPath::capture(&work, &cfg, &state).expect("workspace");
+        let restored: PinnedPath =
+            serde_json::from_slice(&serde_json::to_vec(&pin).expect("serialize"))
+                .expect("persisted");
+        let fd = restored.open(&cfg, &state).expect("open");
+        assert!(
+            nix::fcntl::FdFlag::from_bits_truncate(
+                nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_GETFD).expect("flags")
+            )
+            .contains(nix::fcntl::FdFlag::FD_CLOEXEC)
+        );
+        std::fs::rename(&work, root.path().join("old-work")).expect("rename");
+        std::os::unix::fs::symlink(&state, &work).expect("swap");
+        assert!(
+            restored
+                .open(&cfg, &state)
+                .expect_err("identity mismatch")
+                .to_string()
+                .contains("identity changed")
+        );
+        let mut cfg = SandboxConfig {
+            ro_binds: vec![work],
+            ..Default::default()
+        };
+        cfg.validate(
+            &state,
+            &state.join("a.sock"),
+            &state.join("m.sock"),
+            &mut [],
+        )
+        .expect("daemon remains available");
+        assert!(cfg.launch_mounts(&restored, &state).is_err());
+    }
+    #[test]
     fn provider_tokens_never_enter_argv() {
         // The optional env-token route intentionally carries a provider token in env.
         let mut kind = KindConfig::claude("cli");
@@ -856,8 +1099,10 @@ mod tests {
             exe: "/host/agentd".into(),
             resolved_dns: false,
             env: BTreeMap::new(),
+            pinned: vec![],
         };
         let spec = AgentSpec {
+            workspace: None,
             name: AgentName::parse("test").expect("name"),
             kind: "claude".into(),
             cwd: "/workspace".into(),

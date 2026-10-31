@@ -14,6 +14,17 @@ Design stage. Nothing in this repository runs as murmur yet.
 
 The first implementation step is the peer-message change to the Infinity core described in the design's "Next implementation step".
 
+## Agent credential sharing
+
+The [agentd isolation design](docs/murmur/isolation.md) describes the sandbox and
+its remaining risks. Credential copy-back preserves the baseline JSON object's
+top-level keys, limits files to 64 KiB, and accepts at most one update per agent
+per 30 seconds. Same-kind siblings can pass small JSON values through credential
+propagation outside mail attribution. Shared workspaces also allow a sibling
+channel. The broker cannot verify token freshness or intent, and an unrelated
+host writer can race the final comparison and rename. Configure provider env
+tokens with `credentials = []` to avoid credential copy-back and propagation.
+
 ## Based on Infinity
 
 murmur is a fork of [Infinity](https://github.com/hydro-project/infinity) by the Hydro contributors, detached at commit `1abc6fc`. It does not track upstream. The crates keep their `infinity-*` names for now, and the runtime, RAP and provider protocol are Infinity's. Infinity's own README is in [docs/infinity-README.md](docs/infinity-README.md). murmur is not affiliated with or endorsed by the Infinity project.

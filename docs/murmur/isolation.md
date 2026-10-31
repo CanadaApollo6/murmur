@@ -9,7 +9,8 @@ implementation is verified by the reproducible gates linked below.
 agentd launches each ACP agent incarnation in one bubblewrap sandbox. It uses
 user, PID, mount, network, IPC, UTS and cgroup namespaces. It needs neither root
 nor Landlock. Missing bubblewrap, denied namespaces or a missing kind command
-fail preflight. agentd never silently falls back to an unsandboxed launch.
+fail preflight. FD binds require [bubblewrap 0.10.0 or newer](https://github.com/containers/bubblewrap/releases/tag/v0.10.0). Ubuntu 24.04's
+0.9.0 lacks them, so Linux CI installs a pinned 0.13.1 build. agentd never silently falls back to an unsandboxed launch.
 
 The agent sees read-only system and toolchain paths, its writable workspace,
 a private persistent CLI home, a copy of the configured credential file, and one broker
@@ -98,25 +99,36 @@ Unsandboxed launch still strips inherited `AGENTD_*` settings.
 ## Credential refresh and exposure
 
 Defaults are `~/.claude/.credentials.json` and `~/.codex/auth.json`. Each kind
-accepts at most one credential file under HOME, or `credentials = []`. At launch,
-agentd opens every source path component without following symlinks. The source
-must be a regular file no larger than 1 MiB. A missing file permits launch without
+accepts at most one credential file under HOME, or `credentials = []`. At startup,
+agentd resolves the credential parent once, allowing symlinked CLI directories
+such as stow layouts. An unresolvable parent or symlink leaf fails startup with
+the kind and path in the error. Host I/O uses the resolved directory with
+no-follow traversal and a no-follow leaf. The source must be a regular file no
+larger than 64 KiB. A missing file permits launch without
 credentials. The copy goes into the private home at the same relative path.
 The human's CLI directory is never mounted. Settings, instructions, hooks, agents,
 plugins, new entries and late-created host files or sockets stay private.
 
 Every two seconds while supervising an agent, and once after its session exits,
 agentd reads the private copy through no-follow directory descriptors. Only regular
-files within the size cap containing valid JSON can return to the host. It writes
+files within the size cap containing JSON objects with exactly the baseline's
+top-level key set can return to the host. It writes
 a mode-0600 exclusive temporary file and renames it over the configured host file
 only when the host still has the bytes last copied in or out for that agent.
 Conflicts are logged and skipped. Broker synchronization is serialized. Successful
 refreshes also reach live siblings of the same kind when their private copy and
-baseline still match the old bytes. Superseded JSON values are remembered for the
-broker's lifetime, including across agent restarts, and cannot be copied back
-even with different whitespace or key order.
+baseline still match the old bytes. The broker remembers SHA-256 digests of normalized superseded JSON for its
+lifetime, including across agent restarts. Whitespace and key order cannot
+re-admit a retired value. Each host path has at most 1024 digests. Once full,
+copy-back stops for that path and warns once; history is never evicted. Each
+agent can copy back at most once per 30 seconds, across incarnations, and the
+next tick after that interval reads the latest private value. Unchanged rejected
+private bytes are remembered and are not parsed or logged again.
 
-An agent can write arbitrary valid JSON into the human's credential file. The
+An agent can replace values within the baseline's top-level key set in the
+human's credential file. Same-kind siblings can therefore pass small JSON values
+through credential propagation outside mail attribution. Shared workspaces already
+allow a sibling channel; credential propagation is intentionally retained. The
 broker cannot validate provider token freshness or intent. A CLI that caches
 tokens in memory may need a restart after a sibling's refresh. Dummy-credential
 tests prove copy, rename and conflict handling, not provider rotation semantics.
@@ -158,9 +170,12 @@ through the human's account connectors. Telemetry and asset hosts are excluded.
 The live turns completed with those denied. Proxy-unaware tools fail closed
 because the namespace has no external route or DNS. The proxy validates every DNS
 answer and tries each validated address within its connection timeout. After
-CONNECT succeeds, it reads one bounded TLS ClientHello record within ten seconds.
+CONNECT succeeds, it reassembles one TLS ClientHello across consecutive handshake
+records within ten seconds and a 64 KiB total record budget.
 SNI must match the CONNECT host, ignoring case. Missing SNI, ECH, non-TLS data,
-malformed hellos and oversized records close the tunnel before forwarding bytes.
+malformed hellos, interleaved non-handshake records and oversized hellos close
+the tunnel and emit `Event::EgressDenied`. The original record bytes are forwarded
+unchanged after validation. All configured egress ports are TLS-only.
 
 ## Configuration reference
 
@@ -197,11 +212,25 @@ socket = "/absolute/path/to/infinity/daemon.sock"
 
 `home` entries are relative and cannot traverse upward. Paths expand `~`, must be
 absolute, and cannot expose the state directory, its contents, or ancestors of
-HOME, `/run`, `/run/user`, the actual control socket and its directory, or the
-shared MCP socket. Read-only grants receive the same checks because they permit
+HOME, the actual control socket and its directory, the shared MCP socket, or
+any configured Bwrap credential file or its resolved parent. All paths under
+`/run` are rejected. Read-only grants receive the same checks because they permit
 UNIX socket connections. Workspace paths receive the same checks at spawn.
-Workspaces under HOME, such as `~/code/x`, remain allowed. Startup rejects state
-directories whose per-agent socket paths would exceed `sun_path`.
+Workspaces under HOME, such as `~/code/x`, remain allowed. At spawn the broker
+persists the canonical workspace path and its device and inode with the agent.
+Legacy rows capture identity at their next validated start. Configured directory
+bind identities are recorded at startup in `state/sandbox-binds.json` and retained
+across restarts. Remove the relevant entry only when deliberately replacing a
+trusted toolchain directory. Every launch opens each source with
+`O_PATH|O_DIRECTORY|O_CLOEXEC`, compares identity and rechecks the fd's resolved
+path. Bubblewrap receives `--bind-fd` or `--ro-bind-fd`, verifies the mounted
+identity, and closes each fd before executing the child. Broker fds retain
+CLOEXEC; only the fork child clears it for these explicit mount fds.
+A mismatch fails the launch with a reason in the log and `agentctl ls`'s `error`
+field. An invalid restored workspace or bind does not abort the entire daemon.
+Bind failures disable sandboxed launches while unsandboxed kinds remain available.
+Private sockets bind via `/proc/self/fd`, so state-path length does not constrain
+their `sun_path`.
 Egress patterns cannot be IP literals. Wildcards need at least two suffix labels,
 as in `*.example.com`, and validation lowercases patterns. The kind `egress` list replaces its
 defaults. `none` ignores home, credentials and egress configuration.
@@ -219,7 +248,8 @@ Run `cargo test -p agentd --test isolation -- --nocapture`. The Linux-only test
 starts real agentd with fake ACP children under real bubblewrap. It covers blocked
 control/state/SQLite and sibling proc paths, sibling MCP isolation, socket sender
 attribution, token rejection, host-wide readable proc token scans, credential
-rename, allowed public CONNECT, denied private/unknown CONNECT, and descendant
+rename, a real TLS handshake to example.com with matching SNI, refusal of mismatched
+SNI, denied private/unknown CONNECT, and descendant
 cleanup after SIGTERM and SIGKILL. The public CONNECT check uses `example.com:443`
 and needs outbound network access. A real bwrap capability probe skips the test
 when bubblewrap or namespaces are unavailable locally. With
@@ -257,7 +287,9 @@ evidence. The implementation handoff report records local run results separately
 
 - R1. Agents can read configured provider credentials. A broker-side API forwarder
   that injects auth is the later fix. Env tokens limit the current grant.
-- R2. An agent can write arbitrary valid JSON into the human's credential file.
+- R2. An agent can change values within the baseline credential's top-level key set
+  and propagate small JSON values to same-kind siblings outside mail attribution.
+  Shared workspaces already allow a sibling channel; propagation is retained.
   The broker cannot prove provider freshness. A CLI caching tokens in memory may
   need a restart after a sibling refresh. External host writers do not participate
   in broker synchronization, so the final comparison and rename have a race.

@@ -12,6 +12,7 @@ use infinity_protocol::{ClientMessage, DaemonMessage};
 
 fn spec(root: &std::path::Path) -> AgentSpec {
     AgentSpec {
+        workspace: None,
         name: AgentName::parse("model").expect("name"),
         kind: "infinity".into(),
         cwd: root.into(),

@@ -68,8 +68,13 @@ impl Adapter for AcpAdapter {
             .and_then(|v| v["env"][0]["value"].as_str())
             .map(str::to_owned);
         let mut cmd = Command::new(&req.launch.program);
+        req.launch.inherit_mount_fds(&mut cmd);
         cmd.args(&req.launch.args)
-            .current_dir(&req.spec.cwd)
+            .current_dir(if req.launch.mount_fds.is_empty() {
+                req.spec.cwd.as_path()
+            } else {
+                std::path::Path::new("/")
+            })
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

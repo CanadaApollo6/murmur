@@ -4,6 +4,8 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import ssl
+import stat
 
 root = Path(sys.argv[1])
 cfg = json.loads((root / 'probe-input.json').read_text())
@@ -57,6 +59,14 @@ for name, path in cfg['paths'].items():
             result[name] = True
     except (OSError, ValueError):
         result[name] = False
+result['host_dirfd_hidden'] = True
+for fd in Path('/proc/self/fd').iterdir():
+    if int(fd.name) >= 3:
+        try:
+            if stat.S_ISDIR(fd.stat().st_mode):
+                result['host_dirfd_hidden'] = False
+        except FileNotFoundError:
+            pass
 result['own_token'] = 'AGENTD_MCP_TOKEN' in os.environ
 result['forged_agent'] = False
 try:
@@ -92,7 +102,23 @@ if not cfg['baseline']:
             return s.recv(4096).decode()
     denied = proxy('attacker.invalid')
     result['proxy_deny'] = '403' in denied and 'blocked by agentd egress policy for @a' in denied
-    result['proxy_allow'] = '200 Connection Established' in proxy('example.com')
+    def tls(sni):
+        with socket.create_connection(('127.0.0.1', 3128), timeout=15) as s:
+            s.sendall(b'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n')
+            header = b''
+            while not header.endswith(b'\r\n\r\n'):
+                part = s.recv(1)
+                if not part:
+                    raise AssertionError('CONNECT closed before TLS')
+                header += part
+            assert b'200 Connection Established' in header, header
+            try:
+                with ssl.create_default_context().wrap_socket(s, server_hostname=sni) as secure:
+                    return bool(secure.version())
+            except (ssl.SSLError, ConnectionResetError):
+                return False
+    result['proxy_allow'] = tls('example.com')
+    result['proxy_sni_deny'] = not tls('www.cloudflare.com')
     result['proxy_private_deny'] = '403' in proxy('localhost')
     try:
         socket.create_connection(('1.1.1.1', 443), timeout=0.2)

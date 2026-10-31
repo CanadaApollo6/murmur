@@ -45,6 +45,7 @@ fn kind(root: &Path, codex: bool) -> KindConfig {
 }
 fn spec(root: &Path, kind: &str, policy: PermissionPolicy) -> AgentSpec {
     AgentSpec {
+        workspace: None,
         name: AgentName::parse("worker").expect("name"),
         kind: kind.into(),
         cwd: root.into(),

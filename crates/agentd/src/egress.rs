@@ -183,7 +183,19 @@ async fn connection(
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
     let hello =
-        tokio::time::timeout(Duration::from_secs(10), client_hello(&mut read, &host)).await??;
+        match tokio::time::timeout(Duration::from_secs(10), client_hello(&mut read, &host)).await {
+            Ok(Ok(hello)) => hello,
+            result => {
+                tracing::warn!(%agent, %host, ?result, "TLS ClientHello rejected");
+                if events
+                    .send(Event::EgressDenied { agent, host, port })
+                    .is_err()
+                {
+                    tracing::debug!("no egress event subscribers");
+                }
+                return Ok(());
+            }
+        };
     upstream.write_all(&hello).await?;
     tokio::io::copy_bidirectional(&mut read, &mut upstream).await?;
     Ok(())
@@ -274,17 +286,37 @@ fn check_hello(mut bytes: &[u8], host: &str) -> Result<()> {
     Ok(())
 }
 async fn client_hello(read: &mut (impl AsyncRead + Unpin), host: &str) -> Result<Vec<u8>> {
-    let mut header = [0u8; 5];
-    read.read_exact(&mut header).await?;
-    let len = u16::from_be_bytes([header[3], header[4]]) as usize;
-    if header[0] != 22 || header[1] != 3 || header[2] > 3 || !(4..=16384).contains(&len) {
-        return Err("invalid or oversized TLS record".into());
+    const LIMIT: usize = 64 * 1024;
+    let mut original = Vec::new();
+    let mut handshake = Vec::new();
+    loop {
+        let mut header = [0u8; 5];
+        read.read_exact(&mut header).await?;
+        let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+        if header[0] != 22 || header[1] != 3 || header[2] > 3 || !(1..=16384).contains(&len) {
+            return Err("invalid or oversized TLS handshake record".into());
+        }
+        if original.len() + 5 + len > LIMIT {
+            return Err("ClientHello records exceed 64 KiB".into());
+        }
+        original.extend(header);
+        let offset = original.len();
+        original.resize(offset + len, 0);
+        read.read_exact(&mut original[offset..]).await?;
+        handshake.extend_from_slice(&original[offset..]);
+        if handshake.len() >= 4 {
+            let len = ((handshake[1] as usize) << 16)
+                | ((handshake[2] as usize) << 8)
+                | handshake[3] as usize;
+            if handshake[0] != 1 || len + 4 > LIMIT {
+                return Err("expected ClientHello under 64 KiB".into());
+            }
+            if handshake.len() >= len + 4 {
+                check_hello(&handshake, host)?;
+                return Ok(original);
+            }
+        }
     }
-    let mut record = vec![0; len + 5];
-    record[..5].copy_from_slice(&header);
-    read.read_exact(&mut record[5..]).await?;
-    check_hello(&record[5..], host)?;
-    Ok(record)
 }
 #[cfg(test)]
 mod tests {
@@ -356,6 +388,49 @@ mod tests {
             original
         );
         task.await.expect("writer");
+    }
+    fn record(payload: &[u8], kind: u8) -> Vec<u8> {
+        let mut bytes = vec![kind, 3, 3];
+        bytes.extend((payload.len() as u16).to_be_bytes());
+        bytes.extend(payload);
+        bytes
+    }
+    #[tokio::test]
+    async fn hello_spans_records_but_rejects_oversize_and_interleaving() {
+        let hello = hello(Some("api.example.com"), false);
+        // Split even the handshake length field across records.
+        for split in [2, 35, hello.len() - 6] {
+            let mut bytes = record(&hello[5..5 + split], 22);
+            bytes.extend(record(&hello[5 + split..], 22));
+            assert_eq!(
+                client_hello(&mut bytes.as_slice(), "api.example.com")
+                    .await
+                    .expect("fragmented hello"),
+                bytes
+            );
+        }
+        let mut bytes = record(&hello[5..35], 22);
+        bytes.extend(record(&hello[35..], 23));
+        assert!(
+            client_hello(&mut bytes.as_slice(), "api.example.com")
+                .await
+                .is_err()
+        );
+        let bytes = record(&[1, 1, 0, 0], 22);
+        assert!(
+            client_hello(&mut bytes.as_slice(), "api.example.com")
+                .await
+                .is_err()
+        );
+        let mut bytes = record(&[1, 0, 255, 252], 22);
+        for _ in 0..4 {
+            bytes.extend(record(&vec![0; 16384], 22));
+        }
+        assert!(
+            client_hello(&mut bytes.as_slice(), "api.example.com")
+                .await
+                .is_err()
+        );
     }
     #[tokio::test]
     async fn connects_to_second_address_when_first_fails() {

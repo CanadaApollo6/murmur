@@ -160,7 +160,7 @@ async fn serve(
     let control = Socket::bind(control_path)?;
     let mcp = Socket::bind(mcp_path)?;
     for (_, spec) in mailroom.specs().await? {
-        broker.spawn(spec).await?;
+        broker.restore(spec).await?;
     }
     let api = Arc::new(ControlApi {
         broker,

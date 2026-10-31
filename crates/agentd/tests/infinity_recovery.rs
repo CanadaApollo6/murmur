@@ -493,6 +493,7 @@ async fn broker_permission_timeout_durably_cancels_waiting_choice() {
         let broker = Broker::new(mailroom.clone(), vec![kind], Default::default()).expect("broker");
         let mut events = broker.events();
         let spec = AgentSpec {
+            workspace: None,
             name: AgentName::parse("model").expect("name"), kind: "infinity".into(), cwd: h.cwd.path().into(), model: None,
             permissions: PermissionPolicy { timeout: Some(Duration::from_millis(30)), ..Default::default() }, idle_after: None,
         };
@@ -603,6 +604,7 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
     .expect("broker");
     let mut events = broker.events();
     let spec = AgentSpec {
+        workspace: None,
         name: AgentName::parse("model").expect("name"),
         kind: "infinity".into(),
         cwd: h.cwd.path().into(),
@@ -1040,6 +1042,7 @@ async fn queued_attachment_mail_probe(resume: bool) {
     .expect("broker");
     let mut events = broker.events();
     let spec = AgentSpec {
+        workspace: None,
         name: AgentName::parse("model").expect("name"),
         kind: "infinity".into(),
         cwd: h.cwd.path().into(),
@@ -1183,6 +1186,7 @@ async fn r4_human_sleep_probe() {
     .expect("broker");
     let mut events = broker.events();
     let spec = AgentSpec {
+        workspace: None,
         name: AgentName::parse("model").expect("name"),
         kind: "infinity".into(),
         cwd: h.cwd.path().into(),
@@ -1311,6 +1315,7 @@ async fn r4_before_restart() -> (tempfile::TempDir, tempfile::TempDir) {
     .expect("broker");
     let mut events = broker.events();
     let spec = AgentSpec {
+        workspace: None,
         name: AgentName::parse("model").expect("name"),
         kind: "infinity".into(),
         cwd: h.cwd.path().into(),
@@ -1422,6 +1427,7 @@ async fn r4_after_restart(state_dir: tempfile::TempDir, cwd: tempfile::TempDir) 
     .expect("broker");
     let mut events = broker.events();
     let spec = AgentSpec {
+        workspace: None,
         name: AgentName::parse("model").expect("name"),
         kind: "infinity".into(),
         cwd: h.cwd.path().into(),
@@ -1528,6 +1534,7 @@ async fn r9_broker_mail_after_completed_rap_tool_and_provider_failure() {
             )
             .expect("broker");
             let spec = AgentSpec {
+                workspace: None,
                 name: AgentName::parse("model").expect("name"),
                 kind: "infinity".into(),
                 cwd: h.cwd.path().into(),
@@ -1676,6 +1683,7 @@ async fn r10a_driver_panic_has_bounded_broker_recovery() {
             )
             .expect("broker");
             let spec = AgentSpec {
+                workspace: None,
                 name: AgentName::parse("model").expect("name"),
                 kind: "infinity".into(),
                 cwd: h.cwd.path().into(),
@@ -1809,6 +1817,7 @@ async fn r10a_choice_write_failure_has_bounded_recovery() {
             )
             .expect("broker");
             let spec = AgentSpec {
+            workspace: None,
                 name: AgentName::parse("model").expect("name"),
                 kind: "infinity".into(),
                 cwd: h.cwd.path().into(),
@@ -1970,6 +1979,7 @@ async fn broker_for_root(
     .expect("broker");
     let agent = broker
         .spawn(AgentSpec {
+            workspace: None,
             name,
             kind: "infinity".into(),
             cwd: h.cwd.path().into(),
@@ -2118,6 +2128,7 @@ async fn r11_broker(
     .expect("broker");
     let agent = broker
         .spawn(AgentSpec {
+            workspace: None,
             name: AgentName::parse("r11").expect("name"),
             kind: "infinity".into(),
             cwd: h.cwd.path().into(),
@@ -2538,6 +2549,7 @@ mod r12o {
         });
         let agent = broker
             .spawn(AgentSpec {
+                workspace: None,
                 name: AgentName::parse("r12o").expect("name"),
                 kind: "infinity".into(),
                 cwd: h.cwd.path().into(),
@@ -3066,6 +3078,7 @@ async fn r13a_shutdown_preserved_stream_delivers_followup() {
             let agent = r
                 .broker
                 .spawn(agentd::supervisor::AgentSpec {
+                    workspace: None,
                     name: agentd::model::AgentName::parse("r12o").expect("name"),
                     kind: "infinity".into(),
                     cwd: h.cwd.path().into(),
@@ -3187,6 +3200,7 @@ async fn r13o_shutdown_while_agentd_detached_recovers_tool() {
             eprintln!("r13o status before reattach: {status:?}");
             let agent = broker
                 .spawn(AgentSpec {
+            workspace: None,
                     name: AgentName::parse("r11").expect("name"),
                     kind: "infinity".into(),
                     cwd: h.cwd.path().into(),
@@ -3413,6 +3427,7 @@ mod r14 {
                 )
                 .expect("broker");
                 let spec = AgentSpec {
+            workspace: None,
                     name: AgentName::parse("model").expect("name"),
                     kind: "infinity".into(),
                     cwd: h.cwd.path().into(),

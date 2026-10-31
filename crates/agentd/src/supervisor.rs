@@ -18,6 +18,8 @@ pub struct AgentSpec {
     pub name: AgentName,
     pub kind: String,
     pub cwd: PathBuf,
+    #[serde(default)]
+    pub workspace: Option<crate::sandbox::PinnedPath>,
     pub model: Option<String>,
     pub permissions: PermissionPolicy,
     pub idle_after: Option<Duration>,
@@ -263,6 +265,12 @@ impl Broker {
         self.events.subscribe()
     }
     pub async fn spawn(&self, spec: AgentSpec) -> Result<AgentHandle> {
+        self.spawn_inner(spec, false).await
+    }
+    pub async fn restore(&self, spec: AgentSpec) -> Result<AgentHandle> {
+        self.spawn_inner(spec, true).await
+    }
+    async fn spawn_inner(&self, mut spec: AgentSpec, restore: bool) -> Result<AgentHandle> {
         let kind = self
             .kinds
             .get(&spec.kind)
@@ -278,8 +286,12 @@ impl Broker {
                     "bwrap requires an MCP isolation context".into(),
                 ));
             }
-            cfg.check_bind(&spec.cwd, state)
-                .map_err(|e| Error::Rejected(e.to_string()))?;
+            if !restore {
+                let pin = crate::sandbox::PinnedPath::capture(&spec.cwd, cfg, state)
+                    .map_err(|e| Error::Rejected(e.to_string()))?;
+                spec.cwd = pin.path.clone();
+                spec.workspace = Some(pin);
+            }
         }
         let model_agent = matches!(kind.wire, Wire::Infinity { .. });
         let mut spec = spec;
@@ -533,6 +545,16 @@ impl AgentActor {
                 if let (crate::sandbox::Isolation::Bwrap(sb), Some((state, cfg))) =
                     (&self.kind.isolation, &self.isolation)
                 {
+                    if self.spec.workspace.is_none() {
+                        let pin = crate::sandbox::PinnedPath::capture(&self.spec.cwd, cfg, state)?;
+                        self.spec.cwd = pin.path.clone();
+                        self.spec.workspace = Some(pin);
+                        self.mailroom.save_spec(self.id, self.spec.clone()).await?;
+                    }
+                    let mounts = cfg.launch_mounts(
+                        self.spec.workspace.as_ref().expect("workspace captured"),
+                        state,
+                    )?;
                     let paths = crate::sandbox::AgentPaths::new(state, self.id);
                     crate::sandbox::seed(sb, &paths.home)?;
                     self.credentials
@@ -541,11 +563,21 @@ impl AgentActor {
                         .launch(
                             self.id,
                             &self.kind.name,
-                            &sb.credentials,
+                            &sb.credentials
+                                .iter()
+                                .map(|p| {
+                                    (
+                                        cfg.credential_paths.get(p).unwrap_or(p).clone(),
+                                        p.strip_prefix(crate::sandbox::host_home())
+                                            .expect("validated credential path")
+                                            .to_path_buf(),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
                             &paths.home,
-                            &crate::sandbox::host_home(),
                         )?;
-                    let facts = crate::sandbox::Facts::collect()?;
+                    let mut facts = crate::sandbox::Facts::collect()?;
+                    facts.pinned = mounts;
                     launch = crate::sandbox::plan(cfg, &self.kind, &self.spec, &paths, &facts);
                     launch.mcp_server = Some(
                         mcp.bind(
@@ -569,7 +601,10 @@ impl AgentActor {
             .await;
             if let Err(error) = prepared {
                 mcp.revoke(self.id).await;
-                self.crash(error.to_string());
+                tracing::error!(agent=%self.id, %error, "sandbox preparation failed");
+                self.phase(Phase::Failed {
+                    last: error.to_string(),
+                });
                 return Ok(());
             }
         }

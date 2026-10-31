@@ -253,7 +253,7 @@ impl ControlApi {
             let isolation = handle.as_ref().map_or("none", |h| h.isolation());
             rows.push(
                 json!({"id":format!("agent:{id}"),"name":format!("@{}",spec.name.as_str()),
-                "kind":spec.kind,"isolation":isolation,"phase":phase_name(&phase),
+                "kind":spec.kind,"isolation":isolation,"phase":phase_name(&phase),"error":match &phase { Phase::Failed { last } => Some(last.as_str()), Phase::NeedsRecovery { reason } => Some(reason.as_str()), _ => None },
                 "queued":self.mailroom.pending_for(id).await?.len()}),
             );
         }

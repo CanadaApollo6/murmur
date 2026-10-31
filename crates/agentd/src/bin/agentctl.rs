@@ -88,6 +88,7 @@ async fn run(args: Args) -> Result<()> {
             first_message,
         } => ControlRequest::Spawn {
             spec: AgentSpec {
+                workspace: None,
                 name: AgentName::parse(&name)?,
                 kind: match kind {
                     Kind::Infinity => "infinity",

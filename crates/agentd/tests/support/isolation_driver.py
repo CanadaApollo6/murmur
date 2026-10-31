@@ -32,7 +32,7 @@ for name in ['a', 'b', 'c']:
     (root / name).mkdir()
     shutil.copy(Path(__file__).with_name('isolation_probe.py'), root / name / 'probe.py')
 mode = 'none' if baseline else 'bwrap'
-config = f'sandbox = "{mode}"\n[bwrap]\nro_binds = [{json.dumps(fake)}]\n'
+config = f'sandbox = "{mode}"\n[bwrap]\nro_binds = [{json.dumps(str(Path(fake).parent))}]\n'
 for kind, name, model in [('claude', 'a', 'default'), ('codex', 'b', 'read-only')]:
     config += f'[kind.{kind}]\ncommand = [{json.dumps(fake)}]\nmode = "{model}"\nidle_after_secs = 0\n'
     if not baseline:
@@ -142,6 +142,13 @@ try:
         config['paths']['sibling_environ'] = f'/proc/{sibling}/environ'
         config['paths']['sibling_cmdline'] = f'/proc/{sibling}/cmdline'
     (root / 'a/probe-input.json').write_text(json.dumps(config))
+    if not baseline:
+        watch = socket.socket(socket.AF_UNIX)
+        watch.settimeout(5)
+        watch.connect(str(state / 'agentd.sock'))
+        watch.sendall(b'{"command":"watch"}\n')
+        watched = watch.makefile('rb')
+        assert json.loads(watched.readline())['event'] == 'snapshot'
     ctl({'command': 'send', 'to': '@a', 'body': 'isolation-probe mcp-send hold', 'key': 'probe'})
     wait(lambda: (root / 'a/probe-result.json').exists(), 'probe')
     wait(lambda: (root / 'a/mcp-result.json').exists(), 'own shim')
@@ -151,7 +158,14 @@ try:
         assert all(result[k] for k in ['control', 'state', 'sqlite', 'sibling_environ', 'sibling_cmdline', 'forged_agent']), result
     else:
         assert not any(result[k] for k in ['control', 'state', 'sqlite', 'sibling_environ', 'sibling_cmdline', 'forged_agent', 'own_token', 'direct_network', 'sibling_mcp']), result
-        assert all(result[k] for k in ['token_rejected', 'rename', 'proxy_deny', 'proxy_private_deny', 'proxy_allow']), result
+        assert all(result[k] for k in ['host_dirfd_hidden', 'token_rejected', 'rename', 'proxy_deny', 'proxy_private_deny', 'proxy_allow', 'proxy_sni_deny']), result
+        while True:
+            event = json.loads(watched.readline())
+            if event.get('event') == 'egress_denied' and event.get('host') == 'example.com':
+                break
+        watched.close()
+        watch.close()
+        print('PASS mismatched ClientHello emits egress_denied', flush=True)
         wait(lambda: credential.read_text() == '{"token":1}', 'credential copy-back')
         for relative, before in original_cli.items():
             if relative not in ['.claude/.credentials.json', '.codex/auth.json']:

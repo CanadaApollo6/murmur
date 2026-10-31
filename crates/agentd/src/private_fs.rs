@@ -11,7 +11,7 @@ use std::{
     path::{Component, Path},
 };
 
-pub(crate) const LIMIT: u64 = 1024 * 1024;
+pub(crate) const LIMIT: u64 = 64 * 1024;
 pub(crate) struct Dir(OwnedFd);
 impl Dir {
     pub fn open(path: &Path, create: bool) -> io::Result<Self> {
@@ -23,7 +23,7 @@ impl Dir {
         root.descend(path.strip_prefix("/").map_err(io::Error::other)?, create)
     }
     pub fn descend(&self, path: &Path, create: bool) -> io::Result<Self> {
-        let mut fd = nix::unistd::dup(&self.0)?;
+        let mut fd = self.0.try_clone()?;
         for component in path.components() {
             let Component::Normal(name) = component else {
                 return Err(io::Error::other("unsafe relative path"));
@@ -84,13 +84,13 @@ impl Dir {
         let file = File::from(fd);
         if !file.metadata()?.is_file() || file.metadata()?.len() > LIMIT {
             return Err(io::Error::other(
-                "credential must be a regular file under 1 MiB",
+                "credential must be a regular file under 64 KiB",
             ));
         }
         let mut bytes = Vec::new();
         file.take(LIMIT + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > LIMIT {
-            return Err(io::Error::other("credential exceeds 1 MiB"));
+            return Err(io::Error::other("credential exceeds 64 KiB"));
         }
         Ok(Some(bytes))
     }
@@ -146,7 +146,7 @@ impl Dir {
         ) {
             Ok(fd) => {
                 let dir = Self(fd);
-                let mut entries = nix::dir::Dir::from_fd(nix::unistd::dup(&dir.0)?)?;
+                let mut entries = nix::dir::Dir::from_fd(dir.0.try_clone()?)?;
                 for entry in entries.iter() {
                     let entry = entry?;
                     use std::os::unix::ffi::OsStrExt;

@@ -82,7 +82,13 @@ jobs:
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update && sudo apt-get install -y libcap-dev bubblewrap
+          sudo apt-get update && sudo apt-get install -y libcap-dev meson ninja-build pkg-config
+          curl -fsSL https://github.com/containers/bubblewrap/releases/download/v0.13.1/bubblewrap-0.13.1.tar.xz -o "$RUNNER_TEMP/bubblewrap.tar.xz"
+          echo "0e85c8702248b8dd64144f594147553650cdd0e4c951690345faace79c217c4d  $RUNNER_TEMP/bubblewrap.tar.xz" | sha256sum -c -
+          tar -C "$RUNNER_TEMP" -xf "$RUNNER_TEMP/bubblewrap.tar.xz"
+          meson setup "$RUNNER_TEMP/bwrap-build" "$RUNNER_TEMP/bubblewrap-0.13.1" --prefix=/usr -Dtests=false -Dman=disabled -Dselinux=disabled -Dbash_completion=disabled -Dzsh_completion=disabled
+          ninja -C "$RUNNER_TEMP/bwrap-build"
+          sudo ninja -C "$RUNNER_TEMP/bwrap-build" install
           echo "kernel.apparmor_restrict_unprivileged_userns = 0" | sudo tee /etc/sysctl.d/99-userns.conf
           sudo sysctl --system
 

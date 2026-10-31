@@ -12,11 +12,28 @@ struct Copy {
     home: PathBuf,
     kind: String,
     baseline: Option<Vec<u8>>,
+    rejected: Option<[u8; 32]>,
+    last_error: Option<String>,
 }
 #[derive(Default)]
 pub(crate) struct Credentials {
     copies: HashMap<AgentId, Vec<Copy>>,
-    retired: HashMap<PathBuf, HashSet<Vec<u8>>>,
+    retired: HashMap<PathBuf, HashSet<[u8; 32]>>,
+    exhausted: HashSet<PathBuf>,
+    accepted: HashMap<AgentId, std::time::Instant>,
+}
+const HISTORY_LIMIT: usize = 1024;
+const COPY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
+}
+fn normalized_digest(bytes: &[u8]) -> [u8; 32] {
+    digest(
+        &serde_json::from_slice::<serde_json::Value>(bytes)
+            .and_then(|v| serde_json::to_vec(&v))
+            .unwrap_or_else(|_| bytes.to_vec()),
+    )
 }
 fn host_file(path: &Path) -> Result<(Dir, OsString)> {
     Ok((
@@ -29,26 +46,19 @@ impl Credentials {
         &mut self,
         id: AgentId,
         kind: &str,
-        paths: &[PathBuf],
+        paths: &[(PathBuf, PathBuf)],
         home: &Path,
-        host_home: &Path,
     ) -> Result<()> {
         self.finish(id);
         let private = Dir::open(home, false)?;
         let mut copies = vec![];
-        for host in paths {
-            let relative = host.strip_prefix(host_home)?.to_path_buf();
-            let bytes = match host_file(host) {
-                Ok((dir, name)) => dir.read(&name)?,
-                Err(e)
-                    if e.downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-                {
-                    None
-                }
-                Err(e) => return Err(e),
-            };
-            let (dir, name) = private.parent(&relative, true)?;
+        for (host, relative) in paths {
+            let (dir, name) =
+                host_file(host).map_err(|e| format!("credential {}: {e}", host.display()))?;
+            let bytes = dir
+                .read(&name)
+                .map_err(|e| format!("credential {}: {e}", host.display()))?;
+            let (dir, name) = private.parent(relative, true)?;
             // Never trust persisted credentials from a previous incarnation.
             let old = dir.read(&name)?;
             if !dir.replace(&name, old.as_deref(), bytes.as_deref())? {
@@ -56,10 +66,12 @@ impl Credentials {
             }
             copies.push(Copy {
                 host: host.clone(),
-                relative,
+                relative: relative.clone(),
                 home: home.into(),
                 kind: kind.into(),
                 baseline: bytes,
+                rejected: None,
+                last_error: None,
             });
         }
         self.copies.insert(id, copies);
@@ -70,13 +82,17 @@ impl Credentials {
             return;
         };
         for copy in &mut copies {
-            if let Err(error) = self.refresh(copy) {
-                tracing::warn!(%id, %error, "credential sync skipped");
+            if let Err(error) = self.refresh(id, copy) {
+                let message = error.to_string();
+                if copy.last_error.as_ref() != Some(&message) {
+                    tracing::warn!(%id, %error, "credential sync skipped");
+                    copy.last_error = Some(message);
+                }
             }
         }
         self.copies.insert(id, copies);
     }
-    fn refresh(&mut self, copy: &mut Copy) -> Result<()> {
+    fn refresh(&mut self, id: AgentId, copy: &mut Copy) -> Result<()> {
         let private = Dir::open(&copy.home, false)?;
         let (dir, name) = private.parent(&copy.relative, false)?;
         let Some(bytes) = dir.read(&name)? else {
@@ -85,7 +101,45 @@ impl Credentials {
         if Some(&bytes) == copy.baseline.as_ref() {
             return Ok(());
         }
-        let canonical = serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&bytes)?)?;
+        let raw_digest = digest(&bytes);
+        if copy.rejected == Some(raw_digest) {
+            return Ok(());
+        }
+        if self
+            .retired
+            .get(&copy.host)
+            .is_some_and(|set| set.len() >= HISTORY_LIMIT)
+        {
+            if self.exhausted.insert(copy.host.clone()) {
+                tracing::warn!(path=%copy.host.display(), "credential history full; copy-back disabled until broker restart");
+            }
+            return Ok(());
+        }
+        if self
+            .accepted
+            .get(&id)
+            .is_some_and(|at| at.elapsed() < COPY_INTERVAL)
+        {
+            return Ok(());
+        }
+        // Leave the digest on every rejection. A changed private file is reconsidered.
+        copy.rejected = Some(raw_digest);
+        copy.last_error = None;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let baseline: serde_json::Value = serde_json::from_slice(
+            copy.baseline
+                .as_deref()
+                .ok_or("no credential baseline to replace")?,
+        )?;
+        let (Some(value_object), Some(baseline)) = (value.as_object(), baseline.as_object()) else {
+            return Err("credential refresh and baseline must be JSON objects".into());
+        };
+        if value_object.len() != baseline.len()
+            || value_object.keys().any(|key| !baseline.contains_key(key))
+        {
+            return Err("credential refresh must preserve the baseline top-level key set".into());
+        }
+        let canonical = digest(&serde_json::to_vec(&value)?);
         if self
             .retired
             .get(&copy.host)
@@ -116,17 +170,16 @@ impl Credentials {
             }
         }
         copy.baseline = Some(bytes);
+        copy.rejected = None;
+        self.accepted.insert(id, std::time::Instant::now());
         Ok(())
     }
     fn retire(&mut self, copy: &Copy) {
         if let Some(old) = &copy.baseline {
-            let canonical = serde_json::from_slice::<serde_json::Value>(old)
-                .and_then(|value| serde_json::to_vec(&value))
-                .unwrap_or_else(|_| old.clone());
-            self.retired
-                .entry(copy.host.clone())
-                .or_default()
-                .insert(canonical);
+            let set = self.retired.entry(copy.host.clone()).or_default();
+            if set.len() < HISTORY_LIMIT {
+                set.insert(normalized_digest(old));
+            }
         }
     }
     pub fn finish(&mut self, id: AgentId) {
@@ -142,6 +195,12 @@ impl Credentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn sources(host: &Path, human: &Path) -> Vec<(PathBuf, PathBuf)> {
+        vec![(
+            host.into(),
+            host.strip_prefix(human).expect("relative").into(),
+        )]
+    }
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let root = tempfile::tempdir().expect("root");
         let human = root.path().join("human");
@@ -161,10 +220,10 @@ mod tests {
         let a = AgentId(ulid::Ulid::new());
         let b = AgentId(ulid::Ulid::new());
         credentials
-            .launch(a, "codex", std::slice::from_ref(&host), &home, &human)
+            .launch(a, "codex", &sources(&host, &human), &home)
             .expect("launch a");
         credentials
-            .launch(b, "codex", std::slice::from_ref(&host), &other, &human)
+            .launch(b, "codex", &sources(&host, &human), &other)
             .expect("launch b");
         let private = home.join(".codex/auth.json");
         let sibling = other.join(".codex/auth.json");
@@ -190,7 +249,7 @@ mod tests {
         let mut credentials = Credentials::default();
         let id = AgentId(ulid::Ulid::new());
         credentials
-            .launch(id, "codex", std::slice::from_ref(&host), &home, &human)
+            .launch(id, "codex", &sources(&host, &human), &home)
             .expect("launch");
         let private = home.join(".codex/auth.json");
         for bytes in [
@@ -206,7 +265,7 @@ mod tests {
         credentials.finish(id);
         assert!(
             credentials
-                .launch(id, "codex", std::slice::from_ref(&host), &home, &human)
+                .launch(id, "codex", &sources(&host, &human), &home)
                 .is_err()
         );
         assert_eq!(std::fs::read(&host).expect("host"), b"{\"token\":0}");
@@ -218,9 +277,71 @@ mod tests {
         std::os::unix::fs::symlink(&secret, &host).expect("host symlink");
         assert!(
             credentials
-                .launch(id, "codex", &[host], &home, &human)
+                .launch(id, "codex", &sources(&host, &human), &home)
                 .is_err()
         );
+    }
+    #[test]
+    fn rate_limit_coalesces_latest_and_survives_relaunch() {
+        let (_root, human, host, home) = fixture();
+        let id = AgentId::new();
+        let mut c = Credentials::default();
+        c.launch(id, "codex", &sources(&host, &human), &home)
+            .expect("launch");
+        let private = home.join(".codex/auth.json");
+        std::fs::write(&private, br#"{"token":1}"#).expect("write");
+        c.sync(id);
+        for i in 2..20 {
+            std::fs::write(&private, format!(r#"{{"token":{i}}}"#)).expect("write");
+            c.sync(id);
+        }
+        assert_eq!(std::fs::read(&host).expect("host"), br#"{"token":1}"#);
+        c.accepted
+            .insert(id, std::time::Instant::now() - COPY_INTERVAL);
+        c.sync(id);
+        assert_eq!(std::fs::read(&host).expect("host"), br#"{"token":19}"#);
+        c.finish(id);
+        c.launch(id, "codex", &sources(&host, &human), &home)
+            .expect("relaunch");
+        std::fs::write(&private, br#"{"token":20}"#).expect("write");
+        c.sync(id);
+        assert_eq!(std::fs::read(&host).expect("host"), br#"{"token":19}"#);
+    }
+    #[test]
+    fn history_is_bounded_without_eviction_and_bad_content_is_remembered() {
+        let (_root, human, host, home) = fixture();
+        let id = AgentId::new();
+        let mut c = Credentials::default();
+        c.launch(id, "codex", &sources(&host, &human), &home)
+            .expect("launch");
+        let private = home.join(".codex/auth.json");
+        for bytes in [
+            b"invalid".as_slice(),
+            b"{}",
+            b"[]",
+            br#"{"token":1,"extra":2}"#,
+        ] {
+            std::fs::write(&private, bytes).expect("write");
+            c.sync(id);
+            assert_eq!(c.copies[&id][0].rejected, Some(digest(bytes)));
+            c.sync(id);
+            assert_eq!(std::fs::read(&host).expect("host"), br#"{"token":0}"#);
+        }
+        for i in 1..=HISTORY_LIMIT {
+            c.accepted.remove(&id);
+            std::fs::write(&private, format!(r#"{{"token":{i}}}"#)).expect("write");
+            c.sync(id);
+        }
+        assert_eq!(c.retired[&host].len(), HISTORY_LIMIT);
+        assert!(c.retired[&host].contains(&normalized_digest(br#"{ "token": 0 }"#)));
+        let last = std::fs::read(&host).expect("last accepted");
+        c.accepted.remove(&id);
+        std::fs::write(&private, br#"{"token":99999}"#).expect("write");
+        c.sync(id);
+        c.sync(id);
+        assert_eq!(std::fs::read(&host).expect("host"), last);
+        assert_eq!(c.retired[&host].len(), HISTORY_LIMIT);
+        assert!(c.exhausted.contains(&host));
     }
     #[test]
     fn missing_credentials_launch_without_a_persisted_token() {
@@ -229,7 +350,7 @@ mod tests {
         let mut credentials = Credentials::default();
         let id = AgentId(ulid::Ulid::new());
         credentials
-            .launch(id, "codex", &[host], &home, &human)
+            .launch(id, "codex", &sources(&host, &human), &home)
             .expect("missing credential");
         assert!(!home.join(".codex/auth.json").exists());
     }
