@@ -22,17 +22,6 @@ pub enum SpawnContext {
     Fresh,
 }
 
-/// One executor invocation owned by a resident runtime. The store order
-/// distinguishes occurrences when a provider reuses a call ID.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ToolDispatch {
-    pub call_id: ToolCallId,
-    pub epoch: String,
-    pub call_order: usize,
-    /// Retained through restart settlement until obsolete choices are removed.
-    pub recovering: bool,
-}
-
 /// Persistent conversation history storage (DSQL in Lambda, in-memory for CLI).
 #[async_trait]
 pub trait ConversationStore: Send + Sync + Clone {
@@ -298,20 +287,6 @@ pub trait StateStore: Send + Sync + Clone {
         &self,
         thread_id: &ThreadId<str>,
     ) -> Result<Vec<UserChoice>, Self::Error>;
-
-    /// The outstanding executor dispatch, if any. Missing legacy records mean
-    /// unknown ownership and must not trigger restart settlement.
-    async fn get_tool_dispatch(
-        &self,
-        thread_id: &ThreadId<str>,
-    ) -> Result<Option<ToolDispatch>, Self::Error>;
-
-    /// Persist before invoking an executor, or clear after its result persists.
-    async fn set_tool_dispatch(
-        &self,
-        thread_id: &ThreadId<str>,
-        dispatch: Option<ToolDispatch>,
-    ) -> Result<(), Self::Error>;
 
     /// Whether an existing thread has been explicitly stopped.
     ///

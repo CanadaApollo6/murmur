@@ -75,6 +75,7 @@ pub struct SessionManagerConfig {
 /// means stopping its servers (they reboot transparently on the next tool
 /// invocation) and flagging it in the session store.
 pub struct SessionManager {
+    pub boot_id: String,
     pub session_store: SessionStoreHandle,
     conversation_store: PersistentConversationStore,
     state_store: PersistentStateStore,
@@ -383,6 +384,7 @@ impl SessionManager {
         }
 
         Ok(Self {
+            boot_id: uuid::Uuid::new_v4().to_string(),
             session_store,
             conversation_store,
             state_store,

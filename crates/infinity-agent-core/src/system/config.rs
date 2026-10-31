@@ -38,16 +38,6 @@ pub struct ThreadConfig<M: InputSender, H: HttpClient> {
 #[async_trait(?Send)]
 pub trait ThreadConfigSource<M: InputSender, H: HttpClient> {
     async fn resolve(&self, thread_id: &ThreadId<str>) -> Result<ThreadConfig<M, H>, BoxError>;
-
-    /// Best-effort restart cancellation without resolving tools, booting servers,
-    /// or fetching manifests. Lookup and notification share a bounded budget.
-    /// Sources without a separately available notifier can skip notification.
-    async fn restart_notifier(
-        &self,
-        _thread_id: &ThreadId<str>,
-    ) -> Result<Option<RapNotifier<H>>, BoxError> {
-        Ok(None)
-    }
 }
 
 /// The same fixed configuration for every thread — what
@@ -69,12 +59,5 @@ impl<M: InputSender + 'static, H: HttpClient + 'static> ThreadConfigSource<M, H>
             extra_system_prompt: self.extra_system_prompt.clone(),
             rap_notifier: self.rap_notifier.clone(),
         })
-    }
-
-    async fn restart_notifier(
-        &self,
-        _thread_id: &ThreadId<str>,
-    ) -> Result<Option<RapNotifier<H>>, BoxError> {
-        Ok(self.rap_notifier.clone())
     }
 }

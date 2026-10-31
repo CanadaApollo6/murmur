@@ -336,6 +336,7 @@ pub async fn handle_client_channels(
             .unwrap_or_default();
         let default_entry = mgr.catalog.default_entry();
         let _ = daemon_tx.send(DaemonMessage::Welcome {
+            boot_id: mgr.boot_id.clone(),
             sessions: mgr.list_sessions(Some(daemon_tx.clone())).await,
             available_models: mgr
                 .catalog

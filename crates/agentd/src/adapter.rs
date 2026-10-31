@@ -146,6 +146,7 @@ pub(crate) enum TurnItem {
 
 #[derive(Clone, Debug)]
 pub(crate) enum SessionEvent {
+    CancelComplete,
     TurnStarted { ids: Vec<MessageId> },
     Committed { ids: Vec<MessageId> },
     Activity(String),
@@ -169,6 +170,10 @@ pub(crate) enum AdapterError {
     ResumeUnsupported,
     #[error("resume failed: {0}")]
     ResumeFailed(String),
+    #[error("daemon unavailable: {0}")]
+    Unavailable(String),
+    #[error("stale Infinity choice")]
+    StaleChoice,
     #[error("spawn failed: {0}")]
     Spawn(String),
     #[error("protocol: {0}")]

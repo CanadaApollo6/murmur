@@ -593,26 +593,6 @@ impl SessionRapManager {
 
 #[async_trait(?Send)]
 impl ThreadConfigSource<ChannelSender, SimpleHttpClient> for SessionRapManager {
-    async fn restart_notifier(
-        &self,
-        thread_id: &ThreadId<str>,
-    ) -> Result<Option<RapNotifier<SimpleHttpClient>>, BoxError> {
-        let session_id = self.conversation_store.get_root_thread_id(thread_id);
-        let cwd = self.session_store.lock().await.get_cwd(&session_id).clone();
-        // Daemon-owned servers died with their invocations. Only external
-        // servers can still have work to cancel, and their URLs need no boot.
-        let (_, servers) =
-            collect_server_specs(&session_id, &cwd, self.user_rap_config.as_deref())?;
-        let urls = servers
-            .into_iter()
-            .filter_map(|server| match server.spec {
-                ServerSpec::External { url } => Some(url),
-                _ => None,
-            })
-            .collect();
-        Ok(Some(RapNotifier::new(urls, SimpleHttpClient::new())))
-    }
-
     async fn resolve(
         &self,
         thread_id: &ThreadId<str>,

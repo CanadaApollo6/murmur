@@ -8,8 +8,8 @@ use rap_protocol::ThreadId;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -406,6 +406,7 @@ async fn route_loop<C, S, H, O, F>(
         let (worker_subscribe_tx, worker_subscribe_rx) = mpsc::unbounded_channel();
         let observer = make_observer(&thread_id);
 
+        let failure_observer = make_observer(&thread_id);
         drivers.push({
             let thread_id = thread_id.clone();
             let driver = drive_thread(
@@ -421,9 +422,21 @@ async fn route_loop<C, S, H, O, F>(
                 lifecycle_tx.clone(),
             );
             async move {
-                // Contain a panicking driver to its own thread (the panic is
-                // logged); the router and the other drivers keep running.
-                rap_protocol::log_panic("thread_driver", driver).await;
+                // A failed executor must be visible to attached clients so
+                // they can reconnect and settle the durable pending call.
+                if std::panic::AssertUnwindSafe(driver)
+                    .catch_unwind()
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(%thread_id, "thread driver panicked");
+                    failure_observer.on_event(
+                        &thread_id,
+                        &crate::system::AgentEvent::DriverFailed {
+                            text: "Thread driver failed: panic".into(),
+                        },
+                    );
+                }
                 thread_id
             }
         });

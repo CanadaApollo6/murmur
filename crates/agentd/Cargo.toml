@@ -25,6 +25,18 @@ tracing-subscriber = { workspace = true }
 ulid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
+rap-client = { path = "../rap-client" }
+infinity-daemon = { path = "../infinity-daemon" }
+infinity-agent-core = { path = "../infinity-agent-core" }
+infinity-rap-bridge = { path = "../infinity-rap-bridge" }
+infinity-provider-protocol = { path = "../infinity-provider-protocol", features = ["mock"] }
+rap-protocol = { path = "../rap-protocol" }
+rap-test-servers = { path = "../rap-test-servers" }
+reqwest = { workspace = true }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1"] }
+http-body-util = "0.1"
+bytes = "1"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 
