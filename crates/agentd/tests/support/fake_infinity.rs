@@ -34,6 +34,7 @@ impl Request {
 
 #[derive(Default)]
 pub struct State {
+    pub boot_id: String,
     pub created: bool,
     pub manual_replay: bool,
     pub fail_resume: bool,
@@ -72,6 +73,7 @@ impl FakeDaemon {
                                 } else { HashMap::new() }
                             };
                             let welcome = DaemonMessage::Welcome {
+                                boot_id: state.lock().expect("state").boot_id.clone(),
                                 sessions, available_models: vec![], default_model_name: "fake".into(),
                                 default_context_window: 1000, provider_name: "fake".into(), remotes: vec![],
                             };

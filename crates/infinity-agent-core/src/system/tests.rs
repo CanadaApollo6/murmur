@@ -1417,7 +1417,7 @@ async fn reloaded_session_preserves_shutdown_settled_tool_result() {
             let _req2 = ctrl1.next_request().await;
             running1.shutdown().await;
 
-            // The recorded exchange settles before driver teardown.
+            // The accepted result settles before driver teardown.
             let stored = persisted(&conv, "t1");
             assert!(
                 stored.contains("tc-1") && stored.contains("HUGE TOOL RESULT"),
@@ -2875,386 +2875,6 @@ async fn human_deferrable_mail_waits_for_active_tool_and_receipts_its_dedup_id()
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn restart_settles_orphaned_active_tool() {
-    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let conv = InMemoryConversationStore::new();
-            let state = InMemoryStateStore::new();
-            let (model, mut ctrl) = model_source(None);
-            let (tx, mut rx) = mpsc::unbounded_channel();
-            let running = super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
-                .tool(Box::new(AsyncTool))
-                .start_with_observer(move |_| TestObserver { tx: tx.clone() });
-            running
-                .send_user_text(ThreadId::from_ref("t1"), "work")
-                .await;
-            ctrl.next_request().await;
-            ctrl.send_tool_call("active", "async_tool", serde_json::json!({}));
-            ctrl.finish();
-            collect_until_finished(&mut rx).await;
-            running.shutdown().await;
-            let (model, mut ctrl) = model_source(None);
-            let (tx, mut rx) = mpsc::unbounded_channel();
-            let running = super::AgentSystemBuilder::new_local(conv.clone(), state, model)
-                .tool(Box::new(AsyncTool))
-                .start_with_observer(move |_| TestObserver { tx: tx.clone() });
-            let (tx, mut replay) = mpsc::unbounded_channel();
-            running.subscribe(ThreadId::from_ref("t1"), tx).await;
-            let Evt::Replay(snapshot) = next_evt(&mut replay).await else {
-                panic!("replay")
-            };
-            assert!(snapshot.idle);
-            assert!(persisted(&conv, "t1").contains("interrupted: daemon restarted"));
-            assert!(
-                ctrl.try_next_request().is_none(),
-                "recovery must not start inference"
-            );
-            let peer = peer_input("t1", "after-restart", "peer after restart");
-            running.send(peer.0, &peer.1).await;
-            let request = ctrl.next_request().await;
-            let history = format!("{:?}", request.chat_history);
-            assert!(
-                history.contains("peer after restart")
-                    && history.contains("interrupted: daemon restarted")
-            );
-            ctrl.send_text("recovered");
-            ctrl.finish();
-            collect_until_finished(&mut rx).await;
-            running.shutdown().await;
-        })
-        .await;
-}
-
-fn r6_spawn_before_restart(
-    conv: &crate::stores::InMemoryConversationStore,
-    state: &crate::stores::InMemoryStateStore,
-    compaction: bool,
-) -> ThreadId {
-    use crate::message::InfinityMessage;
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
-        let (model, mut ctrl) = model_source(None);
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let running = super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
-            .start_with_observer(move |_| TestObserver { tx: tx.clone() });
-        running
-            .send_user_text(ThreadId::from_ref("root"), "spawn work")
-            .await;
-        ctrl.next_request().await;
-        if compaction {
-            ctrl.send_text("root ready");
-            ctrl.finish();
-            running
-                .send(
-                    InputMessage {
-                        content: InputMessageContent::User(UserContent::text("")),
-                        group_id: "root".into(),
-                        metadata: None,
-                        synthetic: Some(SyntheticKind::Tagged(TaggedSyntheticKind::Compaction)),
-                        display_as: None,
-                        subscription: false,
-                    },
-                    "r6-compact",
-                )
-                .await;
-            let request = ctrl.next_request().await;
-            assert!(is_compaction_req(&request));
-            return find_compaction_child_id(&request).into();
-        }
-        ctrl.send_tool_call(
-            "spawn1",
-            "spawn_thread",
-            serde_json::json!({
-                "instructions":"child work", "child_of":["root"]
-            }),
-        );
-        ctrl.finish();
-        let followup = ctrl.next_request().await;
-        let child: ThreadId = tool_result_texts(&followup)
-            .iter()
-            .find_map(|text| {
-                text.strip_prefix("Child thread is successfully spawned and has ID: ")?
-                    .split('.')
-                    .next()
-                    .map(Into::into)
-            })
-            .expect("child ID in synchronous spawn result");
-        ctrl.next_request().await;
-        for id in [ThreadId::from_ref("root"), &child] {
-            let messages = conv.thread_messages(id).expect("durable history");
-            assert!(matches!(&messages.last().expect("tail").0,
-                InfinityMessage::ToolCall { call, .. } if call.id == "spawn1"));
-        }
-        child
-    }))
-}
-
-#[test]
-fn r6_restart_after_parent_spawn_must_not_strand_mail() {
-    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
-    use crate::traits::{ConversationStore, StateStore};
-    use std::time::Duration;
-
-    let conv = InMemoryConversationStore::new();
-    let state = InMemoryStateStore::new();
-    let child = r6_spawn_before_restart(&conv, &state, false);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("replacement runtime");
-    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
-        state
-            .add_pending_user_choice(
-                ThreadId::from_ref("root"),
-                super::UserChoice {
-                    id: "spawn-choice".into(),
-                    prompt: "obsolete".into(),
-                    choices: vec!["yes".into()],
-                    default: 0,
-                    response_url: "http://unused.test".into(),
-                },
-            )
-            .await
-            .expect("pending choice");
-        let (model, mut ctrl) = model_source(None);
-        let (tx, mut events) = mpsc::unbounded_channel();
-        let running = super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
-            .start_with_observer(move |_| TestObserver { tx: tx.clone() });
-        let (tx, mut replay) = mpsc::unbounded_channel();
-        running.subscribe(ThreadId::from_ref("root"), tx).await;
-        let Evt::Replay(snapshot) = next_evt(&mut replay).await else {
-            panic!("replay")
-        };
-        let peer = peer_input("root", "r6-after-spawn", "mail after restart");
-        running.send(peer.0, &peer.1).await;
-        let request = tokio::time::timeout(Duration::from_millis(500), ctrl.next_request())
-            .await
-            .expect("restart must not strand mail behind parent spawn_thread");
-        assert!(snapshot.idle && snapshot.pending_choices.is_empty());
-        assert!(
-            state
-                .get_pending_user_choices(ThreadId::from_ref("root"))
-                .await
-                .expect("choices")
-                .is_empty()
-        );
-        assert!(format!("{:?}", request.chat_history).contains("mail after restart"));
-        assert_eq!(
-            persisted(&conv, "root")
-                .matches("interrupted: daemon restarted")
-                .count(),
-            1
-        );
-        assert!(!conv.is_thread_closed(&child).await.expect("child status"));
-        ctrl.send_text("received");
-        ctrl.finish();
-        loop {
-            if matches!(next_evt(&mut events).await, Evt::E(AgentEvent::InputCommitted { dedup_id })
-                if dedup_id == peer.1)
-            {
-                break;
-            }
-        }
-        collect_until_finished(&mut events).await;
-
-        let seed = tool_result_input(child.as_str(), "spawn1", "child instructions resumed");
-        running.send(seed.0, &seed.1).await;
-        let request = ctrl.next_request().await;
-        assert!(
-            tool_result_texts(&request)
-                .iter()
-                .any(|s| s == "child instructions resumed")
-        );
-        ctrl.send_tool_call(
-            "child-close",
-            "close_thread",
-            serde_json::json!({
-                "thread_id": child, "report_to_parent": "child survived parent settlement"
-            }),
-        );
-        ctrl.finish();
-        let report = ctrl.next_request().await;
-        assert!(
-            tool_result_texts(&report)
-                .iter()
-                .any(|s| s.contains("child survived parent settlement"))
-        );
-        assert!(conv.is_thread_closed(&child).await.expect("child closed"));
-        ctrl.send_text("report received");
-        ctrl.finish();
-        running.shutdown().await;
-        assert_eq!(
-            persisted(&conv, "root")
-                .matches("interrupted: daemon restarted")
-                .count(),
-            1
-        );
-    }));
-}
-
-#[test]
-fn r6_restart_preserves_real_child_seed() {
-    r6_restart_preserves_seed(false);
-}
-
-#[test]
-fn r6_restart_preserves_real_compaction_seed() {
-    r6_restart_preserves_seed(true);
-}
-
-fn r6_restart_preserves_seed(compaction: bool) {
-    use crate::message::InfinityMessage;
-    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
-
-    let conv = InMemoryConversationStore::new();
-    let state = InMemoryStateStore::new();
-    let child = r6_spawn_before_restart(&conv, &state, compaction);
-    let seed_call_id = conv
-        .thread_info(&child)
-        .expect("child metadata")
-        .spawn_tool_call_id
-        .expect("seed call ID");
-    let before = persisted(&conv, child.as_str());
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("replacement runtime");
-    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
-        let (model, mut ctrl) = model_source(None);
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let running = super::AgentSystemBuilder::new_local(conv.clone(), state, model)
-            .start_with_observer(move |_| TestObserver { tx: tx.clone() });
-        let (tx, mut replay) = mpsc::unbounded_channel();
-        running.subscribe(&child, tx).await;
-        let Evt::Replay(snapshot) = next_evt(&mut replay).await else {
-            panic!("replay")
-        };
-        assert!(!snapshot.idle, "child seed still awaits its instructions");
-        assert!(
-            matches!(snapshot.history.last(), Some(InfinityMessage::ToolCall { call, .. })
-            if call.id == seed_call_id.as_str() && call.function.name ==
-                    if compaction { "__harness_begin_compaction__" } else { "spawn_thread" })
-        );
-        assert_eq!(persisted(&conv, child.as_str()), before);
-        assert!(
-            ctrl.try_next_request().is_none(),
-            "attachment must not infer"
-        );
-        let seed = tool_result_input(
-            child.as_str(),
-            seed_call_id.as_str(),
-            "child instructions resumed",
-        );
-        running.send(seed.0, &seed.1).await;
-        let request = ctrl.next_request().await;
-        let history = format!("{:?}", request.chat_history);
-        assert!(history.contains("child instructions resumed"));
-        assert!(!history.contains("interrupted: daemon restarted"));
-        ctrl.send_text("child resumed");
-        ctrl.finish();
-        running.shutdown().await;
-    }));
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn r6_restart_bounds_notifier_lookup_and_cleans_choices() {
-    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
-    use crate::traits::StateStore;
-    use rap_client::http::SimpleHttpClient;
-    use std::time::Duration;
-
-    struct StalledConfig;
-    #[async_trait(?Send)]
-    impl super::ThreadConfigSource<ChannelSender, SimpleHttpClient> for StalledConfig {
-        async fn resolve(
-            &self,
-            _: &ThreadId<str>,
-        ) -> Result<
-            super::ThreadConfig<ChannelSender, SimpleHttpClient>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            panic!("restart must not resolve the toolset");
-        }
-        async fn restart_notifier(
-            &self,
-            _: &ThreadId<str>,
-        ) -> Result<
-            Option<rap_client::notifier::RapNotifier<SimpleHttpClient>>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            std::future::pending().await
-        }
-    }
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let conv = InMemoryConversationStore::new();
-            let state = InMemoryStateStore::new();
-            let (model, mut ctrl) = model_source(None);
-            let (tx, mut events) = mpsc::unbounded_channel();
-            let running = super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
-                .tools(vec![Box::new(AsyncTool) as Box<dyn Tool<ChannelSender>>])
-                .start_with_observer(move |_| TestObserver { tx: tx.clone() });
-            running
-                .send_user_text(ThreadId::from_ref("root"), "work")
-                .await;
-            ctrl.next_request().await;
-            ctrl.send_tool_call("orphan", "async_tool", serde_json::json!({}));
-            ctrl.finish();
-            collect_until_finished(&mut events).await;
-            running.shutdown().await;
-            state
-                .add_pending_user_choice(
-                    ThreadId::from_ref("root"),
-                    super::UserChoice {
-                        id: "orphan".into(),
-                        prompt: "obsolete".into(),
-                        choices: vec!["yes".into()],
-                        default: 0,
-                        response_url: "http://unused.test".into(),
-                    },
-                )
-                .await
-                .expect("pending choice");
-            let (model, mut ctrl) = model_source(None);
-            let (tx, _rx) = mpsc::unbounded_channel();
-            let running = super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
-                .thread_config(StalledConfig)
-                .start_with_observer(move |_| TestObserver { tx: tx.clone() });
-            let (tx, mut replay) = mpsc::unbounded_channel();
-            running.subscribe(ThreadId::from_ref("root"), tx).await;
-            let event = tokio::time::timeout(Duration::from_secs(3), replay.recv())
-                .await
-                .expect("restart attachment must bound notifier lookup")
-                .expect("replay");
-            let Evt::Replay(snapshot) = event else {
-                panic!("replay")
-            };
-            assert!(snapshot.idle && snapshot.pending_choices.is_empty());
-            assert!(
-                state
-                    .get_pending_user_choices(ThreadId::from_ref("root"))
-                    .await
-                    .expect("durable choices")
-                    .is_empty()
-            );
-            assert_eq!(
-                persisted(&conv, "root")
-                    .matches("interrupted: daemon restarted")
-                    .count(),
-                1
-            );
-            assert!(ctrl.try_next_request().is_none(), "recovery must not infer");
-            running.shutdown().await;
-        })
-        .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn r7_nonassociative_subscription_child_keeps_event() {
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -3341,10 +2961,12 @@ async fn r7_nonassociative_subscription_child_keeps_event() {
                         panic!("replay");
                     };
                     assert!(
-                        !snapshot.idle,
-                        "subscription seed stays pending after restart"
+                        snapshot.idle,
+                        "accepted subscription payload settles before shutdown"
                     );
-                    assert_eq!(persisted(&conv, child.as_str()), before);
+                    assert!(
+                        persisted(&conv, child.as_str()).contains("r7 unique subscription payload")
+                    );
                     assert!(ctrl.try_next_request().is_none());
                     running.shutdown().await;
                     continue;
@@ -3361,202 +2983,8 @@ async fn r7_nonassociative_subscription_child_keeps_event() {
         .await;
 }
 
-fn r7_nested_spawn_recovery(reuse_id: bool) {
-    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
-    let conv = InMemoryConversationStore::new();
-    let state = InMemoryStateStore::new();
-    let child = r6_spawn_before_restart(&conv, &state, false);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let grandchild = runtime.block_on(tokio::task::LocalSet::new().run_until(async {
-        let (model, mut ctrl) = model_source(None);
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let running = super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
-            .start_with_observer(move |_| TestObserver { tx: tx.clone() });
-        let seed = tool_result_input(child.as_str(), "spawn1", "child seed resumed");
-        running.send(seed.0, &seed.1).await;
-        ctrl.next_request().await;
-        ctrl.send_tool_call(
-            if reuse_id { "spawn1" } else { "spawn2" },
-            "spawn_thread",
-            serde_json::json!({"instructions":"grandchild task", "child_of":["root", child]}),
-        );
-        ctrl.finish();
-        let followup = ctrl.next_request().await;
-        let grandchild: ThreadId = tool_result_texts(&followup)
-            .iter()
-            .find_map(|text| {
-                text.strip_prefix("Child thread is successfully spawned and has ID: ")?
-                    .split('.')
-                    .next()
-                    .map(Into::into)
-            })
-            .expect("real grandchild");
-        ctrl.next_request().await;
-        grandchild
-    }));
-    drop(runtime);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
-        let (model, mut ctrl) = model_source(None);
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let running = super::AgentSystemBuilder::new_local(conv.clone(), state, model)
-            .start_with_observer(move |_| TestObserver { tx: tx.clone() });
-        let (tx, mut replay) = mpsc::unbounded_channel();
-        running.subscribe(&child, tx).await;
-        let Evt::Replay(snapshot) = next_evt(&mut replay).await else {
-            panic!("replay")
-        };
-        assert!(snapshot.idle, "the dispatched nested spawn must settle");
-        assert_eq!(
-            persisted(&conv, child.as_str())
-                .matches("interrupted: daemon restarted")
-                .count(),
-            1
-        );
-        assert!(
-            !conv
-                .thread_info(&grandchild)
-                .expect("grandchild preserved")
-                .closed
-        );
-        let peer = peer_input(child.as_str(), "r7-nested-mail", "mail to nested parent");
-        running.send(peer.0, &peer.1).await;
-        let request =
-            tokio::time::timeout(std::time::Duration::from_millis(700), ctrl.next_request())
-                .await
-                .expect("a nested parent's real spawn must settle on restart");
-        assert!(format!("{:?}", request.chat_history).contains("mail to nested parent"));
-        ctrl.send_text("received");
-        ctrl.finish();
-        running.shutdown().await;
-    }));
-}
-
-#[test]
-fn r7_nested_spawn_distinct_id() {
-    r7_nested_spawn_recovery(false);
-}
-#[test]
-fn r7_nested_spawn_reused_id() {
-    r7_nested_spawn_recovery(true);
-}
-
 #[tokio::test(flavor = "current_thread")]
-async fn r7_first_lazy_load_preserves_same_epoch_dispatch() {
-    use crate::event_processor::{CompletionAction, HistoryManager};
-    use crate::message::InfinityMessage;
-    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
-    use crate::traits::{ConversationStore, StateStore};
-    use infinity_provider_protocol::message::{ToolCall, ToolFunction};
-    use std::collections::HashMap;
-
-    let conv = InMemoryConversationStore::new();
-    let state = InMemoryStateStore::new();
-    let tid = ThreadId::from_ref("lazy");
-    conv.ensure_root_thread(tid).await.expect("root");
-    conv.append_messages(
-        tid,
-        vec![(
-            InfinityMessage::ToolCall {
-                call: ToolCall {
-                    id: "active".into(),
-                    call_id: None,
-                    function: ToolFunction {
-                        name: "async_tool".into(),
-                        arguments: serde_json::json!({}),
-                    },
-                },
-                display_as: None,
-            },
-            "call-entry".into(),
-        )],
-    )
-    .await
-    .expect("persist call");
-    let (model, mut ctrl) = model_source(None);
-    let system = super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model).build();
-    let mut dispatcher =
-        HistoryManager::new_with_history(conv.clone(), state.clone(), tid.to_owned())
-            .await
-            .expect("dispatcher history");
-    dispatcher.dispatch_epoch = system.inner.dispatch_epoch.clone();
-    dispatcher.dispatches = Some(system.inner.dispatches.clone());
-    dispatcher
-        .record_tool_dispatch(rap_protocol::ToolCallId::from_ref("active"))
-        .await
-        .expect("write-ahead record");
-    let guard = dispatcher.start_tool_dispatch().expect("resident dispatch");
-    let tool = AsyncTool;
-    let registry = HashMap::from([("async_tool".into(), &tool as &dyn Tool<ChannelSender>)]);
-    crate::event_processor::execute_action_with_error_result(
-        CompletionAction::ExecuteToolCall {
-            tool_name: "async_tool".into(),
-            tool_args: serde_json::json!({}),
-            tool_call_id: "active".into(),
-            call_id: None,
-            display_as: None,
-        },
-        &registry,
-        &ToolContext {
-            message_sender: system.inner.sender.clone(),
-            group_id: tid.to_owned(),
-            callback_url: String::new(),
-            user_id: None,
-            thread_stack: vec![tid.to_owned()],
-            safe_spawn_point: None,
-        },
-        Some(guard),
-    )
-    .await
-    .expect("dispatch in this runtime");
-    drop(dispatcher);
-
-    let before = persisted(&conv, tid.as_str());
-    let thread = super::thread::Thread::load(system.inner.clone(), tid.to_owned())
-        .await
-        .expect("first lazy load");
-    assert_eq!(persisted(&conv, tid.as_str()), before);
-    assert_eq!(
-        thread.pending_tool_call().expect("still pending").0,
-        "active"
-    );
-    assert!(ctrl.try_next_request().is_none());
-    let result = tool_result_input(tid.as_str(), "active", "real current-process result");
-    let (_cancel, cancel) = tokio::sync::oneshot::channel();
-    let observer = super::EventCollector::new();
-    let respond = async {
-        let request = ctrl.next_request().await;
-        assert!(
-            tool_result_texts(&request)
-                .iter()
-                .any(|text| text == "real current-process result")
-        );
-        ctrl.send_text("done");
-        ctrl.finish();
-    };
-    let (step, ()) = tokio::join!(
-        thread.step_no_defer(vec![result], &observer, cancel),
-        respond
-    );
-    step.expect("real result accepted");
-    assert!(
-        state
-            .get_tool_dispatch(tid)
-            .await
-            .expect("dispatch cleared")
-            .is_none()
-    );
-    assert!(!persisted(&conv, tid.as_str()).contains("interrupted: daemon restarted"));
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn r7_legacy_calls_without_dispatch_records_remain_pending() {
+async fn unanswered_calls_remain_pending_on_load() {
     use crate::message::InfinityMessage;
     use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
     use crate::traits::ConversationStore;
@@ -3615,261 +3043,19 @@ async fn r7_legacy_calls_without_dispatch_records_remain_pending() {
         .await;
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn r7_stale_record_and_partial_recovery_do_not_repeat_settlement() {
-    use crate::message::InfinityMessage;
-    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
-    use crate::traits::{ConversationStore, StateStore, ToolDispatch};
-    use infinity_provider_protocol::message::{
-        ToolCall, ToolFunction, ToolResult, ToolResultContent,
-    };
-
-    for recovering in [false, true] {
-        let conv = InMemoryConversationStore::new();
-        let state = InMemoryStateStore::new();
-        let tid = ThreadId::from_ref("root");
-        conv.ensure_root_thread(tid).await.expect("root");
-        let call = InfinityMessage::ToolCall {
-            call: ToolCall {
-                id: "reused".into(),
-                call_id: None,
-                function: ToolFunction {
-                    name: "async_tool".into(),
-                    arguments: serde_json::json!({}),
-                },
-            },
-            display_as: None,
-        };
-        let result = InfinityMessage::ToolResult {
-            result: ToolResult {
-                id: "reused".into(),
-                call_id: None,
-                content: vec![ToolResultContent::text(if recovering {
-                    "interrupted: daemon restarted"
-                } else {
-                    "first real result"
-                })],
-            },
-            display_segments: None,
-        };
-        let mut messages = vec![
-            (call.clone(), "first-call".into()),
-            (result, "first-result".into()),
-        ];
-        if !recovering {
-            messages.push((call, "second-call".into()));
-        }
-        conv.append_messages(tid, messages)
-            .await
-            .expect("history persisted before cleanup failure");
-        state
-            .set_tool_dispatch(
-                tid,
-                Some(ToolDispatch {
-                    call_id: "reused".into(),
-                    epoch: "previous-runtime".into(),
-                    call_order: 0,
-                    recovering,
-                }),
-            )
-            .await
-            .expect("retained record");
-        state
-            .add_pending_user_choice(
-                tid,
-                super::UserChoice {
-                    id: "choice".into(),
-                    prompt: "pending".into(),
-                    choices: vec!["yes".into()],
-                    default: 0,
-                    response_url: "http://unused.test".into(),
-                },
-            )
-            .await
-            .expect("choice");
-        let before = persisted(&conv, tid.as_str());
-        let (model, mut ctrl) = model_source(None);
-        let system =
-            super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model).build();
-        let thread = super::thread::Thread::load(system.inner.clone(), tid.to_owned())
-            .await
-            .expect("retry load");
-        assert_eq!(
-            persisted(&conv, tid.as_str()),
-            before,
-            "never settle another call occurrence or append another restart result"
-        );
-        assert_eq!(thread.pending_tool_call().is_none(), recovering);
-        assert_eq!(
-            state
-                .get_pending_user_choices(tid)
-                .await
-                .expect("durable choices")
-                .is_empty(),
-            recovering
-        );
-        assert!(
-            state
-                .get_tool_dispatch(tid)
-                .await
-                .expect("obsolete record cleared")
-                .is_none()
-        );
-        assert!(ctrl.try_next_request().is_none());
-    }
-}
-
-mod r8_review {
+mod accepted_result {
     use super::*;
     use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
-    use crate::system::{AgentSystemBuilder, UserChoice};
-    use crate::traits::{ConversationStore, StateStore, ToolDispatch};
-    use rap_protocol::{ChoiceId, ToolCallId};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+    use crate::system::AgentSystemBuilder;
+    use crate::traits::ConversationStore;
+    use rap_protocol::ToolCallId;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
-    use std::time::Duration;
-
-    #[derive(Clone, Copy)]
-    enum Gate {
-        FailOnce,
-        FailAlways,
-        BeforeWrite,
-        AfterWrite,
-    }
-    #[derive(Clone)]
-    struct GateStore {
-        inner: InMemoryStateStore,
-        first: Arc<AtomicBool>,
-        entered: Arc<tokio::sync::Notify>,
-        repaired: Arc<AtomicBool>,
-        attempts: Arc<AtomicUsize>,
-        gate: Gate,
-    }
-    impl GateStore {
-        fn new(gate: Gate) -> Self {
-            Self {
-                inner: InMemoryStateStore::new(),
-                first: Arc::new(AtomicBool::new(true)),
-                entered: Arc::new(tokio::sync::Notify::new()),
-                repaired: Arc::new(AtomicBool::new(false)),
-                attempts: Arc::new(AtomicUsize::new(0)),
-                gate,
-            }
-        }
-    }
-    #[async_trait]
-    impl StateStore for GateStore {
-        type Error = crate::stores::InMemoryStoreError;
-        async fn get_processed_ids(
-            &self,
-            thread_id: &ThreadId<str>,
-        ) -> Result<std::collections::HashSet<String>, Self::Error> {
-            self.inner.get_processed_ids(thread_id).await
-        }
-        async fn add_processed_message_ids(
-            &self,
-            thread_id: &ThreadId<str>,
-            message_ids: Vec<String>,
-        ) -> Result<(), Self::Error> {
-            self.inner
-                .add_processed_message_ids(thread_id, message_ids)
-                .await
-        }
-        async fn get_metadata(
-            &self,
-            root_thread_id: &ThreadId<str>,
-        ) -> Result<Option<serde_json::Value>, Self::Error> {
-            self.inner.get_metadata(root_thread_id).await
-        }
-        async fn set_metadata(
-            &self,
-            root_thread_id: &ThreadId<str>,
-            metadata: serde_json::Value,
-        ) -> Result<(), Self::Error> {
-            self.inner.set_metadata(root_thread_id, metadata).await
-        }
-        async fn get_active_subscriptions(
-            &self,
-            thread_id: &ThreadId<str>,
-        ) -> Result<Vec<ToolCallId>, Self::Error> {
-            self.inner.get_active_subscriptions(thread_id).await
-        }
-        async fn add_active_subscription(
-            &self,
-            thread_id: &ThreadId<str>,
-            tool_call_id: &ToolCallId<str>,
-        ) -> Result<(), Self::Error> {
-            self.inner
-                .add_active_subscription(thread_id, tool_call_id)
-                .await
-        }
-        async fn remove_active_subscription(
-            &self,
-            thread_id: &ThreadId<str>,
-            tool_call_id: &ToolCallId<str>,
-        ) -> Result<(), Self::Error> {
-            self.inner
-                .remove_active_subscription(thread_id, tool_call_id)
-                .await
-        }
-        async fn add_pending_user_choice(
-            &self,
-            thread_id: &ThreadId<str>,
-            choice: UserChoice,
-        ) -> Result<(), Self::Error> {
-            self.inner.add_pending_user_choice(thread_id, choice).await
-        }
-        async fn remove_pending_user_choice(
-            &self,
-            thread_id: &ThreadId<str>,
-            choice_id: &ChoiceId<str>,
-        ) -> Result<(), Self::Error> {
-            self.inner
-                .remove_pending_user_choice(thread_id, choice_id)
-                .await
-        }
-        async fn get_pending_user_choices(
-            &self,
-            thread_id: &ThreadId<str>,
-        ) -> Result<Vec<UserChoice>, Self::Error> {
-            self.inner.get_pending_user_choices(thread_id).await
-        }
-        async fn get_tool_dispatch(
-            &self,
-            thread_id: &ThreadId<str>,
-        ) -> Result<Option<ToolDispatch>, Self::Error> {
-            self.inner.get_tool_dispatch(thread_id).await
-        }
-        async fn set_tool_dispatch(
-            &self,
-            thread_id: &ThreadId<str>,
-            dispatch: Option<ToolDispatch>,
-        ) -> Result<(), Self::Error> {
-            if dispatch.is_some() {
-                self.attempts.fetch_add(1, Ordering::SeqCst);
-            }
-            if dispatch.is_some()
-                && (self.first.swap(false, Ordering::SeqCst)
-                    || (matches!(self.gate, Gate::FailAlways)
-                        && !self.repaired.load(Ordering::SeqCst)))
-            {
-                if matches!(self.gate, Gate::AfterWrite) {
-                    self.inner.set_tool_dispatch(thread_id, dispatch).await?;
-                }
-                self.entered.notify_one();
-                if matches!(self.gate, Gate::BeforeWrite | Gate::AfterWrite) {
-                    std::future::pending::<()>().await;
-                }
-                return Err(crate::stores::InMemoryStoreError(
-                    "r8 one failed dispatch write".into(),
-                ));
-            }
-            self.inner.set_tool_dispatch(thread_id, dispatch).await
-        }
-    }
-
     struct ProbeTool {
         sync: bool,
         invoked: Arc<AtomicUsize>,
@@ -3947,9 +3133,6 @@ mod r8_review {
             ctrl.drop_stream();
             wait_idle(&mut events).await;
             let stored = persisted(&conv, "r9");
-            eprintln!("sync={sync}, durable result={}, dispatch retained={}",
-                stored.contains("probe completed"),
-                state.get_tool_dispatch(ThreadId::from_ref("r9")).await.expect("record").is_some());
             let peer = peer_input("r9", "after", "human broker mail after recovery");
             running.send(peer.0, &peer.1).await;
             let request = tokio::time::timeout(Duration::from_secs(4), ctrl.next_request()).await
@@ -3958,7 +3141,6 @@ mod r8_review {
             assert_eq!(stored.matches("probe completed").count(), 1);
             assert!(!stored.contains("interrupted:"));
             assert!(!stored.contains("unrelated unvalidated mail"));
-            assert!(state.get_tool_dispatch(ThreadId::from_ref("r9")).await.expect("record").is_none());
             ctrl.send_text("recovered"); ctrl.finish();
             running.shutdown().await;
         }).await;
@@ -3980,651 +3162,294 @@ mod r8_review {
             }
         }
     }
+}
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn r8_single_dispatch_write_failure_must_settle() {
-        for sync in [false, true] {
-            tokio::task::LocalSet::new().run_until(async {
-                let conv = InMemoryConversationStore::new();
-                conv.ensure_root_thread(ThreadId::from_ref("r8")).await.expect("root");
-                let state = GateStore::new(Gate::FailOnce);
-                let invoked = Arc::new(AtomicUsize::new(0));
-                let (model, mut ctrl) = model_source(None);
-                let (tx, mut events) = mpsc::unbounded_channel();
-                let running = AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
-                    .tool(Box::new(ProbeTool { sync, invoked: invoked.clone() }))
-                    .start_with_observer(move |_| TestObserver { tx: tx.clone() });
-                let peer = peer_input("r8", "peer-first", "first mail");
-                running.send(peer.0, &peer.1).await;
-                ctrl.next_request().await;
-                ctrl.send_tool_call("lost", "probe", serde_json::json!({}));
-                ctrl.finish();
-                loop { if matches!(next_evt(&mut events).await, Evt::E(AgentEvent::Info {text}) if text.contains("r8 one failed")) { break; } }
-                let peer = peer_input("r8", "peer-after", "mail after one write failure");
-                running.send(peer.0, &peer.1).await;
-                let request = tokio::time::timeout(Duration::from_secs(4), ctrl.next_request()).await
-                    .expect("one failed dispatch write must settle without an interrupting user message");
-                assert!(format!("{:?}", request.chat_history).contains("executor was not invoked"));
-                assert_eq!(invoked.load(Ordering::SeqCst), 0);
-                ctrl.send_text("mail received"); ctrl.finish();
-                wait_idle(&mut events).await;
-                assert!(state.inner.get_tool_dispatch(ThreadId::from_ref("r8")).await.expect("record cleared").is_none());
-                assert_eq!(persisted(&conv, "r8").matches("executor was not invoked").count(), 1);
-                running.shutdown().await;
-            }).await;
+mod held_settlement {
+    use super::*;
+    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
+    use crate::system::UserChoice;
+    use crate::traits::{ConversationStore, StateStore};
+    use rap_protocol::{ChoiceId, ToolCallId};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    #[derive(Clone)]
+    struct GateStore {
+        inner: InMemoryStateStore,
+        failed: Arc<AtomicBool>,
+        attempts: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl StateStore for GateStore {
+        type Error = crate::stores::InMemoryStoreError;
+        async fn get_processed_ids(
+            &self,
+            thread_id: &ThreadId<str>,
+        ) -> Result<std::collections::HashSet<String>, Self::Error> {
+            self.inner.get_processed_ids(thread_id).await
+        }
+        async fn add_processed_message_ids(
+            &self,
+            thread_id: &ThreadId<str>,
+            message_ids: Vec<String>,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .add_processed_message_ids(thread_id, message_ids)
+                .await
+        }
+        async fn get_metadata(
+            &self,
+            root_thread_id: &ThreadId<str>,
+        ) -> Result<Option<serde_json::Value>, Self::Error> {
+            self.inner.get_metadata(root_thread_id).await
+        }
+        async fn set_metadata(
+            &self,
+            root_thread_id: &ThreadId<str>,
+            metadata: serde_json::Value,
+        ) -> Result<(), Self::Error> {
+            self.inner.set_metadata(root_thread_id, metadata).await
+        }
+        async fn get_active_subscriptions(
+            &self,
+            thread_id: &ThreadId<str>,
+        ) -> Result<Vec<ToolCallId>, Self::Error> {
+            self.inner.get_active_subscriptions(thread_id).await
+        }
+        async fn add_active_subscription(
+            &self,
+            thread_id: &ThreadId<str>,
+            tool_call_id: &ToolCallId<str>,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .add_active_subscription(thread_id, tool_call_id)
+                .await
+        }
+        async fn remove_active_subscription(
+            &self,
+            thread_id: &ThreadId<str>,
+            tool_call_id: &ToolCallId<str>,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .remove_active_subscription(thread_id, tool_call_id)
+                .await
+        }
+        async fn add_pending_user_choice(
+            &self,
+            thread_id: &ThreadId<str>,
+            choice: UserChoice,
+        ) -> Result<(), Self::Error> {
+            self.inner.add_pending_user_choice(thread_id, choice).await
+        }
+        async fn remove_pending_user_choice(
+            &self,
+            thread_id: &ThreadId<str>,
+            choice_id: &ChoiceId<str>,
+        ) -> Result<(), Self::Error> {
+            if self.failed.load(Ordering::SeqCst) {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                return Err(crate::stores::InMemoryStoreError(
+                    "choice store unavailable".into(),
+                ));
+            }
+            self.inner
+                .remove_pending_user_choice(thread_id, choice_id)
+                .await
+        }
+        async fn get_pending_user_choices(
+            &self,
+            thread_id: &ThreadId<str>,
+        ) -> Result<Vec<UserChoice>, Self::Error> {
+            self.inner.get_pending_user_choices(thread_id).await
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn r8_dispatch_write_exhaustion_is_held_until_explicit_retry() {
-        for sync in [false, true] {
+    #[tokio::test(start_paused = true)]
+    async fn held_retries_on_input_and_timer_and_exits_when_channels_close() {
+        for recovery in ["input", "timer", "shutdown"] {
             tokio::task::LocalSet::new()
                 .run_until(async {
                     let conv = InMemoryConversationStore::new();
-                    conv.ensure_root_thread(ThreadId::from_ref("r8"))
+                    let tid = ThreadId::from_ref("held");
+                    conv.ensure_root_thread(tid).await.expect("root");
+                    conv.append_messages(
+                        tid,
+                        vec![(
+                            crate::message::InfinityMessage::ToolCall {
+                                call: infinity_provider_protocol::message::ToolCall {
+                                    id: "waiting".into(),
+                                    call_id: None,
+                                    function: infinity_provider_protocol::message::ToolFunction {
+                                        name: "async_tool".into(),
+                                        arguments: serde_json::json!({}),
+                                    },
+                                },
+                                display_as: None,
+                            },
+                            "call".into(),
+                        )],
+                    )
+                    .await
+                    .expect("pending call");
+                    let state = GateStore {
+                        inner: InMemoryStateStore::new(),
+                        failed: Arc::new(AtomicBool::new(false)),
+                        attempts: Arc::new(AtomicUsize::new(0)),
+                    };
+                    state
+                        .add_pending_user_choice(
+                            tid,
+                            UserChoice {
+                                id: "waiting".into(),
+                                prompt: "Choose".into(),
+                                choices: vec!["A".into()],
+                                default: 0,
+                                response_url: "http://unused.test".into(),
+                            },
+                        )
                         .await
-                        .expect("root");
-                    let state = GateStore::new(Gate::FailAlways);
-                    let invoked = Arc::new(AtomicUsize::new(0));
+                        .expect("choice");
+                    state.failed.store(true, Ordering::SeqCst);
                     let (model, mut ctrl) = model_source(None);
                     let (tx, mut events) = mpsc::unbounded_channel();
-                    let running = AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
-                        .tool(Box::new(ProbeTool {
-                            sync,
-                            invoked: invoked.clone(),
-                        }))
-                        .start_with_observer(move |_| TestObserver { tx: tx.clone() });
-                    let peer = peer_input("r8", "peer-first", "first mail");
-                    running.send(peer.0, &peer.1).await;
-                    ctrl.next_request().await;
-                    ctrl.send_tool_call("lost", "probe", serde_json::json!({}));
-                    ctrl.finish();
-                    tokio::time::timeout(Duration::from_secs(5), async {
+                    let running = super::super::AgentSystemBuilder::new_local(
+                        conv.clone(),
+                        state.clone(),
+                        model,
+                    )
+                    .tool(Box::new(AsyncTool))
+                    .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+                    let (tx, mut replay) = mpsc::unbounded_channel();
+                    running.subscribe(tid, tx).await;
+                    next_evt(&mut replay).await;
+                    running.interrupt_handle().interrupt(tid);
+                    loop {
+                        if matches!(
+                            events.recv().await.expect("event"),
+                            Evt::E(AgentEvent::SettlementFailed { .. })
+                        ) {
+                            break;
+                        }
+                    }
+                    assert!(
+                        state.attempts.load(Ordering::SeqCst) <= 32,
+                        "fast retries are bounded"
+                    );
+                    assert!(ctrl.try_next_request().is_none(), "Held runs no inference");
+                    if recovery == "shutdown" {
+                        tokio::time::timeout(Duration::from_secs(1), running.shutdown())
+                            .await
+                            .expect("closed channels release Held driver");
+                        return;
+                    }
+                    state.failed.store(false, Ordering::SeqCst);
+                    if recovery == "input" {
+                        let peer = peer_input("held", "repair", "mail after repair");
+                        running.send(peer.0, &peer.1).await;
+                        tokio::time::timeout(Duration::from_secs(1), ctrl.next_request())
+                            .await
+                            .expect("any input retries Held promptly");
+                        ctrl.send_text("done");
+                        ctrl.finish();
+                    }
+                    tokio::time::timeout(Duration::from_secs(6), async {
                         loop {
                             if matches!(
-                                next_evt(&mut events).await,
-                                Evt::E(AgentEvent::SettlementFailed { .. })
+                                events.recv().await.expect("event"),
+                                Evt::E(AgentEvent::ThreadIdle)
                             ) {
                                 break;
                             }
                         }
                     })
                     .await
-                    .expect("failed dispatch writes must exhaust into Held");
-                    assert!(
-                        !persisted(&conv, "r8").contains("lost"),
-                        "no call may persist without its record"
-                    );
+                    .expect("slow timer settles after storage repair");
                     assert!(
                         state
-                            .inner
-                            .get_tool_dispatch(ThreadId::from_ref("r8"))
+                            .get_pending_user_choices(tid)
                             .await
-                            .expect("no record")
-                            .is_none()
+                            .expect("choices")
+                            .is_empty()
                     );
-                    let peer = peer_input("r8", "peer-after", "mail during held settlement");
-                    running.send(peer.0, &peer.1).await;
-                    let (tx, mut replay) = mpsc::unbounded_channel();
-                    running.subscribe(ThreadId::from_ref("r8"), tx).await;
-                    let Evt::Replay(snapshot) = next_evt(&mut replay).await else {
-                        panic!("replay");
-                    };
-                    assert!(!snapshot.idle);
-                    loop {
-                        if matches!(
-                            next_evt(&mut events).await,
-                            Evt::E(AgentEvent::SettlementFailed { .. })
-                        ) {
-                            break;
-                        }
-                    }
-                    assert!(ctrl.try_next_request().is_none());
-                    assert_eq!(invoked.load(Ordering::SeqCst), 0);
-                    let attempts = state.attempts.load(Ordering::SeqCst);
-                    state.repaired.store(true, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(250)).await;
                     assert_eq!(
-                        state.attempts.load(Ordering::SeqCst),
-                        attempts,
-                        "Held must stop automatic writes"
+                        persisted(&conv, "held")
+                            .matches("Tool call interrupted by user")
+                            .count(),
+                        1
                     );
-                    assert!(ctrl.try_next_request().is_none());
-                    running
-                        .interrupt_handle()
-                        .interrupt(ThreadId::from_ref("r8"));
-                    let request = tokio::time::timeout(Duration::from_secs(2), ctrl.next_request())
-                        .await
-                        .expect("explicit retry must release queued mail");
-                    assert!(
-                        format!("{:?}", request.chat_history).contains("executor was not invoked")
-                    );
-                    ctrl.send_text("repaired");
-                    ctrl.finish();
-                    wait_idle(&mut events).await;
-                    assert!(
-                        state
-                            .inner
-                            .get_tool_dispatch(ThreadId::from_ref("r8"))
-                            .await
-                            .expect("cleared")
-                            .is_none()
-                    );
-                    assert_eq!(invoked.load(Ordering::SeqCst), 0);
                     running.shutdown().await;
                 })
                 .await;
         }
     }
-
-    fn crash_at_dispatch(gate: Gate) {
-        for sync in [false, true] {
-            let conv = InMemoryConversationStore::new();
-            let state = GateStore::new(gate);
-            let invoked = Arc::new(AtomicUsize::new(0));
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("runtime");
-            runtime.block_on(tokio::task::LocalSet::new().run_until(async {
-                conv.ensure_root_thread(ThreadId::from_ref("r8"))
-                    .await
-                    .expect("root");
-                let (model, mut ctrl) = model_source(None);
-                let (tx, _events) = mpsc::unbounded_channel();
-                let running = AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
-                    .tool(Box::new(ProbeTool {
-                        sync,
-                        invoked: invoked.clone(),
-                    }))
-                    .start_with_observer(move |_| TestObserver { tx: tx.clone() });
-                let peer = peer_input("r8", "peer-first", "first mail");
-                running.send(peer.0, &peer.1).await;
-                ctrl.next_request().await;
-                ctrl.send_tool_call("lost", "probe", serde_json::json!({}));
-                ctrl.finish();
-                tokio::time::timeout(Duration::from_secs(2), state.entered.notified())
-                    .await
-                    .expect("dispatch boundary");
-                assert_eq!(
-                    state
-                        .inner
-                        .get_tool_dispatch(ThreadId::from_ref("r8"))
-                        .await
-                        .expect("record")
-                        .is_some(),
-                    matches!(gate, Gate::AfterWrite)
-                );
-                assert_eq!(invoked.load(Ordering::SeqCst), 0);
-                if matches!(gate, Gate::AfterWrite) {
-                    assert!(!persisted(&conv, "r8").contains("lost"));
-                }
-            }));
-            drop(runtime);
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("runtime");
-            runtime.block_on(tokio::task::LocalSet::new().run_until(async {
-                let (model, mut ctrl) = model_source(None);
-                let (tx, mut events) = mpsc::unbounded_channel();
-                let running =
-                    AgentSystemBuilder::new_local(conv.clone(), state.inner.clone(), model)
-                        .tool(Box::new(AsyncTool))
-                        .start_with_observer(move |_| TestObserver { tx: tx.clone() });
-                let (tx, mut replay) = mpsc::unbounded_channel();
-                running.subscribe(ThreadId::from_ref("r8"), tx).await;
-                let Evt::Replay(_) = next_evt(&mut replay).await else {
-                    panic!("replay");
-                };
-                let peer = peer_input("r8", "peer-after", "mail after ordinary restart");
-                running.send(peer.0, &peer.1).await;
-                tokio::time::timeout(Duration::from_secs(4), ctrl.next_request())
-                    .await
-                    .expect("restart at the dispatch write must not strand mail");
-                assert!(
-                    state
-                        .inner
-                        .get_tool_dispatch(ThreadId::from_ref("r8"))
-                        .await
-                        .expect("stale record cleared")
-                        .is_none()
-                );
-                assert!(
-                    !persisted(&conv, "r8").contains("interrupted: daemon restarted"),
-                    "an unmatched record must never settle a call"
-                );
-                assert!(!persisted(&conv, "r8").contains("lost"));
-                ctrl.send_text("mail received");
-                ctrl.finish();
-                wait_idle(&mut events).await;
-                running.shutdown().await;
-            }));
-        }
-    }
-
-    #[test]
-    fn r8_restart_between_call_history_and_dispatch_record() {
-        crash_at_dispatch(Gate::BeforeWrite);
-    }
-
-    #[test]
-    fn r8_restart_after_dispatch_record_before_call_history() {
-        crash_at_dispatch(Gate::AfterWrite);
-    }
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn r8_dispatch_positions_and_durable_result_matrix() {
-    use crate::event_processor::HistoryManager;
-    use crate::message::InfinityMessage;
-    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
-    use crate::traits::{ConversationStore, SpawnContext, StateStore};
-    use infinity_provider_protocol::message::{
-        ToolCall, ToolFunction, ToolResult, ToolResultContent,
-    };
-    use rap_protocol::ToolCallId;
-    for inherited in [false, true] {
-        for compacted in [false, true] {
-            for answered in [false, true] {
-                let conv = InMemoryConversationStore::new();
-                let state = InMemoryStateStore::new();
-                let parent = ThreadId::from_ref("parent");
-                conv.ensure_root_thread(parent).await.expect("parent");
-                let call = InfinityMessage::ToolCall {
-                    call: ToolCall {
-                        id: "same".into(),
-                        call_id: None,
-                        function: ToolFunction {
-                            name: "async_tool".into(),
-                            arguments: serde_json::json!({}),
-                        },
-                    },
-                    display_as: None,
-                };
-                conv.append_messages(
-                    parent,
-                    vec![
-                        (
-                            InfinityMessage::User {
-                                content: UserContent::text("parent"),
-                            },
-                            "p1".into(),
-                        ),
-                        (call.clone(), "p2".into()),
-                    ],
-                )
-                .await
-                .expect("parent history");
-                let tid = if inherited {
-                    conv.spawn_thread(
-                        parent,
-                        ToolCallId::from_ref("seed"),
-                        false,
-                        SpawnContext::InheritUpTo(2),
-                    )
-                    .await
-                    .expect("child")
-                } else {
-                    conv.ensure_root_thread(ThreadId::from_ref("root"))
-                        .await
-                        .expect("root");
-                    ThreadId::from("root")
-                };
-                conv.append_messages(
-                    &tid,
-                    vec![
-                        (
-                            InfinityMessage::User {
-                                content: UserContent::text("own input"),
-                            },
-                            "m1".into(),
-                        ),
-                        (
-                            InfinityMessage::User {
-                                content: UserContent::text("own context"),
-                            },
-                            "m2".into(),
-                        ),
-                        (call, "m3".into()),
-                    ],
-                )
-                .await
-                .expect("own history");
-                if compacted {
-                    conv.save_compaction_summary(&tid, "summary", 2)
-                        .await
-                        .expect("compact");
-                }
-                let mut history =
-                    HistoryManager::new_with_history(conv.clone(), state.clone(), tid.clone())
-                        .await
-                        .expect("history");
-                history.dispatch_epoch = Some("old-runtime".into());
-                history
-                    .record_tool_dispatch(ToolCallId::from_ref("same"))
-                    .await
-                    .expect("record");
-                assert_eq!(
-                    state
-                        .get_tool_dispatch(&tid)
-                        .await
-                        .expect("record")
-                        .expect("record present")
-                        .call_order,
-                    2
-                );
-                if answered {
-                    conv.append_messages(
-                        &tid,
-                        vec![(
-                            InfinityMessage::ToolResult {
-                                result: ToolResult {
-                                    id: "same".into(),
-                                    call_id: None,
-                                    content: vec![ToolResultContent::text("real durable result")],
-                                },
-                                display_segments: None,
-                            },
-                            "result".into(),
-                        )],
-                    )
-                    .await
-                    .expect("result persisted before clear");
-                }
-                let before = conv.thread_messages(&tid).expect("messages").len();
-                let (model, mut ctrl) = model_source(None);
-                let system =
-                    super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
-                        .build();
-                let thread = super::thread::Thread::load(system.inner.clone(), tid.clone())
-                    .await
-                    .expect("recovery");
-                assert!(thread.pending_tool_call().is_none());
-                assert_eq!(
-                    conv.thread_messages(&tid).expect("messages").len(),
-                    before + usize::from(!answered)
-                );
-                assert_eq!(
-                    persisted(&conv, tid.as_str())
-                        .matches("interrupted: daemon restarted")
-                        .count(),
-                    usize::from(!answered)
-                );
-                assert!(
-                    state
-                        .get_tool_dispatch(&tid)
-                        .await
-                        .expect("clear")
-                        .is_none()
-                );
-                assert!(ctrl.try_next_request().is_none());
-            }
-        }
-    }
-}
-
-mod r9_lifecycle {
-    use super::*;
-    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
-    use crate::traits::{ConversationStore, StateStore};
-    use infinity_provider_protocol::message::{ToolResult, ToolResultContent};
-    use rap_protocol::{ProviderCallId, ToolCallId};
-    use std::{sync::Arc, time::Duration};
-
-    struct StalledTool {
-        sync: bool,
-        entered: Arc<tokio::sync::Notify>,
-    }
+async fn caught_executor_panic_is_reported_and_can_be_interrupted() {
+    struct PanicTool;
     #[async_trait]
-    impl Tool<ChannelSender> for StalledTool {
+    impl Tool<ChannelSender> for PanicTool {
         fn name(&self) -> &str {
-            "stalled"
+            "panic_tool"
         }
         fn description(&self) -> &str {
-            "stalled executor"
+            "panics"
         }
         fn parameters(&self) -> serde_json::Value {
             serde_json::json!({"type":"object"})
         }
-        fn supports_sync(&self) -> bool {
-            self.sync
-        }
         async fn execute(
             &self,
             _: serde_json::Value,
-            _: ToolCallId,
-            _: Option<ProviderCallId>,
+            _: rap_protocol::ToolCallId,
+            _: Option<rap_protocol::ProviderCallId>,
             _: &ToolContext<ChannelSender>,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            self.entered.notify_one();
-            std::future::pending().await
-        }
-        async fn execute_synchronous(
-            &self,
-            _: &serde_json::Value,
-            _: &ToolCallId<str>,
-            _: Option<&ProviderCallId<str>>,
-            _: &ToolContext<ChannelSender>,
-        ) -> Option<ToolResult> {
-            self.entered.notify_one();
-            std::future::pending().await
+            panic!("executor panic fixture");
         }
     }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn r9_same_epoch_dropped_executor_settles_and_releases_mail() {
-        for sync in [false, true] {
-            let conv = InMemoryConversationStore::new();
-            let state = InMemoryStateStore::new();
-            let tid = ThreadId::from_ref("dropped");
-            let entered = Arc::new(tokio::sync::Notify::new());
+    tokio::task::LocalSet::new()
+        .run_until(async {
             let (model, mut ctrl) = model_source(None);
-            let system =
-                super::super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
-                    .tool(Box::new(StalledTool {
-                        sync,
-                        entered: entered.clone(),
-                    }))
-                    .build();
-            let thread = super::super::thread::Thread::load(system.inner.clone(), tid.to_owned())
-                .await
-                .expect("load");
-            let observer = super::super::EventCollector::new();
-            let (_cancel, cancel) = tokio::sync::oneshot::channel();
-            let mut step = Box::pin(thread.step_no_defer(
-                vec![user_text_input("dropped", "run")],
-                &observer,
-                cancel,
-            ));
-            tokio::time::timeout(Duration::from_secs(4), async {
-                tokio::select! {
-                    res = &mut step => panic!("executor must remain in flight: {res:?}"),
-                    () = async {
-                        ctrl.next_request().await;
-                        ctrl.send_tool_call("gone", "stalled", serde_json::json!({}));
-                        ctrl.finish();
-                        entered.notified().await;
-                    } => {}
-                }
-            })
-            .await
-            .expect("entered executor");
-            let record = state
-                .get_tool_dispatch(tid)
-                .await
-                .expect("record")
-                .expect("recorded");
-            assert!(system.inner.dispatches.awaiting(&tid.to_owned(), &record));
-            let live_load =
-                super::super::thread::Thread::load(system.inner.clone(), tid.to_owned())
-                    .await
-                    .expect("load while executor is live");
-            assert_eq!(live_load.pending_tool_call().expect("live call").0, "gone");
-            assert!(!persisted(&conv, "dropped").contains("interrupted:"));
-            drop(live_load);
-            drop(step);
-            drop(thread);
-            assert!(!system.inner.dispatches.awaiting(&tid.to_owned(), &record));
-            assert_eq!(Some(&record.epoch), system.inner.dispatch_epoch.as_ref());
-            let loaded = super::super::thread::Thread::load(system.inner.clone(), tid.to_owned())
-                .await
-                .expect("recover same epoch");
-            assert!(loaded.pending_tool_call().is_none());
-            assert_eq!(
-                persisted(&conv, "dropped")
-                    .matches("interrupted: result lost")
-                    .count(),
-                1
-            );
-            assert!(state.get_tool_dispatch(tid).await.expect("clear").is_none());
-            let (_cancel, cancel) = tokio::sync::oneshot::channel();
-            let late = tool_result_input("dropped", "gone", "late result");
-            let outcome = loaded
-                .step_no_defer(vec![late], &observer, cancel)
-                .await
-                .expect("late callback");
-            assert!(matches!(outcome, super::super::StepOutcome::Skipped));
-            assert!(!persisted(&conv, "dropped").contains("late result"));
-            let mut defer = super::super::defer::InMemoryDeferQueue::new();
-            let batch = loaded
-                .filter_deferrable(
-                    vec![peer_input(
-                        "dropped",
-                        "later",
-                        "mail after dropped executor",
-                    )],
-                    &mut defer,
-                )
-                .await
-                .expect("mail");
-            assert_eq!(batch.len(), 1);
-            let (_cancel, cancel) = tokio::sync::oneshot::channel();
-            let respond = async {
-                let req = ctrl.next_request().await;
-                assert!(format!("{:?}", req.chat_history).contains("mail after dropped executor"));
-                ctrl.send_text("done");
-                ctrl.finish();
-            };
-            let (result, ()) =
-                tokio::join!(loaded.step_no_defer(batch, &observer, cancel), respond);
-            result.expect("mail progresses");
-            assert!(persisted(&conv, "dropped").contains("mail after dropped executor"));
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn r9_same_epoch_reload_retains_received_real_result() {
-        use crate::event_processor::HistoryManager;
-        use crate::message::InfinityMessage;
-        use infinity_provider_protocol::message::{ToolCall, ToolFunction};
-        let conv = InMemoryConversationStore::new();
-        let state = InMemoryStateStore::new();
-        let tid = ThreadId::from_ref("received");
-        conv.ensure_root_thread(tid).await.expect("root");
-        conv.append_messages(
-            tid,
-            vec![(
-                InfinityMessage::ToolCall {
-                    call: ToolCall {
-                        id: "real".into(),
-                        call_id: None,
-                        function: ToolFunction {
-                            name: "async_tool".into(),
-                            arguments: serde_json::json!({}),
-                        },
-                    },
-                    display_as: None,
-                },
-                "call".into(),
-            )],
-        )
-        .await
-        .expect("history");
-        let (model, mut ctrl) = model_source(None);
-        let system =
-            super::super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model).build();
-        let mut history =
-            HistoryManager::new_with_history(conv.clone(), state.clone(), tid.to_owned())
-                .await
-                .expect("history");
-        history.dispatch_epoch = system.inner.dispatch_epoch.clone();
-        history.dispatches = Some(system.inner.dispatches.clone());
-        history
-            .record_tool_dispatch(ToolCallId::from_ref("real"))
-            .await
-            .expect("record");
-        history
-            .start_tool_dispatch()
-            .expect("dispatch")
-            .await_callback();
-        history
-            .handle_content(
-                InfinityMessage::ToolResult {
-                    result: ToolResult {
-                        id: "real".into(),
-                        call_id: None,
-                        content: vec![ToolResultContent::text("retained actual result")],
-                    },
-                    display_segments: None,
-                },
-                "result".into(),
+            let conv = crate::stores::InMemoryConversationStore::new();
+            let (tx, mut events) = mpsc::unbounded_channel();
+            let running = super::AgentSystemBuilder::new_local(
+                conv.clone(),
+                crate::stores::InMemoryStateStore::new(),
+                model,
             )
-            .expect("accept result");
-        assert!(!persisted(&conv, "received").contains("retained actual result"));
-        drop(history);
-        for _ in 0..2 {
-            let loaded = super::super::thread::Thread::load(system.inner.clone(), tid.to_owned())
-                .await
-                .expect("load");
-            assert!(loaded.pending_tool_call().is_none());
-        }
-        let stored = persisted(&conv, "received");
-        assert_eq!(stored.matches("retained actual result").count(), 1);
-        assert!(!stored.contains("interrupted:"));
-        assert!(
-            state
-                .get_tool_dispatch(tid)
-                .await
-                .expect("record")
-                .is_none()
-        );
-        assert!(ctrl.try_next_request().is_none());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn r9_attach_preserves_async_call_awaiting_callback() {
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                let (running, mut events, mut ctrl, conv) =
-                    start_system(vec![Box::new(AsyncTool)], None);
-                running
-                    .send_user_text(ThreadId::from_ref("live"), "run async")
-                    .await;
-                ctrl.next_request().await;
-                ctrl.send_tool_call("still-running", "async_tool", serde_json::json!({}));
-                ctrl.finish();
-                collect_until_finished(&mut events).await;
-                let before = persisted(&conv, "live");
-                let (subscriber, mut replay) = mpsc::unbounded_channel();
-                running
-                    .subscribe(ThreadId::from_ref("live"), subscriber)
-                    .await;
-                let Evt::Replay(snapshot) = next_evt(&mut replay).await else {
-                    panic!("replay");
-                };
-                assert!(!snapshot.idle);
-                assert_eq!(persisted(&conv, "live"), before);
-                assert!(!before.contains("interrupted:"));
-                assert!(ctrl.try_next_request().is_none());
-                let result = tool_result_input("live", "still-running", "real async callback");
-                running.send(result.0, &result.1).await;
-                let request = ctrl.next_request().await;
-                assert!(format!("{:?}", request.chat_history).contains("real async callback"));
-                ctrl.send_text("done");
-                ctrl.finish();
-                running.shutdown().await;
-            })
-            .await;
-    }
+            .tool(Box::new(PanicTool))
+            .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+            running
+                .send_user_text(ThreadId::from_ref("panic"), "work")
+                .await;
+            ctrl.next_request().await;
+            ctrl.send_tool_call("panic-call", "panic_tool", serde_json::json!({}));
+            ctrl.finish();
+            loop {
+                if let Evt::E(AgentEvent::DriverFailed { text }) = next_evt(&mut events).await {
+                    assert!(text.starts_with("Thread driver failed:"));
+                    break;
+                }
+            }
+            assert!(!persisted(&conv, "panic").contains("Tool call interrupted by user"));
+            let (tx, mut replay) = mpsc::unbounded_channel();
+            running.subscribe(ThreadId::from_ref("panic"), tx).await;
+            assert!(matches!(next_evt(&mut replay).await, Evt::Replay(snapshot) if !snapshot.idle));
+            running
+                .interrupt_handle()
+                .interrupt(ThreadId::from_ref("panic"));
+            loop {
+                if matches!(next_evt(&mut events).await, Evt::E(AgentEvent::ThreadIdle)) {
+                    break;
+                }
+            }
+            assert!(persisted(&conv, "panic").contains("Tool call interrupted by user"));
+            running.shutdown().await;
+        })
+        .await;
 }

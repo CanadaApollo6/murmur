@@ -19,6 +19,10 @@ struct InfinityResume {
     kind: String,
     socket: std::path::PathBuf,
     root: ThreadRef,
+    #[serde(default)]
+    boot_id: String,
+    #[serde(default)]
+    needs_interrupt: bool,
 }
 
 struct Choice {
@@ -41,6 +45,8 @@ struct InfinitySession {
     choices: HashMap<PermissionId, Choice>,
     cancel_deadline: Option<Instant>,
     ended: bool,
+    boot_id: String,
+    needs_interrupt: bool,
 }
 
 fn protocol(error: impl std::fmt::Display) -> AdapterError {
@@ -55,8 +61,8 @@ impl Adapter for InfinityAdapter {
         };
         let stream = tokio::time::timeout(self.0.request_timeout, UnixStream::connect(socket))
             .await
-            .map_err(|e| AdapterError::Spawn(e.to_string()))?
-            .map_err(|e| AdapterError::Spawn(format!("Infinity daemon socket: {e}")))?;
+            .map_err(|e| AdapterError::Unavailable(e.to_string()))?
+            .map_err(|e| AdapterError::Unavailable(format!("Infinity daemon socket: {e}")))?;
         let (tx, mut outgoing) = mpsc::unbounded_channel();
         let (incoming, rx) = mpsc::channel(64);
         let timeout = self.0.request_timeout;
@@ -109,18 +115,12 @@ impl Adapter for InfinityAdapter {
             choices: HashMap::new(),
             cancel_deadline: None,
             ended: false,
+            boot_id: String::new(),
+            needs_interrupt: false,
         });
-        if let Err(error) = tokio::time::timeout(timeout, session.initialize(&req))
+        tokio::time::timeout(timeout, session.initialize(&req))
             .await
-            .map_err(protocol)
-            .and_then(|r| r)
-        {
-            return Err(if req.resume.is_some() {
-                AdapterError::ResumeFailed(error.to_string())
-            } else {
-                error
-            });
-        }
+            .map_err(protocol)??;
         Ok(session)
     }
 }
@@ -144,7 +144,12 @@ impl InfinitySession {
                 .ok_or(AdapterError::Ended)?
                 .map_err(protocol)?
             {
-                DaemonMessage::Welcome { sessions, .. } => break sessions,
+                DaemonMessage::Welcome {
+                    sessions, boot_id, ..
+                } => {
+                    self.boot_id = boot_id;
+                    break sessions;
+                }
                 DaemonMessage::Error { text, .. } => return Err(protocol(text)),
                 _ => {}
             }
@@ -159,11 +164,15 @@ impl InfinitySession {
             {
                 return Err(protocol("Infinity resume token kind or daemon mismatch"));
             }
-            if !sessions.get(&saved.root).is_some_and(|session| {
-                session.status != infinity_protocol::SessionStatus::Archived
-                    && session.remote.is_none()
-            }) {
-                return Err(protocol("Infinity root thread is missing or archived"));
+            let Some(session) = sessions.get(&saved.root) else {
+                return Err(AdapterError::ResumeFailed(
+                    "Infinity root thread does not exist".into(),
+                ));
+            };
+            if session.status == infinity_protocol::SessionStatus::Archived
+                || session.remote.is_some()
+            {
+                return Err(protocol("Infinity root thread is archived or remote"));
             }
             self.send(ClientMessage::Connect {
                 root_thread_id: saved.root.clone(),
@@ -232,6 +241,14 @@ impl InfinitySession {
             let replay = matches!(message, DaemonMessage::Replay { .. });
             self.receive(message)?;
             if replay {
+                if saved
+                    .as_ref()
+                    .is_some_and(|s| s.needs_interrupt || s.boot_id != self.boot_id)
+                    && self.thread_busy
+                {
+                    self.needs_interrupt = true;
+                    self.cancel().await?;
+                }
                 return Ok(());
             }
         }
@@ -304,9 +321,14 @@ impl InfinitySession {
                 if self.root_event(&thread_id) =>
             {
                 self.thread_busy = true;
+                self.needs_interrupt = false;
                 // Attachment idle can precede this newer completion in the socket.
                 // Receipt recovery applies at idle, never during valid inference.
                 self.receipt_deadline = None;
+                if self.cancel_deadline.take().is_some() {
+                    self.choices.clear();
+                    self.events.push_back(SessionEvent::CancelComplete);
+                }
                 self.started()
             }
             DaemonMessage::ToolResult { thread_id, .. } if self.root_event(&thread_id) => {
@@ -333,6 +355,7 @@ impl InfinitySession {
             }
             DaemonMessage::ThreadIdle { thread_id } if self.root_event(&thread_id) => {
                 self.thread_busy = false;
+                self.needs_interrupt = false;
                 self.receipt_deadline =
                     (!self.pending.is_empty()).then(|| Instant::now() + self.kind.request_timeout);
                 self.finish_input();
@@ -397,6 +420,7 @@ impl InfinitySession {
             DaemonMessage::Error { thread_id, text }
                 if thread_id.is_none() || self.root_event(&thread_id) =>
             {
+                self.needs_interrupt |= text.starts_with("Thread driver failed:");
                 return Err(protocol(text));
             }
             _ => {}
@@ -415,6 +439,8 @@ impl Session for InfinitySession {
             kind: self.kind.name.clone(),
             socket: socket.clone(),
             root: self.root.clone(),
+            boot_id: self.boot_id.clone(),
+            needs_interrupt: self.needs_interrupt,
         })
     }
     fn resumable(&self) -> bool {
@@ -432,6 +458,9 @@ impl Session for InfinitySession {
         }
         if turn.items.is_empty() {
             return Err(protocol("Infinity submit requires mail"));
+        }
+        if !self.thread_busy && self.receipt_deadline.is_none() {
+            self.receipt_deadline = Some(Instant::now() + self.kind.request_timeout);
         }
         for item in turn.items {
             let (envelope, from, text) = match item {
@@ -479,10 +508,7 @@ impl Session for InfinitySession {
         Ok(())
     }
     async fn answer_permission(&mut self, id: PermissionId, key: &str) -> Result<(), AdapterError> {
-        let choice = self
-            .choices
-            .get(&id)
-            .ok_or_else(|| protocol("stale Infinity choice"))?;
+        let choice = self.choices.get(&id).ok_or(AdapterError::StaleChoice)?;
         let selected: usize = key.parse().map_err(protocol)?;
         if selected >= choice.count {
             return Err(protocol("invalid Infinity choice"));

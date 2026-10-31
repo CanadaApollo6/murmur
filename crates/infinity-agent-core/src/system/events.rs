@@ -24,8 +24,10 @@ pub struct UserChoice {
 pub enum AgentEvent {
     /// The resident driver has no queued work, unresolved tool, or choice.
     ThreadIdle,
-    /// Settlement stopped retrying. The resident driver retains its pending
-    /// history and waits for an explicit interrupt to retry after repair.
+    /// The driver panicked and its in-memory execution state was lost.
+    DriverFailed { text: String },
+    /// Settlement exhausted its fast retries. The driver retains pending
+    /// history and retries on input, interruption, and a slow timer.
     SettlementFailed { text: String },
     /// Confirms durable input even when a redelivery skips completion.
     InputCommitted { dedup_id: String },

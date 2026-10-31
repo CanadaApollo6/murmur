@@ -90,7 +90,7 @@ const SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(3);
 
 enum Settlement {
     Retrying { next: Instant, expires: Instant },
-    Held,
+    Held { next: Instant },
 }
 impl Settlement {
     fn retry() -> Self {
@@ -106,7 +106,10 @@ impl Settlement {
                 tokio::time::sleep_until(*next).await;
                 *expires
             }
-            Self::Held => std::future::pending().await,
+            Self::Held { next } => {
+                tokio::time::sleep_until(*next).await;
+                Instant::now()
+            }
         }
     }
 }
@@ -179,7 +182,16 @@ pub(crate) async fn drive_thread<C, S, H, O>(
     let mut settlement: Option<Settlement> = None;
 
     'driver: loop {
-        if in_flight.is_none() && settlement.is_none() && thread.needs_dispatch_settlement() {
+        if in_flight.is_none()
+            && settlement.is_none()
+            && let Err(error) = thread.persist_tool_results(&observer).await
+        {
+            observer.on_event(
+                &thread_id,
+                &AgentEvent::Info {
+                    text: format!("Error: {error}"),
+                },
+            );
             settlement = Some(Settlement::retry());
         }
         if let Some(state) = &settlement {
@@ -187,7 +199,7 @@ pub(crate) async fn drive_thread<C, S, H, O>(
             // Inputs wait, but subscribers can reconnect during a storage outage.
             tokio::select! {
                 biased;
-                expires = state.wait() => {
+                expires = state.wait(), if matches!(state, Settlement::Retrying { .. }) || !rx.is_closed() || !interrupt_rx.is_closed() || !subscribe_closed => {
                     match thread.interrupt(&observer).await {
                         Ok(()) => settlement = None,
                         Err(error) => {
@@ -196,18 +208,23 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                             });
                             settlement = Some(if Instant::now() >= expires {
                                 observer.on_event(&thread_id, &AgentEvent::SettlementFailed {
-                                    text: "Interrupt settlement exhausted; repair storage and interrupt to retry".into(),
+                                    text: "Interrupt settlement exhausted; will retry on input or timer after storage repair".into(),
                                 });
-                                Settlement::Held
+                                Settlement::Held { next: Instant::now() + Duration::from_secs(5) }
                             } else {
                                 Settlement::Retrying { next: Instant::now() + Duration::from_millis(100), expires }
                             });
                         }
                     }
                 }
-                Some(input) = rx.recv() => pending_batch.push(input),
+                Some(input) = rx.recv() => {
+                    pending_batch.push(input);
+                    if matches!(settlement, Some(Settlement::Held { .. })) {
+                        settlement = Some(Settlement::retry());
+                    }
+                },
                 Some(()) = interrupt_rx.recv() => {
-                    if matches!(settlement, Some(Settlement::Held)) {
+                    if matches!(settlement, Some(Settlement::Held { .. })) {
                         settlement = Some(Settlement::retry());
                     }
                 },
@@ -218,9 +235,9 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                             snapshot.idle = false;
                             observer.on_subscribe(&thread_id, req, snapshot);
                             let _ = ack.send(());
-                            if matches!(settlement, Some(Settlement::Held)) {
+                            if matches!(settlement, Some(Settlement::Held { .. })) {
                                 observer.on_event(&thread_id, &AgentEvent::SettlementFailed {
-                                    text: "Interrupt settlement held; repair storage and interrupt to retry".into(),
+                                    text: "Interrupt settlement held; will retry on input or timer after storage repair".into(),
                                 });
                             }
                         }
@@ -244,6 +261,7 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                         &mut total_tokens,
                         &mut compaction_triggered,
                         &mut pending_batch,
+                        &mut settlement,
                     );
                     continue;
                 },
@@ -259,8 +277,11 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                             .cancel()
                             .await;
                         handle_step_result(res, &observer, &thread_id, &mut total_tokens,
-                            &mut compaction_triggered, &mut pending_batch);
-                        if thread.needs_dispatch_settlement() {
+                            &mut compaction_triggered, &mut pending_batch, &mut settlement);
+                        if settlement.is_some() { continue; }
+                        if let Err(error) = thread.persist_tool_results(&observer).await {
+                            observer.on_event(&thread_id, &AgentEvent::Info { text: format!("Error: {error}") });
+                            settlement = Some(Settlement::retry());
                             continue;
                         }
                         return;
@@ -284,6 +305,7 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                             &mut total_tokens,
                             &mut compaction_triggered,
                             &mut pending_batch,
+                            &mut settlement,
                         );
 
                         let (mut user_inputs, non_user_inputs): (Vec<_>, Vec<_>) = batch
@@ -310,6 +332,7 @@ pub(crate) async fn drive_thread<C, S, H, O>(
                     handle_step_result(
                         res, &observer, &thread_id, &mut total_tokens,
                         &mut compaction_triggered, &mut pending_batch,
+                        &mut settlement,
                     );
                     settlement = Some(Settlement::retry());
                     continue;
@@ -397,12 +420,6 @@ pub(crate) async fn drive_thread<C, S, H, O>(
 
             batch
         };
-
-        if thread.needs_dispatch_settlement() {
-            pending_batch.extend(new_inputs);
-            settlement = Some(Settlement::retry());
-            continue;
-        }
 
         // Reset the compaction trigger (and the stale token count) once a
         // compaction round-trips: the next completion reports fresh usage.
@@ -495,6 +512,7 @@ fn handle_step_result(
     total_tokens: &mut u64,
     compaction_triggered: &mut bool,
     pending_batch: &mut Vec<(InputMessage, String)>,
+    settlement: &mut Option<Settlement>,
 ) {
     match res {
         Ok(StepOutcome::Completed {
@@ -539,6 +557,7 @@ fn handle_step_result(
         }
         Ok(StepOutcome::Skipped) => {}
         Err(e) => {
+            *settlement = Some(Settlement::retry());
             observer.on_event(
                 thread_id,
                 &AgentEvent::Info {

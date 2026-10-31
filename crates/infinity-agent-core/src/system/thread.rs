@@ -92,8 +92,7 @@ struct ResolvedConfig<M: InputSender, H: HttpClient> {
 /// reloads it from the stores) and resident embeddings park it on a channel.
 ///
 /// The thread's configuration (tools, prompt, notifier) is resolved lazily
-/// on the first step. Restart recovery uses a separate notifier lookup that
-/// does not boot servers or fetch tool manifests.
+/// on the first step.
 pub struct Thread<C: ConversationStore, S: StateStore, M: InputSender, H: HttpClient> {
     inner: Rc<SystemInner<C, S, M, H>>,
     history: HistoryManager<C, S>,
@@ -119,122 +118,24 @@ where
         inner: Rc<SystemInner<C, S, M, H>>,
         thread_id: ThreadId,
     ) -> Result<Self, BoxError> {
-        let mut history = HistoryManager::new_with_history(
+        let history = HistoryManager::new_with_history(
             inner.conversation_store.clone(),
             inner.state_store.clone(),
             thread_id,
         )
         .await?;
-        history.dispatch_epoch = inner.dispatch_epoch.clone();
-        history.dispatches = inner
-            .dispatch_epoch
-            .as_ref()
-            .map(|_| inner.dispatches.clone());
-        if history.dispatch_epoch.is_some() {
-            *history.dispatch.borrow_mut() = inner
-                .state_store
-                .get_tool_dispatch(&history.thread_id)
-                .await?;
-        }
         let pending_choices = inner
             .state_store
             .get_pending_user_choices(&history.thread_id)
             .await?;
-        let thread = Self {
+        Ok(Self {
             inner,
             history,
             config: RefCell::new(None),
             current_thinking: RefCell::new(None),
             in_flight: Cell::new(false),
             pending_choices: RefCell::new(pending_choices),
-        };
-        let dispatch = thread.history.dispatch.borrow().clone();
-        if let Some(dispatch) = dispatch {
-            let pending = thread.history.pending_dispatch_matches(&dispatch);
-            let orphaned = pending
-                && (Some(&dispatch.epoch) != thread.inner.dispatch_epoch.as_ref()
-                    || !thread
-                        .inner
-                        .dispatches
-                        .awaiting(&thread.history.thread_id, &dispatch));
-            if orphaned {
-                thread
-                    .inner
-                    .state_store
-                    .set_tool_dispatch(
-                        &thread.history.thread_id,
-                        Some(crate::traits::ToolDispatch {
-                            recovering: true,
-                            ..dispatch.clone()
-                        }),
-                    )
-                    .await?;
-                *thread.history.dispatch.borrow_mut() = Some(crate::traits::ToolDispatch {
-                    recovering: true,
-                    ..dispatch.clone()
-                });
-                if let Some(result) = thread
-                    .inner
-                    .dispatches
-                    .result(&thread.history.thread_id, &dispatch)
-                {
-                    thread.history.restore_dispatch_result(result)?;
-                } else {
-                    let text = if Some(&dispatch.epoch) != thread.inner.dispatch_epoch.as_ref() {
-                        "interrupted: daemon restarted"
-                    } else {
-                        "interrupted: result lost"
-                    };
-                    thread.history.interrupt_pending_tool_call_with_text(text);
-                }
-                thread.history.settle_tool_results_on_interrupt().await?;
-                let interrupted = thread.history.take_interrupted_tool_calls();
-                let notification = async {
-                    if let Some(notifier) = thread
-                        .inner
-                        .config
-                        .restart_notifier(&thread.history.thread_id)
-                        .await?
-                    {
-                        for call_id in interrupted {
-                            notifier
-                                .notify_tool_cancelled(&thread.history.thread_id, &call_id)
-                                .await;
-                        }
-                    }
-                    Ok::<_, BoxError>(())
-                };
-                match tokio::time::timeout(std::time::Duration::from_secs(2), notification).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            %error,
-                            thread_id = %thread.history.thread_id,
-                            "Restart cancellation notification failed"
-                        );
-                    }
-                    Err(_) => tracing::warn!(
-                        thread_id = %thread.history.thread_id,
-                        "Restart cancellation notification timed out"
-                    ),
-                }
-            }
-            if orphaned || dispatch.recovering {
-                let choices = thread.pending_choices.borrow().clone();
-                for choice in choices {
-                    thread
-                        .inner
-                        .state_store
-                        .remove_pending_user_choice(&thread.history.thread_id, &choice.id)
-                        .await?;
-                }
-                thread.pending_choices.borrow_mut().clear();
-            }
-            if orphaned || !pending {
-                thread.history.clear_tool_dispatch().await?;
-            }
-        }
-        Ok(thread)
+        })
     }
 
     /// Resolve (once) this thread's configuration and append the built-in
@@ -337,17 +238,19 @@ where
             .is_some_and(|(_, name)| name != CLOSE_THREAD_TOOL)
     }
 
-    pub(crate) fn dispatch_write_pending(&self) -> bool {
-        self.history.dispatch_write_pending()
-    }
-
-    pub(crate) fn needs_dispatch_settlement(&self) -> bool {
-        self.history.dispatch_settlement_pending() || self.history.orphaned_dispatch().is_some()
+    pub(crate) async fn persist_tool_results(
+        &self,
+        observer: &impl ThreadObserver,
+    ) -> Result<(), BoxError> {
+        if self.history.has_pending_tool_results() {
+            self.history.settle_tool_results_on_interrupt().await?;
+            self.emit_committed(observer, &self.history.thread_id);
+        }
+        Ok(())
     }
 
     pub(crate) fn is_settled(&self) -> bool {
-        !self.needs_dispatch_settlement()
-            && !self.in_flight.get()
+        !self.in_flight.get()
             && !self.awaiting_tool_result()
             && self.pending_choices.borrow().is_empty()
     }
@@ -356,20 +259,8 @@ where
     /// acknowledged only after both the tool result and choice removal persist.
     pub(crate) async fn interrupt<O: ThreadObserver>(&self, observer: &O) -> Result<(), BoxError> {
         let thread_id = &self.history.thread_id;
-        let orphan = self.history.orphaned_dispatch();
-        if let Some(dispatch) = &orphan
-            && let Some(result) = self.inner.dispatches.result(thread_id, dispatch)
-        {
-            self.history.restore_dispatch_result(result)?;
-        }
         let pending_tool = self.pending_tool_call().is_some();
-        let interruption_text = if self.dispatch_write_pending() {
-            "Error: dispatch record write failed; executor was not invoked"
-        } else if orphan.is_some() {
-            "interrupted: result lost"
-        } else {
-            event_processor::TOOL_CALL_INTERRUPTED_TEXT
-        };
+        let interruption_text = event_processor::TOOL_CALL_INTERRUPTED_TEXT;
         if pending_tool {
             self.history
                 .interrupt_pending_tool_call_with_text(interruption_text);
@@ -377,6 +268,7 @@ where
         // An accepted real result can shadow the call without being durable.
         // Preserve it, while leaving unrelated user/peer inputs unvalidated.
         self.history.settle_tool_results_on_interrupt().await?;
+        self.emit_committed(observer, thread_id);
         let interrupted = self.history.take_interrupted_tool_calls();
         if !interrupted.is_empty() {
             let config = self.resolved_config().await?;
@@ -525,7 +417,10 @@ where
                 self.inner
                     .state_store
                     .add_pending_user_choice(&thread_id, choice.clone())
-                    .await?;
+                    .await
+                    .map_err(|error| -> BoxError {
+                        format!("choice persistence failed: {error}").into()
+                    })?;
                 {
                     let mut pending = self.pending_choices.borrow_mut();
                     if let Some(existing) = pending.iter_mut().find(|c| c.id == choice.id) {
@@ -757,36 +652,26 @@ where
         self.in_flight.set(false);
         *self.current_thinking.borrow_mut() = None;
 
-        if self.dispatch_write_pending() {
-            return Err("dispatch record write requires settlement".into());
-        }
-        if let Some(CompletionAction::ExecuteToolCall { tool_call_id, .. }) = &action {
-            self.history.record_tool_dispatch(tool_call_id).await?;
-        }
-
         // Persistence errors withhold receipts but must not strand tool dispatch.
         self.history.sync().await?;
         self.emit_committed(observer, &thread_id);
         observer.on_event(&thread_id, &AgentEvent::CompletionFinished { usage });
 
         // A failed dispatch enqueues an error result so the thread can advance.
-        if let Some(action) = action {
-            let dispatch_guard = self.history.start_tool_dispatch();
-            if let Err(e) = event_processor::execute_action_with_error_result(
+        if let Some(action) = action
+            && let Err(e) = event_processor::execute_action_with_error_result(
                 action,
                 &tool_registry,
                 &tool_context,
-                dispatch_guard,
             )
             .await
-            {
-                observer.on_event(
-                    &thread_id,
-                    &AgentEvent::Info {
-                        text: format!("Error: {}", e),
-                    },
-                );
-            }
+        {
+            observer.on_event(
+                &thread_id,
+                &AgentEvent::Info {
+                    text: format!("Error: {e}"),
+                },
+            );
         }
 
         Ok(StepOutcome::Completed {

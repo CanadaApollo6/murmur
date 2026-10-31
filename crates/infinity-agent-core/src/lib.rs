@@ -1,4 +1,3 @@
-mod dispatch;
 pub mod event_processor;
 pub mod message;
 pub mod stores;

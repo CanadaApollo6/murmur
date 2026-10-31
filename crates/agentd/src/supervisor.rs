@@ -290,6 +290,7 @@ impl Broker {
             offered: Vec::new(),
             pending: HashMap::new(),
             crashes: VecDeque::new(),
+            unavailable_attempts: 0,
             idle_since: Instant::now(),
         };
         tokio::spawn(actor.run());
@@ -341,6 +342,7 @@ struct AgentActor {
     offered: Vec<MessageId>,
     pending: HashMap<PermissionId, (PermissionRequest, Option<Instant>)>,
     crashes: VecDeque<Instant>,
+    unavailable_attempts: u32,
     idle_since: Instant,
 }
 
@@ -451,6 +453,7 @@ impl AgentActor {
             .await
         {
             Ok(mut session) => {
+                self.unavailable_attempts = 0;
                 let busy = session.busy();
                 if self.cancelling {
                     if busy {
@@ -475,6 +478,11 @@ impl AgentActor {
                 .phase(Phase::NeedsRecovery {
                     reason: error.to_string(),
                 }),
+            Err(AdapterError::Unavailable(reason)) if self.model_agent => {
+                tracing::warn!(agent=%self.id, %reason, "waiting for Infinity daemon");
+                self.unavailable_attempts = self.unavailable_attempts.saturating_add(1);
+                self.retry(self.unavailable_attempts);
+            }
             Err(error) => self.crash(error.to_string()),
         }
         if self.session.is_none()
@@ -561,6 +569,15 @@ impl AgentActor {
                     agent: self.id,
                     ids,
                 });
+            }
+            SessionEvent::CancelComplete => {
+                self.cancelling = false;
+                self.clear_pending();
+                self.emit(Event::TurnEnded {
+                    agent: self.id,
+                    outcome: TurnOutcome::Cancelled,
+                });
+                self.phase(Phase::Busy);
             }
             SessionEvent::TurnEnded { outcome } => {
                 if !self.offered.is_empty() {
@@ -659,6 +676,11 @@ impl AgentActor {
             }
         };
         if let Err(error) = result {
+            if matches!(error, AdapterError::StaleChoice) {
+                self.pending.remove(&id);
+                self.emit(Event::PermissionAnswered { agent: self.id, id });
+                return Err(Error::StalePermission);
+            }
             self.end(error.to_string()).await?;
             return Err(Error::Closed);
         }
@@ -695,10 +717,14 @@ impl AgentActor {
             mcp.revoke(self.id).await;
         }
         if let Some(session) = self.session.take() {
-            session
+            let token = session
                 .suspend()
                 .await
                 .map_err(|e| Error::Rejected(e.to_string()))?;
+            if self.model_agent {
+                self.mailroom.save_resume(self.id, token.clone()).await?;
+                self.resume = Some(token);
+            }
         }
         self.mailroom
             .settle_session(self.id, self.incarnation, false, self.model_agent)
@@ -732,17 +758,24 @@ impl AgentActor {
         if self.crashes.len() >= self.config.crash_limit {
             self.phase(Phase::Failed { last: reason });
         } else {
-            let attempt = self.crashes.len() as u32;
-            let delay = self
-                .config
-                .backoff_initial
-                .saturating_mul(1u32 << (attempt - 1).min(31))
-                .min(self.config.backoff_max);
-            self.phase(Phase::Crashed {
-                attempt,
-                retry_at: now + delay,
-            });
+            self.retry(self.crashes.len() as u32);
         }
+    }
+    fn retry(&mut self, attempt: u32) {
+        let delay = self
+            .config
+            .backoff_initial
+            .saturating_mul(1u32 << attempt.saturating_sub(1).min(31))
+            .min(self.config.backoff_max)
+            .min(if self.model_agent {
+                Duration::from_secs(60)
+            } else {
+                self.config.backoff_max
+            });
+        self.phase(Phase::Crashed {
+            attempt,
+            retry_at: Instant::now() + delay,
+        });
     }
     fn deadline(&self) -> Option<Instant> {
         let mut deadline = match self.phase {

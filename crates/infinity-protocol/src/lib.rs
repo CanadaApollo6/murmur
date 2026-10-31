@@ -467,6 +467,9 @@ pub enum DaemonMessage {
     },
     /// Sent immediately on socket connection with session list and default model info.
     Welcome {
+        /// Random daemon-lifetime identity, shared by every connection.
+        #[serde(default)]
+        boot_id: String,
         sessions: HashMap<ThreadRef, SessionInfo>,
         available_models: Vec<ModelInfo>,
         default_model_name: String,

@@ -68,62 +68,45 @@ model = "local/qwen3-coder"
 ```
 
 Each Infinity agent owns one root thread, saved in its opaque resume token.
-Missing or archived roots and refused resumes enter `NeedsRecovery` without
-creating a replacement thread. EOF reconnects with a new incarnation. Unconsumed
-mail is re-offered. Human and peer mail both use `DeliverPeerMessage`, with
-stable dedup ID `peer-{MessageId}`. Human mail sets `from` to `human` and identifies
-the human operator in its rendered body. Mail waits behind an active tool and
-wakes passive sleep without interrupting inference. Delivery does not require
-`ThreadIdle` or `Replay.idle`. Those signals still drive phase display and
-cancellation acknowledgment. Use `agentctl cancel` to stop a runaway agent.
-Only matching root `InputCommitted` receipts consume mail. Output, echoes, and
-replay history are not receipts. The separate Infinity history and dedup-ID
-writes retain a crash window that can duplicate either sender's mail on re-offer.
+Only a daemon-reported missing root enters `NeedsRecovery`. Timeouts and transient
+resume errors use normal crash backoff without creating a replacement thread.
+EOF reconnects with a new incarnation. Unconsumed mail is re-offered. Human and
+peer mail both use `DeliverPeerMessage`, with stable dedup ID `peer-{MessageId}`.
+Human mail sets `from` to `human` and identifies the human operator in its body.
+Mail waits behind an active tool and wakes passive sleep. Only exact root
+`InputCommitted` receipts consume mail. Output and replay are not receipts.
+Separate history and dedup-ID writes retain a window that can duplicate mail.
 
-If an Infinity cancellation deadline expires, the actor reconnects and reissues
-`Interrupt` when replay is busy, with a fresh cancellation deadline. Repeated
-failures reach the existing crash limit. Core retains accepted tool results and
-retries failed interrupt writes every 100 ms for three seconds. At exhaustion it
-holds the pending result, emits an error, and stops inference and automatic
-write retries. Repair storage and explicitly interrupt to retry. Retaining an
-accepted result through a storage outage requires the daemon to remain alive.
-RAP cancellation notifications have a two-second timeout and cannot block
-settlement forever.
+The daemon includes a random process boot ID in `Welcome`. The adapter saves it
+in the resume token. When a reopened root has a different boot ID and
+`Replay.idle` is false, agentd sends one `Interrupt`. It uses the same rule after
+a driver-failure protocol error within the same daemon. Core settles the call
+durably and removes pending choices. Recovery never invokes the tool again.
+Only agentd-attached threads auto-recover after a daemon restart. An executor
+lost inside a running daemon needs `agentctl cancel` unless it panicked.
 
-Each resident runtime has a fresh epoch and an in-memory registry of dispatched
-calls. Before persisting a tool call or invoking its executor, core writes a
-dispatch record with the call ID, epoch, and absolute history position. The
-registry marks that exact occurrence as awaiting a result when execution starts.
-Async RAP calls remain live after dispatch returns, until their callback arrives
-or the call is interrupted. Dropping an executor invocation future removes its
-live claim. Accepting a result replaces the claim with the retained result.
+Cancellation has a deadline. Reconnects reissue an outstanding cancellation when
+replay is busy. A later `StartOutput` or `ThinkingStart` acknowledges cancellation
+and clears its deadline while the new completion continues. Core preserves
+accepted real results during settlement. It also persists leading results that
+answer pending calls before driver idle or after a step error, including a
+provider failure. Unrelated unvalidated mail stays unpersisted.
 
-Before a driver exits, accepted results of recorded calls enter bounded
-settlement, even if the follow-up provider request failed before any output.
-Settlement preserves the real result without validating unrelated mail. On load
-or attachment, a recorded pending call is orphaned if its exact occurrence is
-absent from the runtime's awaiting set. Recovery persists its retained result
-when available. Otherwise it uses `interrupted: result lost` for a same-epoch
-orphan and `interrupted: daemon restarted` for an older epoch. Epochs remain an
-explicit runtime boundary and retain the existing store format. An epoch match
-alone never proves a call is live. Late callbacks cannot add a second result.
+Failed settlement writes retry every 100 ms for three seconds, then enter Held.
+Held runs no inference and retains pending results. It retries on new input,
+interrupt, and a five-second timer. Closed channels release a Held driver during
+shutdown. A failed choice write enters this same bounded settlement path, so a
+call cannot wait forever for a prompt that was never saved. RAP cancellation
+notifications have a two-second bound. Retaining accepted results during a
+storage outage requires the daemon to remain alive.
 
-A record without a matching pending call is cleared without another result.
-Recovery never re-executes tools or starts inference.
-
-Seeds and legacy calls without dispatch records remain untouched. Existing
-stores cannot recover orphaned calls from before this policy. Those calls need
-a real result or an explicit interrupt. A failed dispatch-record write prevents
-call persistence and execution. Core retries through bounded settlement. If a
-retry succeeds, it persists the call with a synthetic failure result. If retries
-expire, it reports an error and holds the thread without persisting the call.
-Repair storage and explicitly interrupt to retry held settlement.
-
-An idle-derived receipt deadline is cleared when a later root completion starts,
-including the first turn after attachment. Inference may outlast the receipt
-timeout; a new core idle event arms receipt recovery if a receipt is missing.
-Model agents never idle-suspend. Both human and peer mail can enter a busy
-Infinity session unless an approval or cancellation is pending.
+The receipt deadline starts when submission begins on an idle root. A later
+completion start clears it, so inference may outlast the receipt timeout. A new
+idle event rearms it for outstanding mail. A silent daemon cannot leave offered
+mail waiting forever. Model agents never idle-suspend. An unreachable daemon
+uses backoff capped at 60 seconds without consuming the model agent crash limit.
+A session that connected successfully and then failed does count as a crash.
+ACP spawn failures keep their existing crash policy.
 
 Infinity's daemon owns sandbox and RAP tool configuration. The socket API cannot
 apply agentd's per-agent sandbox launch flags or MCP entries. The adapter rejects
@@ -216,7 +199,8 @@ split across frames may appear without redaction.
 and NeedsRecovery. Busy CLI agents wait for a turn boundary. Infinity accepts
 deferrable mail while busy. Five crashes in ten
 minutes stop retries; backoff doubles from one second to a 60-second cap.
-A failed resume enters NeedsRecovery without creating a fresh conversation.
+A failed ACP resume or a missing Infinity root enters NeedsRecovery without
+creating a fresh conversation.
 Only resumable agents suspend on idle timeout. `None` on the spec inherits the
 kind's timeout; `None` on the kind disables idle suspension.
 

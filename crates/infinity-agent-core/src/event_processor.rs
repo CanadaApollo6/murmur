@@ -143,11 +143,6 @@ enum ToolResultMatch {
 pub struct HistoryManager<C: ConversationStore, S: StateStore> {
     conversation_store: C,
     state_store: S,
-    pub(crate) dispatch_epoch: Option<String>,
-    pub(crate) dispatches: Option<std::rc::Rc<crate::dispatch::RuntimeDispatches>>,
-    pub(crate) dispatch: RefCell<Option<crate::traits::ToolDispatch>>,
-    pending_dispatch: RefCell<Option<crate::traits::ToolDispatch>>,
-    clear_dispatch: Cell<bool>,
     pub thread_id: ThreadId,
     pub root_thread_id: ThreadId,
     ancestor_chain: Vec<ThreadId>,
@@ -231,11 +226,6 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             .unwrap_or_default();
 
         Ok(Self {
-            dispatch_epoch: None,
-            dispatches: None,
-            dispatch: RefCell::new(None),
-            pending_dispatch: RefCell::new(None),
-            clear_dispatch: Cell::new(false),
             conversation_store,
             state_store,
             thread_id,
@@ -515,23 +505,12 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             "bug: append_unvalidated called with un-flushed turn_buffer content"
         );
 
-        let item = PendingItem {
+        self.history.borrow_mut().push(message.clone());
+        self.unvalidated_items.borrow_mut().push(PendingItem {
             message,
             message_id,
             synthetic_kind,
-        };
-        if let Some(runtime) = &self.dispatches
-            && let Some(dispatch) = self.dispatch.borrow().as_ref()
-            && self.pending_dispatch_matches(dispatch)
-            && item
-                .message
-                .tool_result()
-                .is_some_and(|result| result.id == dispatch.call_id.as_str())
-        {
-            runtime.received(&self.thread_id, dispatch, item.clone());
-        }
-        self.history.borrow_mut().push(item.message.clone());
-        self.unvalidated_items.borrow_mut().push(item);
+        });
     }
 
     /// Append *model-produced* content (assistant text/reasoning, tool
@@ -567,6 +546,18 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
     pub fn mark_inputs_model_validated(&self) {
         let drained = std::mem::take(&mut *self.unvalidated_items.borrow_mut());
         self.pending_items.borrow_mut().extend(drained);
+    }
+
+    pub(crate) fn has_pending_tool_results(&self) -> bool {
+        self.unvalidated_items
+            .borrow()
+            .first()
+            .is_some_and(|item| matches!(item.message, InfinityMessage::ToolResult { .. }))
+            || self
+                .pending_items
+                .borrow()
+                .iter()
+                .any(|item| matches!(item.message, InfinityMessage::ToolResult { .. }))
     }
 
     pub(crate) async fn settle_tool_results_on_interrupt(&self) -> Result<(), BoxError> {
@@ -684,16 +675,6 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
                 },
             )];
             history[tail_start + i] = item.message.clone();
-            if let Some(runtime) = &self.dispatches
-                && let Some(dispatch) = self.dispatch.borrow().as_ref()
-                && self.store_order(tail_start + i) > dispatch.call_order
-                && item
-                    .message
-                    .tool_result()
-                    .is_some_and(|result| result.id == dispatch.call_id.as_str())
-            {
-                runtime.received(&self.thread_id, dispatch, item.clone());
-            }
             replaced = true;
         }
         replaced
@@ -718,104 +699,6 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         true
     }
 
-    pub(crate) fn pending_dispatch_matches(&self, dispatch: &crate::traits::ToolDispatch) -> bool {
-        let history = self.history.borrow();
-        matches!(history.last(), Some(InfinityMessage::ToolCall { call, .. })
-            if call.id == dispatch.call_id.as_str()
-                && self.store_order(history.len() - 1) == dispatch.call_order)
-    }
-
-    pub(crate) async fn record_tool_dispatch(
-        &self,
-        call_id: &ToolCallId<str>,
-    ) -> Result<(), BoxError> {
-        let Some(epoch) = &self.dispatch_epoch else {
-            return Ok(());
-        };
-        let dispatch = crate::traits::ToolDispatch {
-            call_id: call_id.to_owned(),
-            epoch: epoch.clone(),
-            call_order: self.store_order(self.history.borrow().len() - 1),
-            recovering: false,
-        };
-        assert!(
-            self.dispatch.borrow().is_none(),
-            "bug: overwriting an unsettled dispatch"
-        );
-        *self.pending_dispatch.borrow_mut() = Some(dispatch);
-        self.persist_tool_dispatch().await
-    }
-
-    pub(crate) fn dispatch_write_pending(&self) -> bool {
-        self.pending_dispatch.borrow().is_some()
-    }
-
-    pub(crate) fn dispatch_settlement_pending(&self) -> bool {
-        self.dispatch_write_pending()
-            || self.clear_dispatch.get()
-            || self.dispatch.borrow().as_ref().is_some_and(|dispatch| {
-                self.dispatches
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.has_result(&self.thread_id, dispatch))
-            })
-    }
-
-    pub(crate) fn orphaned_dispatch(&self) -> Option<crate::traits::ToolDispatch> {
-        let dispatch = self.dispatch.borrow().clone()?;
-        (self.pending_dispatch_matches(&dispatch)
-            && self
-                .dispatches
-                .as_ref()
-                .is_some_and(|runtime| !runtime.awaiting(&self.thread_id, &dispatch)))
-        .then_some(dispatch)
-    }
-
-    pub(crate) fn start_tool_dispatch(&self) -> Option<crate::dispatch::DispatchGuard> {
-        let runtime = self.dispatches.as_ref()?;
-        let dispatch = self.dispatch.borrow().clone()?;
-        Some(runtime.start(&self.thread_id, dispatch))
-    }
-
-    pub(crate) fn restore_dispatch_result(&self, item: PendingItem) -> Result<(), BoxError> {
-        self.handle_content_with_kind(item.message, item.message_id, item.synthetic_kind)?;
-        Ok(())
-    }
-
-    async fn persist_tool_dispatch(&self) -> Result<(), BoxError> {
-        let dispatch = self.pending_dispatch.borrow().clone();
-        if let Some(dispatch) = dispatch {
-            self.state_store
-                .set_tool_dispatch(&self.thread_id, Some(dispatch.clone()))
-                .await?;
-            *self.dispatch.borrow_mut() = Some(dispatch);
-            self.pending_dispatch.borrow_mut().take();
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn clear_tool_dispatch(&self) -> Result<(), BoxError> {
-        self.state_store
-            .set_tool_dispatch(&self.thread_id, None)
-            .await?;
-        if let Some(dispatch) = self.dispatch.borrow_mut().take()
-            && let Some(runtime) = &self.dispatches
-        {
-            runtime.remove(&self.thread_id, &dispatch);
-        }
-        self.clear_dispatch.set(false);
-        Ok(())
-    }
-
-    fn store_order(&self, index: usize) -> usize {
-        // Compaction replaces a prefix with one summary. Ancestor messages
-        // occupy memory slots but never belong to this thread's own store.
-        let offset = self
-            .compacted_up_to
-            .borrow()
-            .map_or(0, |prev| prev as usize - 1);
-        index.saturating_sub(self.ancestor_prefix_len.get()) + offset
-    }
-
     pub async fn sync(&self) -> Result<(), BoxError> {
         // `sync` only persists known-safe (`pending_items`) content.
         // Unvalidated inputs deliberately stay in memory (see the field
@@ -826,25 +709,7 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             "bug: sync() called with un-flushed turn_buffer content"
         );
 
-        // A failed write retains the intent for the driver's bounded settlement.
-        // No call history may reach the store until that intent is durable.
-        self.persist_tool_dispatch().await?;
         let pending_items = std::mem::take(&mut *self.pending_items.borrow_mut());
-        let pending_start = self.history.borrow().len()
-            - self.unvalidated_items.borrow().len()
-            - pending_items.len();
-        if let Some(dispatch) = self.dispatch.borrow().as_ref()
-            && !dispatch.recovering
-            && pending_items.iter().enumerate().any(|(index, item)| {
-                self.store_order(pending_start + index) > dispatch.call_order
-                    && item
-                        .message
-                        .tool_result()
-                        .is_some_and(|result| result.id == dispatch.call_id.as_str())
-            })
-        {
-            self.clear_dispatch.set(true);
-        }
         if !pending_items.is_empty() {
             let msgs = pending_items
                 .iter()
@@ -876,9 +741,6 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             .map(|i| i.message_id.clone())
             .collect();
         self.pending_receipt_ids.borrow_mut().extend(msg_ids);
-        if self.clear_dispatch.get() {
-            self.clear_tool_dispatch().await?;
-        }
         let receipt_ids = self.pending_receipt_ids.borrow().clone();
         if !receipt_ids.is_empty() {
             if let Err(error) = self
@@ -1078,7 +940,16 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         // the in-memory history tail but have not been persisted yet.
         let validated_len = history.len() - self.unvalidated_items.borrow().len();
         safe = safe.min(validated_len);
-        self.store_order(safe)
+        // Convert in-memory index to absolute store order by adding the offset
+        // from any prior compaction. The -1 accounts for the compaction summary
+        // message occupying slot 0 in the in-memory history.
+        let offset = self
+            .compacted_up_to
+            .borrow()
+            .map_or(0, |prev| prev as usize - 1);
+        // Subtract ancestor_prefix_len because those messages are not in this
+        // thread's own store (they come from parent/ancestor threads).
+        safe.saturating_sub(self.ancestor_prefix_len.get()) + offset
     }
 
     /// Record a subscription in the current thread's metadata. The
@@ -2024,15 +1895,6 @@ where
                     } else {
                         None
                     };
-                    if matches!(chunk, StreamChunk::ToolCall(_)) && history.dispatch.borrow().is_some() {
-                        // The sequential executor has accepted the preceding result.
-                        // Make it durable before replacing the single dispatch slot.
-                        history.flush_turn();
-                        history.sync().await?;
-                        if history.dispatch.borrow().is_some() {
-                            Err::<(), BoxError>("previous tool result could not be persisted".into())?;
-                        }
-                    }
                     history.handle_completion(&chunk, completion_id, tool_display_as.clone());
                     match chunk {
                         StreamChunk::Text(text) => {
@@ -2098,8 +1960,7 @@ where
                             // the tool call appear cancelled.
                             let tool = tool_registry.get(call.function.name.as_str()).expect("bug: tool not found in registry after call");
                             if tool.supports_sync() {
-                                history.record_tool_dispatch(ToolCallId::from_ref(&call.id)).await?;
-                                history.sync().await?; // thread spawning needs the committed state
+                                history.sync().await?; // we must sync the history so that thread spawning uses the correct state
 
                                 // The call being executed is the (unanswered)
                                 // history tail, so the safe spawn point cuts
@@ -2110,7 +1971,6 @@ where
                                     safe_spawn_point: Some(history.safe_spawn_point()),
                                     ..tool_context.clone()
                                 };
-                                let _dispatch_guard = history.start_tool_dispatch();
                                 let res = tool.execute_synchronous(
                                     &call.function.arguments,
                                     ToolCallId::from_ref(&call.id),
@@ -2230,7 +2090,6 @@ pub(crate) async fn execute_action_with_error_result<M>(
     action: CompletionAction,
     tool_registry: &HashMap<String, &dyn Tool<M>>,
     tool_context: &ToolContext<M>,
-    dispatch_guard: Option<crate::dispatch::DispatchGuard>,
 ) -> Result<(), crate::tools::ToolError>
 where
     M: InputSender + 'static,
@@ -2245,31 +2104,23 @@ where
     };
 
     if let Err(error) = execute_action(action, tool_registry, tool_context).await {
-        if let Some((tool_call_id, call_id)) = failed_tool_call {
-            match crate::tools::send_tool_error(
+        if let Some((tool_call_id, call_id)) = failed_tool_call
+            && let Err(send_error) = crate::tools::send_tool_error(
                 tool_context,
                 &tool_call_id,
                 call_id,
                 "Tool call failed",
             )
             .await
-            {
-                Ok(()) => {
-                    if let Some(guard) = dispatch_guard {
-                        guard.await_callback();
-                    }
-                }
-                Err(send_error) => tracing::error!(
-                    "failed to send fallback result after tool execution error: {}",
-                    send_error
-                ),
-            }
+        {
+            tracing::error!(
+                "failed to send fallback result after tool execution error: {}",
+                send_error
+            );
         }
         return Err(error);
     }
-    if let Some(guard) = dispatch_guard {
-        guard.await_callback();
-    }
+
     Ok(())
 }
 
@@ -4708,7 +4559,7 @@ mod tests {
             display_as: None,
         };
 
-        let error = execute_action_with_error_result(action, &tools, &context, None)
+        let error = execute_action_with_error_result(action, &tools, &context)
             .await
             .expect_err("tool execution should fail");
         assert_eq!(error.to_string(), "stub");

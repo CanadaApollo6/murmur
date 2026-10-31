@@ -494,7 +494,7 @@ async fn resume_reuses_root_and_ignores_history_receipts() {
 }
 
 #[tokio::test]
-async fn refused_or_missing_resume_needs_recovery_and_never_creates_a_thread() {
+async fn only_missing_resume_needs_recovery_transient_refusal_retries() {
     for missing in [false, true] {
         let mut t = Test::new().await;
         t.agent.stop().await.expect("stop");
@@ -514,17 +514,24 @@ async fn refused_or_missing_resume_needs_recovery_and_never_creates_a_thread() {
             matches!(
                 e,
                 Event::PhaseChanged {
-                    phase: Phase::NeedsRecovery { .. },
-                    ..
-                }
-            )
+                    phase: Phase::NeedsRecovery { .. }, ..
+                } if missing
+            ) || matches!(e, Event::PhaseChanged { phase: Phase::Crashed { .. }, .. } if !missing)
         })
         .await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), t.daemon.next())
-                .await
-                .is_err()
-        );
+        if missing {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), t.daemon.next())
+                    .await
+                    .is_err()
+            );
+        } else {
+            t.daemon.state.lock().expect("state").fail_resume = false;
+            assert!(matches!(
+                t.daemon.next().await.message,
+                ClientMessage::Connect { .. }
+            ));
+        }
         t.finish().await;
     }
 }
@@ -1036,5 +1043,167 @@ async fn resume_uses_core_idle_instead_of_display_history() {
     input.emit(fake::idle());
     t.consumed(id).await;
     t.idle().await;
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn boot_change_and_driver_failure_recover_only_busy_replays() {
+    for (boot_change, driver_failure, idle) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, false),
+        (true, false, true),
+    ] {
+        let mut t = Test::new().await;
+        let id = t.send(true, "before disconnect").await;
+        let input = t.daemon.next().await;
+        {
+            let mut state = t.daemon.state.lock().expect("state");
+            state.manual_replay = true;
+            if boot_change {
+                state.boot_id = "replacement-boot".into();
+            }
+        }
+        if driver_failure {
+            input.emit(DaemonMessage::Error {
+                thread_id: fake::thread(),
+                text: "Thread driver failed: panic".into(),
+            });
+        } else {
+            input.die();
+        }
+        let connect = t.daemon.next().await;
+        assert!(matches!(connect.message, ClientMessage::Connect { .. }));
+        connect.emit(DaemonMessage::Replay {
+            history: vec![],
+            pending_choices: vec![],
+            views: Default::default(),
+            in_progress: false,
+            idle,
+        });
+        if (boot_change || driver_failure) && !idle {
+            let interrupt = t.daemon.next().await;
+            assert!(matches!(interrupt.message, ClientMessage::Interrupt { .. }));
+            interrupt.emit(fake::idle());
+        }
+        let reoffer = t.daemon.next().await;
+        assert!(matches!(
+            reoffer.message,
+            ClientMessage::DeliverPeerMessage { .. }
+        ));
+        reoffer.emit(fake::receipt(format!("peer-{id}")));
+        reoffer.emit(fake::idle());
+        t.consumed(id).await;
+        t.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn silently_dropped_idle_input_has_a_receipt_deadline() {
+    let mut t = Test::new().await;
+    let id = t.send(false, "silently dropped").await;
+    let _input = t.daemon.next().await;
+    t.event(|e| {
+        matches!(
+            e,
+            Event::PhaseChanged {
+                phase: Phase::Crashed { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(!matches!(
+        t.mailroom.delivery(id).await.expect("delivery").state,
+        DeliveryState::Consumed
+    ));
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn stale_choice_answer_does_not_end_the_session() {
+    let mut t = Test::new().await;
+    let id = t.send(true, "choice").await;
+    let input = t.daemon.next().await;
+    input.emit(DaemonMessage::UserChoiceRequired {
+        thread_id: fake::thread(),
+        id: "old".into(),
+        prompt: "Continue?".into(),
+        choices: vec!["Yes".into()],
+        default: 0,
+    });
+    let Event::PermissionPending(choice) =
+        t.event(|e| matches!(e, Event::PermissionPending(_))).await
+    else {
+        panic!("permission");
+    };
+    input.emit(DaemonMessage::UserChoiceComplete {
+        choice_id: "old".into(),
+    });
+    input.emit(DaemonMessage::Info {
+        thread_id: fake::thread(),
+        text: "choice gone".into(),
+    });
+    t.event(|e| matches!(e, Event::Activity { text, .. } if text == "choice gone"))
+        .await;
+    assert!(matches!(
+        t.agent
+            .answer_permission(
+                choice.id,
+                choice.incarnation,
+                PermissionAnswer::Choose("0".into())
+            )
+            .await,
+        Err(Error::StalePermission)
+    ));
+    input.emit(fake::receipt(format!("peer-{id}")));
+    input.emit(fake::idle());
+    t.consumed(id).await;
+    t.idle().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), t.daemon.next())
+            .await
+            .is_err()
+    );
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn boot_recovery_survives_disconnect_before_settlement() {
+    let mut t = Test::new().await;
+    let id = t.send(true, "old work").await;
+    let input = t.daemon.next().await;
+    {
+        let mut state = t.daemon.state.lock().expect("state");
+        state.manual_replay = true;
+        state.boot_id = "replacement".into();
+    }
+    input.die();
+    for disconnect in [true, false] {
+        let connect = t.daemon.next().await;
+        assert!(matches!(connect.message, ClientMessage::Connect { .. }));
+        connect.emit(DaemonMessage::Replay {
+            history: vec![],
+            pending_choices: vec![],
+            views: Default::default(),
+            in_progress: false,
+            idle: false,
+        });
+        let interrupt = t.daemon.next().await;
+        assert!(matches!(interrupt.message, ClientMessage::Interrupt { .. }));
+        if disconnect {
+            interrupt.die();
+        } else {
+            interrupt.emit(fake::idle());
+        }
+    }
+    let reoffer = t.daemon.next().await;
+    assert!(matches!(
+        reoffer.message,
+        ClientMessage::DeliverPeerMessage { .. }
+    ));
+    reoffer.emit(fake::receipt(format!("peer-{id}")));
+    reoffer.emit(fake::idle());
+    t.consumed(id).await;
     t.finish().await;
 }

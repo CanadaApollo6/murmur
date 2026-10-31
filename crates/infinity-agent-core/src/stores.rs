@@ -425,7 +425,6 @@ pub struct InMemoryStateStore {
     metadata: Arc<Mutex<HashMap<ThreadId, serde_json::Value>>>,
     subscriptions: Arc<Mutex<HashMap<ThreadId, HashSet<ToolCallId>>>>,
     pending_user_choices: Arc<Mutex<HashMap<ThreadId, Vec<UserChoice>>>>,
-    dispatches: Arc<Mutex<HashMap<ThreadId, crate::traits::ToolDispatch>>>,
 }
 
 impl InMemoryStateStore {
@@ -483,32 +482,6 @@ impl InMemoryStateStore {
 #[async_trait]
 impl StateStore for InMemoryStateStore {
     type Error = InMemoryStoreError;
-
-    async fn get_tool_dispatch(
-        &self,
-        thread_id: &ThreadId<str>,
-    ) -> Result<Option<crate::traits::ToolDispatch>, Self::Error> {
-        Ok(self
-            .dispatches
-            .lock()
-            .expect("bug: mutex poisoned")
-            .get(thread_id)
-            .cloned())
-    }
-
-    async fn set_tool_dispatch(
-        &self,
-        thread_id: &ThreadId<str>,
-        dispatch: Option<crate::traits::ToolDispatch>,
-    ) -> Result<(), Self::Error> {
-        let mut records = self.dispatches.lock().expect("bug: mutex poisoned");
-        if let Some(dispatch) = dispatch {
-            records.insert(thread_id.to_owned(), dispatch);
-        } else {
-            records.remove(thread_id);
-        }
-        Ok(())
-    }
 
     async fn get_processed_ids(
         &self,

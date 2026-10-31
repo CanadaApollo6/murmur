@@ -96,6 +96,9 @@ impl<M: InputSender + 'static, C: ConversationStore + 'static> Tool<M> for Spawn
             })
         };
 
+        let Some(instructions) = args.get("instructions").and_then(|v| v.as_str()) else {
+            return error_result("Error: spawn_thread requires string instructions".into());
+        };
         let fresh_context = args
             .get("fresh_context")
             .and_then(|v| v.as_bool())
@@ -134,12 +137,6 @@ impl<M: InputSender + 'static, C: ConversationStore + 'static> Tool<M> for Spawn
             context.group_id,
             fresh_context
         );
-
-        let instructions = args
-            .get("instructions")
-            .expect("bug: missing 'instructions' arg")
-            .as_str()
-            .expect("bug: 'instructions' arg is not a string");
 
         // Write the child's own copy of the spawn call into its (so far
         // empty) store, pairing with the instruction tool result sent below.
