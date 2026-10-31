@@ -339,4 +339,4 @@ This does not pause the stall timer.
 
 ## Next implementation step
 
-Commits 1 (peer messages) and 2 (provider cancellation), the ACP spike and the agentd mailroom (`crates/agentd`: SQLite store, delivery state machine, `HopLimit`, and the `act`, `task` and `exposure` lineage from the first message) are done. Next: the ACP adapter for Claude and Codex and the per-agent supervisor actor that drives the mailroom, then the `send_message` surfaces and `agentctl`.
+The mailroom, the ACP adapter for Claude and Codex, the supervisor actors, `agentctl`, the bound MCP messaging tools and the Infinity adapter are done. Next, in order: per-agent isolation (one bwrap sandbox per agent, with only the agent's MCP and egress sockets shared), mail limits (per-sender quota, per-pair undelivered cap, per-turn batch limit), `infinity-provider-local`, a RAP toolset so Infinity model agents can send mail, the WebSocket event bus and graph UI, then the swarm layer.
