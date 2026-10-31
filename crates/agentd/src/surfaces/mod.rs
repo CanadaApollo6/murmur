@@ -76,6 +76,10 @@ impl FileConfig {
             ("claude".to_owned(), KindConfig::claude("claude-agent-acp")),
             ("codex".to_owned(), KindConfig::codex("codex-acp")),
         ]);
+        for kind in kinds.values_mut() {
+            kind.isolation =
+                crate::sandbox::Isolation::Bwrap(crate::sandbox::KindSandbox::defaults(&kind.name));
+        }
         let mut overrides = Vec::new();
         for (name, entry) in self.kind {
             let mut kind = match entry.wire.as_deref() {
@@ -127,18 +131,25 @@ impl FileConfig {
                 }
             } else if entry.sandbox == Some(crate::sandbox::SandboxMode::None) {
                 kind.isolation = crate::sandbox::Isolation::None;
-            } else if let crate::sandbox::Isolation::Bwrap(sb) = &mut kind.isolation {
-                if let Some(home) = entry.home {
-                    sb.home = home;
+            } else {
+                if entry.sandbox == Some(crate::sandbox::SandboxMode::Bwrap) {
+                    kind.isolation = crate::sandbox::Isolation::Bwrap(
+                        crate::sandbox::KindSandbox::defaults(&name),
+                    );
                 }
-                if let Some(credentials) = entry.credentials {
-                    sb.credentials = credentials
-                        .iter()
-                        .map(|p| crate::sandbox::expand(p))
-                        .collect();
-                }
-                if let Some(egress) = entry.egress {
-                    sb.egress = egress;
+                if let crate::sandbox::Isolation::Bwrap(sb) = &mut kind.isolation {
+                    if let Some(home) = entry.home {
+                        sb.home = home;
+                    }
+                    if let Some(credentials) = entry.credentials {
+                        sb.credentials = credentials
+                            .iter()
+                            .map(|p| crate::sandbox::expand(p))
+                            .collect();
+                    }
+                    if let Some(egress) = entry.egress {
+                        sb.egress = egress;
+                    }
                 }
             }
             let effective_none = entry.sandbox == Some(crate::sandbox::SandboxMode::None)
@@ -237,14 +248,12 @@ impl ControlApi {
     async fn agents(&self) -> Result<Value> {
         let mut rows = Vec::new();
         for (id, spec) in self.mailroom.specs().await? {
-            let phase = self
-                .broker
-                .handle(id)
-                .await
-                .map_or(Phase::Ended, |h| h.phase());
+            let handle = self.broker.handle(id).await;
+            let phase = handle.as_ref().map_or(Phase::Ended, |h| h.phase());
+            let isolation = handle.as_ref().map_or("none", |h| h.isolation());
             rows.push(
                 json!({"id":format!("agent:{id}"),"name":format!("@{}",spec.name.as_str()),
-                "kind":spec.kind,"isolation":self.broker.isolation_label(&spec.kind),"phase":phase_name(&phase),
+                "kind":spec.kind,"isolation":isolation,"phase":phase_name(&phase),
                 "queued":self.mailroom.pending_for(id).await?.len()}),
             );
         }
@@ -574,9 +583,11 @@ pub async fn write_frame(
 pub struct SocketIdentity {
     path: PathBuf,
     inode: u64,
+    private: Option<Arc<crate::private_fs::Dir>>,
 }
 impl SocketIdentity {
     pub fn unlink(&self) {
+        let _pin = &self.private;
         if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.ino() == self.inode)
             && let Err(error) = std::fs::remove_file(&self.path)
         {
@@ -588,14 +599,23 @@ pub struct Socket {
     pub listener: UnixListener,
     path: PathBuf,
     inode: u64,
+    private: Option<Arc<crate::private_fs::Dir>>,
 }
 impl Socket {
+    pub(crate) fn bind_private(dir: Arc<crate::private_fs::Dir>, name: &str) -> Result<Self> {
+        Self::bind_at(&dir.socket_path(name), Some(dir))
+    }
     pub fn bind(path: &Path) -> Result<Self> {
+        Self::bind_at(path, None)
+    }
+    fn bind_at(path: &Path, private: Option<Arc<crate::private_fs::Dir>>) -> Result<Self> {
         if !path.is_absolute() {
             return Err("socket path must be absolute".into());
         }
         let parent = path.parent().ok_or("socket needs parent directory")?;
-        private_dir(parent)?;
+        if private.is_none() {
+            private_dir(parent)?;
+        }
         if let Ok(meta) = std::fs::symlink_metadata(path) {
             if !meta.file_type().is_socket() || meta.uid() != nix::unistd::geteuid().as_raw() {
                 return Err("refusing to replace a non-socket or foreign socket".into());
@@ -609,18 +629,22 @@ impl Socket {
             }
         }
         let listener = UnixListener::bind(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        if private.is_none() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         let inode = std::fs::symlink_metadata(path)?.ino();
         Ok(Self {
             listener,
             path: path.into(),
             inode,
+            private,
         })
     }
     pub fn identity(&self) -> SocketIdentity {
         SocketIdentity {
             path: self.path.clone(),
             inode: self.inode,
+            private: self.private.clone(),
         }
     }
     pub fn check_peer(stream: &UnixStream) -> Result<()> {
@@ -692,6 +716,21 @@ mod config_tests {
     use crate::sandbox::{Isolation, SandboxConfig};
     #[test]
     fn isolation_defaults_overrides_and_infinity() {
+        for kind in FileConfig::default().kinds().expect("default kinds") {
+            assert_eq!(
+                matches!(kind.isolation, Isolation::None),
+                !cfg!(target_os = "linux")
+            );
+        }
+        let explicit: FileConfig = toml::from_str("sandbox = 'bwrap'").expect("explicit bwrap");
+        assert!(
+            explicit
+                .kinds()
+                .expect("explicit kinds")
+                .iter()
+                .all(|kind| matches!(kind.isolation, Isolation::Bwrap(_)))
+        );
+
         let config: FileConfig = toml::from_str(
             r#"
 sandbox = "none"
@@ -745,10 +784,15 @@ sandbox = "bwrap"
                 "[kind.claude]\ncommand = ['cli']\n[kind.claude.env]\n{name} = 'host-control'\n"
             ))
             .expect("config");
-            let kinds = config.kinds().expect("kinds");
+            let mut kinds = config.kinds().expect("kinds");
             assert!(
                 SandboxConfig::default()
-                    .validate(Path::new("/state"), &kinds)
+                    .validate(
+                        Path::new("/state"),
+                        Path::new("/state/a.sock"),
+                        Path::new("/state/m.sock"),
+                        &mut kinds
+                    )
                     .is_err()
             );
         }

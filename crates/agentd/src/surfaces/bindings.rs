@@ -102,15 +102,17 @@ impl Bindings {
     ) -> Result<Value> {
         let SessionIdentity { agent, incarnation } = identity;
         self.revoke(agent).await;
-        super::private_dir(&paths.io)?;
-        let socket = super::Socket::bind(&paths.io.join("mcp.sock"))?;
+        let io = std::sync::Arc::new(crate::private_fs::Dir::open(&paths.io, true)?);
+        io.clear("mcp.sock".as_ref())?;
+        io.clear("egress.sock".as_ref())?;
+        let socket = super::Socket::bind_private(io.clone(), "mcp.sock")?;
         let mut socket_paths = vec![socket.identity()];
         let cancel = tokio_util::sync::CancellationToken::new();
         let egress = if cfg.network == crate::sandbox::Network::Proxy {
-            let socket = super::Socket::bind(&paths.io.join("egress.sock"))?;
+            let socket = super::Socket::bind_private(io, "egress.sock")?;
             socket_paths.push(socket.identity());
             let policy = crate::egress::Policy {
-                hosts: sb.egress.iter().chain(&spec.egress).cloned().collect(),
+                hosts: sb.egress.clone(),
                 ports: cfg.egress_ports.clone(),
             };
             let name = spec.name.as_str().to_owned();

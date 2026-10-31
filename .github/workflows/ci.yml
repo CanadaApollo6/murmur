@@ -94,6 +94,8 @@ jobs:
           tool: jj-cli
 
       - name: Run tests
+        env:
+          AGENTD_REQUIRE_SANDBOX: ${{ runner.os == 'Linux' && '1' || '0' }}
         run: cargo test --all-targets
 
       # `--all-targets` does not include doctests, which cover the rustdoc

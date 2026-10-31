@@ -21,8 +21,6 @@ pub struct AgentSpec {
     pub model: Option<String>,
     pub permissions: PermissionPolicy,
     pub idle_after: Option<Duration>,
-    #[serde(default)]
-    pub egress: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +124,7 @@ pub struct AgentHandle {
     pub id: AgentId,
     commands: mpsc::Sender<Command>,
     phase: watch::Receiver<Phase>,
+    isolation: watch::Receiver<&'static str>,
 }
 impl AgentHandle {
     fn nudge(&self) {
@@ -135,6 +134,9 @@ impl AgentHandle {
                 tracing::debug!(agent=%self.id, "mail queued for stopped actor")
             }
         }
+    }
+    pub fn isolation(&self) -> &'static str {
+        *self.isolation.borrow()
     }
     pub fn phase(&self) -> Phase {
         self.phase.borrow().clone()
@@ -196,6 +198,7 @@ pub struct Broker {
     config: Config,
     mcp: Option<Arc<crate::surfaces::Bindings>>,
     isolation: Option<(PathBuf, crate::sandbox::SandboxConfig)>,
+    credentials: Arc<std::sync::Mutex<crate::credentials::Credentials>>,
 }
 impl Broker {
     pub fn new(mailroom: Arc<Mailroom>, kinds: Vec<KindConfig>, config: Config) -> Result<Self> {
@@ -234,6 +237,7 @@ impl Broker {
             config,
             mcp: None,
             isolation: None,
+            credentials: Default::default(),
         })
     }
     pub fn with_mcp(
@@ -245,13 +249,6 @@ impl Broker {
         self.isolation = Some((state, sandbox));
         self.mcp = Some(bindings);
         self
-    }
-    pub fn isolation_label(&self, kind: &str) -> &str {
-        self.kinds.get(kind).map_or("none", |k| {
-            self.isolation
-                .as_ref()
-                .map_or("none", |(_, cfg)| cfg.label(&k.isolation))
-        })
     }
     pub async fn handle(&self, id: AgentId) -> Option<AgentHandle> {
         self.agents.lock().await.get(&id).cloned()
@@ -271,24 +268,18 @@ impl Broker {
             .get(&spec.kind)
             .ok_or_else(|| Error::Rejected("unknown kind".into()))?
             .clone();
-        if let Some((state, _)) = &self.isolation
-            && matches!(kind.isolation, crate::sandbox::Isolation::Bwrap(_))
-        {
-            let cwd =
-                std::fs::canonicalize(&spec.cwd).map_err(|e| Error::Rejected(e.to_string()))?;
-            let state = std::fs::canonicalize(state).map_err(|e| Error::Rejected(e.to_string()))?;
-            if state.starts_with(&cwd)
-                || cwd.starts_with(&state)
-                || cwd == crate::sandbox::host_home()
-                || cwd.starts_with("/run/user")
-            {
+        if matches!(kind.isolation, crate::sandbox::Isolation::Bwrap(_)) {
+            let (state, cfg) = self
+                .isolation
+                .as_ref()
+                .ok_or_else(|| Error::Rejected("bwrap requires an MCP isolation context".into()))?;
+            if self.mcp.is_none() {
                 return Err(Error::Rejected(
-                    "workspace exposes protected host paths".into(),
+                    "bwrap requires an MCP isolation context".into(),
                 ));
             }
-            if !spec.egress.iter().all(|h| crate::sandbox::host_pattern(h)) {
-                return Err(Error::Rejected("invalid egress hostname".into()));
-            }
+            cfg.check_bind(&spec.cwd, state)
+                .map_err(|e| Error::Rejected(e.to_string()))?;
         }
         let model_agent = matches!(kind.wire, Wire::Infinity { .. });
         let mut spec = spec;
@@ -304,15 +295,19 @@ impl Broker {
         self.mailroom.save_spec(id, spec.clone()).await?;
         let (tx, commands) = mpsc::channel(64);
         let (phase_tx, phase) = watch::channel(Phase::Dormant);
+        let (isolation_tx, isolation) = watch::channel("none");
         let handle = AgentHandle {
             id,
             commands: tx,
             phase,
+            isolation,
         };
         let actor = AgentActor {
             _lease: lease,
             mcp: self.mcp.clone(),
             isolation: self.isolation.clone(),
+            credentials: self.credentials.clone(),
+            isolation_tx,
             kind: kind.clone(),
             id,
             idle_after: if model_agent {
@@ -389,6 +384,7 @@ impl Broker {
 
 struct AgentActor {
     isolation: Option<(PathBuf, crate::sandbox::SandboxConfig)>,
+    credentials: Arc<std::sync::Mutex<crate::credentials::Credentials>>,
     kind: KindConfig,
     mcp: Option<Arc<crate::surfaces::Bindings>>,
     _lease: crate::mailroom::ActorLease,
@@ -408,6 +404,7 @@ struct AgentActor {
     events: broadcast::Sender<Event>,
     commands: mpsc::Receiver<Command>,
     phase_tx: watch::Sender<Phase>,
+    isolation_tx: watch::Sender<&'static str>,
     phase: Phase,
     incarnation: Incarnation,
     resume: Option<ResumeToken>,
@@ -458,6 +455,7 @@ impl AgentActor {
                 Err(error) => tracing::error!(%error,"session shutdown failed"),
             }
         }
+        self.finish_credentials();
         if let Err(error) = self
             .mailroom
             .settle_session(self.id, self.incarnation, false, self.model_agent)
@@ -481,10 +479,12 @@ impl AgentActor {
             )
             .await?;
         self.start().await?;
+        let mut credentials_tick = tokio::time::interval(Duration::from_secs(2));
         loop {
             self.pump().await?;
             let deadline = self.deadline();
             tokio::select! {
+                _ = credentials_tick.tick() => self.credentials.lock().expect("bug: credential lock poisoned").sync(self.id),
                 command = self.commands.recv() => {
                     // A full command queue can coalesce a nudge. Observe queued mail
                     // on every command without adding database reads per stream chunk.
@@ -517,7 +517,15 @@ impl AgentActor {
             }
         }
     }
+    fn finish_credentials(&self) {
+        self.credentials
+            .lock()
+            .expect("bug: credential lock poisoned")
+            .finish(self.id);
+    }
     async fn start(&mut self) -> Result<()> {
+        self.finish_credentials();
+        self.isolation_tx.send_replace("none");
         self.phase(Phase::Starting);
         let mut launch = crate::sandbox::direct(&self.kind, &self.spec);
         if let Some(mcp) = &self.mcp {
@@ -527,7 +535,17 @@ impl AgentActor {
                 {
                     let paths = crate::sandbox::AgentPaths::new(state, self.id);
                     crate::sandbox::seed(sb, &paths.home)?;
-                    let facts = crate::sandbox::Facts::collect(sb, &paths)?;
+                    self.credentials
+                        .lock()
+                        .expect("bug: credential lock poisoned")
+                        .launch(
+                            self.id,
+                            &self.kind.name,
+                            &sb.credentials,
+                            &paths.home,
+                            &crate::sandbox::host_home(),
+                        )?;
+                    let facts = crate::sandbox::Facts::collect()?;
                     launch = crate::sandbox::plan(cfg, &self.kind, &self.spec, &paths, &facts);
                     launch.mcp_server = Some(
                         mcp.bind(
@@ -567,6 +585,11 @@ impl AgentActor {
             .await
         {
             Ok(mut session) => {
+                self.isolation_tx.send_replace(
+                    self.isolation
+                        .as_ref()
+                        .map_or("none", |(_, cfg)| cfg.label(&self.kind.isolation)),
+                );
                 let busy = session.busy();
                 if self.cancelling {
                     if busy {
@@ -940,6 +963,7 @@ impl AgentActor {
                 self.resume = Some(token);
             }
         }
+        self.finish_credentials();
         self.mailroom
             .settle_session(self.id, self.incarnation, false, self.model_agent)
             .await?;

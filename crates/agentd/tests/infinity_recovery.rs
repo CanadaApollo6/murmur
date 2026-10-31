@@ -494,7 +494,7 @@ async fn broker_permission_timeout_durably_cancels_waiting_choice() {
         let mut events = broker.events();
         let spec = AgentSpec {
             name: AgentName::parse("model").expect("name"), kind: "infinity".into(), cwd: h.cwd.path().into(), model: None,
-            permissions: PermissionPolicy { timeout: Some(Duration::from_millis(30)), ..Default::default() }, idle_after: None, egress: Vec::new(),
+            permissions: PermissionPolicy { timeout: Some(Duration::from_millis(30)), ..Default::default() }, idle_after: None,
         };
         let agent = broker.spawn(spec.clone()).await.expect("spawn");
         let mut phases = agent.phases();
@@ -609,7 +609,6 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
         model: None,
         permissions: PermissionPolicy::default(),
         idle_after: None,
-        egress: Vec::new(),
     };
     let mut agent = broker.spawn(spec.clone()).await.expect("spawn");
     let mut phases = agent.phases();
@@ -1047,7 +1046,6 @@ async fn queued_attachment_mail_probe(resume: bool) {
         model: None,
         permissions: PermissionPolicy::default(),
         idle_after: None,
-        egress: Vec::new(),
     };
 
     if resume {
@@ -1191,7 +1189,6 @@ async fn r4_human_sleep_probe() {
         model: None,
         permissions: PermissionPolicy::default(),
         idle_after: None,
-        egress: Vec::new(),
     };
     let agent = broker.spawn(spec.clone()).await.expect("spawn");
     let mut phases = agent.phases();
@@ -1320,7 +1317,6 @@ async fn r4_before_restart() -> (tempfile::TempDir, tempfile::TempDir) {
         model: None,
         permissions: PermissionPolicy::default(),
         idle_after: None,
-        egress: Vec::new(),
     };
     let agent = broker.spawn(spec.clone()).await.expect("spawn");
     let mut phases = agent.phases();
@@ -1432,7 +1428,6 @@ async fn r4_after_restart(state_dir: tempfile::TempDir, cwd: tempfile::TempDir) 
         model: None,
         permissions: PermissionPolicy::default(),
         idle_after: None,
-        egress: Vec::new(),
     };
     let agent = broker.spawn(spec.clone()).await.expect("spawn");
     let mut phases = agent.phases();
@@ -1539,7 +1534,6 @@ async fn r9_broker_mail_after_completed_rap_tool_and_provider_failure() {
                 model: None,
                 permissions: PermissionPolicy::default(),
                 idle_after: None,
-                egress: Vec::new(),
             };
             let agent = broker.spawn(spec.clone()).await.expect("spawn");
             let mut phases = agent.phases();
@@ -1691,7 +1685,6 @@ async fn r10a_driver_panic_has_bounded_broker_recovery() {
                     ..Default::default()
                 },
                 idle_after: None,
-                egress: Vec::new(),
             };
             let agent = broker.spawn(spec.clone()).await.expect("spawn");
             let mut phases = agent.phases();
@@ -1822,7 +1815,6 @@ async fn r10a_choice_write_failure_has_bounded_recovery() {
                 model: None,
                 permissions: PermissionPolicy { timeout: Some(Duration::from_millis(30)), ..Default::default() },
                 idle_after: None,
-        egress: Vec::new(),
             };
             let agent = broker.spawn(spec.clone()).await.expect("spawn");
             let mut phases = agent.phases();
@@ -1984,7 +1976,6 @@ async fn broker_for_root(
             model: None,
             permissions: Default::default(),
             idle_after: None,
-            egress: Vec::new(),
         })
         .await
         .expect("spawn");
@@ -2133,7 +2124,6 @@ async fn r11_broker(
             model: None,
             permissions: Default::default(),
             idle_after: None,
-            egress: Vec::new(),
         })
         .await
         .expect("spawn");
@@ -2557,7 +2547,6 @@ mod r12o {
                     ..Default::default()
                 },
                 idle_after: None,
-                egress: Vec::new(),
             })
             .await
             .expect("spawn");
@@ -3083,7 +3072,6 @@ async fn r13a_shutdown_preserved_stream_delivers_followup() {
                     model: None,
                     permissions: Default::default(),
                     idle_after: None,
-                    egress: Vec::new(),
                 })
                 .await
                 .expect("reattach during next tool");
@@ -3205,7 +3193,6 @@ async fn r13o_shutdown_while_agentd_detached_recovers_tool() {
                     model: None,
                     permissions: Default::default(),
                     idle_after: None,
-        egress: Vec::new(),
                 })
                 .await
                 .expect("reattach");
@@ -3435,7 +3422,6 @@ mod r14 {
                         ..Default::default()
                     },
                     idle_after: None,
-        egress: Vec::new(),
                 };
                 let agent = broker.spawn(spec.clone()).await.expect("spawn");
                 let mut phases = agent.phases();

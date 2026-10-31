@@ -29,7 +29,6 @@ fn spec(root: &std::path::Path) -> AgentSpec {
         model: None,
         permissions: Default::default(),
         idle_after: Some(Duration::from_millis(5)),
-        egress: Vec::new(),
     }
 }
 impl Test {

@@ -11,12 +11,20 @@ use crate::{
 };
 use serde::Deserialize;
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxMode {
-    #[default]
     Bwrap,
     None,
+}
+impl Default for SandboxMode {
+    fn default() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Bwrap
+        } else {
+            Self::None
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub enum Isolation {
@@ -71,6 +79,8 @@ pub struct SandboxConfig {
     pub ro_binds: Vec<PathBuf>,
     pub rw_binds: Vec<PathBuf>,
     pub env: Vec<String>,
+    #[serde(skip)]
+    pub protected: Vec<PathBuf>,
 }
 impl Default for SandboxConfig {
     fn default() -> Self {
@@ -90,6 +100,7 @@ impl Default for SandboxConfig {
             .collect(),
             rw_binds: vec![],
             env: vec!["LANG".into(), "LC_ALL".into(), "TZ".into()],
+            protected: vec![],
         }
     }
 }
@@ -116,8 +127,10 @@ pub fn forbidden_env(name: &str) -> bool {
         )
 }
 pub fn host_pattern(host: &str) -> bool {
+    let wildcard = host.starts_with("*.");
     let host = host.strip_prefix("*.").unwrap_or(host);
-    !host.is_empty()
+    (!wildcard || host.split('.').count() >= 2)
+        && !host.is_empty()
         && host.parse::<std::net::IpAddr>().is_err()
         && host.split('.').all(|s| {
             !s.is_empty()
@@ -130,27 +143,68 @@ pub fn expand(path: &Path) -> PathBuf {
     path.strip_prefix("~/")
         .map_or_else(|_| path.into(), |p| host_home().join(p))
 }
-fn checked_path(path: &Path, state: &Path) -> Result<()> {
+// Resolve existing ancestors too, so a missing socket below a symlink is protected.
+fn resolved(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(format!("unsafe sandbox path: {}", path.display()).into());
     }
-    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
-    let state = std::fs::canonicalize(state).unwrap_or_else(|_| state.into());
-    // Ancestors also expose state, so reject those as well.
-    if resolved == host_home()
-        || resolved.starts_with(&state)
-        || state.starts_with(&resolved)
-        || resolved.starts_with("/run/user")
-    {
-        return Err(format!("sandbox bind exposes protected paths: {}", path.display()).into());
+    match std::fs::canonicalize(path) {
+        Ok(p) => Ok(p),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(resolved(path.parent().ok_or("path has no parent")?)?
+                .join(path.file_name().ok_or("path has no name")?))
+        }
+        Err(e) => Err(e.into()),
     }
-    Ok(())
 }
 impl SandboxConfig {
-    pub fn validate(&mut self, state: &Path, kinds: &[KindConfig]) -> Result<()> {
+    pub fn check_bind(&self, path: &Path, state: &Path) -> Result<()> {
+        let path = resolved(path)?;
+        let state = resolved(state)?;
+        let home = resolved(&host_home())?;
+        if path.starts_with(&state)
+            || state.starts_with(&path)
+            || home.starts_with(&path)
+            || Path::new("/run").starts_with(&path)
+            || path.starts_with("/run/user")
+            || self.protected.iter().any(|p| p.starts_with(&path))
+        {
+            return Err(format!("sandbox bind exposes protected paths: {}", path.display()).into());
+        }
+        Ok(())
+    }
+    pub fn validate(
+        &mut self,
+        state: &Path,
+        control: &Path,
+        shared: &Path,
+        kinds: &mut [KindConfig],
+    ) -> Result<()> {
+        self.protected = [
+            control,
+            control.parent().ok_or("control socket needs parent")?,
+            shared,
+        ]
+        .into_iter()
+        .map(resolved)
+        .collect::<Result<_>>()?;
+        let socket = AgentPaths::new(state, AgentId(ulid::Ulid::new()))
+            .io
+            .join("egress.sock");
+        use std::os::unix::ffi::OsStrExt;
+        let limit = if cfg!(target_os = "linux") { 107 } else { 103 };
+        if socket.as_os_str().as_bytes().len() > limit {
+            return Err(format!(
+                "per-agent socket path exceeds sun_path limit of {limit} bytes: {}",
+                socket.display()
+            )
+            .into());
+        }
         for path in self.ro_binds.iter_mut().chain(&mut self.rw_binds) {
             *path = expand(path);
-            checked_path(path, state)?;
+        }
+        for path in self.ro_binds.iter().chain(&self.rw_binds) {
+            self.check_bind(path, state)?;
         }
         for name in &self.env {
             if forbidden_env(name) {
@@ -163,13 +217,23 @@ impl SandboxConfig {
                     return Err(format!("unsafe kind environment variable: {name}").into());
                 }
             }
-            if let Isolation::Bwrap(sb) = &kind.isolation {
+            if let Isolation::Bwrap(sb) = &mut kind.isolation {
+                if sb.credentials.len() > 1 {
+                    return Err("configure at most one credential file per kind".into());
+                }
                 for path in &sb.credentials {
-                    checked_path(path, state)?;
-                    checked_path(path.parent().ok_or("credential needs a parent")?, state)?;
+                    if path.strip_prefix(host_home()).is_err() {
+                        return Err("credentials must be files under HOME".into());
+                    }
+                    if path
+                        .components()
+                        .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+                    {
+                        return Err("unsafe credential path".into());
+                    }
                 }
                 for home in &sb.home {
-                    if Path::new(home).is_absolute()
+                    if home.is_empty()
                         || Path::new(home)
                             .components()
                             .any(|c| !matches!(c, Component::Normal(_)))
@@ -177,8 +241,14 @@ impl SandboxConfig {
                         return Err("home entries must be relative paths without traversal".into());
                     }
                 }
-                if !sb.egress.iter().all(|h| host_pattern(h)) {
-                    return Err("egress entries must be hostnames or *.suffix".into());
+                for host in &mut sb.egress {
+                    if !host_pattern(host) {
+                        return Err(
+                            "egress entries must be hostnames or *.suffix with two suffix labels"
+                                .into(),
+                        );
+                    }
+                    host.make_ascii_lowercase();
                 }
             }
         }
@@ -251,12 +321,12 @@ pub struct Facts {
     env: BTreeMap<String, String>,
 }
 impl Facts {
-    pub fn collect(sb: &KindSandbox, paths: &AgentPaths) -> Result<Self> {
+    pub fn collect() -> Result<Self> {
         let home = host_home();
         let mut facts = Self {
             mounts: vec![],
             links: vec![],
-            home: home.clone(),
+            home,
             exe: std::env::current_exe()?,
             resolved_dns: Path::new("/run/systemd/resolve").exists(),
             env: std::env::vars().collect(),
@@ -272,120 +342,33 @@ impl Facts {
                 });
             }
         }
-        for entry in &sb.home {
-            facts.mounts.push(Mount {
-                source: paths.home.join(entry),
-                target: home.join(entry),
-                readonly: false,
-            });
-        }
-        for credential in &sb.credentials {
-            if !credential.exists() {
-                continue;
-            }
-            let parent = credential.parent().ok_or("credential parent")?;
-            facts.mounts.push(Mount {
-                source: parent.into(),
-                target: parent.into(),
-                readonly: false,
-            });
-            // A directory mount permits atomic credential replacement. Shadow every other
-            // existing entry so host settings, hooks and histories never seed an agent.
-            for entry in std::fs::read_dir(parent)? {
-                let entry = entry?;
-                if sb.credentials.contains(&entry.path()) {
-                    continue;
-                }
-                let shadow = paths
-                    .home
-                    .join("credential-shadows")
-                    .join(parent.strip_prefix("/")?)
-                    .join(entry.file_name());
-                let is_dir = entry.file_type()?.is_dir();
-                if is_dir {
-                    std::fs::create_dir_all(&shadow)?;
-                } else {
-                    std::fs::create_dir_all(shadow.parent().ok_or("shadow parent")?)?;
-                    if !shadow.exists() {
-                        std::fs::write(
-                            &shadow,
-                            if entry.file_name() == "settings.json" {
-                                "{}"
-                            } else if entry.file_name() == "config.toml" {
-                                "sandbox_mode = \"read-only\"\n"
-                            } else {
-                                ""
-                            },
-                        )?;
-                    }
-                }
-                facts.mounts.push(Mount {
-                    source: shadow,
-                    target: entry.path(),
-                    readonly: false,
-                });
-            }
-            // Keep new CLI histories private even if the host has never created them.
-            for name in if kind_is_claude(credential) {
-                &[
-                    "projects",
-                    "todos",
-                    "tasks",
-                    "plugins",
-                    "debug",
-                    "session-env",
-                    "plans",
-                ][..]
-            } else {
-                &["sessions", "logs", "tmp", "skills"][..]
-            } {
-                let target = parent.join(name);
-                if !facts.mounts.iter().any(|m| m.target == target) {
-                    let source = paths
-                        .home
-                        .join("credential-shadows")
-                        .join(parent.strip_prefix("/")?)
-                        .join(name);
-                    std::fs::create_dir_all(&source)?;
-                    facts.mounts.push(Mount {
-                        source,
-                        target,
-                        readonly: false,
-                    });
-                }
-            }
-        }
         Ok(facts)
     }
 }
-fn kind_is_claude(path: &Path) -> bool {
-    path.file_name().is_some_and(|n| n == ".credentials.json")
-}
 pub fn seed(kind: &KindSandbox, home: &Path) -> Result<()> {
-    private_dir(home)?;
+    let dir = crate::private_fs::Dir::open(home, true)?;
     for entry in &kind.home {
-        let path = home.join(entry);
         if entry.ends_with('/') {
-            std::fs::create_dir_all(&path)?;
-        } else if !path.exists() {
-            std::fs::create_dir_all(path.parent().ok_or("home parent")?)?;
-            std::fs::write(
-                path,
+            dir.descend(Path::new(entry), true)?;
+        } else {
+            dir.seed(
+                Path::new(entry),
                 if entry == ".claude.json" {
-                    "{\"hasCompletedOnboarding\":true}"
+                    b"{\"hasCompletedOnboarding\":true}"
                 } else {
-                    ""
+                    b""
                 },
             )?;
         }
     }
-    for (name, seed) in [
-        (".claude/settings.json", "{}"),
-        (".codex/config.toml", "sandbox_mode = \"read-only\"\n"),
+    for (name, bytes) in [
+        (".claude/settings.json", &b"{}"[..]),
+        (".codex/config.toml", &b"sandbox_mode = \"read-only\"\n"[..]),
     ] {
-        let path = home.join(name);
-        if path.parent().is_some_and(Path::is_dir) && !path.exists() {
-            std::fs::write(path, seed)?;
+        match dir.descend(Path::new(name).parent().ok_or("seed needs parent")?, false) {
+            Ok(_) => dir.seed(Path::new(name), bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
     }
     Ok(())
@@ -427,7 +410,11 @@ pub fn plan(
     ] {
         push(&[flag.as_ref(), path.as_ref()]);
     }
-    push(&["--tmpfs".as_ref(), facts.home.as_os_str()]);
+    push(&[
+        "--bind".as_ref(),
+        paths.home.as_os_str(),
+        facts.home.as_os_str(),
+    ]);
     for (paths, flag) in [(&cfg.ro_binds, "--ro-bind"), (&cfg.rw_binds, "--bind")] {
         for path in paths {
             push(&[flag.as_ref(), path.as_os_str(), path.as_os_str()]);
@@ -523,9 +510,7 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
             };
             private_dir(&paths.io)?;
             seed(sb, &paths.home)?;
-            let mut probe_sb = sb.clone();
-            probe_sb.credentials.clear();
-            let facts = Facts::collect(&probe_sb, &paths)?;
+            let facts = Facts::collect()?;
             let spec = AgentSpec {
                 name: AgentName::parse("preflight")?,
                 kind: kind.name.clone(),
@@ -533,7 +518,6 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
                 model: None,
                 permissions: Default::default(),
                 idle_after: None,
-                egress: vec![],
             };
             let mut launch = plan(cfg, kind, &spec, &paths, &facts);
             let pos = launch
@@ -554,9 +538,14 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
             if let Env::Clear(env) = launch.env {
                 cmd.env_clear().envs(env);
             }
-            let out = cmd.output().await?;
+            let out = cmd.output().await.map_err(|e| {
+                format!(
+                    "bwrap preflight for {} failed: {e}; install bwrap or set sandbox = \"none\"",
+                    kind.name
+                )
+            })?;
             if !out.status.success() {
-                return Err(format!("sandbox preflight failed for {} (command {}); check bwrap, user namespaces and ro_binds: {}",kind.name,kind.command,String::from_utf8_lossy(&out.stderr)).into());
+                return Err(format!("sandbox preflight failed for {} (command {}); check bwrap, user namespaces and ro_binds, or set sandbox = \"none\": {}",kind.name,kind.command,String::from_utf8_lossy(&out.stderr)).into());
             }
         }
     }
@@ -662,7 +651,6 @@ mod tests {
                     model: None,
                     permissions: Default::default(),
                     idle_after: None,
-                    egress: vec![],
                 };
                 let launch = plan(&cfg, &kind, &spec, &paths, &facts);
                 let net = if network == Network::Proxy {
@@ -676,7 +664,7 @@ mod tests {
                     ""
                 };
                 let expected = format!(
-                    "--unshare-user\n--unshare-pid\n--unshare-ipc\n--unshare-uts\n--unshare-cgroup\n--die-with-parent\n--new-session\n{net}--ro-bind\n/usr\n/usr\n--ro-bind\n/etc\n/etc\n--symlink\nusr/bin\n/bin\n--proc\n/proc\n--dev\n/dev\n--tmpfs\n/tmp\n--tmpfs\n/run\n--tmpfs\n/home/person\n--ro-bind\n/toolchain/bin\n/toolchain/bin\n--ro-bind\n/host/agentd\n/run/agentd/bin/agentd\n--bind\n/state/agents/id/io\n/run/agentd/io\n--bind\n/state/agents/id/home/private\n/home/person/private\n--bind\n/workspace\n/workspace\n--chdir\n/workspace\n--\n/run/agentd/bin/agentd\nsandbox-init\n{host}--\n{}",
+                    "--unshare-user\n--unshare-pid\n--unshare-ipc\n--unshare-uts\n--unshare-cgroup\n--die-with-parent\n--new-session\n{net}--ro-bind\n/usr\n/usr\n--ro-bind\n/etc\n/etc\n--symlink\nusr/bin\n/bin\n--proc\n/proc\n--dev\n/dev\n--tmpfs\n/tmp\n--tmpfs\n/run\n--bind\n/state/agents/id/home\n/home/person\n--ro-bind\n/toolchain/bin\n/toolchain/bin\n--ro-bind\n/host/agentd\n/run/agentd/bin/agentd\n--bind\n/state/agents/id/io\n/run/agentd/io\n--bind\n/state/agents/id/home/private\n/home/person/private\n--bind\n/workspace\n/workspace\n--chdir\n/workspace\n--\n/run/agentd/bin/agentd\nsandbox-init\n{host}--\n{}",
                     kind.command
                 );
                 assert_eq!(
@@ -738,7 +726,15 @@ mod tests {
                 ro_binds: vec![path],
                 ..Default::default()
             };
-            assert!(cfg.validate(&state, &[]).is_err());
+            assert!(
+                cfg.validate(
+                    &state,
+                    &state.join("agentd.sock"),
+                    &state.join("mcp.sock"),
+                    &mut []
+                )
+                .is_err()
+            );
         }
         for name in [
             "AGENTD_MCP_TOKEN",
@@ -750,11 +746,102 @@ mod tests {
                 env: vec![name.into()],
                 ..Default::default()
             };
-            assert!(cfg.validate(&state, &[]).is_err());
+            assert!(
+                cfg.validate(
+                    &state,
+                    &state.join("agentd.sock"),
+                    &state.join("mcp.sock"),
+                    &mut []
+                )
+                .is_err()
+            );
         }
         assert!(!host_pattern("127.0.0.1"));
         assert!(!host_pattern("*.com/evil"));
         assert!(host_pattern("*.example.com"));
+    }
+    #[test]
+    fn seed_rejects_symlink_components_and_never_writes_through_leaf_links() {
+        let root = tempfile::tempdir().expect("root");
+        let home = root.path().join("home");
+        let sb = KindSandbox::defaults("codex");
+        seed(&sb, &home).expect("seed");
+        let victim = root.path().join("victim");
+        let config = home.join(".codex/config.toml");
+        std::fs::remove_file(&config).expect("unlink");
+        std::os::unix::fs::symlink(&victim, &config).expect("symlink");
+        seed(&sb, &home).expect("exclusive seed treats existing entry as done");
+        assert!(!victim.exists());
+        std::fs::remove_dir_all(home.join(".codex")).expect("remove CLI dir");
+        std::os::unix::fs::symlink(root.path(), home.join(".codex")).expect("parent symlink");
+        assert!(seed(&sb, &home).is_err());
+        assert!(!root.path().join("config.toml").exists());
+    }
+    #[test]
+    fn custom_socket_ancestors_and_long_socket_paths_are_rejected() {
+        let root = tempfile::tempdir().expect("root");
+        let state = root.path().join("state");
+        let work = root.path().join("work");
+        std::fs::create_dir_all(&state).expect("state");
+        std::fs::create_dir_all(&work).expect("work");
+        let control = work.join("human.sock");
+        let mut cfg = SandboxConfig {
+            ro_binds: vec![],
+            ..Default::default()
+        };
+        cfg.validate(&state, &control, &state.join("mcp.sock"), &mut [])
+            .expect("validate");
+        for path in [
+            work,
+            "/".into(),
+            "/run".into(),
+            host_home().parent().expect("home parent").into(),
+            state.clone(),
+        ] {
+            assert!(cfg.check_bind(&path, &state).is_err(), "{}", path.display());
+        }
+        assert!(cfg.check_bind(&host_home().join("code/x"), &state).is_ok());
+        let long = state.join("x".repeat(100));
+        assert!(
+            cfg.validate(&long, &control, &long.join("mcp.sock"), &mut [])
+                .expect_err("sun_path")
+                .to_string()
+                .contains("sun_path")
+        );
+    }
+    #[test]
+    fn patterns_are_normalized_and_broad_wildcards_rejected() {
+        let root = tempfile::tempdir().expect("root");
+        let mut kinds = vec![KindConfig::claude("cli")];
+        kinds[0].isolation = Isolation::Bwrap(KindSandbox {
+            home: vec![],
+            credentials: vec![],
+            egress: vec!["API.Example.COM".into()],
+        });
+        let mut cfg = SandboxConfig {
+            ro_binds: vec![],
+            ..Default::default()
+        };
+        cfg.validate(
+            root.path(),
+            &root.path().join("a.sock"),
+            &root.path().join("m.sock"),
+            &mut kinds,
+        )
+        .expect("validate");
+        let Isolation::Bwrap(sb) = &kinds[0].isolation else {
+            panic!("bwrap");
+        };
+        assert_eq!(sb.egress, ["api.example.com"]);
+        assert!(!host_pattern("*.com"));
+        assert_eq!(
+            SandboxMode::default(),
+            if cfg!(target_os = "linux") {
+                SandboxMode::Bwrap
+            } else {
+                SandboxMode::None
+            }
+        );
     }
     #[test]
     fn provider_tokens_never_enter_argv() {
@@ -777,7 +864,6 @@ mod tests {
             model: None,
             permissions: Default::default(),
             idle_after: None,
-            egress: vec![],
         };
         let launch = plan(
             &SandboxConfig::default(),

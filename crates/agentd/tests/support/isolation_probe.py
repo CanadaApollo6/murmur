@@ -8,6 +8,35 @@ import sys
 root = Path(sys.argv[1])
 cfg = json.loads((root / 'probe-input.json').read_text())
 result = {}
+if cfg.get('action'):
+    action = cfg['action']
+    first = not (root / 'action-result').exists()
+    home = Path.home()
+    if action == 'refresh':
+        target = home / '.codex/auth.json'
+        temp = target.with_name('refresh.tmp')
+        temp.write_text(json.dumps({'token': cfg['token']}))
+        temp.replace(target)
+    elif action == 'symlink':
+        target = home / '.codex/auth.json'
+        target.unlink()
+        target.symlink_to(cfg['secret'])
+    elif action == 'restart' and first:
+        target = home / '.claude/settings.json'
+        target.unlink()
+        target.symlink_to(cfg['victim'])
+        sock = Path('/run/agentd/io/mcp.sock')
+        sock.unlink()
+        sock.write_text('agent planted regular file')
+    (root / 'action-result').write_text(action if first else 'replayed')
+    if action == 'restart':
+        if first:
+            import signal
+            os.kill(os.getppid(), signal.SIGKILL)
+        else:
+            subprocess.Popen(['/usr/bin/python3', '-c', 'import time; time.sleep(600)', cfg['marker']], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    sys.exit(0)
+
 
 def unix(path, request):
     with socket.socket(socket.AF_UNIX) as s:
@@ -40,11 +69,23 @@ except (OSError, StopIteration, KeyError):
 if not cfg['baseline']:
     request = {'session': 'b' * 64, 'token': '', 'request': {'jsonrpc': '2.0', 'id': 1, 'method': 'ping'}}
     result['token_rejected'] = unix('/run/agentd/io/mcp.sock', request)['error']['code'] == -32600
+    for relative in ['.claude/settings.json', '.claude/CLAUDE.md', '.claude/agents/planted.md', '.claude/new-dir/planted', '.codex/AGENTS.md', '.codex/config.toml', '.codex/new-dir/planted']:
+        path = Path.home() / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('planted private config')
+    late = Path(cfg['late'])
+    result['late_file_hidden'] = not (late / 'secret').exists()
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect(str(late / 'sock'))
+        result['late_socket_hidden'] = False
+    except OSError:
+        result['late_socket_hidden'] = True
     credential = Path(cfg['credential'])
     temporary = credential.with_name('refresh.tmp')
-    temporary.write_text('refreshed dummy credential')
+    temporary.write_text('{"token":1}')
     temporary.replace(credential)
-    result['rename'] = credential.read_text() == 'refreshed dummy credential'
+    result['rename'] = credential.read_text() == '{"token":1}'
     def proxy(host):
         with socket.create_connection(('127.0.0.1', 3128), timeout=10) as s:
             s.sendall(f'CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n'.encode())

@@ -90,7 +90,11 @@ impl Drop for Mcp {
     }
 }
 fn main() {
-    let root = PathBuf::from(std::env::var_os("FAKE_ROOT").expect("FAKE_ROOT"));
+    let root = if std::env::var_os("FAKE_ROOT_FROM_CWD").is_some() {
+        std::env::current_dir().expect("cwd")
+    } else {
+        PathBuf::from(std::env::var_os("FAKE_ROOT").expect("FAKE_ROOT"))
+    };
     let mut log = OpenOptions::new()
         .create(true)
         .append(true)

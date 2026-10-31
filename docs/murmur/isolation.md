@@ -12,7 +12,7 @@ nor Landlock. Missing bubblewrap, denied namespaces or a missing kind command
 fail preflight. agentd never silently falls back to an unsandboxed launch.
 
 The agent sees read-only system and toolchain paths, its writable workspace,
-a private persistent CLI home, configured credential directories, and one broker
+a private persistent CLI home, a copy of the configured credential file, and one broker
 directory at `/run/agentd/io`. That directory contains only its `mcp.sock` and,
 in proxy mode, its `egress.sock`.
 
@@ -74,11 +74,12 @@ SIGKILL are covered by the real-sandbox tests.
 | `/usr`, `/etc` | Host, read-only |
 | `/bin`, `/sbin`, `/lib`, `/lib64` | Mirror host symlinks, or bind real directories read-only |
 | `/proc`, `/dev` | Private procfs and minimal devices |
-| `/tmp`, `/run`, `$HOME` | Fresh tmpfs |
+| `/tmp`, `/run` | Fresh tmpfs |
+| `$HOME` | Private persistent home, writable |
 | `/run/agentd/bin/agentd` | Daemon executable, read-only |
 | `/run/agentd/io` | Per-agent socket directory, writable |
-| Kind `home` entries | Private persistent files and directories |
-| Credential parent directories | Host, writable, with sibling entries shadowed as described below |
+| Kind `home` entries | Minimal initial files and directories inside the private home |
+| Credential file | Copied into the private home, with JSON refresh synchronized by CAS |
 | `ro_binds`, `rw_binds` | Operator-selected paths at the same absolute paths |
 | Agent workspace | Writable, also the working directory |
 | `/run/systemd/resolve` | Read-only when present, host-network mode only |
@@ -96,33 +97,36 @@ Unsandboxed launch still strips inherited `AGENTD_*` settings.
 
 ## Credential refresh and exposure
 
-A file bind cannot support a CLI that writes a temporary credential and renames
-it over the old file. Linux returns `EBUSY` at a file mountpoint. agentd instead
-binds the credential's parent directory. A dummy credential integration gate
-writes a temporary file inside the sandbox, renames it successfully, and verifies
-the replacement from the host. It never changes the human's login or forces expiry.
+Defaults are `~/.claude/.credentials.json` and `~/.codex/auth.json`. Each kind
+accepts at most one credential file under HOME, or `credentials = []`. At launch,
+agentd opens every source path component without following symlinks. The source
+must be a regular file no larger than 1 MiB. A missing file permits launch without
+credentials. The copy goes into the private home at the same relative path.
+The human's CLI directory is never mounted. Settings, instructions, hooks, agents,
+plugins, new entries and late-created host files or sockets stay private.
 
-Defaults are `~/.claude/.credentials.json` and `~/.codex/auth.json`. Their narrowest
-existing parent directories are `~/.claude` and `~/.codex`. Those directories also
-hold settings, hooks, sessions, logs, plugins and other CLI state. agentd shadows
-every existing noncredential entry with private persistent storage. Known session
-and cache directories are shadowed even when absent on the host. Claude starts
-with empty settings and minimal onboarding. Codex starts with only
-`sandbox_mode = "read-only"`.
+Every two seconds while supervising an agent, and once after its session exits,
+agentd reads the private copy through no-follow directory descriptors. Only regular
+files within the size cap containing valid JSON can return to the host. It writes
+a mode-0600 exclusive temporary file and renames it over the configured host file
+only when the host still has the bytes last copied in or out for that agent.
+Conflicts are logged and skipped. Broker synchronization is serialized. Successful
+refreshes also reach live siblings of the same kind when their private copy and
+baseline still match the old bytes. Superseded JSON values are remembered for the
+broker's lifetime, including across agent restarts, and cannot be copied back
+even with different whitespace or key order.
 
-A writable credential directory remains a grant of directory access. Names are
-visible, newly added host entries can become visible, and the agent can create
-new host entries that are not shadowed. Mountpoint files cannot be replaced by
-rename, but the surrounding directory is not a credential-only authority.
-Credential mounts also remain shared between agents, and provider refresh races
-are not serialized. This is the deliberate R2 tradeoff, not a claim of complete
-CLI-state isolation. Concurrent replacement of directory entries by the human
-while a sandbox is being prepared is not hardened.
+An agent can write arbitrary valid JSON into the human's credential file. The
+broker cannot validate provider token freshness or intent. A CLI that caches
+tokens in memory may need a restart after a sibling's refresh. Dummy-credential
+tests prove copy, rename and conflict handling, not provider rotation semantics.
+The compare and rename sequence cannot provide filesystem-level atomic CAS
+against an unrelated host writer that ignores the broker's synchronization.
 
 The recommended R1 route is a revocable provider token in `kind.env`, with
 `credentials = []`. Use `CLAUDE_CODE_OAUTH_TOKEN` for Claude or `OPENAI_API_KEY`
 for Codex. This leaves all CLI state private and avoids sharing a refresh token
-and credential directory. The token is intentionally readable inside that agent;
+and credential file. The token is intentionally readable inside that agent;
 it is distinct from the removed broker MCP token. Do not commit provider tokens
 in a repository.
 
@@ -152,12 +156,16 @@ Default hosts are:
 `mcp-proxy.anthropic.com` is deliberately excluded because it permits actions
 through the human's account connectors. Telemetry and asset hosts are excluded.
 The live turns completed with those denied. Proxy-unaware tools fail closed
-because the namespace has no external route or DNS.
+because the namespace has no external route or DNS. The proxy validates every DNS
+answer and tries each validated address within its connection timeout. After
+CONNECT succeeds, it reads one bounded TLS ClientHello record within ten seconds.
+SNI must match the CONNECT host, ignoring case. Missing SNI, ECH, non-TLS data,
+malformed hellos and oversized records close the tunnel before forwarding bytes.
 
 ## Configuration reference
 
 ```toml
-sandbox = "bwrap" # Default. "none" preserves unsandboxed launches.
+sandbox = "bwrap" # Linux default; non-Linux defaults to "none". "none" preserves unsandboxed launches.
 
 [bwrap]
 path = "/usr/bin/bwrap"
@@ -188,16 +196,22 @@ socket = "/absolute/path/to/infinity/daemon.sock"
 ```
 
 `home` entries are relative and cannot traverse upward. Paths expand `~`, must be
-absolute, and cannot expose state, an ancestor of state, the whole human home or
-`/run/user`. Workspace paths receive the same state-overlap checks. Egress
-patterns cannot be IP literals. `AgentSpec.egress` extends the kind policy and is
-reserved for broker-controlled task policy. The kind `egress` list replaces its
+absolute, and cannot expose the state directory, its contents, or ancestors of
+HOME, `/run`, `/run/user`, the actual control socket and its directory, or the
+shared MCP socket. Read-only grants receive the same checks because they permit
+UNIX socket connections. Workspace paths receive the same checks at spawn.
+Workspaces under HOME, such as `~/code/x`, remain allowed. Startup rejects state
+directories whose per-agent socket paths would exceed `sun_path`.
+Egress patterns cannot be IP literals. Wildcards need at least two suffix labels,
+as in `*.example.com`, and validation lowercases patterns. The kind `egress` list replaces its
 defaults. `none` ignores home, credentials and egress configuration.
 
 `agentctl ls` includes an `isolation` field per row with `bwrap+proxy`, `bwrap+host`
 or `none`. On mixed configurations, startup warns by kind that unsandboxed agents
 can act as the human and as any agent. The current CLI uses JSON rows, so this is
-a new field rather than a text-table column.
+a new field rather than a text-table column. Labels are recorded only after a
+successful session start. Host-network kinds also warn at startup that host
+loopback, including local servers, is reachable.
 
 ## Reproducible gates
 
@@ -208,13 +222,15 @@ attribution, token rejection, host-wide readable proc token scans, credential
 rename, allowed public CONNECT, denied private/unknown CONNECT, and descendant
 cleanup after SIGTERM and SIGKILL. The public CONNECT check uses `example.com:443`
 and needs outbound network access. A real bwrap capability probe skips the test
-when bubblewrap or namespaces are unavailable. A skip is not qualification.
+when bubblewrap or namespaces are unavailable locally. With
+`AGENTD_REQUIRE_SANDBOX=1`, unavailable confinement fails the test. Ubuntu CI sets
+that variable; macOS remains excluded. A skip is not qualification.
 
 The [driver](../../crates/agentd/tests/support/isolation_driver.py) accepts an
 exported main binary, the current fake ACP binary and `--baseline`. This reproduces
 control-socket human impersonation and sibling-token theft and impersonation on
-`c437918`, with the same probes blocked on this branch. It retains its temporary
-workspace and prints its location for inspection.
+`c437918`, with the same probes blocked on this branch. It removes its temporary workspace on success unless `--keep` is set. Failures
+retain the workspace for inspection.
 
 The [live driver](../../crates/agentd/tests/support/live_isolation.py) accepts an
 agentd binary and a tool-install directory containing `node_modules/.bin`. Supply
@@ -241,7 +257,10 @@ evidence. The implementation handoff report records local run results separately
 
 - R1. Agents can read configured provider credentials. A broker-side API forwarder
   that injects auth is the later fix. Env tokens limit the current grant.
-- R2. Credential parent directory grants and refresh races remain as described above.
+- R2. An agent can write arbitrary valid JSON into the human's credential file.
+  The broker cannot prove provider freshness. A CLI caching tokens in memory may
+  need a restart after a sibling refresh. External host writers do not participate
+  in broker synchronization, so the final comparison and rename have a race.
 - R3. A writable workspace permits planting hooks or scripts that the human later runs.
   Per-agent clones and reviewed artifacts are future work.
 - R4. Host-network mode restores loopback, abstract UNIX sockets and unrestricted
@@ -256,6 +275,6 @@ evidence. The implementation handoff report records local run results separately
 - R10. Future CLIs may require currently denied telemetry or asset endpoints.
 
 There are no resource budgets or mail quotas in this change. The swarm can extend
-`AgentSpec.egress`, use egress-denial events for scope escalation, substitute an
+a broker-controlled task egress policy, use egress-denial events for scope escalation, substitute an
 API-auth forwarder for the proxy, create per-agent clones, and launch bubblewrap
 inside broker-owned resource scopes. No sandboxed process receives the host user bus.

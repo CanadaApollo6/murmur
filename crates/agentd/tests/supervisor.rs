@@ -27,6 +27,7 @@ fn kind(root: &Path, codex: bool) -> KindConfig {
     } else {
         KindConfig::claude(bin)
     };
+    kind.isolation = agentd::sandbox::Isolation::None;
     kind.env
         .insert("FAKE_ROOT".into(), root.display().to_string());
     kind.env.insert(
@@ -50,7 +51,6 @@ fn spec(root: &Path, kind: &str, policy: PermissionPolicy) -> AgentSpec {
         model: None,
         permissions: policy,
         idle_after: None,
-        egress: Vec::new(),
     }
 }
 fn config() -> Config {
@@ -1595,4 +1595,25 @@ async fn r18_send_must_nudge_replacement_actor() {
 #[tokio::test]
 async fn r18_send_control_same_actor() {
     r18_send_actor_probe(false).await;
+}
+
+#[tokio::test]
+async fn bwrap_without_mcp_context_is_rejected_before_launch() {
+    let root = tempfile::tempdir().expect("root");
+    let mailroom = Arc::new(
+        Mailroom::open(root.path().join("mail.db"), Default::default())
+            .await
+            .expect("mailroom"),
+    );
+    let mut kind = kind(root.path(), false);
+    kind.isolation =
+        agentd::sandbox::Isolation::Bwrap(agentd::sandbox::KindSandbox::defaults("claude"));
+    let broker = Broker::new(mailroom, vec![kind], config()).expect("broker");
+    let result = broker
+        .spawn(spec(root.path(), "claude", Default::default()))
+        .await;
+    assert!(
+        matches!(result, Err(Error::Rejected(reason)) if reason.contains("MCP isolation context"))
+    );
+    assert!(!root.path().join("wire.jsonl").exists());
 }

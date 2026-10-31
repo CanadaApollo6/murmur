@@ -25,7 +25,8 @@ agentctl watch
 The default state directory is `~/.local/state/agentd/`. `--state-dir` overrides it.
 The daemon reads `kinds.toml` there when present. An explicit `--config` must exist.
 Without a config, commands default to `claude-agent-acp` and `codex-acp` on PATH.
-Both kinds are preflighted inside bubblewrap. Install both commands or explicitly
+On Linux, both kinds are preflighted inside bubblewrap. Non-Linux targets default
+to `sandbox = "none"`. Install both commands or explicitly
 set `sandbox = "none"` for kinds you do not intend to sandbox. An Infinity-only
 configuration can set top-level `sandbox = "none"` because Infinity remains on the host.
 
@@ -210,7 +211,7 @@ does not install `send_message`. That requires a separate authenticated RAP tool
 Each kind can also provide `[kind.<name>.sandbox_args]` with `read_only`,
 `workspace_write`, and `full_access` argument arrays. `--sandbox` selects the
 launch arguments and ACP mode. Claude's `default` mode asks permission for edits;
-it is not an OS read-only sandbox. The broker does not add OS isolation. Shims
+it is not an OS read-only sandbox. Bubblewrap confinement is described below. Shims
 must support the selected mode; a mode-setting failure prevents prompting.
 
 `agentctl --socket /absolute/path` or `AGENTD_SOCKET` selects a custom control
@@ -266,11 +267,18 @@ Infinity agents are currently unsandboxed because their shared daemon runs on
 the host. Mixed configurations warn at startup. An unsandboxed agent can act
 as the human and reach every agent's socket.
 
-Credential refresh uses directory binds so temporary-file replacement can reach
-the host. Existing noncredential siblings are shadowed with private state.
-The real parent directory remains writable, including new unshadowed entries.
+The broker copies only `~/.claude/.credentials.json` or `~/.codex/auth.json` into
+the private home. It never mounts the human's CLI directory. Credential reads use
+no-follow directory descriptors and accept regular files up to 1 MiB. Valid JSON
+refreshes return through compare-and-swap and propagate to unchanged live
+siblings. Conflicts and superseded values are skipped and logged. Refresh checks
+run every two seconds and once after session exit.
+
+An agent can write arbitrary valid JSON into the human's credential file. A CLI
+that caches tokens in memory may need a restart after a sibling's refresh.
+An unrelated host writer can still race the final comparison and rename.
 Use `credentials = []` and `CLAUDE_CODE_OAUTH_TOKEN` or `OPENAI_API_KEY` in
-`kind.env` to avoid exposing that directory and the human's refresh token.
+`kind.env` to avoid exposing the human's refresh token.
 The OAuth hosts listed in the design are unverified. The default allowlist
 excludes account connectors at `mcp-proxy.anthropic.com`.
 

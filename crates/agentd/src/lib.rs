@@ -15,3 +15,6 @@ pub mod surfaces;
 
 pub mod egress;
 pub mod sandbox;
+
+mod credentials;
+mod private_fs;

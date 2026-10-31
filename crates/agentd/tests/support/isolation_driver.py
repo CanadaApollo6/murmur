@@ -17,11 +17,18 @@ hard_exit = '--sigkill' in sys.argv
 root = Path(tempfile.mkdtemp(prefix='agentd-isolation-'))
 state = root / 'state'
 state.mkdir(mode=0o700)
-credential_dir = root / 'credentials'
-credential_dir.mkdir()
-credential = credential_dir / 'dummy.json'
-credential.write_text('old dummy credential')
-for name in ['a', 'b']:
+human = root / 'home'
+for directory in ['.claude', '.codex']:
+    (human / directory).mkdir(parents=True)
+credential = human / '.claude/.credentials.json'
+codex_credential = human / '.codex/auth.json'
+credential.write_text('{"token":0}')
+codex_credential.write_text('{"token":0}')
+for name in ['.claude/settings.json', '.claude/CLAUDE.md', '.codex/AGENTS.md', '.codex/config.toml']:
+    (human / name).write_text('human CLI config')
+original_cli = {str(p.relative_to(human)): p.read_bytes() for p in human.rglob('*') if p.is_file()}
+
+for name in ['a', 'b', 'c']:
     (root / name).mkdir()
     shutil.copy(Path(__file__).with_name('isolation_probe.py'), root / name / 'probe.py')
 mode = 'none' if baseline else 'bwrap'
@@ -29,8 +36,8 @@ config = f'sandbox = "{mode}"\n[bwrap]\nro_binds = [{json.dumps(fake)}]\n'
 for kind, name, model in [('claude', 'a', 'default'), ('codex', 'b', 'read-only')]:
     config += f'[kind.{kind}]\ncommand = [{json.dumps(fake)}]\nmode = "{model}"\nidle_after_secs = 0\n'
     if not baseline:
-        config += f'credentials = [{json.dumps(str(credential))}]\negress = ["localhost", "example.com"]\n'
-    config += f'[kind.{kind}.env]\nFAKE_ROOT = {json.dumps(str(root / name))}\nFAKE_MODE = {json.dumps(model)}\n'
+        config += f'egress = ["localhost", "example.com"]\n'
+    config += f'[kind.{kind}.env]\nFAKE_ROOT = {json.dumps(str(root / name))}\nFAKE_MODE = {json.dumps(model)}\nFAKE_ROOT_FROM_CWD = "1"\n'
 if not baseline:
     config += '[kind.infinity]\nwire = "infinity"\nsocket = "/nonexistent/infinity.sock"\n'
 (root / 'config.toml').write_text(config)
@@ -38,7 +45,7 @@ if not baseline:
 if baseline:
     (root / 'config.toml').write_text('\n'.join(line for line in config.splitlines() if not line.startswith(('sandbox =', '[bwrap]', 'ro_binds ='))))
 log = open(root / 'daemon.log', 'wb')
-daemon = subprocess.Popen([binary, '--config', str(root / 'config.toml'), '--state-dir', str(state)], stdout=subprocess.DEVNULL, stderr=log)
+daemon = subprocess.Popen([binary, '--config', str(root / 'config.toml'), '--state-dir', str(state)], stdout=subprocess.DEVNULL, stderr=log, env=dict(os.environ, HOME=str(human)))
 
 def wait(fn, label, seconds=20):
     until = time.monotonic() + seconds
@@ -106,16 +113,25 @@ def wire_ready(name):
     p = root / name / 'wire.jsonl'
     return p.exists() and 'session/set_mode' in p.read_text()
 
+success = False
 try:
     wait(lambda: (state / 'agentd.sock').exists(), 'listen')
     b = spawn('b', 'codex')
     wait(lambda: wire_ready('b'), 'b idle')
     # The shim carries the sibling token on main. In the sandbox it carries none.
     sibling = wait(lambda: proc_scan(str(root / 'b').encode(), 'environ' if baseline else 'cmdline'), 'sibling host PID')[0]
+    c = spawn('c', 'codex')
+    wait(lambda: any(row['id'] == c['id'] and row['phase'] == 'idle' for row in ctl({'command': 'ls'})), 'sibling idle')
     a = spawn('a', 'claude')
     wait(lambda: wire_ready('a'), 'a idle')
+    late = human / '.claude/late'
+    late.mkdir()
+    (late / 'secret').write_text('late host secret')
+    late_socket = socket.socket(socket.AF_UNIX)
+    late_socket.bind(str(late / 'sock'))
+    late_socket.listen(1)
     marker = str(root / 'detached-marker')
-    config = {'baseline': baseline, 'shared': str(state / 'mcp.sock'), 'credential': str(credential), 'marker': marker,
+    config = {'baseline': baseline, 'shared': str(state / 'mcp.sock'), 'credential': str(credential), 'marker': marker, 'late': str(late),
               'paths': {'control': str(state / 'agentd.sock'), 'state': str(state), 'sqlite': str(state / 'mail.db'),
                         'sibling_environ': f'/proc/{sibling}/environ', 'sibling_cmdline': f'/proc/{sibling}/cmdline', 'sibling_mcp': str(state / 'agents' / b['id'].split(':', 1)[1] / 'io/mcp.sock')}}
     if not baseline:
@@ -136,11 +152,56 @@ try:
     else:
         assert not any(result[k] for k in ['control', 'state', 'sqlite', 'sibling_environ', 'sibling_cmdline', 'forged_agent', 'own_token', 'direct_network', 'sibling_mcp']), result
         assert all(result[k] for k in ['token_rejected', 'rename', 'proxy_deny', 'proxy_private_deny', 'proxy_allow']), result
-        assert credential.read_text() == 'refreshed dummy credential'
+        wait(lambda: credential.read_text() == '{"token":1}', 'credential copy-back')
+        for relative, before in original_cli.items():
+            if relative not in ['.claude/.credentials.json', '.codex/auth.json']:
+                assert (human / relative).read_bytes() == before, relative
+        for relative in ['.claude/agents', '.claude/new-dir', '.codex/new-dir']:
+            assert not (human / relative).exists(), relative
+        assert result['late_file_hidden'] and result['late_socket_hidden'], result
+        print('PASS private CLI writes and late host file/socket isolation', flush=True)
+        def action(name, data, crash=False):
+            work = root / name
+            (work / 'action-result').unlink(missing_ok=True)
+            (work / 'probe-input.json').write_text(json.dumps(data))
+            ctl({'command': 'send', 'to': '@' + name, 'body': 'isolation-probe' + (' die-before' if crash else ''), 'key': str(time.monotonic())})
+            wait(lambda: (work / 'action-result').exists(), 'action ' + data['action'])
+        bhome = state / 'agents' / b['id'].split(':', 1)[1] / 'home'
+        chome = state / 'agents' / c['id'].split(':', 1)[1] / 'home'
+        action('b', {'action': 'refresh', 'token': 1})
+        wait(lambda: json.loads(codex_credential.read_text())['token'] == 1, 'host refresh')
+        wait(lambda: json.loads((chome / '.codex/auth.json').read_text())['token'] == 1, 'sibling refresh')
+        action('b', {'action': 'refresh', 'token': 0})
+        time.sleep(2.2)
+        assert json.loads(codex_credential.read_text())['token'] == 1, 'stale cached token clobbered host'
+        codex_credential.write_text('{"token":99}')
+        action('b', {'action': 'refresh', 'token': 2})
+        time.sleep(2.2)
+        assert json.loads(codex_credential.read_text())['token'] == 99, 'human refresh clobbered'
+        print('PASS rename refresh reaches host and sibling; stale and external updates preserved', flush=True)
+        secret = root / 'host-secret'
+        secret.write_text('{"host_secret":true}')
+        action('b', {'action': 'symlink', 'secret': str(secret)}, crash=True)
+        wait(lambda: any(row['id'] == b['id'] and row['phase'] == 'failed' for row in ctl({'command': 'ls'})), 'symlink relaunch fails closed', seconds=30)
+        assert json.loads(codex_credential.read_text())['token'] == 99
+        assert secret.read_text() == '{"host_secret":true}'
+        assert (bhome / '.codex/auth.json').is_symlink()
+        assert next(row for row in ctl({'command': 'ls'}) if row['id'] == b['id'])['isolation'] == 'none'
+        print('PASS private credential symlink blocks sync and relaunch without reading host secret', flush=True)
+        ctl({'command': 'cancel', 'to': '@a'})
+        wait(lambda: any(row['id'] == a['id'] and row['phase'] == 'idle' for row in ctl({'command': 'ls'})), 'a cancelled')
+        victim = root / 'outside-seed'
+        action('a', {'action': 'restart', 'victim': str(victim), 'marker': marker})
+        wait(lambda: (root / 'a/action-result').read_text() == 'replayed', 'crash replay')
+        wait(lambda: any(row['id'] == a['id'] and row['phase'] == 'idle' for row in ctl({'command': 'ls'})), 'socket restart')
+        assert not victim.exists(), 'seed followed dangling symlink'
+        import stat
+        assert stat.S_ISSOCK((state / 'agents' / a['id'].split(':', 1)[1] / 'io/mcp.sock').stat().st_mode)
+        print('PASS dangling seed symlink creates no host file and planted mcp.sock self-heals', flush=True)
         assert not proc_scan(b'AGENTD_MCP_TOKEN=', 'environ'), 'host-wide token env leak'
         assert not proc_scan(b'AGENTD_MCP_TOKEN', 'cmdline'), 'host-wide token argv leak'
         print('PASS host-wide readable /proc argv and environ scan: no MCP token; kernel-denied files are not inspected', flush=True)
-        assert all(row['isolation'] == 'bwrap+proxy' for row in ctl({'command': 'ls'}))
+        assert all(row['isolation'] == 'bwrap+proxy' for row in ctl({'command': 'ls'}) if row['phase'] == 'idle')
     if not baseline:
         wait(lambda: proc_scan(marker.encode(), 'cmdline'), 'detached descendant')
     recorded = process_tree(daemon.pid)
@@ -161,8 +222,11 @@ try:
         assert not proc_scan(marker.encode(), 'cmdline'), 'sandbox descendant survived agentd'
         assert not surviving(recorded), f'captured sandbox processes survived: {surviving(recorded)}'
         print(f'PASS no sandboxed process survived agentd exit; checked {len(recorded)} host PIDs and start times', flush=True)
+    success = True
 finally:
     if daemon.poll() is None:
         daemon.terminate()
         daemon.wait(timeout=10)
     log.close()
+    if success and '--keep' not in sys.argv:
+        shutil.rmtree(root)

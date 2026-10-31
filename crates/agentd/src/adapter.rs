@@ -54,9 +54,11 @@ impl KindConfig {
     fn new(name: &str, command: String, mode: &str) -> Self {
         Self {
             wire: Wire::Acp,
-            isolation: crate::sandbox::Isolation::Bwrap(crate::sandbox::KindSandbox::defaults(
-                name,
-            )),
+            isolation: if cfg!(target_os = "linux") {
+                crate::sandbox::Isolation::Bwrap(crate::sandbox::KindSandbox::defaults(name))
+            } else {
+                crate::sandbox::Isolation::None
+            },
             model: None,
             name: name.into(),
             command,

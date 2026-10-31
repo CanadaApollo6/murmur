@@ -5,7 +5,7 @@ use crate::surfaces::{Result, Socket};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 
 #[derive(Clone)]
@@ -16,7 +16,7 @@ pub struct Policy {
 fn public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
-            let [a, b, _, _] = ip.octets();
+            let [a, b, c, _] = ip.octets();
             !ip.is_private()
                 && !ip.is_loopback()
                 && !ip.is_link_local()
@@ -28,6 +28,10 @@ fn public(ip: IpAddr) -> bool {
                 && a < 240
                 && !(a == 192 && b == 0)
                 && !(a == 198 && (b == 18 || b == 19))
+                // IANA IPv4/IPv6 special-purpose registries, including documentation.
+                && !(a == 198 && b == 51 && c == 100)
+                && !(a == 203 && b == 0 && c == 113)
+                && !(a == 192 && matches!((b, c), (31, 196) | (52, 193) | (88, 99) | (175, 48)))
         }
         IpAddr::V6(ip) => {
             let b = ip.octets();
@@ -42,7 +46,11 @@ fn public(ip: IpAddr) -> bool {
                 // Require global unicast and exclude 6to4 and Teredo transitions.
                 && b[0] & 0xe0 == 0x20
                 && !(b[0] == 0x20 && b[1] == 0x02)
-                && !(b[..4] == [0x20, 0x01, 0, 0])
+                && !(b[0] == 0x20 && b[1] == 0x01 && b[2] < 2)
+                && !(b[..4] == [0x20, 0x01, 0x0d, 0xb8])
+                && !(b[..4] == [0x20, 0x01, 0x00, 0x03])
+                && !(b[..4] == [0x26, 0x20, 0x00, 0x4f])
+                && !(b[0] == 0x3f && b[1] == 0xff && b[2] < 16)
         }
     }
 }
@@ -59,14 +67,19 @@ impl Policy {
                 }
             })
     }
-    fn permitted(&self, host: &str, port: u16, addrs: &[SocketAddr]) -> Option<SocketAddr> {
+    fn permitted<'a>(
+        &self,
+        host: &str,
+        port: u16,
+        addrs: &'a [SocketAddr],
+    ) -> Option<&'a [SocketAddr]> {
         if !self.allows(host, port)
             || addrs.is_empty()
             || addrs.iter().any(|a| !public(a.ip()) || a.port() != port)
         {
             None
         } else {
-            Some(addrs[0])
+            Some(addrs)
         }
     }
 }
@@ -153,7 +166,7 @@ async fn connection(
     } else {
         vec![]
     };
-    let Some(addr) = policy.permitted(&host, port, &addrs) else {
+    let Some(addrs) = policy.permitted(&host, port, &addrs) else {
         let body = format!("blocked by agentd egress policy for @{name}\n");
         read.get_mut().write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await?;
         // Events have no delivery guarantee, just like activity and phase events.
@@ -165,17 +178,205 @@ async fn connection(
         }
         return Ok(());
     };
-    let mut upstream =
-        tokio::time::timeout(Duration::from_secs(15), TcpStream::connect(addr)).await??;
+    let mut upstream = connect(addrs).await?;
     read.get_mut()
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
+    let hello =
+        tokio::time::timeout(Duration::from_secs(10), client_hello(&mut read, &host)).await??;
+    upstream.write_all(&hello).await?;
     tokio::io::copy_bidirectional(&mut read, &mut upstream).await?;
     Ok(())
+}
+async fn connect(addrs: &[SocketAddr]) -> Result<TcpStream> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let budget = Duration::from_secs(15) / addrs.len().max(1) as u32;
+        for addr in addrs {
+            if let Ok(Ok(stream)) = tokio::time::timeout(budget, TcpStream::connect(addr)).await {
+                return Ok(stream);
+            }
+        }
+        Err("all validated egress addresses failed".into())
+    })
+    .await?
+}
+fn take<'a>(bytes: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
+    if len > bytes.len() {
+        return Err("truncated ClientHello".into());
+    }
+    let (head, tail) = bytes.split_at(len);
+    *bytes = tail;
+    Ok(head)
+}
+fn u16be(bytes: &mut &[u8]) -> Result<usize> {
+    let n = take(bytes, 2)?;
+    Ok(u16::from_be_bytes([n[0], n[1]]) as usize)
+}
+fn vector<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8]> {
+    let len = u16be(bytes)?;
+    take(bytes, len)
+}
+fn check_hello(mut bytes: &[u8], host: &str) -> Result<()> {
+    let handshake = take(&mut bytes, 4)?;
+    let len =
+        ((handshake[1] as usize) << 16) | ((handshake[2] as usize) << 8) | handshake[3] as usize;
+    if handshake[0] != 1 || len != bytes.len() {
+        return Err("expected one complete ClientHello".into());
+    }
+    let version = take(&mut bytes, 2)?;
+    if version[0] != 3 || version[1] > 3 {
+        return Err("invalid TLS version".into());
+    }
+    take(&mut bytes, 32)?;
+    let session_len = take(&mut bytes, 1)?[0] as usize;
+    if session_len > 32 {
+        return Err("invalid TLS session ID".into());
+    }
+    take(&mut bytes, session_len)?;
+    let ciphers = vector(&mut bytes)?;
+    if ciphers.is_empty() || ciphers.len() % 2 != 0 {
+        return Err("invalid cipher suites".into());
+    }
+    let compression_len = take(&mut bytes, 1)?[0] as usize;
+    if take(&mut bytes, compression_len)?.is_empty() {
+        return Err("missing compression methods".into());
+    }
+    let mut extensions = vector(&mut bytes)?;
+    if !bytes.is_empty() {
+        return Err("trailing ClientHello bytes".into());
+    }
+    let mut sni = None;
+    let mut seen = std::collections::HashSet::new();
+    while !extensions.is_empty() {
+        let kind = u16be(&mut extensions)?;
+        let mut value = vector(&mut extensions)?;
+        if !seen.insert(kind) || kind == 0xfe0d {
+            return Err("duplicate extension or ECH forbidden".into());
+        }
+        if kind == 0 {
+            let mut names = vector(&mut value)?;
+            if !value.is_empty() {
+                return Err("invalid SNI list".into());
+            }
+            while !names.is_empty() {
+                let kind = take(&mut names, 1)?[0];
+                let name = vector(&mut names)?;
+                if kind != 0 || sni.is_some() {
+                    return Err("invalid SNI name".into());
+                }
+                sni = Some(std::str::from_utf8(name)?);
+            }
+        }
+    }
+    if !sni.is_some_and(|sni| sni.eq_ignore_ascii_case(host)) {
+        return Err("TLS SNI must match CONNECT host".into());
+    }
+    Ok(())
+}
+async fn client_hello(read: &mut (impl AsyncRead + Unpin), host: &str) -> Result<Vec<u8>> {
+    let mut header = [0u8; 5];
+    read.read_exact(&mut header).await?;
+    let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if header[0] != 22 || header[1] != 3 || header[2] > 3 || !(4..=16384).contains(&len) {
+        return Err("invalid or oversized TLS record".into());
+    }
+    let mut record = vec![0; len + 5];
+    record[..5].copy_from_slice(&header);
+    read.read_exact(&mut record[5..]).await?;
+    check_hello(&record[5..], host)?;
+    Ok(record)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn hello(host: Option<&str>, ech: bool) -> Vec<u8> {
+        let mut extensions = vec![];
+        if let Some(host) = host {
+            let mut names = vec![0];
+            names.extend((host.len() as u16).to_be_bytes());
+            names.extend(host.as_bytes());
+            extensions.extend([0, 0]);
+            extensions.extend(((names.len() + 2) as u16).to_be_bytes());
+            extensions.extend((names.len() as u16).to_be_bytes());
+            extensions.extend(names);
+        }
+        if ech {
+            extensions.extend([0xfe, 0x0d, 0, 0]);
+        }
+        let mut body = vec![3, 3];
+        body.extend([0; 32]);
+        body.extend([0, 0, 2, 0x13, 1, 1, 0]);
+        body.extend((extensions.len() as u16).to_be_bytes());
+        body.extend(extensions);
+        let mut record = vec![22, 3, 1];
+        record.extend(((body.len() + 4) as u16).to_be_bytes());
+        record.extend([
+            1,
+            0,
+            ((body.len() >> 8) & 255) as u8,
+            (body.len() & 255) as u8,
+        ]);
+        record.extend(body);
+        record
+    }
+    #[tokio::test]
+    async fn tls_sni_requires_connect_host_and_rejects_ech_and_non_tls() {
+        for (bytes, allowed) in [
+            (hello(Some("API.example.com"), false), true),
+            (hello(Some("mcp.example.com"), false), false),
+            (hello(Some("api.example.com"), true), false),
+            (hello(None, false), false),
+            (b"GET / HTTP/1.1\r\n".to_vec(), false),
+            (vec![22, 3, 1, 255, 255], false),
+            (vec![22, 3, 1, 0, 4, 1, 255, 255, 255], false),
+        ] {
+            assert_eq!(
+                client_hello(&mut bytes.as_slice(), "api.example.com")
+                    .await
+                    .is_ok(),
+                allowed
+            );
+        }
+    }
+    #[tokio::test]
+    async fn tls_record_split_across_reads_is_forwarded_intact() {
+        let bytes = hello(Some("api.example.com"), false);
+        let (mut writer, mut reader) = tokio::io::duplex(7);
+        let original = bytes.clone();
+        let task = tokio::spawn(async move {
+            for part in bytes.chunks(3) {
+                writer.write_all(part).await.expect("write fragment");
+                tokio::task::yield_now().await;
+            }
+        });
+        assert_eq!(
+            client_hello(&mut reader, "api.example.com")
+                .await
+                .expect("hello"),
+            original
+        );
+        task.await.expect("writer");
+    }
+    #[tokio::test]
+    async fn connects_to_second_address_when_first_fails() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let first = closed.local_addr().expect("address");
+        drop(closed);
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let second = live.local_addr().expect("address");
+        assert_eq!(
+            connect(&[first, second])
+                .await
+                .expect("fallback")
+                .peer_addr()
+                .expect("peer"),
+            second
+        );
+    }
     #[test]
     fn policy_checks_every_address_and_hostname_boundary() {
         let policy = Policy {
@@ -185,7 +386,7 @@ mod tests {
         let good: SocketAddr = "1.1.1.1:443".parse().expect("address");
         assert_eq!(
             policy.permitted("api.example.com", 443, &[good]),
-            Some(good)
+            Some(&[good][..])
         );
         assert!(policy.permitted("x.example.org", 443, &[good]).is_some());
         for host in [
@@ -208,6 +409,17 @@ mod tests {
             "fc00::1",
             "fe80::1",
             "::ffff:127.0.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "192.31.196.1",
+            "192.52.193.1",
+            "192.88.99.1",
+            "192.175.48.1",
+            "2001:db8::1",
+            "2001:2::1",
+            "2001:10::1",
+            "3fff::1",
+            "3fff:fff::1",
         ] {
             let bad = SocketAddr::new(ip.parse().expect("IP"), 443);
             assert!(

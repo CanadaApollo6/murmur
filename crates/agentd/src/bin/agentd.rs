@@ -87,8 +87,8 @@ async fn run(args: Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| state.join("mcp.sock"));
     let mut sandbox = cfg.bwrap.clone();
-    let kinds = cfg.kinds()?;
-    sandbox.validate(&state, &kinds)?;
+    let mut kinds = cfg.kinds()?;
+    sandbox.validate(&state, &control_path, &mcp_path, &mut kinds)?;
     if kinds
         .iter()
         .any(|k| matches!(k.isolation, agentd::sandbox::Isolation::Bwrap(_)))
@@ -97,6 +97,16 @@ async fn run(args: Args) -> Result<()> {
             if matches!(kind.isolation, agentd::sandbox::Isolation::None) {
                 eprintln!(
                     "agentd: WARNING mixed isolation: kind {} is unsandboxed and its agents can act as the human and as any agent",
+                    kind.name
+                );
+            }
+        }
+    }
+    if sandbox.network == agentd::sandbox::Network::Host {
+        for kind in &kinds {
+            if matches!(kind.isolation, agentd::sandbox::Isolation::Bwrap(_)) {
+                eprintln!(
+                    "agentd: WARNING kind {} uses bwrap with host network: host loopback, including local servers, is reachable",
                     kind.name
                 );
             }

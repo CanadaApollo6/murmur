@@ -106,7 +106,6 @@ async fn run(args: Args) -> Result<()> {
                     ..Default::default()
                 },
                 idle_after: None,
-                egress: Vec::new(),
             },
             first_message: first_message.map(Body::new).transpose()?,
             key,
