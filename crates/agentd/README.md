@@ -106,10 +106,13 @@ does not restore a cleared marker.
 
 Every kind has a mail-starvation stall timer in the supervisor. It bounds mail
 queued or deferred behind running work, including mail offered to a busy Infinity
-thread. The running turn's own mail does not arm it. An initial uncommitted
-Infinity delivery uses the adapter's receipt deadline instead. If a completion
+thread. Mail included in the running completion does not arm it. Batch-mates
+core has not picked up yet count as other waiting mail, even from one submit.
+An initial uncommitted Infinity delivery uses the adapter's receipt deadline
+instead. If a completion
 finishes without committing an offer, that mail is waiting behind other work
-and arms the stall timer. Cancelling a `Broker::send` caller cannot separate
+and arms the stall timer until core admits it into a completion. Admission is
+not a durable receipt. Cancelling a `Broker::send` caller cannot separate
 durable acceptance from the actor wakeup.
 `stall_timeout_secs` seconds without real session activity invokes the existing
 cancel path. Stream chunks, tool starts and results, completion boundaries,

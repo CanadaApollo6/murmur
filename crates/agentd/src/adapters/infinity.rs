@@ -305,6 +305,20 @@ impl InfinitySession {
 
     fn receive(&mut self, message: DaemonMessage) -> Result<(), AdapterError> {
         match message {
+            DaemonMessage::InputAdmitted {
+                thread_id,
+                dedup_id,
+            } if self.root_event(&thread_id) => {
+                if let Some(id) = self
+                    .pending
+                    .keys()
+                    .find(|id| dedup_id == format!("peer-{id}"))
+                    .copied()
+                {
+                    self.events
+                        .push_back(SessionEvent::Admitted { ids: vec![id] });
+                }
+            }
             DaemonMessage::InputCommitted {
                 thread_id,
                 dedup_id,

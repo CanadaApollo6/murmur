@@ -2051,6 +2051,63 @@ async fn r17_choice_id_reuse_after_turn_gets_new_deadline() {
 }
 
 #[cfg(test)]
+async fn r18_admission_probe(matching_root: bool) {
+    let mut t = Test::with_stall(Default::default(), Duration::from_millis(300)).await;
+    let id = t.send(true, "waiting mail").await;
+    let offer = t.daemon.next().await;
+    offer.emit(fake::start());
+    offer.emit(fake::round_done());
+    offer.emit(DaemonMessage::InputAdmitted {
+        thread_id: if matching_root {
+            fake::thread()
+        } else {
+            Some("child".into())
+        },
+        dedup_id: format!("peer-{id}"),
+    });
+    offer.emit(DaemonMessage::InputAdmitted {
+        thread_id: fake::thread(),
+        dedup_id: "peer-unrelated".into(),
+    });
+    offer.emit(fake::start());
+    offer.emit(DaemonMessage::Info {
+        thread_id: fake::thread(),
+        text: "admission barrier".into(),
+    });
+    t.event(|e| matches!(e, Event::Activity { text, .. } if text == "admission barrier"))
+        .await;
+    let next = tokio::time::timeout(Duration::from_millis(700), t.daemon.next()).await;
+    let interrupted = next
+        .as_ref()
+        .is_ok_and(|r| matches!(r.message, ClientMessage::Interrupt { .. }));
+    assert_eq!(
+        interrupted, !matching_root,
+        "only exact root admission retires Waiting, including across continuation StartOutput"
+    );
+    assert!(
+        matches!(
+            t.mailroom.delivery(id).await.expect("delivery").state,
+            DeliveryState::Offered { .. }
+        ),
+        "admission never consumes mail"
+    );
+    offer.emit(fake::receipt(format!("peer-{id}")));
+    t.consumed(id).await;
+    offer.emit(fake::idle());
+    t.idle().await;
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn r18_exact_admission_retires_waiting_without_a_receipt() {
+    r18_admission_probe(true).await;
+}
+
+#[tokio::test]
+async fn r18_foreign_admission_and_tool_continuation_keep_waiting() {
+    r18_admission_probe(false).await;
+}
+
 mod r17o {
     use super::*;
 

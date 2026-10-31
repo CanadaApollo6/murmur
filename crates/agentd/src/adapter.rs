@@ -156,6 +156,7 @@ pub(crate) enum SessionEvent {
     CancelComplete,
     CancelTimedOut,
     TurnStarted { ids: Vec<MessageId> },
+    Admitted { ids: Vec<MessageId> },
     Committed { ids: Vec<MessageId> },
     Waiting { ids: Vec<MessageId> },
     Activity(String),

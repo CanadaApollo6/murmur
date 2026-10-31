@@ -346,6 +346,11 @@ pub enum ClientMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DaemonMessage {
+    /// Input included in a completion, without confirming durability.
+    InputAdmitted {
+        thread_id: Option<ThreadRef>,
+        dedup_id: String,
+    },
     InputCommitted {
         thread_id: Option<ThreadRef>,
         dedup_id: String,

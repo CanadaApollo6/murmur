@@ -4168,6 +4168,8 @@ async fn r17_command_choice_id_reuse_gets_new_deadline() {
 #[cfg(test)]
 mod r17o {
     use super::*;
+    use agentd::mailroom::NewMessage;
+    use agentd::model::*;
     use agentd::supervisor::{Config, Event, Phase};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4291,7 +4293,7 @@ mod r17o {
             eprintln!("r17o mail racing cli start, after tool result: inference_requests={} mail={final_state:?}", delivered.len());
             r.broker.shutdown().await.expect("shutdown");
             assert!(fetching, "probe precondition: manifest is resolving");
-            assert_eq!(final_state, agentd::model::DeliveryState::Consumed);
+            assert_eq!(final_state, DeliveryState::Consumed);
             assert_eq!(phase_before, Phase::Idle, "probe precondition: agentd offers from Idle");
             assert!(!started_before_offer, "probe precondition: the CLI completion's StartOutput has not reached agentd");
             assert!(!cli_completion_has_mail, "probe precondition: the CLI completion does not carry agentd mail");
@@ -4356,6 +4358,150 @@ mod r17o {
             assert_ne!(status, Some(SessionStatus::Archived));
             assert_eq!(h.manager.lock().await.session_store.lock().await.get_cwd(&root.id), h.cwd.path());
             assert!(resumed, "migrated session must accept new input");
+        }).await;
+    }
+    async fn r18_healthy_next_turn(with_foreign_turn: bool) {
+        tokio::task::LocalSet::new().run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let (port, fetches) = slow_manifest_server(Duration::from_millis(1000)).await;
+            rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
+            let r = r12o::rig_with_stall(&h, Duration::from_secs(10), Duration::from_millis(300), fast(), None, Duration::from_millis(500)).await;
+            h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: true }).expect("attach");
+            wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
+            if with_foreign_turn {
+                h.client_tx.send(ClientMessage::UserInput { thread_id: r.root.clone(), text: "short CLI turn".into() }).expect("cli input");
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while fetches.load(Ordering::SeqCst) == 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
+                }).await.expect("cold manifest fetch");
+                assert_eq!(r.agent.phase(), Phase::Idle);
+            }
+            let mail = r12o::send(&r, "r18 healthy own mail").await;
+            let first = tokio::time::timeout(Duration::from_secs(4), h.ctrl.next_request()).await.expect("first request");
+            let own = if with_foreign_turn {
+                assert!(!format!("{first:?}").contains("r18 healthy own mail"));
+                h.ctrl.send_text("CLI finished normally");
+                h.ctrl.finish();
+                tokio::time::timeout(Duration::from_secs(4), h.ctrl.next_request()).await.expect("own request")
+            } else { first };
+            assert!(format!("{own:?}").contains("r18 healthy own mail"));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let before = r.mailroom.delivery(mail).await.expect("delivery").state;
+            assert!(r.mailroom.pending_for(r.agent.id).await.expect("queued mail").is_empty());
+            assert_eq!(r.log.borrow().iter().filter(|e| matches!(e, Event::Offered { ids, .. } if ids.contains(&mail))).count(), 1);
+            assert!(!stalled(&r), "must reach own inference before any stall");
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            let cancelled = stalled(&r);
+            let after = r.mailroom.delivery(mail).await.expect("delivery").state;
+            eprintln!("R18 healthy own inference foreign={with_foreign_turn} stalled={cancelled} before={before:?} after={after:?} {}", r12o::summary(&r));
+            h.ctrl.send_text("healthy inference completed");
+            h.ctrl.finish();
+            r12o::drain(&mut h, Duration::from_millis(500)).await;
+            r.broker.shutdown().await.expect("shutdown");
+            assert_eq!(before, after, "admission must not consume or re-offer mail");
+            assert!(matches!(after, DeliveryState::Offered { .. }), "admission is not a durable receipt");
+            assert_eq!(r.mailroom.delivery(mail).await.expect("delivery").state, DeliveryState::Consumed, "exact receipt consumes mail after inference finishes");
+            assert!(!cancelled, "mail included in the current inference must not cancel that inference as waiting mail");
+        }).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn r18_response_done_must_not_cancel_next_turns_own_mail() {
+        r18_healthy_next_turn(true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn r18_control_own_mail_without_prior_response_done() {
+        r18_healthy_next_turn(false).await;
+    }
+
+    fn timeline(r: &r12o::Rig) -> Vec<String> {
+        r.log
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                Event::Activity { text, .. } => Some(format!("A:{text}")),
+                Event::PhaseChanged { phase, .. } => Some(format!("P:{phase:?}")),
+                Event::Offered { ids, .. } => Some(format!("Offered:{}", ids.len())),
+                Event::Consumed { ids, .. } => Some(format!("Consumed:{}", ids.len())),
+                Event::TurnEnded { outcome, .. } => Some(format!("TurnEnded:{outcome:?}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn queue_silently(r: &r12o::Rig, text: &str) -> MessageId {
+        r.mailroom
+            .accept(NewMessage {
+                from: Sender::Human,
+                to: r.agent.id,
+                body: Body::new(text).expect("body"),
+                reply_to: None,
+                client_key: ClientKey(text.into()),
+                act: agentd::swarm::Act::Inform,
+                task: None,
+            })
+            .await
+            .expect("accept")
+            .1
+            .id()
+    }
+
+    /// Can one agentd submit be split across core completions? Three mails offered from
+    /// Idle in one submit on a cold root (slow manifest). The model then calls a tool that
+    /// never returns. If all three are in the first completion, no mail waits and the stall
+    /// must not fire. If core splits them, the excluded mail waits and the stall fires.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r18o_one_submit_split_across_completions() {
+        tokio::task::LocalSet::new().run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let (port, _fetches) = slow_manifest_server(Duration::from_millis(1500)).await;
+            rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
+            let r = r12o::rig_with_stall(&h, Duration::from_secs(10), Duration::from_millis(300), fast(), None, Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let a = queue_silently(&r, "r18o batch one").await;
+            let b = queue_silently(&r, "r18o batch two").await;
+            let c = r12o::send(&r, "r18o batch three").await;
+            let request = tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request()).await.expect("first completion");
+            let offered_batches = r.log.borrow().iter().filter_map(|e| match e { Event::Offered { ids, .. } => Some(ids.len()), _ => None }).collect::<Vec<_>>();
+            let first = format!("{:?}", request.chat_history);
+            let included = ["one", "two", "three"].map(|n| first.contains(&format!("r18o batch {n}")));
+            h.ctrl.send_tool_call("own-call", "slow_job", serde_json::json!({}));
+            h.ctrl.finish();
+            let tool_seen = wait_log(&r, |e| matches!(e, Event::Activity { text, .. } if text == "slow_job"), Duration::from_secs(3)).await;
+            eprintln!("r18o split timeline after first completion: tool_seen={tool_seen} {:?}", timeline(&r));
+            assert!(tool_seen, "tool call observed");
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            let stall = stalled(&r);
+            let states = [
+                r.mailroom.delivery(a).await.expect("a").state,
+                r.mailroom.delivery(b).await.expect("b").state,
+                r.mailroom.delivery(c).await.expect("c").state,
+            ];
+            eprintln!("r18o one submit split: offered_events={offered_batches:?} first_completion_includes={included:?} stall_after_2.5s={stall} states={states:?} {}", r12o::summary(&r));
+            let mut histories = Vec::new();
+            let end = tokio::time::Instant::now() + Duration::from_secs(6);
+            while let Ok(req) = tokio::time::timeout_at(end, h.ctrl.next_request()).await {
+                histories.push(format!("{:?}", req.chat_history));
+                h.ctrl.send_text("ok");
+                h.ctrl.finish();
+            }
+            for id in [a, b, c] {
+                wait_log(&r, |e| matches!(e, Event::Consumed { ids, .. } if ids.contains(&id)), Duration::from_secs(3)).await;
+            }
+            let last = histories.last().cloned().unwrap_or_default();
+            let occurrences = ["one", "two", "three"].map(|n| last.matches(&format!("r18o batch {n}")).count());
+            let receipts = [a, b, c].map(|id| r.log.borrow().iter().filter(|e| matches!(e, Event::Consumed { ids, .. } if ids.contains(&id))).count());
+            let finals = [
+                r.mailroom.delivery(a).await.expect("a").state,
+                r.mailroom.delivery(b).await.expect("b").state,
+                r.mailroom.delivery(c).await.expect("c").state,
+            ];
+            eprintln!("r18o one submit split, after drain: requests={} last_history_occurrences={occurrences:?} receipts={receipts:?} states={finals:?} {}", histories.len(), r12o::summary(&r));
+            r.broker.shutdown().await.expect("shutdown");
+            assert!(finals.iter().all(|s| *s == DeliveryState::Consumed), "all consumed");
+            assert_eq!(receipts, [1, 1, 1], "one receipt each");
+            assert!(occurrences.iter().all(|n| *n == 1), "model sees each mail exactly once");
+            assert_eq!(offered_batches, vec![3], "probe precondition: one submit of three");
+            let all_in_first = included.iter().all(|x| *x);
+            assert_eq!(stall, !all_in_first, "stall fires exactly when a batch-mate missed the first completion");
         }).await;
     }
 }

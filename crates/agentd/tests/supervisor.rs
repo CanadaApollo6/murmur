@@ -1445,3 +1445,153 @@ async fn r17_cancelled_send_still_arms_timer_for_durable_mail() {
         "durably accepted mail must arm starvation even if the send caller disappears"
     );
 }
+
+async fn r18_send_actor_probe(replace: bool) {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    async fn event(events: &mut broadcast::Receiver<Event>, f: impl Fn(&Event) -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if f(&events.recv().await.expect("event")) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("event timeout");
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let mailroom = Arc::new(
+        Mailroom::open(root.path().join("mail.db"), Default::default())
+            .await
+            .expect("mailroom"),
+    );
+    let mut k = kind(root.path(), false);
+    k.stall_timeout = Duration::from_millis(300);
+    let broker = Arc::new(Broker::new(mailroom.clone(), vec![k], config()).expect("broker"));
+    let mut events = broker.events();
+    let requested = spec(root.path(), "claude", Default::default());
+    let old = broker.spawn(requested.clone()).await.expect("old actor");
+    event(&mut events, |e| {
+        matches!(
+            e,
+            Event::PhaseChanged {
+                phase: Phase::Idle,
+                ..
+            }
+        )
+    })
+    .await;
+    let message = NewMessage {
+        from: Sender::Human,
+        to: old.id,
+        body: Body::new("response-only").expect("body"),
+        reply_to: None,
+        client_key: ClientKey("r18-delayed-send".into()),
+        act: Act::Inform,
+        task: None,
+    };
+    let (captured, capture) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let (done, completed) = tokio::sync::oneshot::channel();
+    let sending = broker.clone();
+    let thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("sender runtime");
+        let mut send = Box::pin(sending.send(message));
+        {
+            let _entered = runtime.enter();
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(matches!(send.as_mut().poll(&mut cx), Poll::Pending));
+        }
+        captured.send(()).expect("captured handle");
+        released
+            .recv_timeout(Duration::from_secs(10))
+            .expect("resume sender task");
+        let outcome = runtime.block_on(send).expect("durable send");
+        done.send(outcome.1.id()).expect("send complete");
+    });
+    capture.await.expect("capture");
+    let new = if replace {
+        old.stop().await.expect("stop old actor");
+        let new = broker.spawn(requested).await.expect("replacement actor");
+        event(&mut events, |e| {
+            matches!(
+                e,
+                Event::PhaseChanged {
+                    phase: Phase::Idle,
+                    ..
+                }
+            )
+        })
+        .await;
+        new
+    } else {
+        old.clone()
+    };
+    assert_eq!(old.id, new.id);
+    let hold = broker
+        .send(NewMessage {
+            from: Sender::Human,
+            to: new.id,
+            body: Body::new("hold").expect("body"),
+            reply_to: None,
+            client_key: ClientKey("r18-hold".into()),
+            act: Act::Inform,
+            task: None,
+        })
+        .await
+        .expect("hold")
+        .1
+        .id();
+    event(
+        &mut events,
+        |e| matches!(e, Event::Started { ids, .. } if ids.contains(&hold)),
+    )
+    .await;
+    release.send(()).expect("release sender");
+    let waiting = completed.await.expect("completed send");
+    thread.join().expect("sender thread");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let wire = std::fs::read_to_string(root.path().join("wire.jsonl")).expect("wire");
+    let cancelled = wire
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).expect("JSON"))
+        .any(|m| m["method"] == "session/cancel");
+    let state = mailroom.delivery(waiting).await.expect("delivery").state;
+    eprintln!(
+        "R18 replacement actor replace={replace} elapsed=1200ms stall=300ms cancelled={cancelled} mail={state:?} phase={:?}",
+        new.phase()
+    );
+    new.pending_permissions()
+        .await
+        .expect("unrelated command wakes actor");
+    event(
+        &mut events,
+        |e| matches!(e, Event::Consumed { ids, .. } if ids.contains(&waiting)),
+    )
+    .await;
+    broker.shutdown().await.expect("shutdown");
+    drop(broker);
+    Arc::try_unwrap(mailroom)
+        .ok()
+        .expect("sole mailroom")
+        .close()
+        .await
+        .expect("close");
+    assert!(
+        cancelled,
+        "send completed after actor replacement must wake the current actor"
+    );
+}
+
+#[tokio::test]
+async fn r18_send_must_nudge_replacement_actor() {
+    r18_send_actor_probe(true).await;
+}
+#[tokio::test]
+async fn r18_send_control_same_actor() {
+    r18_send_actor_probe(false).await;
+}

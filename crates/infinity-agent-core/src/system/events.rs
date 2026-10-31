@@ -29,6 +29,8 @@ pub enum AgentEvent {
     /// Settlement exhausted its fast retries. The driver retains pending
     /// history and retries on input, interruption, and a slow timer.
     SettlementFailed { text: String },
+    /// Input included in the next completion. This is not a durable receipt.
+    InputAdmitted { dedup_id: String },
     /// Confirms durable input even when a redelivery skips completion.
     InputCommitted { dedup_id: String },
     /// A user text input was accepted into the thread's history.
