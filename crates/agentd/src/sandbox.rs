@@ -1,5 +1,5 @@
 //! Linux namespace launch plans. The adapter only sees a program and its environment.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
@@ -157,21 +157,80 @@ pub fn expand(path: &Path) -> PathBuf {
     path.strip_prefix("~/")
         .map_or_else(|_| path.into(), |p| host_home().join(p))
 }
-// Resolve existing ancestors too, so a missing socket below a symlink is protected.
+// Resolve future paths too, including dangling credential-parent links.
 fn resolved(path: &Path) -> Result<PathBuf> {
-    if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(format!("unsafe sandbox path: {}", path.display()).into());
     }
-    match std::fs::canonicalize(path) {
-        Ok(p) => Ok(p),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(resolved(path.parent().ok_or("path has no parent")?)?
-                .join(path.file_name().ok_or("path has no name")?))
-        }
-        Err(e) => Err(e.into()),
+    resolve_path(path, |_| Ok(()))
+}
+fn resolve_path(path: &Path, mut symlink: impl FnMut(&Path) -> Result<()>) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(format!("unsafe sandbox path: {}", path.display()).into());
     }
+    let mut pending: VecDeque<_> = path
+        .components()
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    let mut result = PathBuf::new();
+    let mut hops = 0;
+    while let Some(part) = pending.pop_front() {
+        match part.as_os_str() {
+            p if p == "/" => result = PathBuf::from("/"),
+            p if p == "." => {}
+            p if p == ".." => {
+                result.pop();
+            }
+            _ => {
+                let next = result.join(&part);
+                match std::fs::symlink_metadata(&next) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        hops += 1;
+                        if hops > 40 {
+                            return Err(format!("too many symlink hops: {}", path.display()).into());
+                        }
+                        symlink(&next)?;
+                        let target = std::fs::read_link(&next)?;
+                        for part in target.components().rev() {
+                            pending.push_front(part.as_os_str().to_owned());
+                        }
+                    }
+                    Ok(_) => {
+                        // Do not follow a link installed between metadata and resolution.
+                        if std::fs::canonicalize(&next)? != next {
+                            return Err(format!(
+                                "sandbox path changed while resolving: {}",
+                                next.display()
+                            )
+                            .into());
+                        }
+                        result = next;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => result = next,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+    }
+    Ok(result)
 }
 impl SandboxConfig {
+    pub fn spawn_cwd(&self, path: &Path, workspaces: &[&PinnedPath]) -> Result<PathBuf> {
+        resolve_path(path, |link| {
+            if workspaces.iter().any(|p| link.starts_with(&p.path))
+                || self
+                    .binds
+                    .iter()
+                    .any(|(p, _, readonly)| !readonly && link.starts_with(&p.path))
+            {
+                return Err(format!(
+                    "cwd traverses agent-writable symlink {} -> {}; re-issue knowingly with the canonical path",
+                    link.display(), resolved(link)?.display()
+                ).into());
+            }
+            Ok(())
+        })
+    }
     pub fn check_bind(&self, path: &Path, state: &Path) -> Result<()> {
         if path.starts_with("/run") {
             return Err(format!("sandbox bind exposes runtime paths: {}", path.display()).into());
@@ -305,10 +364,9 @@ impl SandboxConfig {
         for (paths, readonly) in [(&self.ro_binds, true), (&self.rw_binds, false)] {
             for path in paths {
                 let path = expand(path);
-                let previous = previous_pins
-                    .get(&path)
-                    .filter(|p| p.identity.is_some() && !self.repin_binds);
+                let previous = previous_pins.get(&path).filter(|_| !self.repin_binds);
                 let captured = match previous {
+                    Some(pin) if pin.is_legacy() => pin.upgrade(self, state, false),
                     Some(pin) => pin.open(self, state, false).map(|_| pin.clone()),
                     None => PinnedPath::capture_bind(&path, self, state),
                 };
@@ -355,14 +413,21 @@ impl SandboxConfig {
             .iter()
             .map(|(pin, target, readonly)| {
                 Ok(PinnedMount {
-                    fd: Arc::new(pin.open(self, state, false).map_err(|e| self.bind_failure(target, e))?),
+                    fd: Arc::new(
+                        pin.open(self, state, false)
+                            .map_err(|e| self.bind_failure(target, e))?,
+                    ),
                     target: target.clone(),
                     readonly: *readonly,
                 })
             })
             .chain(std::iter::once_with(|| {
                 Ok(PinnedMount {
-                    fd: Arc::new(workspace.open(self, state, true).map_err(|e| format!("{e}; recover with a human spawn of the failed agent name and a validated cwd"))?),
+                    fd: Arc::new(
+                        workspace
+                            .open(self, state, true)
+                            .map_err(|e| workspace.failure(e))?,
+                    ),
                     target: workspace.path.clone(),
                     readonly: false,
                 })
@@ -452,6 +517,19 @@ impl PinnedPath {
     }
     pub fn is_legacy(&self) -> bool {
         self.identity.is_none()
+    }
+    pub fn failure(&self, error: impl std::fmt::Display) -> String {
+        format!(
+            "{error}; recover with a human spawn of the failed agent name only if its cwd still resolves to {}; otherwise spawn under a new name with the canonical cwd",
+            self.path.display()
+        )
+    }
+    pub fn upgrade(&self, cfg: &SandboxConfig, state: &Path, directory: bool) -> Result<Self> {
+        let captured = Self::capture_source(&self.path, cfg, state, directory)?;
+        if captured.ino != self.ino || captured.path != self.path {
+            return Err(format!("sandbox source identity changed: {}", self.path.display()).into());
+        }
+        Ok(captured)
     }
     fn capture_source(
         path: &Path,
@@ -935,6 +1013,48 @@ mod tests {
         assert_ne!(
             FilesystemIdentity::from_fsid([0, 0], 7),
             FilesystemIdentity::from_fsid([0, 0], 8)
+        );
+    }
+    #[test]
+    fn spawn_rejects_links_in_rw_binds_and_follows_operator_aliases() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tree = tmp.path().join("writable");
+        let target = tmp.path().join("target");
+        let state = tmp.path().join("state");
+        for path in [&tree, &target, &state] {
+            std::fs::create_dir(path).expect("directory");
+        }
+        let mut cfg = SandboxConfig::default();
+        let pin = PinnedPath::capture(&tree, &cfg, &state).expect("bind pin");
+        cfg.binds.push((pin, tree.clone(), false));
+        let link = tree.join("planted");
+        symlink(&target, &link).expect("planted link");
+        let alias = tmp.path().join("operator-alias");
+        symlink(&tree, &alias).expect("operator alias");
+        for path in [link.clone(), alias.join("planted")] {
+            let error = cfg
+                .spawn_cwd(&path, &[])
+                .expect_err("rw link refused")
+                .to_string();
+            assert!(error.contains(&link.display().to_string()), "{error}");
+            assert!(error.contains(&target.display().to_string()), "{error}");
+        }
+        assert_eq!(cfg.spawn_cwd(&alias, &[]).expect("outside alias"), tree);
+        cfg.binds[0].2 = true;
+        assert_eq!(cfg.spawn_cwd(&link, &[]).expect("read-only link"), target);
+    }
+    #[test]
+    fn future_path_resolution_limits_symlink_hops() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let link = tmp.path().join("loop");
+        symlink("loop", &link).expect("cycle");
+        assert!(
+            resolved(&link)
+                .expect_err("bounded loop")
+                .to_string()
+                .contains("too many symlink hops")
         );
     }
     #[test]

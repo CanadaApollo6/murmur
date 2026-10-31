@@ -100,6 +100,76 @@ def stable_pin():
         with closing(sqlite3.connect(d.state / 'mail.db')) as db:
             assert 'identity' in json.loads(db.execute('SELECT spec FROM agent_specs').fetchone()[0])['workspace']
 
+def legacy_swap():
+    for case in ['workspace', 'workspace-same-inode', 'bind']:
+        with tempfile.TemporaryDirectory(prefix='agentd-legacy-bind-') as tmp:
+            source = Path(tmp) / 'tool'
+            source.mkdir()
+            with Daemon([str(source)] if case == 'bind' else None) as d:
+                d.start()
+                d.spawn()
+                d.settled()
+                d.stop()
+                original = d.work if case.startswith('workspace') else source
+                if case.startswith('workspace'):
+                    d.edit_spec(lambda p: (p.pop('identity'), p.update(dev=1)))
+                else:
+                    file = d.state / 'sandbox-binds.json'
+                    pins = json.loads(file.read_text())
+                    pins[str(source)].pop('identity')
+                    pins[str(source)]['dev'] = 1
+                    file.write_text(json.dumps(pins))
+                moved = original.with_suffix('.moved')
+                original.rename(moved)
+                wire_before = (moved / 'wire.jsonl').read_bytes() if case.startswith('workspace') else None
+                target = moved if case == 'workspace-same-inode' else d.root / 'secret'
+                target.mkdir(exist_ok=True)
+                original.symlink_to(target, target_is_directory=True)
+                d.start()
+                failed = d.settled(phase='failed')
+                d.stop()
+                assert 'identity changed' in failed['error'], failed
+                if target == moved:
+                    assert (target / 'wire.jsonl').read_bytes() == wire_before, 'victim relaunched in relocated path'
+                else:
+                    assert not (target / 'wire.jsonl').exists(), 'victim executed in swapped target'
+                if case == 'bind':
+                    assert '--repin-binds' in failed['error'], failed
+                    retained = json.loads(file.read_text())[str(source)]
+                    assert retained['path'] == pins[str(source)]['path']
+                    assert retained['ino'] == pins[str(source)]['ino']
+                    assert retained.get('identity') is None
+                else:
+                    assert 'human spawn' in failed['error'], failed
+                    with closing(sqlite3.connect(d.state / 'mail.db')) as db:
+                        pin = json.loads(db.execute('SELECT spec FROM agent_specs').fetchone()[0])['workspace']
+                        assert pin.get('identity') is None
+                print('PASS legacy', case, 'rejects swapped path without upgrading pin', flush=True)
+
+def dangling_parent():
+    for case in ['absolute', 'relative-multihop']:
+        with Daemon() as d:
+            parent = d.home / '.codex'
+            parent.rmdir()
+            dotfiles = d.home / 'dotfiles'
+            dotfiles.mkdir()
+            target = dotfiles / 'missing' / 'codex'
+            if case == 'absolute':
+                parent.symlink_to(target, target_is_directory=True)
+            else:
+                alias = d.root / 'alias'
+                alias.symlink_to(dotfiles, target_is_directory=True)
+                hop = d.home / 'credential-hop'
+                hop.symlink_to('../alias/missing/../missing/codex', target_is_directory=True)
+                parent.symlink_to('credential-hop', target_is_directory=True)
+            d.start()
+            rejected = d.spawn('exposed', cwd=dotfiles)
+            assert 'protected paths' in str(rejected), rejected
+            assert not target.exists(), 'target must still be dangling'
+            d.spawn()
+            d.settled()
+            print('PASS dangling credential parent', case, 'protects future target', flush=True)
+
 def corrupt_identity(pin):
     if 'identity' in pin and 'Fsid' in pin['identity']:
         pin['identity']['Fsid'][0] ^= 1
@@ -249,7 +319,7 @@ def binds(selected=None):
                         assert json.loads((d.state / 'sandbox-binds.json').read_text())[str(source)] == saved
                 print(f'PASS bind {case}', flush=True)
 
-cases = {'stable-pin': stable_pin, 'workspace-recovery': workspace_recovery, 'bind-recovery': bind_recovery, 'credentials': credentials, 'binds': binds}
+cases = {'legacy-swap': legacy_swap, 'dangling-parent': dangling_parent, 'stable-pin': stable_pin, 'workspace-recovery': workspace_recovery, 'bind-recovery': bind_recovery, 'credentials': credentials, 'binds': binds}
 for name in sys.argv[3:] or cases:
     key, _, subcase = name.partition('/')
     cases[key]([subcase]) if subcase else cases[key]()

@@ -96,7 +96,7 @@ async fn run(args: Args) -> Result<()> {
                     Kind::Codex => "codex",
                 }
                 .into(),
-                cwd: std::fs::canonicalize(cwd)?,
+                cwd: std::path::absolute(cwd)?,
                 model,
                 permissions: PermissionPolicy {
                     sandbox: match sandbox {

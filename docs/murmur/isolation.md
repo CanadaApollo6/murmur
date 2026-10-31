@@ -102,8 +102,8 @@ Defaults are `~/.claude/.credentials.json` and `~/.codex/auth.json`. Each kind
 accepts at most one credential file under HOME, or `credentials = []`. At startup,
 agentd resolves existing credential parents, allowing symlinked CLI directories
 such as stow layouts. Missing parents remain protected by their lexical path and
-resolved ancestors, and are resolved again at launch. Host I/O uses the resolved
-directory with no-follow traversal and a no-follow leaf. The source must be a regular file no
+resolved ancestors, including targets of dangling symlinks, and are resolved again
+at launch. Host I/O uses the resolved directory with no-follow traversal and a no-follow leaf. The source must be a regular file no
 larger than 256 KiB. These filesystem errors fail the affected launch with a named
 reason in the log and `agentctl ls`, while the daemon remains available. A missing
 file or parent permits launch without credentials. The copy goes into the private home at the same relative path.
@@ -220,15 +220,23 @@ UNIX socket connections. Workspace paths receive the same checks at spawn.
 Workspaces under HOME, such as `~/code/x`, remain allowed. At spawn the broker
 persists the canonical workspace path with its filesystem ID from `fstatfs` and
 inode. An all-zero filesystem ID falls back to device and inode. Legacy rows
-capture identity at their next validated start. Configured file and directory
-bind identities are recorded at startup in `state/sandbox-binds.json` and retained
-across restarts. A human `spawn` of a Failed agent's name with a validated cwd
-re-pins its workspace and replaces the failed actor, retaining its identity and
-mailbox. To authorize configured bind replacements, restart with `--repin-binds`.
+upgrade at their next validated start only if the canonical path and inode still
+match the recorded pin. Configured file and directory bind identities are recorded
+at startup in `state/sandbox-binds.json` and retained
+across restarts. Spawn and re-spawn reject symlinks inside any agent's pinned
+workspace or a writable bind, naming the link and its canonical target. Symlinks
+outside those trees remain allowed. A human `spawn` of a Failed agent's name
+re-pins its workspace only if the cwd still resolves to the pinned canonical path,
+retaining its identity and mailbox. A different canonical cwd requires a new name.
+Spawn replies include the canonical cwd. To authorize configured bind
+replacements, restart with `--repin-binds`.
 The flag validates all sources before capturing them. A failed re-pin retains any
 existing pin. Binds accept regular files and directories; workspaces require
-directories. Every launch opens each source with `O_PATH|O_CLOEXEC`, plus
-`O_DIRECTORY` for workspaces, compares identity and rechecks the fd's resolved
+directories. A file bind stops matching after a tool replaces the file by rename,
+such as `git config --global`. Restart with `--repin-binds` to authorize the
+replacement, or bind a directory that contains the file. Every launch opens each
+source with `O_PATH|O_CLOEXEC`, plus `O_DIRECTORY` for workspaces, compares identity
+and rechecks the fd's resolved
 path. Bubblewrap receives `--bind-fd` or `--ro-bind-fd`, verifies the mounted
 identity, and closes each fd before executing the child. Broker fds retain
 CLOEXEC; only the fork child clears it for these explicit mount fds.

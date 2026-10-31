@@ -124,6 +124,7 @@ enum Command {
 #[derive(Clone)]
 pub struct AgentHandle {
     pub id: AgentId,
+    pub cwd: PathBuf,
     commands: mpsc::Sender<Command>,
     phase: watch::Receiver<Phase>,
     isolation: watch::Receiver<&'static str>,
@@ -276,6 +277,17 @@ impl Broker {
             .get(&spec.kind)
             .ok_or_else(|| Error::Rejected("unknown kind".into()))?
             .clone();
+        let mut agents = self.agents.lock().await;
+        let saved_specs = self.mailroom.specs().await?;
+        if !restore && let Some((_, cfg)) = &self.isolation {
+            let workspaces = saved_specs
+                .iter()
+                .filter_map(|(_, s)| s.workspace.as_ref())
+                .collect::<Vec<_>>();
+            spec.cwd = cfg
+                .spawn_cwd(&spec.cwd, &workspaces)
+                .map_err(|e| Error::Rejected(e.to_string()))?;
+        }
         if matches!(kind.isolation, crate::sandbox::Isolation::Bwrap(_)) {
             let (state, cfg) = self
                 .isolation
@@ -289,7 +301,11 @@ impl Broker {
             if !restore {
                 let pin = crate::sandbox::PinnedPath::capture(&spec.cwd, cfg, state)
                     .map_err(|e| Error::Rejected(e.to_string()))?;
-                spec.cwd = pin.path.clone();
+                if pin.path != spec.cwd {
+                    return Err(Error::Rejected(
+                        "cwd changed while resolving; retry with the canonical path".into(),
+                    ));
+                }
                 spec.workspace = Some(pin);
             }
         }
@@ -298,10 +314,21 @@ impl Broker {
         if spec.model.is_none() {
             spec.model = kind.model.clone();
         }
-        let mut agents = self.agents.lock().await;
         let id = self.mailroom.register(spec.name.clone()).await?;
         if let Some(handle) = agents.get(&id).filter(|h| !h.commands.is_closed()) {
             if !restore && matches!(handle.phase(), Phase::Failed { .. }) {
+                if let Some(pin) = saved_specs
+                    .iter()
+                    .find(|(saved, _)| *saved == id)
+                    .and_then(|(_, s)| s.workspace.as_ref())
+                    && spec.cwd != pin.path
+                {
+                    return Err(Error::Rejected(format!(
+                        "failed agent cwd must still resolve to pinned path {}; resolved cwd is {}; spawn under a new name instead",
+                        pin.path.display(),
+                        spec.cwd.display()
+                    )));
+                }
                 handle.stop().await?;
             } else {
                 return Err(Error::Rejected("agent already supervised".into()));
@@ -314,6 +341,7 @@ impl Broker {
         let (isolation_tx, isolation) = watch::channel("none");
         let handle = AgentHandle {
             id,
+            cwd: spec.cwd.clone(),
             commands: tx,
             phase,
             isolation,
@@ -550,7 +578,14 @@ impl AgentActor {
                     (&self.kind.isolation, &self.isolation)
                 {
                     if self.spec.workspace.as_ref().is_none_or(|p| p.is_legacy()) {
-                        let pin = crate::sandbox::PinnedPath::capture(&self.spec.cwd, cfg, state)?;
+                        let pin = match &self.spec.workspace {
+                            Some(pin) => {
+                                pin.upgrade(cfg, state, true).map_err(|e| pin.failure(e))?
+                            }
+                            None => {
+                                crate::sandbox::PinnedPath::capture(&self.spec.cwd, cfg, state)?
+                            }
+                        };
                         self.spec.cwd = pin.path.clone();
                         self.spec.workspace = Some(pin);
                         self.mailroom.save_spec(self.id, self.spec.clone()).await?;

@@ -257,6 +257,8 @@ Missing bubblewrap, unavailable namespaces or missing commands fail startup pref
 
 See [the isolation design and configuration reference](../../docs/murmur/isolation.md)
 for `[bwrap]`, per-kind `home`, `credentials`, `egress`, env-token examples and gates.
+File binds stop matching after tools rewrite the file by rename, such as
+`git config --global`. Restart with `--repin-binds` or use a directory bind.
 Existing CLI permission modes still apply inside the sandbox. `agentctl ls` shows
 `isolation` as `bwrap+proxy`, `bwrap+host` or `none`.
 

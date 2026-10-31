@@ -321,7 +321,7 @@ impl ControlApi {
                 if let Some(body) = first_message {
                     self.send(Bindings::human(), &to, body, None, key).await?;
                 }
-                Ok(json!({"id":format!("agent:{}",handle.id),"name":to}))
+                Ok(json!({"id":format!("agent:{}",handle.id),"name":to,"cwd":handle.cwd}))
             }
             ControlRequest::Ls => self.agents().await,
             ControlRequest::Send { to, body, key } => {
