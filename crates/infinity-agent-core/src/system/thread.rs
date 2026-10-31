@@ -126,6 +126,10 @@ where
         )
         .await?;
         history.dispatch_epoch = inner.dispatch_epoch.clone();
+        history.dispatches = inner
+            .dispatch_epoch
+            .as_ref()
+            .map(|_| inner.dispatches.clone());
         if history.dispatch_epoch.is_some() {
             *history.dispatch.borrow_mut() = inner
                 .state_store
@@ -147,7 +151,12 @@ where
         let dispatch = thread.history.dispatch.borrow().clone();
         if let Some(dispatch) = dispatch {
             let pending = thread.history.pending_dispatch_matches(&dispatch);
-            let orphaned = pending && Some(&dispatch.epoch) != thread.inner.dispatch_epoch.as_ref();
+            let orphaned = pending
+                && (Some(&dispatch.epoch) != thread.inner.dispatch_epoch.as_ref()
+                    || !thread
+                        .inner
+                        .dispatches
+                        .awaiting(&thread.history.thread_id, &dispatch));
             if orphaned {
                 thread
                     .inner
@@ -160,12 +169,24 @@ where
                         }),
                     )
                     .await?;
-                // A tool call does not outlive the daemon that dispatched it.
-                // Even external executors retain the old ephemeral callback URL.
-                thread
-                    .history
-                    .interrupt_pending_tool_call_with_text("interrupted: daemon restarted");
-                thread.history.dispatch.borrow_mut().take();
+                *thread.history.dispatch.borrow_mut() = Some(crate::traits::ToolDispatch {
+                    recovering: true,
+                    ..dispatch.clone()
+                });
+                if let Some(result) = thread
+                    .inner
+                    .dispatches
+                    .result(&thread.history.thread_id, &dispatch)
+                {
+                    thread.history.restore_dispatch_result(result)?;
+                } else {
+                    let text = if Some(&dispatch.epoch) != thread.inner.dispatch_epoch.as_ref() {
+                        "interrupted: daemon restarted"
+                    } else {
+                        "interrupted: result lost"
+                    };
+                    thread.history.interrupt_pending_tool_call_with_text(text);
+                }
                 thread.history.settle_tool_results_on_interrupt().await?;
                 let interrupted = thread.history.take_interrupted_tool_calls();
                 let notification = async {
@@ -321,7 +342,7 @@ where
     }
 
     pub(crate) fn needs_dispatch_settlement(&self) -> bool {
-        self.history.dispatch_settlement_pending()
+        self.history.dispatch_settlement_pending() || self.history.orphaned_dispatch().is_some()
     }
 
     pub(crate) fn is_settled(&self) -> bool {
@@ -335,9 +356,17 @@ where
     /// acknowledged only after both the tool result and choice removal persist.
     pub(crate) async fn interrupt<O: ThreadObserver>(&self, observer: &O) -> Result<(), BoxError> {
         let thread_id = &self.history.thread_id;
+        let orphan = self.history.orphaned_dispatch();
+        if let Some(dispatch) = &orphan
+            && let Some(result) = self.inner.dispatches.result(thread_id, dispatch)
+        {
+            self.history.restore_dispatch_result(result)?;
+        }
         let pending_tool = self.pending_tool_call().is_some();
         let interruption_text = if self.dispatch_write_pending() {
             "Error: dispatch record write failed; executor was not invoked"
+        } else if orphan.is_some() {
+            "interrupted: result lost"
         } else {
             event_processor::TOOL_CALL_INTERRUPTED_TEXT
         };
@@ -741,20 +770,23 @@ where
         observer.on_event(&thread_id, &AgentEvent::CompletionFinished { usage });
 
         // A failed dispatch enqueues an error result so the thread can advance.
-        if let Some(action) = action
-            && let Err(e) = event_processor::execute_action_with_error_result(
+        if let Some(action) = action {
+            let dispatch_guard = self.history.start_tool_dispatch();
+            if let Err(e) = event_processor::execute_action_with_error_result(
                 action,
                 &tool_registry,
                 &tool_context,
+                dispatch_guard,
             )
             .await
-        {
-            observer.on_event(
-                &thread_id,
-                &AgentEvent::Info {
-                    text: format!("Error: {}", e),
-                },
-            );
+            {
+                observer.on_event(
+                    &thread_id,
+                    &AgentEvent::Info {
+                        text: format!("Error: {}", e),
+                    },
+                );
+            }
         }
 
         Ok(StepOutcome::Completed {

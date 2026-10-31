@@ -144,6 +144,7 @@ pub struct HistoryManager<C: ConversationStore, S: StateStore> {
     conversation_store: C,
     state_store: S,
     pub(crate) dispatch_epoch: Option<String>,
+    pub(crate) dispatches: Option<std::rc::Rc<crate::dispatch::RuntimeDispatches>>,
     pub(crate) dispatch: RefCell<Option<crate::traits::ToolDispatch>>,
     pending_dispatch: RefCell<Option<crate::traits::ToolDispatch>>,
     clear_dispatch: Cell<bool>,
@@ -231,6 +232,7 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
 
         Ok(Self {
             dispatch_epoch: None,
+            dispatches: None,
             dispatch: RefCell::new(None),
             pending_dispatch: RefCell::new(None),
             clear_dispatch: Cell::new(false),
@@ -513,12 +515,23 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             "bug: append_unvalidated called with un-flushed turn_buffer content"
         );
 
-        self.history.borrow_mut().push(message.clone());
-        self.unvalidated_items.borrow_mut().push(PendingItem {
+        let item = PendingItem {
             message,
             message_id,
             synthetic_kind,
-        });
+        };
+        if let Some(runtime) = &self.dispatches
+            && let Some(dispatch) = self.dispatch.borrow().as_ref()
+            && self.pending_dispatch_matches(dispatch)
+            && item
+                .message
+                .tool_result()
+                .is_some_and(|result| result.id == dispatch.call_id.as_str())
+        {
+            runtime.received(&self.thread_id, dispatch, item.clone());
+        }
+        self.history.borrow_mut().push(item.message.clone());
+        self.unvalidated_items.borrow_mut().push(item);
     }
 
     /// Append *model-produced* content (assistant text/reasoning, tool
@@ -671,6 +684,16 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
                 },
             )];
             history[tail_start + i] = item.message.clone();
+            if let Some(runtime) = &self.dispatches
+                && let Some(dispatch) = self.dispatch.borrow().as_ref()
+                && self.store_order(tail_start + i) > dispatch.call_order
+                && item
+                    .message
+                    .tool_result()
+                    .is_some_and(|result| result.id == dispatch.call_id.as_str())
+            {
+                runtime.received(&self.thread_id, dispatch, item.clone());
+            }
             replaced = true;
         }
         replaced
@@ -728,7 +751,34 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
     }
 
     pub(crate) fn dispatch_settlement_pending(&self) -> bool {
-        self.dispatch_write_pending() || self.clear_dispatch.get()
+        self.dispatch_write_pending()
+            || self.clear_dispatch.get()
+            || self.dispatch.borrow().as_ref().is_some_and(|dispatch| {
+                self.dispatches
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.has_result(&self.thread_id, dispatch))
+            })
+    }
+
+    pub(crate) fn orphaned_dispatch(&self) -> Option<crate::traits::ToolDispatch> {
+        let dispatch = self.dispatch.borrow().clone()?;
+        (self.pending_dispatch_matches(&dispatch)
+            && self
+                .dispatches
+                .as_ref()
+                .is_some_and(|runtime| !runtime.awaiting(&self.thread_id, &dispatch)))
+        .then_some(dispatch)
+    }
+
+    pub(crate) fn start_tool_dispatch(&self) -> Option<crate::dispatch::DispatchGuard> {
+        let runtime = self.dispatches.as_ref()?;
+        let dispatch = self.dispatch.borrow().clone()?;
+        Some(runtime.start(&self.thread_id, dispatch))
+    }
+
+    pub(crate) fn restore_dispatch_result(&self, item: PendingItem) -> Result<(), BoxError> {
+        self.handle_content_with_kind(item.message, item.message_id, item.synthetic_kind)?;
+        Ok(())
     }
 
     async fn persist_tool_dispatch(&self) -> Result<(), BoxError> {
@@ -747,7 +797,11 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         self.state_store
             .set_tool_dispatch(&self.thread_id, None)
             .await?;
-        self.dispatch.borrow_mut().take();
+        if let Some(dispatch) = self.dispatch.borrow_mut().take()
+            && let Some(runtime) = &self.dispatches
+        {
+            runtime.remove(&self.thread_id, &dispatch);
+        }
         self.clear_dispatch.set(false);
         Ok(())
     }
@@ -780,6 +834,7 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             - self.unvalidated_items.borrow().len()
             - pending_items.len();
         if let Some(dispatch) = self.dispatch.borrow().as_ref()
+            && !dispatch.recovering
             && pending_items.iter().enumerate().any(|(index, item)| {
                 self.store_order(pending_start + index) > dispatch.call_order
                     && item
@@ -2055,6 +2110,7 @@ where
                                     safe_spawn_point: Some(history.safe_spawn_point()),
                                     ..tool_context.clone()
                                 };
+                                let _dispatch_guard = history.start_tool_dispatch();
                                 let res = tool.execute_synchronous(
                                     &call.function.arguments,
                                     ToolCallId::from_ref(&call.id),
@@ -2174,6 +2230,7 @@ pub(crate) async fn execute_action_with_error_result<M>(
     action: CompletionAction,
     tool_registry: &HashMap<String, &dyn Tool<M>>,
     tool_context: &ToolContext<M>,
+    dispatch_guard: Option<crate::dispatch::DispatchGuard>,
 ) -> Result<(), crate::tools::ToolError>
 where
     M: InputSender + 'static,
@@ -2188,23 +2245,31 @@ where
     };
 
     if let Err(error) = execute_action(action, tool_registry, tool_context).await {
-        if let Some((tool_call_id, call_id)) = failed_tool_call
-            && let Err(send_error) = crate::tools::send_tool_error(
+        if let Some((tool_call_id, call_id)) = failed_tool_call {
+            match crate::tools::send_tool_error(
                 tool_context,
                 &tool_call_id,
                 call_id,
                 "Tool call failed",
             )
             .await
-        {
-            tracing::error!(
-                "failed to send fallback result after tool execution error: {}",
-                send_error
-            );
+            {
+                Ok(()) => {
+                    if let Some(guard) = dispatch_guard {
+                        guard.await_callback();
+                    }
+                }
+                Err(send_error) => tracing::error!(
+                    "failed to send fallback result after tool execution error: {}",
+                    send_error
+                ),
+            }
         }
         return Err(error);
     }
-
+    if let Some(guard) = dispatch_guard {
+        guard.await_callback();
+    }
     Ok(())
 }
 
@@ -4643,7 +4708,7 @@ mod tests {
             display_as: None,
         };
 
-        let error = execute_action_with_error_result(action, &tools, &context)
+        let error = execute_action_with_error_result(action, &tools, &context, None)
             .await
             .expect_err("tool execution should fail");
         assert_eq!(error.to_string(), "stub");
