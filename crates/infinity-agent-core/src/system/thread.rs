@@ -316,8 +316,17 @@ where
             .is_some_and(|(_, name)| name != CLOSE_THREAD_TOOL)
     }
 
+    pub(crate) fn dispatch_write_pending(&self) -> bool {
+        self.history.dispatch_write_pending()
+    }
+
+    pub(crate) fn needs_dispatch_settlement(&self) -> bool {
+        self.history.dispatch_settlement_pending()
+    }
+
     pub(crate) fn is_settled(&self) -> bool {
-        !self.in_flight.get()
+        !self.needs_dispatch_settlement()
+            && !self.in_flight.get()
             && !self.awaiting_tool_result()
             && self.pending_choices.borrow().is_empty()
     }
@@ -327,8 +336,14 @@ where
     pub(crate) async fn interrupt<O: ThreadObserver>(&self, observer: &O) -> Result<(), BoxError> {
         let thread_id = &self.history.thread_id;
         let pending_tool = self.pending_tool_call().is_some();
+        let interruption_text = if self.dispatch_write_pending() {
+            "Error: dispatch record write failed; executor was not invoked"
+        } else {
+            event_processor::TOOL_CALL_INTERRUPTED_TEXT
+        };
         if pending_tool {
-            self.history.interrupt_pending_tool_call();
+            self.history
+                .interrupt_pending_tool_call_with_text(interruption_text);
         }
         // An accepted real result can shadow the call without being durable.
         // Preserve it, while leaving unrelated user/peer inputs unvalidated.
@@ -363,9 +378,7 @@ where
             observer.on_event(
                 thread_id,
                 &AgentEvent::ToolResult {
-                    segments: vec![rap_protocol::DisplaySegment::Text(
-                        event_processor::TOOL_CALL_INTERRUPTED_TEXT.into(),
-                    )],
+                    segments: vec![rap_protocol::DisplaySegment::Text(interruption_text.into())],
                 },
             );
         }
@@ -715,14 +728,17 @@ where
         self.in_flight.set(false);
         *self.current_thinking.borrow_mut() = None;
 
+        if self.dispatch_write_pending() {
+            return Err("dispatch record write requires settlement".into());
+        }
+        if let Some(CompletionAction::ExecuteToolCall { tool_call_id, .. }) = &action {
+            self.history.record_tool_dispatch(tool_call_id).await?;
+        }
+
         // Persistence errors withhold receipts but must not strand tool dispatch.
         self.history.sync().await?;
         self.emit_committed(observer, &thread_id);
         observer.on_event(&thread_id, &AgentEvent::CompletionFinished { usage });
-
-        if let Some(CompletionAction::ExecuteToolCall { tool_call_id, .. }) = &action {
-            self.history.record_tool_dispatch(tool_call_id).await?;
-        }
 
         // A failed dispatch enqueues an error result so the thread can advance.
         if let Some(action) = action

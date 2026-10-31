@@ -90,12 +90,22 @@ accepted result through a storage outage requires the daemon to remain alive.
 RAP cancellation notifications have a two-second timeout and cannot block
 settlement forever.
 
-On first thread load after a daemon restart, core durably settles orphaned
-in-process tools, missing tools, and daemon-owned RAP or MCP executors with
-`interrupted: daemon restarted`. External RAP URL tools can still deliver their
-callbacks, so their pending calls remain intact. Structural child-spawn,
-compaction, and thread-close calls are preserved. Recovery does not re-execute
-tools or start inference.
+Each resident runtime has a fresh epoch. Before persisting a tool call or
+invoking its executor, core writes a dispatch record with the call ID, epoch,
+and absolute history position. On load, a pending call receives
+`interrupted: daemon restarted` only if its record matches that occurrence
+and belongs to an older epoch. This includes external RAP calls and structural
+tools. Current-epoch calls remain pending. A record without a matching pending
+call is cleared without settlement. Recovery never re-executes tools or starts
+inference.
+
+Seeds and legacy calls without dispatch records remain untouched. Existing
+stores cannot recover orphaned calls from before this policy. Those calls need
+a real result or an explicit interrupt. A failed dispatch-record write prevents
+call persistence and execution. Core retries through bounded settlement. If a
+retry succeeds, it persists the call with a synthetic failure result. If retries
+expire, it reports an error and holds the thread without persisting the call.
+Repair storage and explicitly interrupt to retry held settlement.
 
 An idle-derived receipt deadline is cleared when a later root completion starts,
 including the first turn after attachment. Inference may outlast the receipt
