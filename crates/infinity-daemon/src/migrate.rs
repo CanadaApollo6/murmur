@@ -56,6 +56,9 @@ async fn run_migration(
     dest_cwd: &Path,
     session_manager: &SharedSessionManager,
 ) -> Result<(), BoxError> {
+    if session_ref.remote.as_ref() == to {
+        return Err("source and destination hosts must differ".into());
+    }
     let source_is_local = session_ref.remote.is_none();
     let source_remote = session_ref.remote.clone();
     let real_session_id = session_ref.id.clone();

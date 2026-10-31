@@ -1824,6 +1824,15 @@ mod r16o {
 
 #[tokio::test]
 async fn r16a_finite_human_timeout_survives_reconnects() {
+    finite_human_timeout_survives_reconnects(false).await;
+}
+
+#[tokio::test]
+async fn r17_answered_choice_replay_keeps_original_deadline() {
+    finite_human_timeout_survives_reconnects(true).await;
+}
+
+async fn finite_human_timeout_survives_reconnects(answer_before_replay: bool) {
     let policy = PermissionPolicy {
         timeout: Some(Duration::from_secs(600)),
         ..Default::default()
@@ -1844,7 +1853,11 @@ async fn r16a_finite_human_timeout_survives_reconnects() {
         default: 1,
     };
     connection.emit(choice());
-    t.event(|e| matches!(e, Event::PermissionPending(_))).await;
+    let Event::PermissionPending(mut request) =
+        t.event(|e| matches!(e, Event::PermissionPending(_))).await
+    else {
+        unreachable!()
+    };
     let started = tokio::time::Instant::now();
     for _ in 0..2 {
         tokio::time::pause();
@@ -1855,6 +1868,21 @@ async fn r16a_finite_human_timeout_survives_reconnects() {
                 .await
                 .is_err()
         );
+        if answer_before_replay {
+            t.agent
+                .answer_permission(
+                    request.id,
+                    request.incarnation,
+                    PermissionAnswer::Choose("0".into()),
+                )
+                .await
+                .expect("answer before replay");
+            let answer = t.daemon.next().await;
+            assert!(matches!(
+                answer.message,
+                ClientMessage::UserChoiceAnswered { .. }
+            ));
+        }
         connection.die();
         connection = t.daemon.next().await;
         connection.emit(DaemonMessage::Replay {
@@ -1864,7 +1892,12 @@ async fn r16a_finite_human_timeout_survives_reconnects() {
             in_progress: false,
             idle: false,
         });
-        t.event(|e| matches!(e, Event::PermissionPending(_))).await;
+        let Event::PermissionPending(restored) =
+            t.event(|e| matches!(e, Event::PermissionPending(_))).await
+        else {
+            unreachable!()
+        };
+        request = restored;
     }
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(99)).await;
@@ -1879,7 +1912,7 @@ async fn r16a_finite_human_timeout_survives_reconnects() {
     tokio::time::resume();
     let cancel = tokio::time::timeout(Duration::from_millis(150), t.daemon.next()).await;
     eprintln!(
-        "r16 finite human deadline: elapsed={:?} expired={}",
+        "finite human deadline: answered_before_replay={answer_before_replay} elapsed={:?} expired={}",
         started.elapsed(),
         cancel.is_ok()
     );
@@ -1949,4 +1982,261 @@ async fn r16_pending_choice_with_queued_mail_has_starvation_bound() {
         DeliveryState::Queued
     );
     t.finish().await;
+}
+
+async fn r17_choice_reuse_probe(reuse: bool, end_turn: bool) {
+    let policy = PermissionPolicy {
+        timeout: Some(Duration::from_secs(600)),
+        ..Default::default()
+    };
+    let mut t = Test::with_stall(policy, Duration::ZERO).await;
+    let first = t.send(false, "work").await;
+    let connection = t.daemon.next().await;
+    connection.emit(fake::start());
+    connection.emit(fake::receipt(format!("peer-{first}")));
+    t.consumed(first).await;
+    let choice = |id: &str| DaemonMessage::UserChoiceRequired {
+        thread_id: fake::thread(),
+        id: id.into(),
+        prompt: "choose".into(),
+        choices: vec!["yes".into()],
+        default: 0,
+    };
+    connection.emit(choice("reused"));
+    t.event(|e| matches!(e, Event::PermissionPending(_))).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(550)).await;
+    tokio::time::resume();
+    connection.emit(DaemonMessage::UserChoiceComplete {
+        choice_id: "reused".into(),
+    });
+    t.event(|e| matches!(e, Event::PermissionAnswered { .. }))
+        .await;
+    if end_turn {
+        connection.emit(fake::idle());
+        t.idle().await;
+    }
+    connection.emit(DaemonMessage::ToolResult {
+        thread_id: fake::thread(),
+        segments: vec![],
+    });
+    connection.emit(choice(if reuse { "reused" } else { "different" }));
+    t.event(|e| matches!(e, Event::PermissionPending(_))).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(51)).await;
+    tokio::time::resume();
+    let next = tokio::time::timeout(Duration::from_millis(30), t.daemon.next()).await;
+    eprintln!(
+        "R17 reused={reuse} ended_turn={end_turn} new_choice_age=51s budget=600s premature_interrupt={}",
+        next.as_ref()
+            .is_ok_and(|r| matches!(r.message, ClientMessage::Interrupt { .. }))
+    );
+    t.finish().await;
+    assert!(
+        next.is_err(),
+        "a new choice must receive its own permission budget"
+    );
+}
+#[tokio::test]
+async fn r17_settled_choice_id_reuse_gets_new_deadline() {
+    r17_choice_reuse_probe(true, false).await;
+}
+#[tokio::test]
+async fn r17_distinct_choice_id_gets_new_deadline() {
+    r17_choice_reuse_probe(false, false).await;
+}
+#[tokio::test]
+async fn r17_choice_id_reuse_after_turn_gets_new_deadline() {
+    r17_choice_reuse_probe(true, true).await;
+}
+
+#[cfg(test)]
+mod r17o {
+    use super::*;
+
+    /// The daemon has begun root work that agentd did not submit (a CLI turn), but its
+    /// first StartOutput has not reached agentd. agentd is Idle and offers mail as its own
+    /// turn. The completion that follows is the CLI's: it commits only the CLI input and
+    /// leaves agentd's input queued behind a tool that never returns.
+    #[tokio::test]
+    async fn r17o_offer_before_foreign_start_output_must_arm_stall() {
+        let mut t = Test::with_stall(Default::default(), Duration::from_millis(300)).await;
+        let first = t.send(false, "first turn").await;
+        let connection = t.daemon.next().await;
+        connection.emit(fake::start());
+        connection.emit(fake::receipt(format!("peer-{first}")));
+        t.consumed(first).await;
+        connection.emit(fake::idle());
+        t.idle().await;
+        let phase_before = t.agent.phase();
+        let waiting = t.send(true, "mail racing a cli start").await;
+        let offer = t.daemon.next().await;
+        assert!(matches!(
+            offer.message,
+            ClientMessage::DeliverPeerMessage { .. }
+        ));
+        offer.emit(DaemonMessage::UserInputEcho {
+            thread_id: fake::thread(),
+            text: "cli input".into(),
+        });
+        offer.emit(fake::start());
+        offer.emit(DaemonMessage::ToolCall {
+            thread_id: fake::thread(),
+            name: "cli_long_tool".into(),
+            args: "{}".into(),
+            display_as: None,
+        });
+        offer.emit(fake::receipt("cli-input".into()));
+        offer.emit(fake::round_done());
+        t.event(|e| matches!(e, Event::Activity { text, .. } if text == "cli_long_tool"))
+            .await;
+        let next = tokio::time::timeout(Duration::from_secs(2), t.daemon.next()).await;
+        let interrupted = next
+            .as_ref()
+            .is_ok_and(|r| matches!(r.message, ClientMessage::Interrupt { .. }));
+        let state = t.mailroom.delivery(waiting).await.expect("delivery").state;
+        eprintln!(
+            "r17o offer before foreign StartOutput: phase_before_offer={phase_before:?} interrupted_within_2s={interrupted} phase={:?} mail={state:?}",
+            t.agent.phase()
+        );
+        if interrupted {
+            offer.emit(fake::start());
+        }
+        offer.emit(fake::receipt(format!("peer-{waiting}")));
+        offer.emit(fake::idle());
+        t.finish().await;
+        assert_eq!(phase_before, Phase::Idle, "probe precondition");
+        assert!(
+            interrupted,
+            "mail queued behind foreign work must arm the stall timer"
+        );
+    }
+
+    /// RAP keys a choice by its tool call ID, so a tool that asks two questions in one call
+    /// reuses the wire ID. agentd answers the first; the second must get its own timeout.
+    #[tokio::test]
+    async fn r17o_second_question_on_same_call_keeps_full_human_deadline() {
+        let policy = PermissionPolicy {
+            timeout: Some(Duration::from_secs(600)),
+            ..Default::default()
+        };
+        let mut t = Test::with_stall(policy, Duration::ZERO).await;
+        let first = t.send(false, "ask twice").await;
+        let connection = t.daemon.next().await;
+        connection.emit(fake::start());
+        connection.emit(fake::receipt(format!("peer-{first}")));
+        t.consumed(first).await;
+        let question = |prompt: &str| DaemonMessage::UserChoiceRequired {
+            thread_id: fake::thread(),
+            id: "call-1".into(),
+            prompt: prompt.into(),
+            choices: vec!["yes".into(), "no".into()],
+            default: 1,
+        };
+        connection.emit(question("first question"));
+        let Event::PermissionPending(q1) =
+            t.event(|e| matches!(e, Event::PermissionPending(_))).await
+        else {
+            unreachable!()
+        };
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(590)).await;
+        tokio::time::resume();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), t.daemon.next())
+                .await
+                .is_err()
+        );
+        t.agent
+            .answer_permission(q1.id, q1.incarnation, PermissionAnswer::Choose("0".into()))
+            .await
+            .expect("human answers the first question");
+        let answered = t.daemon.next().await;
+        assert!(matches!(
+            answered.message,
+            ClientMessage::UserChoiceAnswered { .. }
+        ));
+        connection.emit(question("second question"));
+        let Event::PermissionPending(q2) =
+            t.event(|e| matches!(e, Event::PermissionPending(_))).await
+        else {
+            unreachable!()
+        };
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::time::resume();
+        let early = tokio::time::timeout(Duration::from_millis(150), t.daemon.next()).await;
+        let cancelled = early
+            .as_ref()
+            .is_ok_and(|r| matches!(r.message, ClientMessage::Interrupt { .. }));
+        let pending = t.agent.pending_permissions().await.expect("pending");
+        eprintln!(
+            "r17o second question on same call: q2_title={:?} cancelled_20s_after_q2={cancelled} pending_after={} phase={:?}",
+            q2.title,
+            pending.len(),
+            t.agent.phase()
+        );
+        if cancelled {
+            connection.emit(fake::start());
+        }
+        connection.emit(fake::idle());
+        t.finish().await;
+        assert_ne!(q1.id, q2.id, "probe precondition: a new permission");
+        assert!(
+            !cancelled,
+            "a second question must not inherit the first question's deadline"
+        );
+    }
+
+    /// Control: the second question comes from a different call ID.
+    #[tokio::test]
+    async fn r17o_control_second_question_new_call_keeps_full_deadline() {
+        let policy = PermissionPolicy {
+            timeout: Some(Duration::from_secs(600)),
+            ..Default::default()
+        };
+        let mut t = Test::with_stall(policy, Duration::ZERO).await;
+        let first = t.send(false, "ask twice").await;
+        let connection = t.daemon.next().await;
+        connection.emit(fake::start());
+        connection.emit(fake::receipt(format!("peer-{first}")));
+        t.consumed(first).await;
+        let question = |id: &str| DaemonMessage::UserChoiceRequired {
+            thread_id: fake::thread(),
+            id: id.into(),
+            prompt: "question".into(),
+            choices: vec!["yes".into(), "no".into()],
+            default: 1,
+        };
+        connection.emit(question("call-1"));
+        let Event::PermissionPending(q1) =
+            t.event(|e| matches!(e, Event::PermissionPending(_))).await
+        else {
+            unreachable!()
+        };
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(590)).await;
+        tokio::time::resume();
+        t.agent
+            .answer_permission(q1.id, q1.incarnation, PermissionAnswer::Choose("0".into()))
+            .await
+            .expect("answer");
+        let _answered = t.daemon.next().await;
+        connection.emit(question("call-2"));
+        t.event(|e| matches!(e, Event::PermissionPending(_))).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::time::resume();
+        let early = tokio::time::timeout(Duration::from_millis(150), t.daemon.next()).await;
+        eprintln!(
+            "r17o control second question new call: cancelled_20s_after_q2={}",
+            early.is_ok()
+        );
+        connection.emit(fake::idle());
+        t.finish().await;
+        assert!(
+            early.is_err(),
+            "control: a different call keeps its full deadline"
+        );
+    }
 }

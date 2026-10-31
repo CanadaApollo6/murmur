@@ -107,7 +107,10 @@ does not restore a cleared marker.
 Every kind has a mail-starvation stall timer in the supervisor. It bounds mail
 queued or deferred behind running work, including mail offered to a busy Infinity
 thread. The running turn's own mail does not arm it. An initial uncommitted
-Infinity delivery uses the adapter's receipt deadline instead.
+Infinity delivery uses the adapter's receipt deadline instead. If a completion
+finishes without committing an offer, that mail is waiting behind other work
+and arms the stall timer. Cancelling a `Broker::send` caller cannot separate
+durable acceptance from the actor wakeup.
 `stall_timeout_secs` seconds without real session activity invokes the existing
 cancel path. Stream chunks, tool starts and results, completion boundaries,
 new choices, receipts, and turn ends reset the clock. Reconnects, restored or
@@ -117,7 +120,10 @@ waits and the human takes longer than `stall_timeout_secs`, the turn is cancelle
 Raise the limit or set it to `0` for long human waits with mail flowing.
 A pending choice with no other mail waiting still waits indefinitely when
 `permissions.timeout = None`. A finite permission deadline stays tied to the
-original wire choice ID across reconnects; replay does not renew it.
+original wire choice ID across reconnects; replay does not renew it, even after
+a local answer. Daemon dismissal or authoritative idle retires that deadline. A new live question
+replacing an answered choice also gets a fresh deadline, including on the same
+tool call.
 With no waiting mail, there is no stall deadline. Each `[kind.NAME]` can set
 `stall_timeout_secs`; `0` disables it. `KindConfig::stall_timeout` uses a Duration.
 The default is 600 seconds for every kind. A tool that runs silently longer than
@@ -133,7 +139,8 @@ Follow-up: migration handoff protocol: freeze, settle or transfer in-flight call
 transfer processed-ID dedup state, commit/reconcile, crash/cancel-safe rollback,
 notify attached brokers. This covers Astra r16 P2 #2 through #4, Opus r16 P2-1, and the
 r14/r15 migration findings about admission races, stranded results, and failed
-migration archiving the source. Answered-choice dismissal is also deferred:
+migration archiving the source. Same-host migration requests are rejected before
+source cleanup. Answered-choice dismissal is also deferred:
 the daemon retains a choice until its tool returns, so removing it on answer
 must update the live driver and notify attached clients as well as persistence.
 The stall timer bounds a hung tool after an answer while other mail waits.
@@ -172,7 +179,9 @@ storage permits automatic recovery within that ten-minute window.
 
 The receipt deadline starts when submission begins on an idle root. A later
 completion start clears it, so inference may outlast the receipt timeout. A new
-idle event rearms it for outstanding mail. A silent daemon cannot leave offered
+idle event rearms it for outstanding mail. A completion that commits only CLI
+or subscription input leaves broker mail subject to the stall timer. A silent
+daemon cannot leave offered
 mail waiting forever. Model agents never idle-suspend. An unreachable daemon
 uses backoff capped at 60 seconds without consuming the model agent crash limit.
 Other connected-session failures count as crashes. A model stream that stalls

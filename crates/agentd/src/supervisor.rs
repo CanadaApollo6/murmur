@@ -121,6 +121,14 @@ pub struct AgentHandle {
     phase: watch::Receiver<Phase>,
 }
 impl AgentHandle {
+    fn nudge(&self) {
+        match self.commands.try_send(Command::Nudge) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!(agent=%self.id, "mail queued for stopped actor")
+            }
+        }
+    }
     pub fn phase(&self) -> Phase {
         self.phase.borrow().clone()
     }
@@ -228,12 +236,7 @@ impl Broker {
     }
     pub(crate) async fn nudge(&self, id: AgentId) {
         if let Some(handle) = self.agents.lock().await.get(&id) {
-            match handle.commands.try_send(Command::Nudge) {
-                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    tracing::debug!(agent=%id, "mail queued for stopped actor")
-                }
-            }
+            handle.nudge();
         }
     }
     /// The receiver is display-only and may lag. SQLite remains delivery authority.
@@ -305,10 +308,23 @@ impl Broker {
     }
     /// Trusted in-process API. External callers are authenticated by surfaces.
     pub async fn send(&self, message: NewMessage) -> Result<(SendOutcome, Envelope)> {
-        let id = message.to;
-        let outcome = self.mailroom.accept(message).await?;
-        self.nudge(id).await;
-        Ok(outcome)
+        let handle = self.handle(message.to).await;
+        let mailroom = Arc::clone(&self.mailroom);
+        // A dropped caller must not separate a durable accept from its wakeup.
+        tokio::spawn(async move {
+            let outcome = mailroom.accept(message).await;
+            match &outcome {
+                Ok(_) => {
+                    if let Some(handle) = handle {
+                        handle.nudge();
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "broker send failed"),
+            }
+            outcome.map_err(Error::from)
+        })
+        .await
+        .map_err(crate::mailroom::Error::from)?
     }
     pub async fn shutdown(&self) -> Result<()> {
         let handles = self
@@ -605,6 +621,11 @@ impl AgentActor {
                     ids,
                 });
             }
+            SessionEvent::Waiting { ids } => {
+                self.validate_ids(&ids)?;
+                self.waiting_offers.retain(|id| !ids.contains(id));
+                self.waiting_offers.extend(ids);
+            }
             SessionEvent::Committed { ids } => {
                 self.validate_ids(&ids)?;
                 self.unavailable_attempts = 0;
@@ -674,7 +695,8 @@ impl AgentActor {
                     self.permission(request).await?;
                 }
             }
-            SessionEvent::PermissionSettled(id) => {
+            SessionEvent::PermissionSettled { id, key } => {
+                self.choice_deadlines.remove(&key);
                 if self.pending.remove(&id).is_some() {
                     self.emit(Event::PermissionAnswered { agent: self.id, id });
                 }
