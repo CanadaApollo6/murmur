@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SessionEntry {
     pub cwd: PathBuf,
-    /// When true, only user text input should re-awaken the agent.
+    /// When true, event input cannot start a driver. Connect or user text resumes admission.
     #[serde(default)]
     pub shut_down: bool,
     /// When true, the agent is idle (no active work).
@@ -135,6 +135,7 @@ impl SessionStore {
         tracing::trace!("Clearing shut down status for {}", session_id);
         if let Some(entry) = self.sessions.get_mut(session_id)
             && entry.shut_down
+            && !entry.archived
         {
             entry.shut_down = false;
             self.notify(session_id);

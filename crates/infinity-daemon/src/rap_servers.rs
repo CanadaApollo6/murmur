@@ -22,10 +22,14 @@
 //! flag.
 
 use infinity_agent_core::ThreadId;
-use std::collections::HashMap;
+use infinity_agent_core::message::{InputMessage, InputMessageContent};
+use infinity_agent_core::tools::ToolContext;
+use infinity_agent_core::traits::InputSender;
+use infinity_provider_protocol::message::UserContent;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use infinity_agent_core::system::local::ChannelSender;
@@ -46,6 +50,39 @@ use crate::session::observer::SubscriberMap;
 use crate::{config, mcp_proxy, set_title_tool};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+type PendingCalls = Arc<Mutex<HashMap<(ThreadId, rap_protocol::ToolCallId), PendingCall>>>;
+
+struct PendingCall {
+    server_id: uuid::Uuid,
+    context: ToolContext<ChannelSender>,
+    call_id: Option<rap_protocol::ProviderCallId>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RapInputSender {
+    sender: ChannelSender,
+    pending: PendingCalls,
+}
+
+#[async_trait]
+impl InputSender for RapInputSender {
+    type Error = infinity_agent_core::system::local::ChannelSendError;
+
+    async fn send_to_input_queue(
+        &self,
+        message: InputMessage,
+        dedup_id: &str,
+    ) -> Result<(), Self::Error> {
+        if let InputMessageContent::User(UserContent::ToolResult(result)) = &message.content {
+            self.pending
+                .lock()
+                .expect("bug: pending calls poisoned")
+                .remove(&(message.group_id.clone(), result.id.clone().into()));
+        }
+        self.sender.send_to_input_queue(message, dedup_id).await
+    }
+}
 
 // ── ManagedRapServer ─────────────────────────────────────────────────────────
 
@@ -108,6 +145,8 @@ pub struct ManagedRapServer {
     session_id: ThreadId,
     spec: ServerSpec,
     state: tokio::sync::Mutex<ServerState>,
+    id: uuid::Uuid,
+    pending: PendingCalls,
 }
 
 impl ManagedRapServer {
@@ -117,6 +156,8 @@ impl ManagedRapServer {
             session_id,
             spec,
             state: tokio::sync::Mutex::new(ServerState::Down),
+            id: uuid::Uuid::new_v4(),
+            pending: PendingCalls::default(),
         }
     }
 
@@ -220,6 +261,42 @@ impl ManagedRapServer {
                     tracing::info!("Stopped RAP server for session {}", self.session_id);
                 }
                 *state = ServerState::Down;
+                let stopped = {
+                    let mut pending = self.pending.lock().expect("bug: pending calls poisoned");
+                    let keys: Vec<_> = pending
+                        .iter()
+                        .filter(|(_, call)| call.server_id == self.id)
+                        .map(|(key, _)| key.clone())
+                        .collect();
+                    keys.into_iter()
+                        .filter_map(|key| pending.remove(&key).map(|call| (key.1, call)))
+                        .collect::<Vec<_>>()
+                };
+                for (id, call) in stopped {
+                    let infinity_rap_bridge::CallbackDelivery::Input { message, dedup_id } =
+                        infinity_rap_bridge::prepare_callback(
+                            rap_protocol::RapCallback::ToolResult(rap_protocol::RapToolResult {
+                                group_id: call.context.group_id,
+                                id,
+                                call_id: call.call_id,
+                                text: Some("Error: tool server stopped by session shutdown".into()),
+                                content: None,
+                                display_as: None,
+                                subscription: None,
+                            }),
+                        )
+                    else {
+                        unreachable!()
+                    };
+                    if let Err(error) = call
+                        .context
+                        .message_sender
+                        .send_to_input_queue(*message, &dedup_id)
+                        .await
+                    {
+                        tracing::warn!(%error, "failed to settle stopped RAP call");
+                    }
+                }
             }
             // In-process proxies and external servers are not ours to stop.
             ServerSpec::Mcp { .. } | ServerSpec::HttpMcp { .. } | ServerSpec::External { .. } => {}
@@ -396,10 +473,46 @@ impl Tool<ChannelSender> for ManagedRapTool {
         args: serde_json::Value,
         id: rap_protocol::ToolCallId,
         call_id: Option<rap_protocol::ProviderCallId>,
-        context: &infinity_agent_core::tools::ToolContext<ChannelSender>,
+        context: &ToolContext<ChannelSender>,
     ) -> Result<(), BoxError> {
-        let endpoint = self.server.invoke_endpoint().await?;
-        invoke_rap_tool(
+        // Register under the server lock so shutdown sees every dispatched call.
+        let state = loop {
+            self.server.ensure_up().await?;
+            let state = self.server.state.lock().await;
+            if matches!(*state, ServerState::Up { .. }) {
+                break state;
+            }
+        };
+        let ServerState::Up { manifest, .. } = &*state else {
+            unreachable!()
+        };
+        let key = (context.group_id.clone(), id.clone());
+        self.server
+            .pending
+            .lock()
+            .expect("bug: pending calls poisoned")
+            .insert(
+                key.clone(),
+                PendingCall {
+                    server_id: self.server.id,
+                    context: context.clone(),
+                    call_id: call_id.clone(),
+                },
+            );
+        let endpoint = manifest.endpoint.clone();
+        drop(state);
+        let tracked_context = ToolContext {
+            message_sender: RapInputSender {
+                sender: context.message_sender.clone(),
+                pending: self.server.pending.clone(),
+            },
+            group_id: context.group_id.clone(),
+            callback_url: context.callback_url.clone(),
+            user_id: context.user_id.clone(),
+            thread_stack: context.thread_stack.clone(),
+            safe_spawn_point: context.safe_spawn_point,
+        };
+        let result = invoke_rap_tool(
             &self.http_client,
             RapInvocationParams {
                 endpoint: &endpoint,
@@ -409,9 +522,17 @@ impl Tool<ChannelSender> for ManagedRapTool {
                 call_id,
                 callback_url: None,
             },
-            context,
+            &tracked_context,
         )
-        .await
+        .await;
+        if result.is_err() {
+            self.server
+                .pending
+                .lock()
+                .expect("bug: pending calls poisoned")
+                .remove(&key);
+        }
+        result
     }
 }
 
@@ -439,6 +560,8 @@ pub struct SessionRapManager {
     /// Sessions whose servers have been shut down at least once (observable
     /// for tests and diagnostics).
     shutdown_log: Rc<std::cell::RefCell<Vec<ThreadId>>>,
+    pending: PendingCalls,
+    servers: Rc<std::cell::RefCell<Vec<Weak<ManagedRapServer>>>>,
 }
 
 impl SessionRapManager {
@@ -455,6 +578,15 @@ impl SessionRapManager {
             user_rap_config,
             subscriber_map,
             shutdown_log: Rc::new(std::cell::RefCell::new(Vec::new())),
+            pending: PendingCalls::default(),
+            servers: Rc::default(),
+        }
+    }
+
+    pub(crate) fn callback_sender(&self, sender: ChannelSender) -> RapInputSender {
+        RapInputSender {
+            sender,
+            pending: self.pending.clone(),
         }
     }
 
@@ -488,7 +620,8 @@ impl SessionRapManager {
         match collect_server_specs(session_id, &cwd, self.user_rap_config.as_deref()) {
             Ok((source_info, specs)) => {
                 self.info(session_id, source_info);
-                for server in specs {
+                for mut server in specs {
+                    server.pending = self.pending.clone();
                     servers.push(Arc::new(server));
                 }
             }
@@ -540,6 +673,9 @@ impl SessionRapManager {
              for minor follow-ups within the same task."
         );
 
+        self.servers
+            .borrow_mut()
+            .extend(servers.iter().map(Arc::downgrade));
         let toolset = Rc::new(SessionToolset {
             tools,
             servers,
@@ -552,14 +688,19 @@ impl SessionRapManager {
     /// Stop the session's RAP servers (keeping the cached toolset, so a later
     /// tool invocation reboots them transparently). Safe to call at any time.
     pub async fn shutdown_session(&self, session_id: &ThreadId<str>) {
-        let toolset = {
-            let toolsets = self.toolsets.lock().await;
-            toolsets.get(session_id).cloned()
+        // Drivers can retain an evicted toolset and reboot its server handles.
+        let servers: Vec<_> = {
+            let _toolsets = self.toolsets.lock().await;
+            let mut servers = self.servers.borrow_mut();
+            servers.retain(|server| server.strong_count() > 0);
+            servers
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter(|server| server.session_id.as_str() == session_id.as_str())
+                .collect()
         };
-        if let Some(toolset) = toolset {
-            for server in &toolset.servers {
-                server.shutdown().await;
-            }
+        for server in servers {
+            server.shutdown().await;
         }
         self.shutdown_log.borrow_mut().push(session_id.to_owned());
     }
@@ -574,7 +715,13 @@ impl SessionRapManager {
 
     /// Stop every managed server (daemon exit).
     pub async fn shutdown_all(&self) {
-        let session_ids: Vec<ThreadId> = self.toolsets.lock().await.keys().cloned().collect();
+        let session_ids: HashSet<ThreadId> = self
+            .servers
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|server| server.session_id.clone())
+            .collect();
         for session_id in session_ids {
             self.shutdown_session(&session_id).await;
         }

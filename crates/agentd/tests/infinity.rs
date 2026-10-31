@@ -1400,7 +1400,7 @@ async fn r12_repeated_interrupt_expiry_is_bounded_without_receipts() {
         t.daemon.next().await.message,
         ClientMessage::Interrupt { .. }
     ));
-    for attempt in 1..5 {
+    for attempt in 1..7 {
         let event = t
             .event(|e| {
                 matches!(
@@ -1430,6 +1430,9 @@ async fn r12_repeated_interrupt_expiry_is_bounded_without_receipts() {
             ClientMessage::Interrupt { .. }
         ));
     }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(10 * 60)).await;
+    tokio::time::resume();
     t.event(|e| {
         matches!(
             e,
@@ -1449,4 +1452,49 @@ async fn r12_repeated_interrupt_expiry_is_bounded_without_receipts() {
     assert_eq!(delivery.state, DeliveryState::Queued);
     assert_eq!(delivery.attempts, 0);
     t.finish().await;
+}
+
+#[tokio::test]
+async fn r11a_failure_marker_clears_and_rearms() {
+    for in_progress in [false, true] {
+        let mut t = Test::new().await;
+        t.daemon.state.lock().expect("state").manual_replay = true;
+        for failure in [true, true, false] {
+            let id = t.send(true, "work").await;
+            let input = t.daemon.next().await;
+            input.emit(fake::start());
+            if failure {
+                input.emit(DaemonMessage::Error {
+                    thread_id: fake::thread(),
+                    text: "Thread driver failed: panic".into(),
+                });
+            } else {
+                input.die();
+            }
+            let connect = t.daemon.next().await;
+            assert!(matches!(connect.message, ClientMessage::Connect { .. }));
+            connect.emit(DaemonMessage::Replay {
+                history: vec![],
+                pending_choices: vec![],
+                views: Default::default(),
+                in_progress,
+                idle: false,
+            });
+            if failure {
+                let interrupt = t.daemon.next().await;
+                assert!(matches!(interrupt.message, ClientMessage::Interrupt { .. }));
+                interrupt.emit(fake::start());
+            }
+            let reoffer = t.daemon.next().await;
+            assert!(matches!(
+                reoffer.message,
+                ClientMessage::DeliverPeerMessage { .. }
+            ));
+            reoffer.emit(fake::receipt(format!("peer-{id}")));
+            reoffer.emit(fake::idle());
+            t.consumed(id).await;
+            t.idle().await;
+        }
+        t.finish().await;
+    }
 }

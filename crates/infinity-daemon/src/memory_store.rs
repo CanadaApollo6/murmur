@@ -1206,7 +1206,12 @@ impl StateStore for PersistentStateStore {
 
     async fn is_thread_stopped(&self, thread_id: &ThreadId<str>) -> Result<bool, MemoryError> {
         let session_id = self.conversation_store.get_root_thread_id(thread_id);
-        Ok(self.session_store.lock().await.is_shut_down(&session_id))
+        let store = self.session_store.lock().await;
+        Ok(store.is_shut_down(&session_id)
+            || store
+                .sessions
+                .get(&session_id)
+                .is_some_and(|entry| entry.archived))
     }
 }
 
@@ -1285,6 +1290,34 @@ mod tests {
                 .is_err(),
             "append must report a failed payload write"
         );
+    }
+
+    #[tokio::test]
+    async fn archived_root_is_stopped_even_with_stale_shutdown_flag() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let conv = PersistentConversationStore::new_with_dir(
+            dir.path(),
+            test_model(),
+            Arc::new(crate::ids::UuidIdSource),
+        );
+        let root = ThreadId::from_ref("root");
+        conv.ensure_root_thread(root).await.expect("root");
+        let mut sessions = crate::session_store::SessionStore::load(
+            dir.path().join("sessions.json").to_str().expect("path"),
+            tokio::sync::mpsc::unbounded_channel().0,
+        );
+        sessions.create(root, dir.path().into());
+        sessions.mark_archived(root);
+        assert!(
+            !sessions.is_shut_down(root),
+            "exercise archive admission independently"
+        );
+        let store = PersistentStateStore::new(
+            dir.path(),
+            conv,
+            Arc::new(tokio::sync::Mutex::new(sessions)),
+        );
+        assert!(store.is_thread_stopped(root).await.expect("admission"));
     }
 
     #[tokio::test]

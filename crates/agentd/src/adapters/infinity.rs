@@ -242,14 +242,6 @@ impl InfinitySession {
                 .ok_or(AdapterError::Ended)?
                 .map_err(protocol)?;
             let replay = matches!(message, DaemonMessage::Replay { .. });
-            // Shutdown kills RAP servers, but a streaming completion survives.
-            let streaming = matches!(
-                message,
-                DaemonMessage::Replay {
-                    in_progress: true,
-                    ..
-                }
-            );
             self.receive(message)?;
             if replay {
                 if saved
@@ -258,9 +250,7 @@ impl InfinitySession {
                     && self.thread_busy
                 {
                     self.needs_interrupt = true;
-                    if !streaming {
-                        self.cancel().await?;
-                    }
+                    self.cancel().await?;
                 }
                 return Ok(());
             }
@@ -434,7 +424,6 @@ impl InfinitySession {
                 if let Some(session) = sessions.get(&self.root) {
                     match session.status {
                         infinity_protocol::SessionStatus::Stopped => {
-                            self.needs_interrupt = true;
                             return Err(AdapterError::Unavailable(
                                 "Infinity root thread stopped".into(),
                             ));
