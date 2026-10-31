@@ -1403,9 +1403,10 @@ mod tests {
                 Ok(())
             }
         }
-        for failed_write in ["state", "payload", "dispatch"] {
+        for failed_write in ["state", "payload", "dispatch", "prior-result"] {
             let fail_payload = failed_write == "payload";
             let fail_dispatch = failed_write == "dispatch";
+            let fail_prior_result = failed_write == "prior-result";
             tokio::task::LocalSet::new().run_until(async {
                 let dir = tempfile::tempdir().expect("create temp dir");
                 let conv = PersistentConversationStore::new_with_dir(dir.path(), test_model(), Arc::new(crate::ids::UuidIdSource));
@@ -1417,7 +1418,7 @@ mod tests {
                 let state = PersistentStateStore::new(dir.path(), conv.clone(), Arc::new(tokio::sync::Mutex::new(sessions)));
                 let blocked = dir.path().join(if fail_payload { "root.json" } else if fail_dispatch { "root.dispatch.json" } else { "root.state.json" });
                 if fail_payload { std::fs::remove_file(&blocked).expect("remove snapshot"); }
-                if !fail_dispatch { std::fs::create_dir(&blocked).expect("block write"); }
+                if !fail_dispatch && !fail_prior_result { std::fs::create_dir(&blocked).expect("block write"); }
                 let (model, mut ctrl) = infinity_provider_protocol::mock::mock_model();
                 let entry = ModelEntry { model_id: "mock".into(), display_name: "mock".into(), context_window: 0, max_output_tokens: None, supports_image_input: false };
                 let model = StaticModel::from_entry(Arc::new(SingleModelProvider::new(entry.clone(), model)), &entry);
@@ -1445,8 +1446,9 @@ mod tests {
                     }).await.expect("dispatch write failure must be reported");
                     assert!(dispatch.try_recv().is_err(), "an unrecorded invocation must never execute");
                     std::fs::remove_dir(&blocked).expect("repair dispatch store");
-                    running.send_user_text(tid, "retry after storage repair").await;
-                    ctrl.next_request().await;
+                    running.send(peer.clone(), "peer-after-dispatch-failure").await;
+                    let request = tokio::time::timeout(std::time::Duration::from_secs(2), ctrl.next_request()).await.expect("mail after dispatch repair");
+                    assert!(format!("{:?}", request.chat_history).contains("executor was not invoked"));
                     ctrl.send_tool_call("retry", "dispatch", serde_json::json!({}));
                     ctrl.finish();
                     assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(2), dispatch.recv()).await.expect("repaired dispatch").expect("call").as_str(), "retry");
@@ -1458,6 +1460,40 @@ mod tests {
                 let dispatched = tokio::time::timeout(std::time::Duration::from_secs(2), dispatch.recv()).await
                     .expect("persistence failure must not strand tool dispatch").expect("dispatched tool");
                 assert_eq!(dispatched.as_str(), "tc-work");
+                if fail_prior_result {
+                    let payload = dir.path().join("root.json");
+                    std::fs::remove_file(&payload).expect("remove payload");
+                    std::fs::create_dir(&payload).expect("block result write");
+                    let result = InputMessage {
+                        content: InputMessageContent::User(UserContent::ToolResult(infinity_provider_protocol::message::ToolResult {
+                            id: "tc-work".into(), call_id: None, content: vec![infinity_provider_protocol::message::ToolResultContent::text("first real result")],
+                        })), group_id: tid.to_owned(), metadata: None, synthetic: None, display_as: None, subscription: false,
+                    };
+                    running.send(result, "first-result").await;
+                    ctrl.next_request().await;
+                    ctrl.send_tool_call("next-call", "dispatch", serde_json::json!({})); ctrl.finish();
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        loop {
+                            if matches!(events.recv().await.expect("result persistence error"), AgentEvent::Info { text } if text.contains("previous tool result could not be persisted")) { break; }
+                        }
+                    }).await.expect("previous result must prevent record replacement");
+                    assert!(dispatch.try_recv().is_err(), "no second executor before the first result is durable");
+                    let record_path = dir.path().join("root.dispatch.json");
+                    let record: infinity_agent_core::traits::ToolDispatch = serde_json::from_slice(&std::fs::read(&record_path).expect("earlier dispatch retained")).expect("record JSON");
+                    assert_eq!(record.call_id.as_str(), "tc-work");
+                    std::fs::remove_dir(&payload).expect("repair result store");
+                    running.interrupt_handle().interrupt(tid);
+                    running.send(peer.clone(), "peer-after-result-repair").await;
+                    let request = tokio::time::timeout(std::time::Duration::from_secs(2), ctrl.next_request()).await.expect("mail after result repair");
+                    assert!(format!("{:?}", request.chat_history).contains("first real result"));
+                    ctrl.send_text("recovered"); ctrl.finish();
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        loop { if matches!(events.recv().await.expect("idle"), AgentEvent::ThreadIdle) { break; } }
+                    }).await.expect("repaired result must settle");
+                    assert!(!record_path.exists());
+                    running.shutdown().await;
+                    return;
+                }
                 while let Ok(event) = events.try_recv() {
                     assert!(!matches!(event, AgentEvent::InputCommitted { dedup_id } if dedup_id == "peer-recover"), "failed write must not receipt peer");
                 }

@@ -145,6 +145,7 @@ pub struct HistoryManager<C: ConversationStore, S: StateStore> {
     state_store: S,
     pub(crate) dispatch_epoch: Option<String>,
     pub(crate) dispatch: RefCell<Option<crate::traits::ToolDispatch>>,
+    pending_dispatch: RefCell<Option<crate::traits::ToolDispatch>>,
     clear_dispatch: Cell<bool>,
     pub thread_id: ThreadId,
     pub root_thread_id: ThreadId,
@@ -231,6 +232,7 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         Ok(Self {
             dispatch_epoch: None,
             dispatch: RefCell::new(None),
+            pending_dispatch: RefCell::new(None),
             clear_dispatch: Cell::new(false),
             conversation_store,
             state_store,
@@ -713,10 +715,31 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             call_order: self.store_order(self.history.borrow().len() - 1),
             recovering: false,
         };
-        self.state_store
-            .set_tool_dispatch(&self.thread_id, Some(dispatch.clone()))
-            .await?;
-        *self.dispatch.borrow_mut() = Some(dispatch);
+        assert!(
+            self.dispatch.borrow().is_none(),
+            "bug: overwriting an unsettled dispatch"
+        );
+        *self.pending_dispatch.borrow_mut() = Some(dispatch);
+        self.persist_tool_dispatch().await
+    }
+
+    pub(crate) fn dispatch_write_pending(&self) -> bool {
+        self.pending_dispatch.borrow().is_some()
+    }
+
+    pub(crate) fn dispatch_settlement_pending(&self) -> bool {
+        self.dispatch_write_pending() || self.clear_dispatch.get()
+    }
+
+    async fn persist_tool_dispatch(&self) -> Result<(), BoxError> {
+        let dispatch = self.pending_dispatch.borrow().clone();
+        if let Some(dispatch) = dispatch {
+            self.state_store
+                .set_tool_dispatch(&self.thread_id, Some(dispatch.clone()))
+                .await?;
+            *self.dispatch.borrow_mut() = Some(dispatch);
+            self.pending_dispatch.borrow_mut().take();
+        }
         Ok(())
     }
 
@@ -749,7 +772,24 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             "bug: sync() called with un-flushed turn_buffer content"
         );
 
+        // A failed write retains the intent for the driver's bounded settlement.
+        // No call history may reach the store until that intent is durable.
+        self.persist_tool_dispatch().await?;
         let pending_items = std::mem::take(&mut *self.pending_items.borrow_mut());
+        let pending_start = self.history.borrow().len()
+            - self.unvalidated_items.borrow().len()
+            - pending_items.len();
+        if let Some(dispatch) = self.dispatch.borrow().as_ref()
+            && pending_items.iter().enumerate().any(|(index, item)| {
+                self.store_order(pending_start + index) > dispatch.call_order
+                    && item
+                        .message
+                        .tool_result()
+                        .is_some_and(|result| result.id == dispatch.call_id.as_str())
+            })
+        {
+            self.clear_dispatch.set(true);
+        }
         if !pending_items.is_empty() {
             let msgs = pending_items
                 .iter()
@@ -764,20 +804,6 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
                 *self.pending_items.borrow_mut() = pending_items;
                 return Ok(());
             }
-        }
-        let pending_start = self.history.borrow().len()
-            - self.unvalidated_items.borrow().len()
-            - pending_items.len();
-        if let Some(dispatch) = self.dispatch.borrow().as_ref()
-            && pending_items.iter().enumerate().any(|(index, item)| {
-                self.store_order(pending_start + index) > dispatch.call_order
-                    && item
-                        .message
-                        .tool_result()
-                        .is_some_and(|result| result.id == dispatch.call_id.as_str())
-            })
-        {
-            self.clear_dispatch.set(true);
         }
         // Only inputs that are not naturally idempotent need durable dedup
         // IDs: user text and subscription events (a redelivered subscription
@@ -1943,6 +1969,15 @@ where
                     } else {
                         None
                     };
+                    if matches!(chunk, StreamChunk::ToolCall(_)) && history.dispatch.borrow().is_some() {
+                        // The sequential executor has accepted the preceding result.
+                        // Make it durable before replacing the single dispatch slot.
+                        history.flush_turn();
+                        history.sync().await?;
+                        if history.dispatch.borrow().is_some() {
+                            Err::<(), BoxError>("previous tool result could not be persisted".into())?;
+                        }
+                    }
                     history.handle_completion(&chunk, completion_id, tool_display_as.clone());
                     match chunk {
                         StreamChunk::Text(text) => {
@@ -2008,8 +2043,8 @@ where
                             // the tool call appear cancelled.
                             let tool = tool_registry.get(call.function.name.as_str()).expect("bug: tool not found in registry after call");
                             if tool.supports_sync() {
-                                history.sync().await?; // thread spawning needs the committed state
                                 history.record_tool_dispatch(ToolCallId::from_ref(&call.id)).await?;
+                                history.sync().await?; // thread spawning needs the committed state
 
                                 // The call being executed is the (unanswered)
                                 // history tail, so the safe spawn point cuts

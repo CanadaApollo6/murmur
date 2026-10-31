@@ -179,6 +179,9 @@ pub(crate) async fn drive_thread<C, S, H, O>(
     let mut settlement: Option<Settlement> = None;
 
     'driver: loop {
+        if in_flight.is_none() && settlement.is_none() && thread.needs_dispatch_settlement() {
+            settlement = Some(Settlement::retry());
+        }
         if let Some(state) = &settlement {
             // Keep the only copy of accepted results until settlement persists.
             // Inputs wait, but subscribers can reconnect during a storage outage.
@@ -389,6 +392,12 @@ pub(crate) async fn drive_thread<C, S, H, O>(
 
             batch
         };
+
+        if thread.needs_dispatch_settlement() {
+            pending_batch.extend(new_inputs);
+            settlement = Some(Settlement::retry());
+            continue;
+        }
 
         // Reset the compaction trigger (and the stale token count) once a
         // compaction round-trips: the next completion reports fresh usage.
