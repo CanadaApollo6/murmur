@@ -156,13 +156,19 @@ Restart recovery is broker-owned. The daemon adds a boot ID to `Welcome` and
 reports driver panics as protocol errors. Core keeps durable interrupt settlement,
 leading-result persistence, bounded cancellation notification, and idle/display
 events. It does not infer executor liveness or repair calls during load. Only
-agentd-attached threads auto-recover after a daemon restart. An executor lost
-inside a running daemon needs `agentctl cancel` unless a driver failure or
-session shutdown signals the loss. Detached sleep tasks return terminal errors
+agentd-attached threads auto-recover after a daemon restart. On ShutdownSession or ArchiveSession, the daemon returns a terminal tool error
+for each outstanding call from a killed command-backed RAP server. Its live
+driver continues normally. External servers and MCP proxies stay running, so
+their calls survive. agentd only reconnects a Stopped root to reopen mail
+admission. Shutdown does not arm an Interrupt or cancel a model stream.
+Other executor loss inside a running daemon needs `agentctl cancel` unless a
+driver failure signals it. Detached sleep tasks return terminal errors
 on panic. Receipt and settlement timeouts retry without spending the crash
-budget. Repeated interrupt deadline expiry without progress enters `NeedsRecovery`.
+budget. Repeated interrupt deadline expiry for ten minutes without progress enters
+`NeedsRecovery`. Successful attachment does not reset backoff.
 Stopped roots reconnect without spending a crash and preserve surviving model
-streams. Archived roots need human recovery.
+streams. Archived roots need human recovery. Interrupt and Connect cannot clear their
+shutdown flag, and event admission also checks archive state.
 
 murmur is detached from upstream, so both commits land directly. They stay small and additive anyway: a small core diff keeps upstream fixes easy to port by hand.
 
@@ -303,6 +309,9 @@ v1 (one machine, a handful of agents) builds the parts that change stored data, 
 - Which third family completes the screening ensemble, given that Clef is Qwen-based?
 - What does `size_immune_team` optimize beyond queueing arithmetic, and how does it price a family that is accurate but slow?
 - History and processed IDs are two separate writes in core (`sync()` in `event_processor.rs`). Two paths reach the gap between them: a process crash between the writes, and a failed processed-ID write followed by the driver going idle, which drops the retry state. Either way a re-offer appends the peer message a second time. Neither path loses mail or sends a false receipt. Accepted for v1. One fix closes both: write history and processed IDs together, or rebuild processed IDs from history on load.
+
+An inference watchdog for model streams that stall without a shutdown remains
+a follow-up. The adapter currently has no inference deadline.
 
 ## Next implementation step
 

@@ -82,16 +82,19 @@ The daemon includes a random process boot ID in `Welcome`. The adapter saves it
 in the resume token. When a reopened root has a different boot ID and
 `Replay.idle` is false, agentd sends one `Interrupt`. It uses the same rule after
 a driver-failure protocol error from the root or any child on the connection.
-A stopped root ends the attachment without spending the crash budget and records
-that it needs an interrupt. Connect clears and persists shutdown even when the
-driver is still live. Recovery interrupts busy replay unless `in_progress` shows
-a surviving model completion. CLI quit kills RAP servers but lets that completion
-finish. Pending non-passive tool calls still require interruption.
-An archived root requires recovery instead of reconnecting. Core settles the call
-durably and removes pending choices. Recovery never invokes the tool again.
-Only agentd-attached threads auto-recover after a daemon restart. An executor
-lost inside a running daemon needs `agentctl cancel` unless a driver failure or
-session shutdown signals the loss. Detached sleep tasks catch panics and return
+The daemon settles outstanding calls from command-backed RAP servers when
+ShutdownSession or ArchiveSession kills those servers. Each call receives a
+terminal tool error, so its live driver continues without agentd detecting the
+loss. Calls to external servers and MCP proxies survive because those servers
+stay running. Model streams also continue after a CLI quit.
+A stopped root reconnects without spending the crash budget or requesting an
+Interrupt. Connect clears and persists shutdown so the router admits mail again.
+An archived root requires human recovery and remains closed to event input,
+including after Interrupt or Connect starts a driver.
+Daemon boot changes and driver failures still mark busy replay for Interrupt.
+Only agentd-attached threads auto-recover after a daemon restart. Other executor
+loss inside a running daemon needs `agentctl cancel` unless a driver failure
+signals it. Detached sleep tasks catch panics and return
 a terminal tool error. Invalid or unrepresentable sleep durations return an error
 before a task starts. The adapter persists its recovery marker when it changes,
 including when idle or a new completion clears it, so an unclean agentd exit
@@ -113,18 +116,20 @@ call cannot wait forever for a prompt that was never saved. RAP cancellation
 notifications have a two-second bound. Retaining accepted results during a
 storage outage requires the daemon to remain alive. Receipt deadlines and
 exhausted or held settlement errors reconnect without spending the crash budget.
-Interrupt deadlines also retry, but `crash_limit` expiries without a committed
-input, completed turn, or cancellation acknowledgment enter `NeedsRecovery`.
+Interrupt deadlines also retry. Ten minutes of repeated expiry without a
+committed input, completed turn, or cancellation acknowledgment enters
+`NeedsRecovery`.
 Successful attachment alone does not reset retry backoff. Mailroom `max_attempts`
 still bounds unreceipted delivery and moves exhausted mail to Held. Repairing
-storage permits automatic recovery until the interrupt retry limit is reached.
+storage permits automatic recovery within that ten-minute window.
 
 The receipt deadline starts when submission begins on an idle root. A later
 completion start clears it, so inference may outlast the receipt timeout. A new
 idle event rearms it for outstanding mail. A silent daemon cannot leave offered
 mail waiting forever. Model agents never idle-suspend. An unreachable daemon
 uses backoff capped at 60 seconds without consuming the model agent crash limit.
-Other connected-session failures count as crashes.
+Other connected-session failures count as crashes. A model stream that stalls
+without finishing has no inference watchdog.
 ACP spawn failures keep their existing crash policy.
 
 Infinity's daemon owns sandbox and RAP tool configuration. The socket API cannot

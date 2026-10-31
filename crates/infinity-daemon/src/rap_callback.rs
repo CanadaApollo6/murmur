@@ -22,7 +22,10 @@ pub fn serve_callbacks(
     bridge: RapCallbackBridge,
     session_manager: SessionManager,
 ) -> SharedSessionManager {
-    let (mut views, _callback_server_task) = bridge.serve_into(session_manager.input_sender());
+    let sender = session_manager
+        .rap_manager
+        .callback_sender(session_manager.input_sender());
+    let (mut views, _callback_server_task) = bridge.serve_into(sender);
     let session_manager = SharedSessionManager::new(Mutex::new(session_manager));
 
     let sm = session_manager.clone();

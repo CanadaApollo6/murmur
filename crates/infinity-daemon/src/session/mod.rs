@@ -674,9 +674,9 @@ impl SessionManager {
     /// and mark it shut down in the store.
     ///
     /// The agent system keeps running — a thread that is mid-completion
-    /// finishes and flushes its turn, then parks. Sending new user input
-    /// clears the flag and picks the session back up (its servers reboot
-    /// lazily); RAP callbacks arriving while shut down are ignored.
+    /// finishes and flushes its turn. Killed RAP calls receive terminal errors.
+    /// Connect or new user input resumes a non-archived session's admission;
+    /// its servers reboot lazily. Events cannot start a stopped driver.
     #[tracing::instrument(skip(self))]
     pub async fn cleanup_session(&self, session_id: &ThreadId<str>) {
         if let Err(error) = self

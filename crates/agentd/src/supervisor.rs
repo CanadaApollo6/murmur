@@ -291,7 +291,7 @@ impl Broker {
             pending: HashMap::new(),
             crashes: VecDeque::new(),
             unavailable_attempts: 0,
-            interrupt_timeouts: 0,
+            interrupt_since: None,
             idle_since: Instant::now(),
         };
         tokio::spawn(actor.run());
@@ -344,7 +344,7 @@ struct AgentActor {
     pending: HashMap<PermissionId, (PermissionRequest, Option<Instant>)>,
     crashes: VecDeque<Instant>,
     unavailable_attempts: u32,
-    interrupt_timeouts: usize,
+    interrupt_since: Option<Instant>,
     idle_since: Instant,
 }
 
@@ -571,7 +571,7 @@ impl AgentActor {
             SessionEvent::Committed { ids } => {
                 self.validate_ids(&ids)?;
                 self.unavailable_attempts = 0;
-                self.interrupt_timeouts = 0;
+                self.interrupt_since = None;
                 self.mailroom.mark_consumed(&ids, self.incarnation).await?;
                 self.offered.retain(|id| !ids.contains(id));
                 self.emit(Event::Consumed {
@@ -581,7 +581,7 @@ impl AgentActor {
             }
             SessionEvent::CancelComplete => {
                 self.unavailable_attempts = 0;
-                self.interrupt_timeouts = 0;
+                self.interrupt_since = None;
                 self.cancelling = false;
                 self.clear_pending();
                 self.emit(Event::TurnEnded {
@@ -595,7 +595,7 @@ impl AgentActor {
                     self.end("turn ended without receipt".into()).await?;
                 } else {
                     self.unavailable_attempts = 0;
-                    self.interrupt_timeouts = 0;
+                    self.interrupt_since = None;
                     self.cancelling = false;
                     self.clear_pending();
                     self.emit(Event::TurnEnded {
@@ -626,11 +626,12 @@ impl AgentActor {
             SessionEvent::CancelTimedOut => {
                 self.stop_session().await?;
                 self.unavailable_attempts = self.unavailable_attempts.saturating_add(1);
-                self.interrupt_timeouts = self.interrupt_timeouts.saturating_add(1);
-                if self.interrupt_timeouts >= self.config.crash_limit {
+                let since = self.interrupt_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_secs(10 * 60) {
                     self.phase(Phase::NeedsRecovery {
-                        reason: "Infinity interrupt deadline repeatedly exceeded without progress"
-                            .into(),
+                        reason:
+                            "Infinity interrupt deadlines expired for ten minutes without progress"
+                                .into(),
                     });
                 } else {
                     self.retry(self.unavailable_attempts);

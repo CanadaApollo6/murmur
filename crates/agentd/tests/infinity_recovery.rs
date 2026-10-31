@@ -586,7 +586,7 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
             let mut kind = agentd::KindConfig::infinity(socket);
             kind.cancel_timeout =
                 if matches!(probe, ToolSettlementProbe::InterruptWriteFailure { .. }) {
-                    Duration::from_secs(4)
+                    agentd::KindConfig::infinity(std::path::PathBuf::from("unused")).cancel_timeout
                 } else {
                     Duration::from_millis(100)
                 };
@@ -745,7 +745,7 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
             .await
             .expect("queue human");
         let mut crashes = 0;
-        tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(Duration::from_secs(90), async {
             loop {
                 match events.recv().await.expect("event") {
                     Event::PhaseChanged {
@@ -753,7 +753,7 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
                         ..
                     } => {
                         crashes += 1;
-                        if crashes == if permanent { 6 } else { 2 } {
+                        if crashes == if permanent { 30 } else { 2 } {
                             break;
                         }
                     }
@@ -761,6 +761,10 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
                         phase: Phase::Failed { .. },
                         ..
                     } => panic!("storage outage exhausted crash budget"),
+                    Event::PhaseChanged {
+                        phase: Phase::NeedsRecovery { .. },
+                        ..
+                    } => panic!("short storage outage requires manual recovery"),
                     Event::TurnEnded {
                         outcome: TurnOutcome::Cancelled,
                         ..
@@ -2237,15 +2241,34 @@ async fn r11_shutdown_command_tool(archive: bool) {
                 "archive must enter NeedsRecovery directly"
             );
         }
-        assert!(h.ctrl.try_next_request().is_none());
+        let request = tokio::time::timeout(Duration::from_secs(3), h.ctrl.next_request())
+            .await
+            .expect("archived tool receives terminal result");
+        let history = format!("{:?}", request.chat_history);
+        assert!(history.contains("tool server stopped by session shutdown"));
+        assert!(
+            !history.contains("mail after CLI quit"),
+            "archive must retain broker mail"
+        );
+        h.ctrl.send_text("archived tool settled");
+        h.ctrl.finish();
     } else {
         let request = tokio::time::timeout(Duration::from_secs(8), h.ctrl.next_request())
             .await
             .expect("shutdown must not strand mail behind killed tool");
-        let history = format!("{:?}", request.chat_history);
+        let mut history = format!("{:?}", request.chat_history);
+        if !history.contains("mail after CLI quit") {
+            assert!(history.contains("tool server stopped by session shutdown"));
+            h.ctrl.send_text("shutdown handled");
+            h.ctrl.finish();
+            let next = tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request())
+                .await
+                .expect("deferred mail");
+            history = format!("{:?}", next.chat_history);
+        }
         assert!(
             history.contains("mail after CLI quit")
-                && history.contains("Tool call interrupted by user")
+                && history.contains("tool server stopped by session shutdown")
         );
         h.ctrl.send_text("recovered");
         h.ctrl.finish();
@@ -2304,8 +2327,7 @@ async fn r12a_shutdown_recovery_usage_case(report_usage: bool) {
     tokio::task::LocalSet::new()
         .run_until(async {
             let mut h = start_harness().await.expect("harness");
-            let port = r10a_waiting_server().await.expect("RAP tool");
-            rap_test_servers::write_rap_config(h.cwd.path(), port).expect("RAP config");
+            let marker = r12o::slow_rap(&h);
             let (broker, agent, root) = r11_broker(&h).await;
             h.client_tx
                 .send(ClientMessage::Connect {
@@ -2321,12 +2343,13 @@ async fn r12a_shutdown_recovery_usage_case(report_usage: bool) {
             r11_send(&broker, agent.id, "start work before shutdown").await;
             h.ctrl.next_request().await;
             h.ctrl
-                .send_tool_call("pre-shutdown", "waiting_choice", serde_json::json!({}));
+                .send_tool_call("pre-shutdown", "delayed_work", serde_json::json!({}));
             h.ctrl.finish();
             wait_for_message(&mut h.daemon_rx, |m| {
                 matches!(m, DaemonMessage::ResponseDone { .. })
             })
             .await;
+            r12o::invocations(&marker).await;
             r11_send(&broker, agent.id, "mail pending during shutdown").await;
             tokio::time::sleep(Duration::from_millis(50)).await;
             h.client_tx
@@ -2354,7 +2377,7 @@ async fn r12a_shutdown_recovery_usage_case(report_usage: bool) {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 h.ctrl.send_tool_call(
                     &format!("post-shutdown-{round}"),
-                    "waiting_choice",
+                    "delayed_work",
                     serde_json::json!({}),
                 );
                 h.ctrl.finish_with_usage(report_usage.then_some(
@@ -2718,6 +2741,15 @@ async fn r12o_repeated_cli_quit_crash_budget() {
                     .expect("quit");
                 quits += 1;
                 r12o::port_dead(port).await;
+                let request = tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request())
+                    .await
+                    .expect("daemon settles killed call");
+                assert!(
+                    format!("{:?}", request.chat_history)
+                        .contains("tool server stopped by session shutdown")
+                );
+                h.ctrl.send_text("shutdown handled");
+                h.ctrl.finish();
                 let settled = r12o::wait_phase(
                     &r.agent,
                     |p| matches!(p, Phase::Idle | Phase::Failed { .. }),
@@ -2813,6 +2845,15 @@ async fn r12_post_shutdown_mail_does_not_wait_for_receipt_expiry() {
                 })
                 .expect("quit");
             r12o::port_dead(port).await;
+            let request = tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request())
+                .await
+                .expect("daemon settles killed call");
+            assert!(
+                format!("{:?}", request.chat_history)
+                    .contains("tool server stopped by session shutdown")
+            );
+            h.ctrl.send_text("shutdown handled");
+            h.ctrl.finish();
             assert!(
                 r12o::wait_phase(&r.agent, |p| *p == Phase::Idle, Duration::from_secs(5)).await
             );
@@ -2838,6 +2879,393 @@ async fn r12_post_shutdown_mail_does_not_wait_for_receipt_expiry() {
                 SessionStatus::Stopped
             ));
             r.broker.shutdown().await.expect("shutdown");
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r13a_quick_reconnect_must_not_hide_executor_shutdown() {
+    use agentd::supervisor::Config;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let marker = r12o::slow_rap(&h);
+            let cfg = Config {
+                backoff_initial: Duration::from_millis(10),
+                backoff_max: Duration::from_millis(20),
+                ..Default::default()
+            };
+            let r = r12o::rig(
+                &h,
+                Duration::from_millis(300),
+                Duration::from_millis(300),
+                cfg,
+                None,
+            )
+            .await;
+            r12o::send(&r, "start work before quick reconnect").await;
+            h.ctrl.next_request().await;
+            h.ctrl.send_tool_call(
+                "quick-reconnect-call",
+                "delayed_work",
+                serde_json::json!({}),
+            );
+            h.ctrl.finish();
+            let port = r12o::invocations(&marker).await[0];
+            let waiting = r12o::send(&r, "mail waiting on killed executor").await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            h.client_tx
+                .send(ClientMessage::ShutdownSession {
+                    root_thread_id: r.root.clone(),
+                })
+                .expect("shutdown");
+            h.client_tx
+                .send(ClientMessage::Connect {
+                    root_thread_id: r.root.clone(),
+                    thread_id: None,
+                    keeps_session_alive: true,
+                })
+                .expect("immediate connect");
+            r12o::port_dead(port).await;
+            let recovered =
+                tokio::time::timeout(Duration::from_secs(4), h.ctrl.next_request()).await;
+            let phase = r.agent.phase();
+            let delivery = r.mailroom.delivery(waiting).await.expect("delivery");
+            eprintln!(
+                "R13 quick reconnect: recovered={} phase={phase:?} delivery={delivery:?} {}",
+                recovered.is_ok(),
+                r12o::summary(&r)
+            );
+            let request =
+                recovered.expect("shutdown plus immediate Connect must deliver deferred mail");
+            let history = format!("{:?}", request.chat_history);
+            assert!(history.contains("tool server stopped by session shutdown"));
+            assert_eq!(
+                history.matches("mail waiting on killed executor").count(),
+                1
+            );
+            h.ctrl.send_text("recovered");
+            h.ctrl.finish();
+            assert!(
+                r12o::wait_phase(
+                    &r.agent,
+                    |p| *p == agentd::supervisor::Phase::Idle,
+                    Duration::from_secs(4)
+                )
+                .await
+            );
+            let delivery = r.mailroom.delivery(waiting).await.expect("delivery");
+            assert_eq!(delivery.state, agentd::model::DeliveryState::Consumed);
+            assert_eq!(delivery.attempts, 1);
+            r.broker.shutdown().await.expect("broker shutdown");
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r13a_shutdown_preserved_stream_delivers_followup() {
+    use agentd::supervisor::{Config, Event, TurnOutcome};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let marker = r12o::slow_rap(&h);
+            let cfg = Config {
+                backoff_initial: Duration::from_millis(10),
+                backoff_max: Duration::from_millis(20),
+                ..Default::default()
+            };
+            let r = r12o::rig(
+                &h,
+                Duration::from_secs(2),
+                Duration::from_millis(100),
+                cfg,
+                None,
+            )
+            .await;
+            r12o::send(&r, "start stream").await;
+            h.ctrl.next_request().await;
+            h.ctrl.send_text("partial answer ");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            h.client_tx
+                .send(ClientMessage::ShutdownSession {
+                    root_thread_id: r.root.clone(),
+                })
+                .expect("shutdown");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mail = r12o::send(&r, "follow-up after stream").await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            h.ctrl.send_text("rest of answer");
+            h.ctrl
+                .send_tool_call("after-stream", "delayed_work", serde_json::json!({}));
+            h.ctrl.finish();
+            r12o::invocations(&marker).await;
+            r.agent.stop().await.expect("detach during next tool");
+            let agent = r
+                .broker
+                .spawn(agentd::supervisor::AgentSpec {
+                    name: agentd::model::AgentName::parse("r12o").expect("name"),
+                    kind: "infinity".into(),
+                    cwd: h.cwd.path().into(),
+                    model: None,
+                    permissions: Default::default(),
+                    idle_after: None,
+                })
+                .await
+                .expect("reattach during next tool");
+            let request = tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request())
+                .await
+                .expect("mail after completed stream");
+            let history = format!("{:?}", request.chat_history);
+            assert!(
+                history.contains("Delayed work complete"),
+                "quit must not leave a stale Interrupt marker that cancels the next tool: {history}"
+            );
+            assert!(
+                history.contains("partial answer")
+                    && history.contains("rest of answer")
+                    && history.contains("follow-up after stream")
+            );
+            h.ctrl.send_text("delivered");
+            h.ctrl.finish();
+            assert!(
+                r12o::wait_phase(
+                    &agent,
+                    |p| *p == agentd::supervisor::Phase::Idle,
+                    Duration::from_secs(4)
+                )
+                .await
+            );
+            assert_eq!(
+                r.mailroom.delivery(mail).await.expect("mail").state,
+                agentd::model::DeliveryState::Consumed
+            );
+            assert!(!r.log.borrow().iter().any(|e| matches!(
+                e,
+                Event::TurnEnded {
+                    outcome: TurnOutcome::Cancelled,
+                    ..
+                }
+            )));
+            r.broker.shutdown().await.expect("shutdown");
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r13a_interrupt_must_not_resume_archived_thread() {
+    tokio::task::LocalSet::new().run_until(async {
+        let mut h = start_harness().await.expect("harness");
+        let root = create_session_and_chat(&mut h).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        h.client_tx.send(ClientMessage::ArchiveSession { root_thread_id: root.clone() }).expect("archive");
+        wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::SessionsUpdated { sessions } if sessions.get(&root).is_some_and(|s| s.status == SessionStatus::Archived))).await;
+        let before = h.manager.lock().await.session_store.lock().await.is_shut_down(&root.id);
+        assert!(before);
+        h.client_tx.send(ClientMessage::Interrupt { thread_id: root.clone() }).expect("interrupt archived root");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after = h.manager.lock().await.session_store.lock().await.is_shut_down(&root.id);
+        h.client_tx.send(ClientMessage::DeliverPeerMessage { thread_id: root.clone(), message_id: "archived-mail".into(), from: "peer".into(), text: "must not awaken archived thread".into() }).expect("late peer mail");
+        let inference = tokio::time::timeout(Duration::from_millis(500), h.ctrl.next_request()).await;
+        eprintln!("R13 archived interrupt: shut_down before={before} after={after} inference={}", inference.is_ok());
+        if inference.is_ok() { h.ctrl.send_text("unexpected archived inference"); h.ctrl.finish(); }
+        assert!(after && inference.is_err(), "orphan Interrupt must preserve the archived root's event admission gate");
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r13o_shutdown_while_agentd_detached_recovers_tool() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use agentd::model::AgentName;
+            use agentd::supervisor::{AgentSpec, Phase};
+            let mut h = start_harness().await.expect("harness");
+            let config_dir = h.cwd.path().join(".infinity");
+            std::fs::create_dir(&config_dir).expect("config directory");
+            let started = h.cwd.path().join("tool-started");
+            let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/support/delayed_rap.py");
+            std::fs::write(config_dir.join("rap.json"), serde_json::json!({"tool_sets":[{
+                "type":"toolset_command", "command":format!("python3 '{}' '{}'", script.display(), started.display())
+            }]}).to_string()).expect("config");
+            let (broker, agent, root) = r11_broker(&h).await;
+            h.client_tx
+                .send(ClientMessage::Connect { root_thread_id: root.clone(), thread_id: None, keeps_session_alive: true })
+                .expect("observer connect");
+            wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
+            r11_send(&broker, agent.id, "start delayed work").await;
+            h.ctrl.next_request().await;
+            h.ctrl.send_tool_call("delayed-call", "delayed_work", serde_json::json!({}));
+            h.ctrl.finish();
+            wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::ResponseDone { .. })).await;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !started.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("command tool invoked");
+            let port: u16 = std::fs::read_to_string(&started).expect("port").parse().expect("port");
+            agent.stop().await.expect("agentd detaches");
+            h.client_tx
+                .send(ClientMessage::ShutdownSession { root_thread_id: root.clone() })
+                .expect("CLI quit while agentd is detached");
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("shutdown kills command RAP server before callback");
+            let status = h.manager.lock().await.list_sessions(None).await.get(&root).map(|s| s.status.clone());
+            eprintln!("r13o status before reattach: {status:?}");
+            let agent = broker
+                .spawn(AgentSpec {
+                    name: AgentName::parse("r11").expect("name"),
+                    kind: "infinity".into(),
+                    cwd: h.cwd.path().into(),
+                    model: None,
+                    permissions: Default::default(),
+                    idle_after: None,
+                })
+                .await
+                .expect("reattach");
+            r11_send(&broker, agent.id, "mail after detached quit").await;
+            let request = tokio::time::timeout(Duration::from_secs(10), h.ctrl.next_request()).await;
+            let status = h.manager.lock().await.list_sessions(None).await.get(&root).map(|s| s.status.clone());
+            eprintln!("r13o after 10 s: phase={:?} status={status:?} inference={}", agent.phase(), request.is_ok());
+            let request = request.expect("quit while agentd was detached must not strand mail behind the killed tool");
+            let mut history = format!("{:?}", request.chat_history);
+            if !history.contains("mail after detached quit") {
+                assert!(history.contains("tool server stopped by session shutdown"));
+                h.ctrl.send_text("tool shutdown handled"); h.ctrl.finish();
+                let next = tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request()).await.expect("deferred mail");
+                history = format!("{:?}", next.chat_history);
+            }
+            assert!(history.contains("mail after detached quit") && history.contains("tool server stopped by session shutdown"));
+            assert!(!matches!(agent.phase(), Phase::Failed { .. }));
+            h.ctrl.send_text("recovered");
+            h.ctrl.finish();
+            broker.shutdown().await.expect("shutdown");
+        })
+        .await;
+}
+
+/// A client Interrupt for an archived root with no live driver.
+#[tokio::test(flavor = "current_thread")]
+async fn r13o_interrupt_on_archived_root_reopens_stopped_gate() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let root = create_session_and_chat(&mut h).await;
+            h.client_tx
+                .send(ClientMessage::ArchiveSession { root_thread_id: root.clone() })
+                .expect("archive");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let shut = |h: &TestHarness| {
+                let m = h.manager.clone();
+                let id = root.id.clone();
+                async move { m.lock().await.session_store.lock().await.is_shut_down(&id) }
+            };
+            assert!(shut(&h).await, "archive marks the session shut down");
+            h.client_tx
+                .send(ClientMessage::Interrupt { thread_id: root.clone() })
+                .expect("interrupt");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let after_interrupt = shut(&h).await;
+            h.client_tx
+                .send(ClientMessage::DeliverPeerMessage {
+                    thread_id: root.clone(),
+                    message_id: "late-peer".into(),
+                    from: "agent:late".into(),
+                    text: "late event for archived root".into(),
+                })
+                .expect("peer");
+            let inference = tokio::time::timeout(Duration::from_secs(2), h.ctrl.next_request()).await.is_ok();
+            let status = h.manager.lock().await.list_sessions(None).await.get(&root).map(|s| s.status.clone());
+            eprintln!("r13o archived: shut_down_after_interrupt={after_interrupt} event_input_ran_inference={inference} status={status:?}");
+            assert!(after_interrupt, "an Interrupt must not reopen an archived session's stopped gate");
+            assert!(!inference, "event-style input must not run inference on an archived session");
+        })
+        .await;
+}
+
+/// A client Connect to an archived root.
+#[tokio::test(flavor = "current_thread")]
+async fn r13o_connect_on_archived_root_reopens_stopped_gate() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let root = create_session_and_chat(&mut h).await;
+            h.client_tx
+                .send(ClientMessage::ArchiveSession { root_thread_id: root.clone() })
+                .expect("archive");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let shut = |h: &TestHarness| {
+                let m = h.manager.clone();
+                let id = root.id.clone();
+                async move { m.lock().await.session_store.lock().await.is_shut_down(&id) }
+            };
+            assert!(shut(&h).await, "archive marks the session shut down");
+            h.client_tx
+                .send(ClientMessage::Connect { root_thread_id: root.clone(), thread_id: None, keeps_session_alive: false })
+                .expect("connect");
+            wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Connected { .. } | DaemonMessage::Error { .. })).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let after_connect = shut(&h).await;
+            h.client_tx
+                .send(ClientMessage::DeliverPeerMessage {
+                    thread_id: root.clone(),
+                    message_id: "late-peer".into(),
+                    from: "agent:late".into(),
+                    text: "late event for archived root".into(),
+                })
+                .expect("peer");
+            let inference = tokio::time::timeout(Duration::from_secs(2), h.ctrl.next_request()).await.is_ok();
+            eprintln!("r13o archived connect: shut_down_after_connect={after_connect} event_input_ran_inference={inference}");
+            assert!(after_connect, "a Connect must not reopen an archived session's stopped gate");
+            assert!(!inference, "event-style input must not run inference on an archived session");
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r13_shutdown_settles_calls_from_retained_evicted_toolset() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let marker = r12o::slow_rap(&h);
+            let (broker, agent, root) = r11_broker(&h).await;
+            r11_send(&broker, agent.id, "keep the same driver alive").await;
+            h.ctrl.next_request().await;
+            for i in 0..2 {
+                h.ctrl.send_tool_call(
+                    &format!("retained-{i}"),
+                    "delayed_work",
+                    serde_json::json!({}),
+                );
+                h.ctrl.finish();
+                let port = r12o::invocations(&marker).await[0];
+                std::fs::remove_file(&marker).expect("clear marker");
+                h.client_tx
+                    .send(ClientMessage::ShutdownSession {
+                        root_thread_id: root.clone(),
+                    })
+                    .expect("quit");
+                r12o::port_dead(port).await;
+                let request = tokio::time::timeout(Duration::from_secs(4), h.ctrl.next_request())
+                    .await
+                    .expect("each killed call settles");
+                let history = format!("{:?}", request.chat_history);
+                assert_eq!(
+                    history
+                        .matches("Error: tool server stopped by session shutdown")
+                        .count(),
+                    i + 1
+                );
+            }
+            h.ctrl.send_text("both calls settled");
+            h.ctrl.finish();
+            broker.shutdown().await.expect("shutdown");
         })
         .await;
 }
