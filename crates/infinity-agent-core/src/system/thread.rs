@@ -119,12 +119,19 @@ where
         inner: Rc<SystemInner<C, S, M, H>>,
         thread_id: ThreadId,
     ) -> Result<Self, BoxError> {
-        let history = HistoryManager::new_with_history(
+        let mut history = HistoryManager::new_with_history(
             inner.conversation_store.clone(),
             inner.state_store.clone(),
             thread_id,
         )
         .await?;
+        history.dispatch_epoch = inner.dispatch_epoch.clone();
+        if history.dispatch_epoch.is_some() {
+            *history.dispatch.borrow_mut() = inner
+                .state_store
+                .get_tool_dispatch(&history.thread_id)
+                .await?;
+        }
         let pending_choices = inner
             .state_store
             .get_pending_user_choices(&history.thread_id)
@@ -137,68 +144,61 @@ where
             in_flight: Cell::new(false),
             pending_choices: RefCell::new(pending_choices),
         };
-        if let Some(loaded) = &thread.inner.loaded_threads
-            && !loaded.borrow().contains(&thread.history.thread_id)
-        {
-            let mut orphaned = matches!(thread.history.history.borrow().last(),
-                Some(crate::message::InfinityMessage::ToolResult { result, .. })
-                    if result.content.iter().any(|content| matches!(content,
-                        ToolResultContent::Text(text) if text.text == "interrupted: daemon restarted")));
-            if let Some((call_id, name)) = thread.pending_tool_call()
-                && name != CLOSE_THREAD_TOOL
-            {
-                let is_child_seed = matches!(
-                    name.as_str(),
-                    "spawn_thread" | "__harness_begin_compaction__"
-                ) && thread
+        let dispatch = thread.history.dispatch.borrow().clone();
+        if let Some(dispatch) = dispatch {
+            let pending = thread.history.pending_dispatch_matches(&dispatch);
+            let orphaned = pending && Some(&dispatch.epoch) != thread.inner.dispatch_epoch.as_ref();
+            if orphaned {
+                thread
                     .inner
-                    .conversation_store
-                    .get_thread_parent_info(&thread.history.thread_id)
-                    .await?
-                    .is_some_and(|(_, spawn_call_id)| spawn_call_id.as_str() == call_id);
-                if !is_child_seed {
-                    // A tool call does not outlive the daemon that dispatched it.
-                    // Even external executors retain the old ephemeral callback URL.
-                    thread
-                        .history
-                        .interrupt_pending_tool_call_with_text("interrupted: daemon restarted");
-                    thread.history.settle_tool_results_on_interrupt().await?;
-                    let interrupted = thread.history.take_interrupted_tool_calls();
-                    let notification = async {
-                        if let Some(notifier) = thread
-                            .inner
-                            .config
-                            .restart_notifier(&thread.history.thread_id)
-                            .await?
-                        {
-                            for call_id in interrupted {
-                                notifier
-                                    .notify_tool_cancelled(&thread.history.thread_id, &call_id)
-                                    .await;
-                            }
-                        }
-                        Ok::<_, BoxError>(())
-                    };
-                    match tokio::time::timeout(std::time::Duration::from_secs(2), notification)
-                        .await
+                    .state_store
+                    .set_tool_dispatch(
+                        &thread.history.thread_id,
+                        Some(crate::traits::ToolDispatch {
+                            recovering: true,
+                            ..dispatch.clone()
+                        }),
+                    )
+                    .await?;
+                // A tool call does not outlive the daemon that dispatched it.
+                // Even external executors retain the old ephemeral callback URL.
+                thread
+                    .history
+                    .interrupt_pending_tool_call_with_text("interrupted: daemon restarted");
+                thread.history.dispatch.borrow_mut().take();
+                thread.history.settle_tool_results_on_interrupt().await?;
+                let interrupted = thread.history.take_interrupted_tool_calls();
+                let notification = async {
+                    if let Some(notifier) = thread
+                        .inner
+                        .config
+                        .restart_notifier(&thread.history.thread_id)
+                        .await?
                     {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
-                            tracing::warn!(
-                                %error,
-                                thread_id = %thread.history.thread_id,
-                                "Restart cancellation notification failed"
-                            );
+                        for call_id in interrupted {
+                            notifier
+                                .notify_tool_cancelled(&thread.history.thread_id, &call_id)
+                                .await;
                         }
-                        Err(_) => tracing::warn!(
-                            thread_id = %thread.history.thread_id,
-                            "Restart cancellation notification timed out"
-                        ),
                     }
-                    orphaned = true;
+                    Ok::<_, BoxError>(())
+                };
+                match tokio::time::timeout(std::time::Duration::from_secs(2), notification).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            %error,
+                            thread_id = %thread.history.thread_id,
+                            "Restart cancellation notification failed"
+                        );
+                    }
+                    Err(_) => tracing::warn!(
+                        thread_id = %thread.history.thread_id,
+                        "Restart cancellation notification timed out"
+                    ),
                 }
             }
-            if orphaned {
+            if orphaned || dispatch.recovering {
                 let choices = thread.pending_choices.borrow().clone();
                 for choice in choices {
                     thread
@@ -209,7 +209,9 @@ where
                 }
                 thread.pending_choices.borrow_mut().clear();
             }
-            loaded.borrow_mut().insert(thread.history.thread_id.clone());
+            if orphaned || !pending {
+                thread.history.clear_tool_dispatch().await?;
+            }
         }
         Ok(thread)
     }
@@ -717,6 +719,10 @@ where
         self.history.sync().await?;
         self.emit_committed(observer, &thread_id);
         observer.on_event(&thread_id, &AgentEvent::CompletionFinished { usage });
+
+        if let Some(CompletionAction::ExecuteToolCall { tool_call_id, .. }) = &action {
+            self.history.record_tool_dispatch(tool_call_id).await?;
+        }
 
         // A failed dispatch enqueues an error result so the thread can advance.
         if let Some(action) = action

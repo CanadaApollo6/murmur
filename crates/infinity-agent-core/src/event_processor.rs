@@ -143,6 +143,9 @@ enum ToolResultMatch {
 pub struct HistoryManager<C: ConversationStore, S: StateStore> {
     conversation_store: C,
     state_store: S,
+    pub(crate) dispatch_epoch: Option<String>,
+    pub(crate) dispatch: RefCell<Option<crate::traits::ToolDispatch>>,
+    clear_dispatch: Cell<bool>,
     pub thread_id: ThreadId,
     pub root_thread_id: ThreadId,
     ancestor_chain: Vec<ThreadId>,
@@ -226,6 +229,9 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             .unwrap_or_default();
 
         Ok(Self {
+            dispatch_epoch: None,
+            dispatch: RefCell::new(None),
+            clear_dispatch: Cell::new(false),
             conversation_store,
             state_store,
             thread_id,
@@ -687,6 +693,52 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         true
     }
 
+    pub(crate) fn pending_dispatch_matches(&self, dispatch: &crate::traits::ToolDispatch) -> bool {
+        let history = self.history.borrow();
+        matches!(history.last(), Some(InfinityMessage::ToolCall { call, .. })
+            if call.id == dispatch.call_id.as_str()
+                && self.store_order(history.len() - 1) == dispatch.call_order)
+    }
+
+    pub(crate) async fn record_tool_dispatch(
+        &self,
+        call_id: &ToolCallId<str>,
+    ) -> Result<(), BoxError> {
+        let Some(epoch) = &self.dispatch_epoch else {
+            return Ok(());
+        };
+        let dispatch = crate::traits::ToolDispatch {
+            call_id: call_id.to_owned(),
+            epoch: epoch.clone(),
+            call_order: self.store_order(self.history.borrow().len() - 1),
+            recovering: false,
+        };
+        self.state_store
+            .set_tool_dispatch(&self.thread_id, Some(dispatch.clone()))
+            .await?;
+        *self.dispatch.borrow_mut() = Some(dispatch);
+        Ok(())
+    }
+
+    pub(crate) async fn clear_tool_dispatch(&self) -> Result<(), BoxError> {
+        self.state_store
+            .set_tool_dispatch(&self.thread_id, None)
+            .await?;
+        self.dispatch.borrow_mut().take();
+        self.clear_dispatch.set(false);
+        Ok(())
+    }
+
+    fn store_order(&self, index: usize) -> usize {
+        // Compaction replaces a prefix with one summary. Ancestor messages
+        // occupy memory slots but never belong to this thread's own store.
+        let offset = self
+            .compacted_up_to
+            .borrow()
+            .map_or(0, |prev| prev as usize - 1);
+        index.saturating_sub(self.ancestor_prefix_len.get()) + offset
+    }
+
     pub async fn sync(&self) -> Result<(), BoxError> {
         // `sync` only persists known-safe (`pending_items`) content.
         // Unvalidated inputs deliberately stay in memory (see the field
@@ -713,6 +765,20 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
                 return Ok(());
             }
         }
+        let pending_start = self.history.borrow().len()
+            - self.unvalidated_items.borrow().len()
+            - pending_items.len();
+        if let Some(dispatch) = self.dispatch.borrow().as_ref()
+            && pending_items.iter().enumerate().any(|(index, item)| {
+                self.store_order(pending_start + index) > dispatch.call_order
+                    && item
+                        .message
+                        .tool_result()
+                        .is_some_and(|result| result.id == dispatch.call_id.as_str())
+            })
+        {
+            self.clear_dispatch.set(true);
+        }
         // Only inputs that are not naturally idempotent need durable dedup
         // IDs: user text and subscription events (a redelivered subscription
         // event would mint a fresh invocation and be appended again). Tool
@@ -729,6 +795,9 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
             .map(|i| i.message_id.clone())
             .collect();
         self.pending_receipt_ids.borrow_mut().extend(msg_ids);
+        if self.clear_dispatch.get() {
+            self.clear_tool_dispatch().await?;
+        }
         let receipt_ids = self.pending_receipt_ids.borrow().clone();
         if !receipt_ids.is_empty() {
             if let Err(error) = self
@@ -928,16 +997,7 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
         // the in-memory history tail but have not been persisted yet.
         let validated_len = history.len() - self.unvalidated_items.borrow().len();
         safe = safe.min(validated_len);
-        // Convert in-memory index to absolute store order by adding the offset
-        // from any prior compaction. The -1 accounts for the compaction summary
-        // message occupying slot 0 in the in-memory history.
-        let offset = self
-            .compacted_up_to
-            .borrow()
-            .map_or(0, |prev| prev as usize - 1);
-        // Subtract ancestor_prefix_len because those messages are not in this
-        // thread's own store (they come from parent/ancestor threads).
-        safe.saturating_sub(self.ancestor_prefix_len.get()) + offset
+        self.store_order(safe)
     }
 
     /// Record a subscription in the current thread's metadata. The
@@ -1948,7 +2008,8 @@ where
                             // the tool call appear cancelled.
                             let tool = tool_registry.get(call.function.name.as_str()).expect("bug: tool not found in registry after call");
                             if tool.supports_sync() {
-                                history.sync().await?; // we must sync the history so that thread spawning uses the correct state
+                                history.sync().await?; // thread spawning needs the committed state
+                                history.record_tool_dispatch(ToolCallId::from_ref(&call.id)).await?;
 
                                 // The call being executed is the (unanswered)
                                 // history tail, so the safe spawn point cuts

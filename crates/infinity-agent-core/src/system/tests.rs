@@ -3277,3 +3277,465 @@ async fn r6_restart_bounds_notifier_lookup_and_cleans_choices() {
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn r7_nonassociative_subscription_child_keeps_event() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for restart in [false, true] {
+                let conv = crate::stores::InMemoryConversationStore::new();
+                let state = crate::stores::InMemoryStateStore::new();
+                let (model, mut ctrl) = model_source(None);
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let mut running =
+                    super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
+                        .tool(Box::new(SubscribeTool))
+                        .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+                running
+                    .send_user_text(ThreadId::from_ref("t1"), "subscribe")
+                    .await;
+                ctrl.next_request().await;
+                ctrl.send_tool_call("tc-sub", "subscribe_tool", serde_json::json!({}));
+                ctrl.finish();
+                collect_until_finished(&mut rx).await;
+                let subscribed = ctrl.next_request().await;
+                assert!(
+                    tool_result_texts(&subscribed)
+                        .iter()
+                        .any(|t| t == "subscribed")
+                );
+                ctrl.send_text("subscribed and ready");
+                ctrl.finish();
+                wait_idle(&mut running).await;
+                while rx.try_recv().is_ok() {}
+                let (mut event, id) =
+                    subscription_event_input("t1", "tc-sub", "r7 unique subscription payload");
+                event.synthetic = Some(SyntheticKind::Tagged(
+                    TaggedSyntheticKind::SubscriptionEvent {
+                        tool_call_id: "tc-sub".into(),
+                        associative: false,
+                        r#final: true,
+                    },
+                ));
+                running.send(event, &id).await;
+                let request = tokio::time::timeout(
+                    std::time::Duration::from_millis(700),
+                    ctrl.next_request(),
+                )
+                .await;
+                let child = loop {
+                    let event = tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        running.next_lifecycle_event(),
+                    )
+                    .await
+                    .expect("child lifecycle")
+                    .expect("lifecycle open");
+                    if event.thread_id.as_str() != "t1" && event.state == ThreadLifecycleState::Live
+                    {
+                        break event.thread_id;
+                    }
+                };
+                let request = request.expect(
+                    "fresh subscription child must process its event without a daemon restart",
+                );
+                assert!(
+                    tool_result_texts(&request)
+                        .iter()
+                        .any(|t| t.contains("r7 unique subscription payload"))
+                );
+                assert!(
+                    !persisted(&conv, child.as_str()).contains("interrupted: daemon restarted")
+                );
+                if restart {
+                    let before = persisted(&conv, child.as_str());
+                    assert!(before.contains("receive_event__injected"));
+                    assert!(
+                        !before.contains("r7 unique subscription payload"),
+                        "payload is still unvalidated"
+                    );
+                    running.shutdown().await;
+                    let (model, mut ctrl) = model_source(None);
+                    let (tx, _rx) = mpsc::unbounded_channel();
+                    let running = super::AgentSystemBuilder::new_local(conv.clone(), state, model)
+                        .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+                    let (tx, mut replay) = mpsc::unbounded_channel();
+                    running.subscribe(&child, tx).await;
+                    let Evt::Replay(snapshot) = next_evt(&mut replay).await else {
+                        panic!("replay");
+                    };
+                    assert!(
+                        !snapshot.idle,
+                        "subscription seed stays pending after restart"
+                    );
+                    assert_eq!(persisted(&conv, child.as_str()), before);
+                    assert!(ctrl.try_next_request().is_none());
+                    running.shutdown().await;
+                    continue;
+                }
+                ctrl.send_text("handled");
+                ctrl.finish();
+                collect_until_finished(&mut rx).await;
+                let history = persisted(&conv, child.as_str());
+                assert!(history.contains("r7 unique subscription payload"));
+                assert!(!history.contains("interrupted: daemon restarted"));
+                running.shutdown().await;
+            }
+        })
+        .await;
+}
+
+fn r7_nested_spawn_recovery(reuse_id: bool) {
+    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
+    let conv = InMemoryConversationStore::new();
+    let state = InMemoryStateStore::new();
+    let child = r6_spawn_before_restart(&conv, &state, false);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let grandchild = runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        let (model, mut ctrl) = model_source(None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let running = super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model)
+            .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+        let seed = tool_result_input(child.as_str(), "spawn1", "child seed resumed");
+        running.send(seed.0, &seed.1).await;
+        ctrl.next_request().await;
+        ctrl.send_tool_call(
+            if reuse_id { "spawn1" } else { "spawn2" },
+            "spawn_thread",
+            serde_json::json!({"instructions":"grandchild task", "child_of":["root", child]}),
+        );
+        ctrl.finish();
+        let followup = ctrl.next_request().await;
+        let grandchild: ThreadId = tool_result_texts(&followup)
+            .iter()
+            .find_map(|text| {
+                text.strip_prefix("Child thread is successfully spawned and has ID: ")?
+                    .split('.')
+                    .next()
+                    .map(Into::into)
+            })
+            .expect("real grandchild");
+        ctrl.next_request().await;
+        grandchild
+    }));
+    drop(runtime);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        let (model, mut ctrl) = model_source(None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let running = super::AgentSystemBuilder::new_local(conv.clone(), state, model)
+            .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+        let (tx, mut replay) = mpsc::unbounded_channel();
+        running.subscribe(&child, tx).await;
+        let Evt::Replay(snapshot) = next_evt(&mut replay).await else {
+            panic!("replay")
+        };
+        assert!(snapshot.idle, "the dispatched nested spawn must settle");
+        assert_eq!(
+            persisted(&conv, child.as_str())
+                .matches("interrupted: daemon restarted")
+                .count(),
+            1
+        );
+        assert!(
+            !conv
+                .thread_info(&grandchild)
+                .expect("grandchild preserved")
+                .closed
+        );
+        let peer = peer_input(child.as_str(), "r7-nested-mail", "mail to nested parent");
+        running.send(peer.0, &peer.1).await;
+        let request =
+            tokio::time::timeout(std::time::Duration::from_millis(700), ctrl.next_request())
+                .await
+                .expect("a nested parent's real spawn must settle on restart");
+        assert!(format!("{:?}", request.chat_history).contains("mail to nested parent"));
+        ctrl.send_text("received");
+        ctrl.finish();
+        running.shutdown().await;
+    }));
+}
+
+#[test]
+fn r7_nested_spawn_distinct_id() {
+    r7_nested_spawn_recovery(false);
+}
+#[test]
+fn r7_nested_spawn_reused_id() {
+    r7_nested_spawn_recovery(true);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r7_first_lazy_load_preserves_same_epoch_dispatch() {
+    use crate::event_processor::{CompletionAction, HistoryManager};
+    use crate::message::InfinityMessage;
+    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
+    use crate::traits::{ConversationStore, StateStore};
+    use infinity_provider_protocol::message::{ToolCall, ToolFunction};
+    use std::collections::HashMap;
+
+    let conv = InMemoryConversationStore::new();
+    let state = InMemoryStateStore::new();
+    let tid = ThreadId::from_ref("lazy");
+    conv.ensure_root_thread(tid).await.expect("root");
+    conv.append_messages(
+        tid,
+        vec![(
+            InfinityMessage::ToolCall {
+                call: ToolCall {
+                    id: "active".into(),
+                    call_id: None,
+                    function: ToolFunction {
+                        name: "async_tool".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                },
+                display_as: None,
+            },
+            "call-entry".into(),
+        )],
+    )
+    .await
+    .expect("persist call");
+    let (model, mut ctrl) = model_source(None);
+    let system = super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model).build();
+    let mut dispatcher =
+        HistoryManager::new_with_history(conv.clone(), state.clone(), tid.to_owned())
+            .await
+            .expect("dispatcher history");
+    dispatcher.dispatch_epoch = system.inner.dispatch_epoch.clone();
+    dispatcher
+        .record_tool_dispatch(rap_protocol::ToolCallId::from_ref("active"))
+        .await
+        .expect("write-ahead record");
+    let tool = AsyncTool;
+    let registry = HashMap::from([("async_tool".into(), &tool as &dyn Tool<ChannelSender>)]);
+    crate::event_processor::execute_action_with_error_result(
+        CompletionAction::ExecuteToolCall {
+            tool_name: "async_tool".into(),
+            tool_args: serde_json::json!({}),
+            tool_call_id: "active".into(),
+            call_id: None,
+            display_as: None,
+        },
+        &registry,
+        &ToolContext {
+            message_sender: system.inner.sender.clone(),
+            group_id: tid.to_owned(),
+            callback_url: String::new(),
+            user_id: None,
+            thread_stack: vec![tid.to_owned()],
+            safe_spawn_point: None,
+        },
+    )
+    .await
+    .expect("dispatch in this runtime");
+    drop(dispatcher);
+
+    let before = persisted(&conv, tid.as_str());
+    let thread = super::thread::Thread::load(system.inner.clone(), tid.to_owned())
+        .await
+        .expect("first lazy load");
+    assert_eq!(persisted(&conv, tid.as_str()), before);
+    assert_eq!(
+        thread.pending_tool_call().expect("still pending").0,
+        "active"
+    );
+    assert!(ctrl.try_next_request().is_none());
+    let result = tool_result_input(tid.as_str(), "active", "real current-process result");
+    let (_cancel, cancel) = tokio::sync::oneshot::channel();
+    let observer = super::EventCollector::new();
+    let respond = async {
+        let request = ctrl.next_request().await;
+        assert!(
+            tool_result_texts(&request)
+                .iter()
+                .any(|text| text == "real current-process result")
+        );
+        ctrl.send_text("done");
+        ctrl.finish();
+    };
+    let (step, ()) = tokio::join!(
+        thread.step_no_defer(vec![result], &observer, cancel),
+        respond
+    );
+    step.expect("real result accepted");
+    assert!(
+        state
+            .get_tool_dispatch(tid)
+            .await
+            .expect("dispatch cleared")
+            .is_none()
+    );
+    assert!(!persisted(&conv, tid.as_str()).contains("interrupted: daemon restarted"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r7_legacy_calls_without_dispatch_records_remain_pending() {
+    use crate::message::InfinityMessage;
+    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
+    use crate::traits::ConversationStore;
+    use infinity_provider_protocol::message::{ToolCall, ToolFunction};
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for name in [
+                "spawn_thread",
+                "__harness_begin_compaction__",
+                "receive_event__injected",
+                "async_tool",
+            ] {
+                let conv = InMemoryConversationStore::new();
+                let tid = ThreadId::from_ref("legacy");
+                conv.ensure_root_thread(tid).await.expect("root");
+                conv.append_messages(
+                    tid,
+                    vec![(
+                        InfinityMessage::ToolCall {
+                            call: ToolCall {
+                                id: "unrecorded".into(),
+                                call_id: None,
+                                function: ToolFunction {
+                                    name: name.into(),
+                                    arguments: serde_json::json!({}),
+                                },
+                            },
+                            display_as: None,
+                        },
+                        "legacy-entry".into(),
+                    )],
+                )
+                .await
+                .expect("legacy history");
+                let before = persisted(&conv, tid.as_str());
+                let (model, mut ctrl) = model_source(None);
+                let (tx, _rx) = mpsc::unbounded_channel();
+                let running = super::AgentSystemBuilder::new_local(
+                    conv.clone(),
+                    InMemoryStateStore::new(),
+                    model,
+                )
+                .start_with_observer(move |_| TestObserver { tx: tx.clone() });
+                let (tx, mut replay) = mpsc::unbounded_channel();
+                running.subscribe(tid, tx).await;
+                let Evt::Replay(snapshot) = next_evt(&mut replay).await else {
+                    panic!("replay")
+                };
+                assert!(!snapshot.idle, "unrecorded {name} must stay pending");
+                assert_eq!(persisted(&conv, tid.as_str()), before);
+                assert!(ctrl.try_next_request().is_none());
+                running.shutdown().await;
+            }
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r7_stale_record_and_partial_recovery_do_not_repeat_settlement() {
+    use crate::message::InfinityMessage;
+    use crate::stores::{InMemoryConversationStore, InMemoryStateStore};
+    use crate::traits::{ConversationStore, StateStore, ToolDispatch};
+    use infinity_provider_protocol::message::{
+        ToolCall, ToolFunction, ToolResult, ToolResultContent,
+    };
+
+    for recovering in [false, true] {
+        let conv = InMemoryConversationStore::new();
+        let state = InMemoryStateStore::new();
+        let tid = ThreadId::from_ref("root");
+        conv.ensure_root_thread(tid).await.expect("root");
+        let call = InfinityMessage::ToolCall {
+            call: ToolCall {
+                id: "reused".into(),
+                call_id: None,
+                function: ToolFunction {
+                    name: "async_tool".into(),
+                    arguments: serde_json::json!({}),
+                },
+            },
+            display_as: None,
+        };
+        let result = InfinityMessage::ToolResult {
+            result: ToolResult {
+                id: "reused".into(),
+                call_id: None,
+                content: vec![ToolResultContent::text(if recovering {
+                    "interrupted: daemon restarted"
+                } else {
+                    "first real result"
+                })],
+            },
+            display_segments: None,
+        };
+        let mut messages = vec![
+            (call.clone(), "first-call".into()),
+            (result, "first-result".into()),
+        ];
+        if !recovering {
+            messages.push((call, "second-call".into()));
+        }
+        conv.append_messages(tid, messages)
+            .await
+            .expect("history persisted before cleanup failure");
+        state
+            .set_tool_dispatch(
+                tid,
+                Some(ToolDispatch {
+                    call_id: "reused".into(),
+                    epoch: "previous-runtime".into(),
+                    call_order: 0,
+                    recovering,
+                }),
+            )
+            .await
+            .expect("retained record");
+        state
+            .add_pending_user_choice(
+                tid,
+                super::UserChoice {
+                    id: "choice".into(),
+                    prompt: "pending".into(),
+                    choices: vec!["yes".into()],
+                    default: 0,
+                    response_url: "http://unused.test".into(),
+                },
+            )
+            .await
+            .expect("choice");
+        let before = persisted(&conv, tid.as_str());
+        let (model, mut ctrl) = model_source(None);
+        let system =
+            super::AgentSystemBuilder::new_local(conv.clone(), state.clone(), model).build();
+        let thread = super::thread::Thread::load(system.inner.clone(), tid.to_owned())
+            .await
+            .expect("retry load");
+        assert_eq!(
+            persisted(&conv, tid.as_str()),
+            before,
+            "never settle another call occurrence or append another restart result"
+        );
+        assert_eq!(thread.pending_tool_call().is_none(), recovering);
+        assert_eq!(
+            state
+                .get_pending_user_choices(tid)
+                .await
+                .expect("durable choices")
+                .is_empty(),
+            recovering
+        );
+        assert!(
+            state
+                .get_tool_dispatch(tid)
+                .await
+                .expect("obsolete record cleared")
+                .is_none()
+        );
+        assert!(ctrl.try_next_request().is_none());
+    }
+}
