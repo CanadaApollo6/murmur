@@ -14,7 +14,8 @@
 //!   stops the server processes but keeps the cached tool definitions.
 //! - The next tool invocation boots the server back up transparently
 //!   ([`ManagedRapServer::invoke_endpoint`]), so shutting servers down is
-//!   always safe — there is no teardown/wakeup race to coordinate.
+//!   transparent for non-archived sessions. Archived sessions cannot reboot
+//!   servers or dispatch calls.
 //!
 //! Migration flows boot the same configured servers eagerly (outside any
 //! session) via [`boot_migration_servers`], pairing source and destination
@@ -55,6 +56,7 @@ type PendingCalls = Arc<Mutex<HashMap<(ThreadId, rap_protocol::ToolCallId), Pend
 
 struct PendingCall {
     server_id: uuid::Uuid,
+    invocation: uuid::Uuid,
     context: ToolContext<ChannelSender>,
     call_id: Option<rap_protocol::ProviderCallId>,
 }
@@ -63,6 +65,7 @@ struct PendingCall {
 pub(crate) struct RapInputSender {
     sender: ChannelSender,
     pending: PendingCalls,
+    invocation: Option<uuid::Uuid>,
 }
 
 #[async_trait]
@@ -74,13 +77,40 @@ impl InputSender for RapInputSender {
         message: InputMessage,
         dedup_id: &str,
     ) -> Result<(), Self::Error> {
-        if let InputMessageContent::User(UserContent::ToolResult(result)) = &message.content {
-            self.pending
-                .lock()
-                .expect("bug: pending calls poisoned")
-                .remove(&(message.group_id.clone(), result.id.clone().into()));
+        let dedup_id = match self.invocation {
+            Some(scope) => format!(
+                "managed:{scope}:rap-tool-result-{}",
+                match &message.content {
+                    InputMessageContent::User(UserContent::ToolResult(result)) => &result.id,
+                    _ => return self.sender.send_to_input_queue(message, dedup_id).await,
+                }
+            ),
+            None => dedup_id.to_owned(),
+        };
+        if let Some(scoped) = dedup_id.strip_prefix("managed:")
+            && message.synthetic.is_none()
+        {
+            let scope = scoped
+                .split(':')
+                .next()
+                .and_then(|s| uuid::Uuid::parse_str(s).ok());
+            let mut pending = self.pending.lock().expect("bug: pending calls poisoned");
+            let key = pending
+                .iter()
+                .find(|(_, call)| Some(call.invocation) == scope)
+                .map(|(key, _)| key.clone());
+            let Some(key) = key else {
+                tracing::debug!(%dedup_id, "ignoring callback for retired RAP invocation");
+                return Ok(());
+            };
+            if matches!(
+                message.content,
+                InputMessageContent::User(UserContent::ToolResult(_))
+            ) {
+                pending.remove(&key);
+            }
         }
-        self.sender.send_to_input_queue(message, dedup_id).await
+        self.sender.send_to_input_queue(message, &dedup_id).await
     }
 }
 
@@ -147,6 +177,7 @@ pub struct ManagedRapServer {
     state: tokio::sync::Mutex<ServerState>,
     id: uuid::Uuid,
     pending: PendingCalls,
+    session_store: Option<SessionStoreHandle>,
 }
 
 impl ManagedRapServer {
@@ -157,7 +188,20 @@ impl ManagedRapServer {
             spec,
             state: tokio::sync::Mutex::new(ServerState::Down),
             id: uuid::Uuid::new_v4(),
+            session_store: None,
             pending: PendingCalls::default(),
+        }
+    }
+
+    async fn archived(&self) -> bool {
+        match &self.session_store {
+            Some(store) => store
+                .lock()
+                .await
+                .sessions
+                .get(&self.session_id)
+                .is_some_and(|entry| entry.archived),
+            None => false,
         }
     }
 
@@ -175,6 +219,9 @@ impl ManagedRapServer {
     /// always has a usable manifest.
     pub async fn ensure_up(&self) -> Result<ToolsetManifest, BoxError> {
         let mut state = self.state.lock().await;
+        if self.archived().await {
+            return Err("archived session cannot boot RAP servers".into());
+        }
         if let ServerState::Up { manifest, .. } = &*state {
             return Ok(manifest.clone());
         }
@@ -273,6 +320,7 @@ impl ManagedRapServer {
                         .collect::<Vec<_>>()
                 };
                 for (id, call) in stopped {
+                    let scope = call.invocation;
                     let infinity_rap_bridge::CallbackDelivery::Input { message, dedup_id } =
                         infinity_rap_bridge::prepare_callback(
                             rap_protocol::RapCallback::ToolResult(rap_protocol::RapToolResult {
@@ -291,7 +339,7 @@ impl ManagedRapServer {
                     if let Err(error) = call
                         .context
                         .message_sender
-                        .send_to_input_queue(*message, &dedup_id)
+                        .send_to_input_queue(*message, &format!("managed:{scope}:{dedup_id}"))
                         .await
                     {
                         tracing::warn!(%error, "failed to settle stopped RAP call");
@@ -468,6 +516,18 @@ impl Tool<ChannelSender> for ManagedRapTool {
         self.descriptor.display_script.as_deref()
     }
 
+    fn retire_call(&self, thread: &ThreadId<str>, id: &rap_protocol::ToolCallId<str>) {
+        let mut pending = self
+            .server
+            .pending
+            .lock()
+            .expect("bug: pending calls poisoned");
+        let key = (thread.to_owned(), id.to_owned());
+        if let Some(invocation) = pending.get(&key).map(|call| call.invocation) {
+            pending.retain(|_, call| call.invocation != invocation);
+        }
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,
@@ -486,28 +546,45 @@ impl Tool<ChannelSender> for ManagedRapTool {
         let ServerState::Up { manifest, .. } = &*state else {
             unreachable!()
         };
+        if self.server.archived().await {
+            return Err("archived session cannot dispatch RAP calls".into());
+        }
         let key = (context.group_id.clone(), id.clone());
-        self.server
-            .pending
-            .lock()
-            .expect("bug: pending calls poisoned")
-            .insert(
-                key.clone(),
-                PendingCall {
-                    server_id: self.server.id,
-                    context: context.clone(),
-                    call_id: call_id.clone(),
-                },
-            );
+        let invocation =
+            matches!(self.server.spec, ServerSpec::Command { .. }).then(uuid::Uuid::new_v4);
+        if let Some(invocation) = invocation {
+            self.server
+                .pending
+                .lock()
+                .expect("bug: pending calls poisoned")
+                .insert(
+                    key,
+                    PendingCall {
+                        server_id: self.server.id,
+                        invocation,
+                        context: context.clone(),
+                        call_id: call_id.clone(),
+                    },
+                );
+        }
         let endpoint = manifest.endpoint.clone();
         drop(state);
         let tracked_context = ToolContext {
             message_sender: RapInputSender {
                 sender: context.message_sender.clone(),
                 pending: self.server.pending.clone(),
+                invocation,
             },
             group_id: context.group_id.clone(),
-            callback_url: context.callback_url.clone(),
+            callback_url: invocation.map_or_else(
+                || context.callback_url.clone(),
+                |scope| {
+                    format!(
+                        "{}/managed/{scope}",
+                        context.callback_url.trim_end_matches('/')
+                    )
+                },
+            ),
             user_id: context.user_id.clone(),
             thread_stack: context.thread_stack.clone(),
             safe_spawn_point: context.safe_spawn_point,
@@ -518,21 +595,37 @@ impl Tool<ChannelSender> for ManagedRapTool {
                 endpoint: &endpoint,
                 operation: &self.descriptor.name,
                 arguments: args,
-                id,
-                call_id,
+                id: id.clone(),
+                call_id: call_id.clone(),
                 callback_url: None,
             },
             &tracked_context,
         )
         .await;
-        if result.is_err() {
-            self.server
-                .pending
-                .lock()
-                .expect("bug: pending calls poisoned")
-                .remove(&key);
+        if let Err(error) = result {
+            tracing::warn!(%error, "RAP invocation failed");
+            // Use the invocation's result identity for transport failures too.
+            let infinity_rap_bridge::CallbackDelivery::Input { message, dedup_id } =
+                infinity_rap_bridge::prepare_callback(rap_protocol::RapCallback::ToolResult(
+                    rap_protocol::RapToolResult {
+                        group_id: context.group_id.clone(),
+                        id,
+                        call_id,
+                        text: Some("Error: Tool call failed".into()),
+                        content: None,
+                        display_as: None,
+                        subscription: None,
+                    },
+                ))
+            else {
+                unreachable!()
+            };
+            tracked_context
+                .message_sender
+                .send_to_input_queue(*message, &dedup_id)
+                .await?;
         }
-        result
+        Ok(())
     }
 }
 
@@ -587,6 +680,7 @@ impl SessionRapManager {
         RapInputSender {
             sender,
             pending: self.pending.clone(),
+            invocation: None,
         }
     }
 
@@ -622,6 +716,7 @@ impl SessionRapManager {
                 self.info(session_id, source_info);
                 for mut server in specs {
                     server.pending = self.pending.clone();
+                    server.session_store = Some(self.session_store.clone());
                     servers.push(Arc::new(server));
                 }
             }
@@ -805,4 +900,218 @@ fn collect_server_specs(
         servers.push(ManagedRapServer::new(session_id.to_owned(), id, spec));
     }
     Ok((source_info, servers))
+}
+
+#[cfg(test)]
+mod r14a_registry {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::client_handler::handle_client_channels;
+    use crate::ids::SequentialIdSource;
+    use crate::rap_callback;
+    use crate::session::{SessionManager, SessionManagerConfig, SharedSessionManager};
+    use infinity_protocol::{ClientMessage, DaemonMessage};
+    use infinity_provider_protocol::mock::{MockModelController, mock_model};
+    use infinity_provider_protocol::{ModelEntry, ModelProvider, SingleModelProvider};
+    use tokio::sync::mpsc;
+
+    type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+    struct TestHarness {
+        manager: SharedSessionManager,
+        ctrl: MockModelController,
+        client_tx: mpsc::UnboundedSender<ClientMessage>,
+        daemon_rx: mpsc::UnboundedReceiver<DaemonMessage>,
+        _state_dir: tempfile::TempDir,
+        cwd: tempfile::TempDir,
+    }
+
+    /// Boot a session manager with a mock model, serve its RAP callback listener,
+    /// and connect one client. Must run inside a `LocalSet`.
+    async fn start_harness() -> Result<TestHarness, BoxError> {
+        let (model, ctrl) = mock_model();
+        let entry = ModelEntry {
+            model_id: "mock-model".to_owned(),
+            display_name: "Mock Model".to_owned(),
+            context_window: 100_000,
+            max_output_tokens: None,
+            supports_image_input: false,
+        };
+        let state_dir = tempfile::tempdir()?;
+        let cwd = tempfile::tempdir()?;
+
+        let bridge = infinity_rap_bridge::RapCallbackBridge::bind().await?;
+        let callback_url = bridge.callback_url().to_owned();
+        let manager = SessionManager::with_providers(
+            SessionManagerConfig {
+                state_dir: state_dir.path().to_path_buf(),
+                callback_url: callback_url.clone(),
+                user_rap_config: None,
+                id_source: Arc::new(SequentialIdSource::new()),
+            },
+            vec![(
+                "mock".to_owned(),
+                Arc::new(SingleModelProvider::new(entry, model)) as Arc<dyn ModelProvider>,
+            )],
+            vec![],
+        )
+        .await?;
+        let manager = rap_callback::serve_callbacks(bridge, manager);
+
+        let (client_tx, client_rx) = mpsc::unbounded_channel::<ClientMessage>();
+        let (daemon_tx, daemon_rx) = mpsc::unbounded_channel::<DaemonMessage>();
+        tokio::task::spawn_local(handle_client_channels(
+            client_rx,
+            daemon_tx,
+            manager.clone(),
+        ));
+
+        Ok(TestHarness {
+            manager,
+            ctrl,
+            client_tx,
+            daemon_rx,
+            _state_dir: state_dir,
+            cwd,
+        })
+    }
+
+    /// Receive daemon messages until the predicate matches, with a timeout.
+    async fn wait_for_message(
+        rx: &mut mpsc::UnboundedReceiver<DaemonMessage>,
+        mut pred: impl FnMut(&DaemonMessage) -> bool,
+    ) -> DaemonMessage {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let msg = rx
+                    .recv()
+                    .await
+                    .expect("daemon channel closed while waiting");
+                if pred(&msg) {
+                    return msg;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for daemon message")
+    }
+
+    /// Create a session, run one chat round, and return the session id.
+    async fn create_session_and_chat(h: &mut TestHarness) -> infinity_protocol::ThreadRef {
+        h.client_tx
+            .send(ClientMessage::CreateSession {
+                cwd: h.cwd.path().to_path_buf(),
+                location: None,
+                model: None,
+                keeps_session_alive: true,
+            })
+            .expect("send CreateSession");
+
+        let connected = wait_for_message(&mut h.daemon_rx, |m| {
+            matches!(m, DaemonMessage::Connected { .. })
+        })
+        .await;
+        let DaemonMessage::Connected {
+            root_thread_id: session_id,
+            ..
+        } = connected
+        else {
+            unreachable!()
+        };
+
+        h.client_tx
+            .send(ClientMessage::UserInput {
+                thread_id: session_id.clone(),
+                text: "hello".to_owned(),
+            })
+            .expect("send UserInput");
+
+        let _req = h.ctrl.next_request().await;
+        h.ctrl.send_text("hi there");
+        h.ctrl.finish();
+
+        wait_for_message(&mut h.daemon_rx, |m| {
+            matches!(m, DaemonMessage::ResponseDone { .. })
+        })
+        .await;
+
+        session_id
+    }
+
+    async fn r10a_waiting_server() -> std::io::Result<u16> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        tokio::task::spawn_local(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                tokio::task::spawn_local(async move {
+                    let service = hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| async move {
+                            use http_body_util::BodyExt;
+                            let response = if req.uri().path() == "/.well-known/rap-toolset" {
+                                serde_json::json!({"name":"choice", "endpoint":format!("http://127.0.0.1:{port}/invoke"), "tools":[{"name":"waiting_choice","description":"waits for choice","inputSchema":{"type":"object"}}]}).to_string()
+                            } else {
+                                req.into_body().collect().await.expect("body");
+                                "{}".into()
+                            };
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                http_body_util::Full::new(bytes::Bytes::from(response)),
+                            ))
+                        },
+                    );
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await
+                        .expect("serve");
+                });
+            }
+        });
+        Ok(port)
+    }
+
+    async fn cancellation_case(command: bool) {
+        tokio::task::LocalSet::new().run_until(async {
+        let mut h = start_harness().await.expect("harness");
+        let marker = h.cwd.path().join("invoked");
+        if command {
+            std::fs::create_dir(h.cwd.path().join(".infinity")).expect("config dir");
+            let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agentd/tests/support/delayed_rap.py");
+            std::fs::write(h.cwd.path().join(".infinity/rap.json"), serde_json::json!({"tool_sets":[{"type":"toolset_command", "command":format!("python3 '{}' '{}'", script.display(), marker.display())}]}).to_string()).expect("config");
+        } else {
+            let port = r10a_waiting_server().await.expect("external RAP");
+            rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
+        }
+        let root = create_session_and_chat(&mut h).await;
+        wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::ThreadIdle { .. })).await;
+        for i in 0..3 {
+            h.client_tx.send(ClientMessage::UserInput { thread_id: root.clone(), text: "run work".into() }).expect("input");
+            h.ctrl.next_request().await;
+            h.ctrl.send_tool_call(&format!("external-{i}"), if command { "delayed_work" } else { "waiting_choice" }, serde_json::json!({})); h.ctrl.finish();
+            wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::ResponseDone { .. })).await;
+            if command {
+                tokio::time::timeout(Duration::from_secs(3), async { while !marker.exists() { tokio::time::sleep(Duration::from_millis(10)).await; } }).await.expect("dispatched");
+                std::fs::remove_file(&marker).expect("marker");
+            } else { tokio::time::sleep(Duration::from_millis(100)).await; }
+            h.client_tx.send(ClientMessage::Interrupt { thread_id: root.clone() }).expect("interrupt");
+            wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::ThreadIdle { .. })).await;
+        }
+        assert!(h.manager.lock().await.rap_manager.pending.lock().expect("registry").is_empty(), "cancelled calls retire before shutdown");
+        h.client_tx.send(ClientMessage::ShutdownSession { root_thread_id: root.clone() }).expect("quit");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let manager = h.manager.lock().await;
+        let count = manager.rap_manager.pending.lock().expect("registry").len();
+        eprintln!("R14 cancelled external calls still registered after quit: {count}");
+        assert_eq!(count, 0, "settled calls must not leak for the daemon lifetime");
+    }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r14a_cancelled_external_calls_retire() {
+        cancellation_case(false).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn r14a_cancelled_command_calls_retire() {
+        cancellation_case(true).await;
+    }
 }

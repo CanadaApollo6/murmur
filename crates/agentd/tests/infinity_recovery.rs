@@ -2241,17 +2241,24 @@ async fn r11_shutdown_command_tool(archive: bool) {
                 "archive must enter NeedsRecovery directly"
             );
         }
-        let request = tokio::time::timeout(Duration::from_secs(3), h.ctrl.next_request())
-            .await
-            .expect("archived tool receives terminal result");
-        let history = format!("{:?}", request.chat_history);
-        assert!(history.contains("tool server stopped by session shutdown"));
         assert!(
-            !history.contains("mail after CLI quit"),
-            "archive must retain broker mail"
+            tokio::time::timeout(Duration::from_millis(300), h.ctrl.next_request())
+                .await
+                .is_err(),
+            "archived settlement must not run inference"
         );
-        h.ctrl.send_text("archived tool settled");
-        h.ctrl.finish();
+        let stored = std::fs::read_to_string(
+            h._state_dir
+                .path()
+                .join("threads")
+                .join(format!("{}.json", root.id)),
+        )
+        .expect("history");
+        assert!(stored.contains("tool server stopped by session shutdown"));
+        assert!(
+            !stored.contains("mail after CLI quit"),
+            "archive retains broker mail"
+        );
     } else {
         let request = tokio::time::timeout(Duration::from_secs(8), h.ctrl.next_request())
             .await
@@ -2455,6 +2462,17 @@ mod r12o {
         cfg: Config,
         perm: Option<Duration>,
     ) -> Rig {
+        rig_with_stall(h, request, cancel, cfg, perm, Duration::from_secs(600)).await
+    }
+
+    pub(super) async fn rig_with_stall(
+        h: &TestHarness,
+        request: Duration,
+        cancel: Duration,
+        cfg: Config,
+        perm: Option<Duration>,
+        stall: Duration,
+    ) -> Rig {
         let socket = h.cwd.path().join("r12o.sock");
         let listener = tokio::net::UnixListener::bind(&socket).expect("socket");
         let manager = h.manager.clone();
@@ -2473,6 +2491,7 @@ mod r12o {
                 .expect("mailroom"),
         );
         let mut kind = agentd::KindConfig::infinity(socket);
+        kind.stall_timeout = stall;
         kind.request_timeout = request;
         kind.cancel_timeout = cancel;
         let broker = Broker::new(mailroom.clone(), vec![kind], cfg).expect("broker");
@@ -3268,4 +3287,537 @@ async fn r13_shutdown_settles_calls_from_retained_evicted_toolset() {
             broker.shutdown().await.expect("shutdown");
         })
         .await;
+}
+
+mod r14 {
+    use super::*;
+    use agentd::model::PermissionAnswer;
+    use agentd::supervisor::Phase;
+    #[tokio::test(flavor = "current_thread")]
+    async fn r13a_shutdown_preserved_stream_needs_automatic_exit() {
+        use agentd::supervisor::Config;
+        tokio::task::LocalSet::new().run_until(async {
+        let mut h = start_harness().await.expect("harness");
+        let cfg = Config { backoff_initial: Duration::from_millis(10), backoff_max: Duration::from_millis(20), ..Default::default() };
+        let r = r12o::rig_with_stall(&h, Duration::from_millis(100), Duration::from_millis(100), cfg, None, Duration::from_millis(300)).await;
+        r12o::send(&r, "start stream that remains open").await;
+        h.ctrl.next_request().await;
+        h.ctrl.send_text("partial answer");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        h.client_tx.send(ClientMessage::ShutdownSession { root_thread_id: r.root.clone() }).expect("shutdown");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mail = r12o::send(&r, "follow-up waiting for stalled stream").await;
+        let request = tokio::time::timeout(Duration::from_secs(3), h.ctrl.next_request()).await;
+        let escaped = request.is_ok();
+        if let Ok(request) = request { assert!(format!("{:?}", request.chat_history).contains("follow-up waiting for stalled stream")); h.ctrl.send_text("recovered"); h.ctrl.finish(); }
+        assert!(r.log.borrow().iter().any(|event| matches!(event, agentd::supervisor::Event::Activity { text, .. } if text.contains("mail-starvation stall timeout"))), "must exit through stall timer");
+        eprintln!("R13 preserved stream: escaped={escaped} phase={:?} mail={:?} {}", r.agent.phase(), r.mailroom.delivery(mail).await.expect("mail"), r12o::summary(&r));
+        r.broker.shutdown().await.expect("broker shutdown");
+        assert!(escaped, "recovered streaming session has no deadline and no operator-free exit");
+    }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r11a_shutdown_busy() {
+        use agentd::mailroom::{Mailroom, NewMessage};
+        use agentd::model::*;
+        use agentd::supervisor::{AgentSpec, Broker, Phase};
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut h = start_harness().await.expect("harness");
+                let port = r10a_waiting_server().await.expect("RAP tool");
+                rap_test_servers::write_rap_config(h.cwd.path(), port).expect("RAP config");
+                let socket = h.cwd.path().join("broker-infinity.sock");
+                let listener = tokio::net::UnixListener::bind(&socket).expect("socket");
+                let manager = h.manager.clone();
+                let accept = tokio::task::spawn_local(async move {
+                    loop {
+                        let (stream, _) = listener.accept().await.expect("accept");
+                        tokio::task::spawn_local(infinity_daemon::client_handler::handle_client(
+                            stream,
+                            manager.clone(),
+                        ));
+                    }
+                });
+                let mailroom = Arc::new(
+                    Mailroom::open(h.cwd.path().join("broker.db"), Default::default())
+                        .await
+                        .expect("mailroom"),
+                );
+                let broker = Broker::new(
+                    mailroom.clone(),
+                    vec![{
+                        let mut kind = agentd::KindConfig::infinity(socket);
+                        kind.stall_timeout = Duration::from_millis(300);
+                        kind.cancel_timeout = Duration::from_millis(100);
+                        kind.request_timeout = Duration::from_millis(200);
+                        kind
+                    }],
+                    agentd::supervisor::Config {
+                        backoff_initial: Duration::from_millis(10),
+                        backoff_max: Duration::from_millis(10),
+                        ..Default::default()
+                    },
+                )
+                .expect("broker");
+                let spec = AgentSpec {
+                    name: AgentName::parse("model").expect("name"),
+                    kind: "infinity".into(),
+                    cwd: h.cwd.path().into(),
+                    model: None,
+                    permissions: PermissionPolicy {
+                        timeout: Some(Duration::from_millis(30)),
+                        ..Default::default()
+                    },
+                    idle_after: None,
+                };
+                let agent = broker.spawn(spec.clone()).await.expect("spawn");
+                let mut phases = agent.phases();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while *phases.borrow_and_update() != Phase::Idle {
+                        phases.changed().await.expect("phase");
+                    }
+                })
+                .await
+                .expect("initial idle");
+                let root = h
+                    .manager
+                    .lock()
+                    .await
+                    .list_sessions(None)
+                    .await
+                    .into_keys()
+                    .next()
+                    .expect("root");
+                h.client_tx
+                    .send(ClientMessage::Connect {
+                        root_thread_id: root.clone(),
+                        thread_id: None,
+                        keeps_session_alive: true,
+                    })
+                    .expect("connect observer");
+                wait_for_message(&mut h.daemon_rx, |m| {
+                    matches!(m, DaemonMessage::Replay { .. })
+                })
+                .await;
+                let human = |body: &str| NewMessage {
+                    from: Sender::Human,
+                    to: agent.id,
+                    body: Body::new(body).expect("body"),
+                    reply_to: None,
+                    client_key: ClientKey(body.into()),
+                    act: agentd::swarm::Act::Inform,
+                    task: None,
+                };
+
+                let mut timer_events = broker.events();
+            let _trigger = broker
+                    .send(human("start external work"))
+                    .await
+                    .expect("send");
+                h.ctrl.next_request().await;
+                h.ctrl
+                    .send_tool_call("active-external", "waiting_choice", serde_json::json!({}));
+                h.ctrl.finish();
+                wait_for_message(&mut h.daemon_rx, |m| {
+                    matches!(m, DaemonMessage::ResponseDone { .. })
+                })
+                .await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                h.client_tx
+                    .send(ClientMessage::ShutdownSession {
+                        root_thread_id: root.clone(),
+                    })
+                    .expect("shutdown");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let mail = broker
+                    .send(human("after CLI shutdown"))
+                    .await
+                    .expect("send")
+                    .1
+                    .id();
+                let recovered =
+                    tokio::time::timeout(Duration::from_secs(4), h.ctrl.next_request()).await;
+                let state = mailroom.delivery(mail).await.expect("state").state;
+                eprintln!(
+                    "R11 busy shutdown: request={}, phase={:?}, delivery={:?}",
+                    recovered.is_ok(),
+                    *phases.borrow(),
+                    state
+                );
+                let request = recovered
+                    .as_ref()
+                    .expect("stall timer releases external call");
+                assert!(format!("{:?}", request.chat_history).contains("after CLI shutdown"));
+                h.ctrl.send_text("recovered automatically");
+                h.ctrl.finish();
+                assert!(r12o::wait_phase(&agent, |p| *p == Phase::Idle, Duration::from_secs(3)).await);
+            assert_eq!(mailroom.delivery(mail).await.expect("delivery").state, DeliveryState::Consumed);
+            assert!(std::iter::from_fn(|| timer_events.try_recv().ok()).any(|event| matches!(event, agentd::supervisor::Event::Activity { text, .. } if text.contains("mail-starvation stall timeout"))), "must exit through stall timer");
+            broker.shutdown().await.expect("broker shutdown");
+                accept.abort();
+                assert!(
+                    recovered.is_ok(),
+                    "one CLI shutdown stranded later mail: {:?}",
+                    state
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r14a_reused_call_id_shutdown_settles_each_invocation() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut h = start_harness().await.expect("harness");
+                let marker = r12o::slow_rap(&h);
+                let (broker, agent, root) = r11_broker(&h).await;
+                r11_send(&broker, agent.id, "keep the same driver alive").await;
+                h.ctrl.next_request().await;
+                for i in 0..2 {
+                    h.ctrl
+                        .send_tool_call("reused-call", "delayed_work", serde_json::json!({}));
+                    h.ctrl.finish();
+                    let port = r12o::invocations(&marker).await[0];
+                    std::fs::remove_file(&marker).expect("clear marker");
+                    h.client_tx
+                        .send(ClientMessage::ShutdownSession {
+                            root_thread_id: root.clone(),
+                        })
+                        .expect("quit");
+                    r12o::port_dead(port).await;
+                    eprintln!(
+                        "R14 reused id killed generation {i}; phase {:?}",
+                        agent.phase()
+                    );
+                    if i == 1 {
+                        r11_send(&broker, agent.id, "mail behind second killed reused call").await;
+                    }
+                    let request =
+                        tokio::time::timeout(Duration::from_secs(4), h.ctrl.next_request())
+                            .await
+                            .expect("each killed call settles");
+                    let history = format!("{:?}", request.chat_history);
+                    assert_eq!(
+                        history
+                            .matches("Error: tool server stopped by session shutdown")
+                            .count(),
+                        i + 1
+                    );
+                }
+                h.ctrl.send_text("both calls settled");
+                h.ctrl.finish();
+                broker.shutdown().await.expect("shutdown");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r14a_archived_live_driver_rejects_broker_mail() {
+        tokio::task::LocalSet::new().run_until(async {
+        let mut h = start_harness().await.expect("harness");
+        let root = create_session_and_chat(&mut h).await;
+        h.client_tx.send(ClientMessage::UserInput { thread_id: root.clone(), text: "start finite stream".into() }).expect("start");
+        h.ctrl.next_request().await;
+        h.ctrl.send_text("partial response");
+        h.client_tx.send(ClientMessage::ArchiveSession { root_thread_id: root.clone() }).expect("archive");
+        wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::SessionsUpdated { sessions } if sessions.get(&root).is_some_and(|s| s.status == SessionStatus::Archived))).await;
+        h.client_tx.send(ClientMessage::DeliverPeerMessage { thread_id: root.clone(), message_id: "r14-late-mail".into(), from: "agent:peer".into(), text: "mail must stay queued after archive".into() }).expect("in-flight broker mail");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        h.ctrl.send_text("finished response"); h.ctrl.finish();
+        let request = tokio::time::timeout(Duration::from_secs(2), h.ctrl.next_request()).await;
+        if let Ok(ref r) = request { eprintln!("R14 archived new inference: {:?}", r.chat_history); h.ctrl.send_text("unexpected"); h.ctrl.finish(); }
+        assert!(request.is_err(), "mail sent after archive must not start a new inference on the existing driver");
+    }).await;
+    }
+
+    pub struct ChoiceServer {
+        pub port: u16,
+        pub answers: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        _runtime: tokio::runtime::Runtime,
+    }
+
+    /// An external RAP server whose only tool asks the user a choice and
+    /// reports the answer as its result.
+    pub fn choice_server() -> ChoiceServer {
+        let runtime = tokio::runtime::Runtime::new().expect("external runtime");
+        let answers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let invocations = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let port = runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("listener");
+            let port = listener.local_addr().expect("addr").port();
+            let answers = answers.clone();
+            let invocations = invocations.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let answers = answers.clone();
+                    let invocations = invocations.clone();
+                    tokio::spawn(async move {
+                        let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                            let answers = answers.clone();
+                            let invocations = invocations.clone();
+                            async move {
+                                use http_body_util::BodyExt;
+                                let path = req.uri().path().to_owned();
+                                let body = req.into_body().collect().await.expect("body").to_bytes();
+                                let response = if path == "/.well-known/rap-toolset" {
+                                    serde_json::json!({"name":"external", "endpoint":format!("http://127.0.0.1:{port}/invoke"), "tools":[{"name":"external_choice","description":"ask","inputSchema":{"type":"object"}}]}).to_string()
+                                } else if path == "/invoke" {
+                                    let inv: serde_json::Value = serde_json::from_slice(&body).expect("invocation");
+                                    invocations.lock().expect("lock").push(inv.clone());
+                                    tokio::spawn(async move {
+                                        let choice = serde_json::json!({"type":"user_choice","group_id":inv["group_id"],"id":inv["id"],"call_id":inv["call_id"],"prompt":"Pick","choices":["A","B"],"default":0,"response_url":format!("http://127.0.0.1:{port}/choice")});
+                                        let _ = reqwest::Client::new().post(inv["callback_url"].as_str().expect("callback")).json(&choice).send().await;
+                                    });
+                                    "{}".into()
+                                } else if path == "/choice" {
+                                    let answer: serde_json::Value = serde_json::from_slice(&body).expect("answer");
+                                    answers.lock().expect("lock").push(answer.clone());
+                                    let inv = invocations.lock().expect("lock").last().cloned().expect("invocation");
+                                    tokio::spawn(async move {
+                                        let result = serde_json::json!({"type":"tool_result","group_id":inv["group_id"],"id":inv["id"],"call_id":inv["call_id"],"text":format!("chose {}", answer["selected"])});
+                                        let _ = reqwest::Client::new().post(inv["callback_url"].as_str().expect("callback")).json(&result).send().await;
+                                    });
+                                    "{}".into()
+                                } else {
+                                    "{}".into()
+                                };
+                                Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from(response))))
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
+                    });
+                }
+            });
+            port
+        });
+        ChoiceServer {
+            port,
+            answers,
+            _runtime: runtime,
+        }
+    }
+
+    pub async fn wait_permission(
+        agent: &agentd::supervisor::AgentHandle,
+        secs: u64,
+    ) -> Option<agentd::model::PermissionRequest> {
+        tokio::time::timeout(Duration::from_secs(secs), async {
+            loop {
+                if let Ok(p) = agent.pending_permissions().await
+                    && let Some(p) = p.into_iter().next()
+                {
+                    return p;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .ok()
+    }
+
+    #[test]
+    fn r14o_quit_with_external_choice_then_answer() {
+        let server = choice_server();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            rap_test_servers::write_rap_config(h.cwd.path(), server.port).expect("config");
+            let (broker, agent, root) = r11_broker(&h).await;
+            r11_send(&broker, agent.id, "ask the external choice").await;
+            h.ctrl.next_request().await;
+            h.ctrl
+                .send_tool_call("ext-choice", "external_choice", serde_json::json!({}));
+            h.ctrl.finish();
+            let first = wait_permission(&agent, 5)
+                .await
+                .expect("choice reaches agentd");
+            assert_eq!(first.title, "Pick");
+            h.client_tx
+                .send(ClientMessage::ShutdownSession {
+                    root_thread_id: root.clone(),
+                })
+                .expect("quit");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let after = agent.pending_permissions().await.expect("pending");
+            eprintln!(
+                "r14o after quit+2s: phase={:?} pending={} store_has_choice={}",
+                agent.phase(),
+                after.len(),
+                h.manager
+                    .lock()
+                    .await
+                    .state_store()
+                    .has_pending_choices(&root.id)
+            );
+            if let Some(p) = after.into_iter().next() {
+                let answered = agent
+                    .answer_permission(p.id, p.incarnation, PermissionAnswer::Choose("1".into()))
+                    .await;
+                eprintln!("r14o answered re-offered choice: {answered:?}");
+            }
+            let request = tokio::time::timeout(Duration::from_secs(8), h.ctrl.next_request()).await;
+            eprintln!(
+                "r14o after answer+8s: phase={:?} server_answers={:?} inference={}",
+                agent.phase(),
+                server.answers.lock().expect("lock"),
+                request.is_ok()
+            );
+            let recovered = request.is_ok() || agent.phase() == Phase::Idle;
+            if let Ok(request) = &request {
+                eprintln!(
+                    "r14o history has real result: {}",
+                    format!("{:?}", request.chat_history).contains("chose 1")
+                );
+                h.ctrl.send_text("done");
+                h.ctrl.finish();
+            }
+            assert!(
+                recovered,
+                "a quit must not leave an answered external choice stranded: phase={:?}",
+                agent.phase()
+            );
+            broker.shutdown().await.expect("shutdown");
+        }));
+        drop(runtime);
+    }
+
+    #[test]
+    fn r14o_quit_with_external_choice_exits_via_stall_timer() {
+        let server = choice_server();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            rap_test_servers::write_rap_config(h.cwd.path(), server.port).expect("config");
+            let r = r12o::rig_with_stall(&h, Duration::from_millis(300), Duration::from_millis(300), agentd::supervisor::Config::default(), None, Duration::from_millis(300)).await;
+            let agent = r.agent.clone(); let root = r.root.clone(); let broker = &r.broker;
+            r11_send(broker, agent.id, "ask the external choice").await;
+            h.ctrl.next_request().await;
+            h.ctrl.send_tool_call("ext-choice", "external_choice", serde_json::json!({}));
+            h.ctrl.finish();
+            let first = wait_permission(&agent, 5).await.expect("choice reaches agentd");
+            assert_eq!(first.title, "Pick");
+            h.client_tx.send(ClientMessage::ShutdownSession { root_thread_id: root.clone() }).expect("quit");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            r12o::send(&r, "mail waiting behind external choice").await;
+            let request = tokio::time::timeout(Duration::from_secs(8), h.ctrl.next_request()).await;
+            eprintln!("r14o after answer+8s: phase={:?} server_answers={:?} inference={}", agent.phase(), server.answers.lock().expect("lock"), request.is_ok());
+            let recovered = request.is_ok();
+            assert!(r.log.borrow().iter().any(|event| matches!(event, agentd::supervisor::Event::Activity { text, .. } if text.contains("mail-starvation stall timeout"))), "must exit through stall timer");
+            assert!(server.answers.lock().expect("answers").is_empty());
+            if let Ok(request) = &request { eprintln!("r14o history has real result: {}", format!("{:?}", request.chat_history).contains("chose 1")); h.ctrl.send_text("done"); h.ctrl.finish(); }
+            assert!(recovered, "a quit must not leave an answered external choice stranded: phase={:?}", agent.phase());
+            broker.shutdown().await.expect("shutdown");
+        }));
+        drop(runtime);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r14o_archive_during_command_tool_keeps_running_tools() {
+        tokio::task::LocalSet::new().run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let marker = r12o::slow_rap(&h);
+            let (broker, agent, root) = r11_broker(&h).await;
+            r11_send(&broker, agent.id, "start work before archive").await;
+            h.ctrl.next_request().await;
+            h.ctrl.send_tool_call("before-archive", "delayed_work", serde_json::json!({}));
+            h.ctrl.finish();
+            let port = r12o::invocations(&marker).await[0];
+            std::fs::remove_file(&marker).expect("clear marker");
+            h.client_tx.send(ClientMessage::ArchiveSession { root_thread_id: root.clone() }).expect("archive");
+            r12o::port_dead(port).await;
+            let status = h.manager.lock().await.list_sessions(None).await.get(&root).map(|s| s.status.clone());
+            let cont = tokio::time::timeout(Duration::from_secs(4), h.ctrl.next_request()).await;
+            eprintln!("r14o archive: status={status:?} continuation_after_archive={}", cont.is_ok());
+            if cont.is_err() {
+                assert!(!marker.exists(), "rebooted_server_after_archive=false");
+                let stored = std::fs::read_to_string(h._state_dir.path().join("threads").join(format!("{}.json", root.id))).expect("history");
+                assert!(stored.contains("tool server stopped by session shutdown"), "terminal result persists without completion");
+                eprintln!("rebooted_server_after_archive=false");
+                broker.shutdown().await.expect("shutdown");
+                return;
+            }
+            h.ctrl.send_tool_call("after-archive", "delayed_work", serde_json::json!({}));
+            h.ctrl.finish();
+            let rebooted = tokio::time::timeout(Duration::from_secs(4), async {
+                while !marker.exists() { tokio::time::sleep(Duration::from_millis(20)).await; }
+            }).await.is_ok();
+            let second = tokio::time::timeout(Duration::from_secs(6), h.ctrl.next_request()).await;
+            let real = second.as_ref().map(|r| format!("{:?}", r.chat_history).contains("Delayed work complete")).unwrap_or(false);
+            let status = h.manager.lock().await.list_sessions(None).await.get(&root).map(|s| s.status.clone());
+            eprintln!("r14o archive: rebooted_server_after_archive={rebooted} second_round={} real_result={real} status={status:?} agent={:?}", second.is_ok(), agent.phase());
+            if second.is_ok() { h.ctrl.send_text("archived agent still working"); h.ctrl.finish(); }
+            broker.shutdown().await.expect("shutdown");
+            assert!(cont.is_err(), "continuation_after_archive must be false");
+            assert!(!rebooted, "an archived session must not boot its servers and run new tool calls");
+        }).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unknown_choice_answer_receives_error() {
+    tokio::task::LocalSet::new().run_until(async {
+        let mut h = start_harness().await.expect("harness");
+        create_session_and_chat(&mut h).await;
+        h.client_tx.send(ClientMessage::UserChoiceAnswered { choice_id: "unknown-choice".into(), selected: 0 }).expect("answer");
+        let error = wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Error { text, .. } if text.contains("Unknown or stale choice"))).await;
+        assert!(format!("{error:?}").contains("unknown-choice"));
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn command_invocation_scope_rejects_late_callback_with_reused_id() {
+    tokio::task::LocalSet::new().run_until(async {
+        let mut h = start_harness().await.expect("harness");
+        let marker = r12o::slow_rap(&h);
+        let captures = h.cwd.path().join("invocations.jsonl");
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/delayed_rap.py");
+        std::fs::write(h.cwd.path().join(".infinity/rap.json"), serde_json::json!({"tool_sets":[{"type":"toolset_command", "command":format!("python3 '{}' '{}' '{}'", script.display(), marker.display(), captures.display())}]}).to_string()).expect("config");
+        let (broker, agent, root) = r11_broker(&h).await;
+        h.client_tx.send(ClientMessage::Connect { root_thread_id: root.clone(), thread_id: None, keeps_session_alive: true }).expect("observer");
+        wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
+        r11_send(&broker, agent.id, "two calls reusing one id").await;
+        h.ctrl.next_request().await;
+        let mut calls = Vec::new();
+        for generation in 0..2 {
+            h.ctrl.send_tool_call("reused", "delayed_work", serde_json::json!({})); h.ctrl.finish();
+            r12o::invocations(&marker).await;
+            std::fs::remove_file(&marker).expect("marker");
+            let all = std::fs::read_to_string(&captures).expect("invocations");
+            let invocation: serde_json::Value = serde_json::from_str(all.lines().last().expect("invocation")).expect("json");
+            calls.push(invocation);
+            if generation == 0 {
+                h.client_tx.send(ClientMessage::Interrupt { thread_id: root.clone() }).expect("cancel first invocation");
+                wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::ThreadIdle { .. })).await;
+                r11_send(&broker, agent.id, "start replacement invocation").await;
+                h.ctrl.next_request().await;
+            }
+        }
+        assert_ne!(calls[0]["callback_url"], calls[1]["callback_url"]);
+        let callback = |inv: &serde_json::Value, text: &str| serde_json::json!({"type":"tool_result", "group_id":inv["group_id"], "id":inv["id"], "call_id":inv["call_id"], "text":text, "subscription":true}).to_string();
+        assert_eq!(reqwest_post(calls[0]["callback_url"].as_str().expect("url"), &callback(&calls[0], "stale result must not settle replacement")).await, 200);
+        assert!(tokio::time::timeout(Duration::from_millis(200), h.ctrl.next_request()).await.is_err(), "old callback must not settle newer call");
+        assert_eq!(reqwest_post(calls[1]["callback_url"].as_str().expect("url"), &callback(&calls[1], "replacement real result")).await, 200);
+        h.client_tx.send(ClientMessage::ShutdownSession { root_thread_id: root }).expect("quit after accepted real result");
+        let request = tokio::time::timeout(Duration::from_secs(3), h.ctrl.next_request()).await.expect("real continuation");
+        let history = format!("{:?}", request.chat_history);
+        assert!(history.contains("replacement real result"));
+        assert!(!history.contains("stale result must not settle replacement"));
+        assert!(!history.contains("tool server stopped by session shutdown"), "locally accepted real result wins over later shutdown");
+        let event = serde_json::json!({"type":"subscription_event", "group_id":calls[1]["group_id"], "tool_call_id":calls[1]["id"], "text":"subscription after terminal result", "associative":false}).to_string();
+        assert_eq!(reqwest_post(calls[1]["callback_url"].as_str().expect("url"), &event).await, 200);
+        h.ctrl.send_text("done"); h.ctrl.finish();
+        let event_request = tokio::time::timeout(Duration::from_secs(3), h.ctrl.next_request()).await.expect("subscription survives registry retirement");
+        assert!(format!("{:?}", event_request.chat_history).contains("subscription after terminal result"));
+        h.ctrl.send_text("event handled"); h.ctrl.finish();
+        broker.shutdown().await.expect("shutdown");
+    }).await;
 }

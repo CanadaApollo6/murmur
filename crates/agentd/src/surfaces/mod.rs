@@ -55,6 +55,7 @@ struct KindFile {
     #[serde(default)]
     env: BTreeMap<String, String>,
     idle_after_secs: Option<u64>,
+    stall_timeout_secs: Option<u64>,
     #[serde(default)]
     sandbox_args: crate::SandboxArgs,
 }
@@ -120,6 +121,9 @@ impl FileConfig {
                 } else {
                     Some(Duration::from_secs(seconds))
                 };
+            }
+            if let Some(seconds) = entry.stall_timeout_secs {
+                kind.stall_timeout = Duration::from_secs(seconds);
             }
             kind.sandbox_args = entry.sandbox_args;
             kinds.insert(name, kind);

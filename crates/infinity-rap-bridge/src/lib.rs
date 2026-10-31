@@ -11,7 +11,7 @@ use infinity_agent_core::system::local::ChannelSender;
 use infinity_agent_core::tools::Tool;
 use infinity_agent_core::tools::rap_tool::RapTool;
 use infinity_agent_core::traits::InputSender;
-use rap_client::callback_server::{bind_callback_listener, start_callback_server_on};
+use rap_client::callback_server::{bind_callback_listener, start_callback_server_on_with_path};
 use rap_client::http::{InMemoryToolsetCache, SimpleHttpClient};
 use rap_client::notifier::RapNotifier;
 use rap_client::toolset_loader::ToolsetLoader;
@@ -94,7 +94,9 @@ impl RapCallbackBridge {
     /// returning view updates on a channel.
     ///
     /// Each converted input is sent with its prepared deduplication ID, so
-    /// HTTP retries of one callback are absorbed by the state store. Send
+    /// HTTP retries of one callback are absorbed by the state store. A callback
+    /// path `/managed/{scope}` also scopes that identity to one invocation.
+    /// Send
     /// failures are logged and do not stop the listener. Admission belongs
     /// to the receiving system: the local router consults the state store's
     /// existence and stopped-thread checks before spawning a driver, so an
@@ -111,12 +113,16 @@ impl RapCallbackBridge {
         S: InputSender + 'static,
     {
         let (view_tx, view_rx) = mpsc::unbounded_channel();
-        let task = start_callback_server_on(self.listener, move |callback| {
+        let task = start_callback_server_on_with_path(self.listener, move |callback, path| {
             let sender = sender.clone();
             let view_tx = view_tx.clone();
             async move {
                 match prepare_callback(callback) {
                     CallbackDelivery::Input { message, dedup_id } => {
+                        let dedup_id = path.strip_prefix("/managed/").map_or_else(
+                            || dedup_id.clone(),
+                            |scope| format!("managed:{scope}:{dedup_id}"),
+                        );
                         if let Err(error) = sender.send_to_input_queue(*message, &dedup_id).await {
                             tracing::warn!(%error, "failed to route RAP callback");
                         }
@@ -371,5 +377,31 @@ mod tests {
             1,
             "view updates must not become agent input"
         );
+    }
+    #[tokio::test]
+    async fn callback_paths_scope_retries_to_one_invocation() {
+        let bridge = RapCallbackBridge::bind().await.expect("listener");
+        let base = bridge.callback_url().to_owned();
+        let sender = RecordingSender::default();
+        let (_views, task) = bridge.serve_into(sender.clone());
+        let payload = serde_json::json!({"type":"tool_result", "group_id":"thread", "id":"reused", "text":"done"}).to_string();
+        use rap_client::http::HttpClient;
+        let http = SimpleHttpClient::new();
+        for scope in ["first", "first", "second"] {
+            assert_eq!(
+                http.post(&format!("{base}/managed/{scope}"), &payload)
+                    .await
+                    .expect("callback"),
+                200
+            );
+        }
+        let sent = sender.sent.lock().expect("recording");
+        assert_eq!(sent[0].1, sent[1].1, "retry identity is stable");
+        assert_ne!(
+            sent[0].1, sent[2].1,
+            "reused model ID has a fresh invocation identity"
+        );
+        assert_eq!(sent[0].1, "managed:first:rap-tool-result-reused");
+        task.abort();
     }
 }

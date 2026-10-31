@@ -70,6 +70,11 @@ async fn run_migration(
             .await
             .get_cwd(&real_session_id)
             .clone();
+        {
+            let mut store = mgr.session_store.lock().await;
+            store.mark_archived(&real_session_id);
+            store.save()?;
+        }
         mgr.cleanup_session(&real_session_id).await;
         Some(cwd)
     } else {
@@ -217,6 +222,11 @@ pub async fn handle_emigrate(
     };
     {
         let mgr = session_manager.lock().await;
+        {
+            let mut store = mgr.session_store.lock().await;
+            store.mark_archived(session_id);
+            store.save()?;
+        }
         mgr.cleanup_session(session_id).await;
     }
 

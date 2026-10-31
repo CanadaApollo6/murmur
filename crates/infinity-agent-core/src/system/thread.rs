@@ -238,6 +238,18 @@ where
             .is_some_and(|(_, name)| name != CLOSE_THREAD_TOOL)
     }
 
+    fn retire_pending_call(&self) {
+        if let Some((id, name)) = self.pending_tool_call()
+            && let Some(config) = self.config.borrow().as_ref()
+            && let Some(tool) = config.tools.iter().find(|tool| tool.name() == name)
+        {
+            tool.retire_call(
+                &self.history.thread_id,
+                rap_protocol::ToolCallId::from_ref(&id),
+            );
+        }
+    }
+
     pub(crate) async fn persist_tool_results(
         &self,
         observer: &impl ThreadObserver,
@@ -262,6 +274,7 @@ where
         let pending_tool = self.pending_tool_call().is_some();
         let interruption_text = event_processor::TOOL_CALL_INTERRUPTED_TEXT;
         if pending_tool {
+            self.retire_pending_call();
             self.history
                 .interrupt_pending_tool_call_with_text(interruption_text);
         }
@@ -322,6 +335,23 @@ where
         inputs: Vec<(InputMessage, String)>,
         defer: &mut D,
     ) -> Result<Vec<(InputMessage, String)>, BoxError> {
+        if self
+            .inner
+            .state_store
+            .is_thread_archived(&self.history.thread_id)
+            .await?
+        {
+            return Ok(inputs
+                .into_iter()
+                .filter(|(input, _)| {
+                    input.synthetic.is_none()
+                        && matches!(
+                            input.content,
+                            InputMessageContent::User(UserContent::ToolResult(_))
+                        )
+                })
+                .collect());
+        }
         // Deferral decisions depend on tool passivity, so resolve the
         // thread's configuration if it hasn't been yet.
         self.resolved_config().await?;
@@ -381,6 +411,7 @@ where
         observer: &O,
     ) -> Result<bool, BoxError> {
         let thread_id = self.history.thread_id.clone();
+        let pending = self.pending_tool_call();
         let prepare_result = event_processor::prepare_input(
             input_msg.clone(),
             message_id,
@@ -442,6 +473,12 @@ where
                 Ok(false)
             }
             Ok(event_processor::PrepareResult::Ready) => {
+                if let Some((id, name)) = pending
+                    && let Some(config) = self.config.borrow().as_ref()
+                    && let Some(tool) = config.tools.iter().find(|tool| tool.name() == name)
+                {
+                    tool.retire_call(&thread_id, rap_protocol::ToolCallId::from_ref(&id));
+                }
                 self.emit_input_echo(&input_msg, observer, &thread_id);
                 if let InputMessageContent::User(UserContent::ToolResult(result)) =
                     &input_msg.content
@@ -572,6 +609,16 @@ where
             return Ok(StepOutcome::Skipped);
         }
 
+        if self
+            .inner
+            .state_store
+            .is_thread_archived(&thread_id)
+            .await?
+        {
+            self.persist_tool_results(observer).await?;
+            return Ok(StepOutcome::Skipped);
+        }
+
         // ── Completion phase ──
         let model = self.inner.model.resolve(&thread_id).await?;
 
@@ -607,6 +654,15 @@ where
             safe_spawn_point: None,
         };
 
+        if self
+            .inner
+            .state_store
+            .is_thread_archived(&thread_id)
+            .await?
+        {
+            self.persist_tool_results(observer).await?;
+            return Ok(StepOutcome::Skipped);
+        }
         observer.on_event(&thread_id, &AgentEvent::CompletionStarted);
         self.in_flight.set(true);
 
@@ -656,6 +712,16 @@ where
         self.history.sync().await?;
         self.emit_committed(observer, &thread_id);
         observer.on_event(&thread_id, &AgentEvent::CompletionFinished { usage });
+
+        if self
+            .inner
+            .state_store
+            .is_thread_archived(&thread_id)
+            .await?
+        {
+            self.interrupt(observer).await?;
+            return Ok(StepOutcome::Skipped);
+        }
 
         // A failed dispatch enqueues an error result so the thread can advance.
         if let Some(action) = action

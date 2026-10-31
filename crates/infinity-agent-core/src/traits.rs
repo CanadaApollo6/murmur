@@ -304,6 +304,11 @@ pub trait StateStore: Send + Sync + Clone {
     async fn is_thread_stopped(&self, _thread_id: &ThreadId<str>) -> Result<bool, Self::Error> {
         Ok(false)
     }
+
+    /// Archived threads accept only settlement and never start new completions.
+    async fn is_thread_archived(&self, _thread_id: &ThreadId<str>) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
 }
 
 /// Abstraction over input message delivery (SQS in Lambda, channel/direct in CLI).

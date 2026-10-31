@@ -1047,14 +1047,30 @@ impl PersistentStateStore {
         Ok(())
     }
 
-    /// Clear pending choices from the root and every descendant, including
-    /// closed and compaction threads that are not shown in the session UI.
-    pub async fn clear_pending_choices_for_session(
+    /// Preserve choices for outstanding calls; clear orphaned session choices.
+    pub async fn clear_orphaned_choices_for_session(
         &self,
         session_id: &ThreadId<str>,
     ) -> Result<(), MemoryError> {
         for thread_id in self.conversation_store.get_session_thread_ids(session_id) {
-            self.clear_pending_choices(&thread_id).await?;
+            let choices = self.get_pending_user_choices(&thread_id).await?;
+            if choices.is_empty() {
+                continue;
+            }
+            let history = self
+                .conversation_store
+                .load_history_up_to(&thread_id, None, None)
+                .await?;
+            let pending = history.last().and_then(|message| match message {
+                InfinityMessage::ToolCall { call, .. } => Some(call.id.as_str()),
+                _ => None,
+            });
+            for choice in choices {
+                if pending != Some(choice.id.as_str()) {
+                    self.remove_pending_user_choice(&thread_id, &choice.id)
+                        .await?;
+                }
+            }
         }
         Ok(())
     }
@@ -1202,6 +1218,17 @@ impl StateStore for PersistentStateStore {
     ) -> Result<Vec<UserChoice>, MemoryError> {
         self.ensure_loaded(thread_id);
         Ok(self.core.get_pending_user_choices(thread_id).await?)
+    }
+
+    async fn is_thread_archived(&self, thread_id: &ThreadId<str>) -> Result<bool, MemoryError> {
+        let root = self.conversation_store.get_root_thread_id(thread_id);
+        Ok(self
+            .session_store
+            .lock()
+            .await
+            .sessions
+            .get(&root)
+            .is_some_and(|entry| entry.archived))
     }
 
     async fn is_thread_stopped(&self, thread_id: &ThreadId<str>) -> Result<bool, MemoryError> {

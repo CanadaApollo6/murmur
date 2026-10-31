@@ -323,6 +323,8 @@ impl InfinitySession {
             | DaemonMessage::ThinkingStart { thread_id }
                 if self.root_event(&thread_id) =>
             {
+                self.events
+                    .push_back(SessionEvent::Activity("completion started".into()));
                 self.thread_busy = true;
                 self.needs_interrupt = false;
                 // Attachment idle can precede this newer completion in the socket.
@@ -334,7 +336,16 @@ impl InfinitySession {
                 }
                 self.started()
             }
+            DaemonMessage::ResponseDone { thread_id, .. }
+            | DaemonMessage::ThinkingEnd { thread_id }
+                if self.root_event(&thread_id) =>
+            {
+                self.events
+                    .push_back(SessionEvent::Activity("completion finished".into()));
+            }
             DaemonMessage::ToolResult { thread_id, .. } if self.root_event(&thread_id) => {
+                self.events
+                    .push_back(SessionEvent::Activity("tool result".into()));
                 self.thread_busy = true;
                 self.started();
             }

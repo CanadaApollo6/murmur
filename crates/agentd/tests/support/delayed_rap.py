@@ -29,6 +29,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.reply({})
         if self.path != "/invoke":
             return
+        if len(sys.argv) > 2:
+            with open(sys.argv[2], "a") as capture:
+                capture.write(json.dumps(invocation) + "\n")
         pathlib.Path(sys.argv[1]).write_text(str(self.server.server_port))
 
         def callback():
