@@ -105,6 +105,7 @@ async fn create_session_and_chat(h: &mut TestHarness, keeps_session_alive: bool)
             location: None,
             model: None,
             keeps_session_alive,
+            input_admitted: false,
         })
         .expect("send CreateSession");
 
@@ -278,6 +279,7 @@ async fn active_subscription_keeps_rap_servers_warm() {
                     location: None,
                     model: None,
                     keeps_session_alive: false,
+                    input_admitted: false,
                 })
                 .expect("send CreateSession");
             let connected = wait_for_message(&mut h.daemon_rx, |m| {

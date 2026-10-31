@@ -76,7 +76,7 @@ impl Test {
         };
         let create = t.daemon.next().await;
         assert!(
-            matches!(create.message, ClientMessage::CreateSession { model: Some(m), keeps_session_alive: true, .. }
+            matches!(create.message, ClientMessage::CreateSession { model: Some(m), keeps_session_alive: true, input_admitted: true, .. }
             if m.provider_id == "fake" && m.model_id == "small")
         );
         t.event(|e| {
@@ -464,7 +464,7 @@ async fn resume_reuses_root_and_ignores_history_receipts() {
     t.agent = t.broker.spawn(spec(t.root.path())).await.expect("respawn");
     let connect = t.daemon.next().await;
     assert!(
-        matches!(connect.message, ClientMessage::Connect { root_thread_id, keeps_session_alive: true, .. } if root_thread_id == fake::root())
+        matches!(connect.message, ClientMessage::Connect { root_thread_id, keeps_session_alive: true, input_admitted: true, .. } if root_thread_id == fake::root())
     );
     t.idle().await;
     let id = t.send(true, "new mail").await;
@@ -2296,4 +2296,26 @@ mod r17o {
             "control: a different call keeps its full deadline"
         );
     }
+}
+
+#[tokio::test]
+async fn r19_legacy_daemon_without_admission_keeps_waiting_until_receipt() {
+    let mut t = Test::with_stall(Default::default(), Duration::from_millis(300)).await;
+    let id = t.send(true, "legacy daemon mail").await;
+    let offer = t.daemon.next().await;
+    offer.emit(fake::start());
+    offer.emit(fake::round_done());
+    offer.emit(fake::start());
+    let interrupt = t.daemon.next().await;
+    assert!(matches!(interrupt.message, ClientMessage::Interrupt { .. }));
+    assert!(matches!(
+        t.mailroom.delivery(id).await.expect("delivery").state,
+        DeliveryState::Offered { .. }
+    ));
+    offer.emit(fake::receipt(format!("peer-{id}")));
+    t.consumed(id).await;
+    offer.emit(fake::round_done());
+    offer.emit(fake::idle());
+    t.idle().await;
+    t.finish().await;
 }

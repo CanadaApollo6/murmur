@@ -533,6 +533,7 @@ impl SessionManager {
         tx: mpsc::UnboundedSender<DaemonMessage>,
         wants_replay: bool,
         keeps_session_alive: bool,
+        input_admitted: bool,
     ) {
         let installed = self
             .subscribe
@@ -542,6 +543,7 @@ impl SessionManager {
                     tx: tx.clone(),
                     wants_replay,
                     keeps_session_alive,
+                    input_admitted,
                 },
             )
             .await;

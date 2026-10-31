@@ -103,6 +103,7 @@ impl RemoteDaemons {
         remote_name: &infinity_protocol::RemoteName,
         session_id: &infinity_agent_core::ThreadId<str>,
         thread_id: Option<&infinity_agent_core::ThreadId<str>>,
+        input_admitted: bool,
     ) -> Result<
         (
             mpsc::UnboundedSender<ClientMessage>,
@@ -117,6 +118,7 @@ impl RemoteDaemons {
                 root_thread_id: infinity_protocol::ThreadRef::local(session_id.to_owned()),
                 thread_id: thread_id.map(|t| infinity_protocol::ThreadRef::local(t.to_owned())),
                 keeps_session_alive: true,
+                input_admitted,
             })
             .map_err(|e| format!("send Connect failed: {e}"))?;
 

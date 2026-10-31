@@ -19,6 +19,7 @@ pub struct Subscriber {
     /// When `false`, this subscriber does not prevent the session from
     /// idling out (e.g. the Slack bot's persistent connections).
     pub keeps_session_alive: bool,
+    pub input_admitted: bool,
 }
 
 /// A request to subscribe to a thread's display events.
@@ -26,6 +27,7 @@ pub struct SubscribeRequest {
     pub tx: mpsc::UnboundedSender<DaemonMessage>,
     pub wants_replay: bool,
     pub keeps_session_alive: bool,
+    pub input_admitted: bool,
 }
 
 /// Shared subscriber list for one thread.
@@ -35,7 +37,7 @@ pub type ThreadSubscribers = Arc<std::sync::Mutex<Vec<Subscriber>>>;
 /// detection).
 pub type SubscriberMap = Arc<std::sync::Mutex<HashMap<ThreadId, ThreadSubscribers>>>;
 
-/// Deliver `msg` to every subscriber in the list, pruning subscribers whose
+/// Deliver `msg` to subscribers that opted in to its event, pruning those whose
 /// client has disconnected (their channel is closed). This is the single
 /// fan-out primitive; every broadcast in the daemon goes through it so
 /// delivery and pruning semantics cannot drift between call sites.
@@ -52,6 +54,9 @@ pub fn broadcast_pruning(
     let mut requester_reached = false;
     let mut subs = subs.lock().expect("bug: mutex poisoned");
     subs.retain(|sub| {
+        if matches!(msg, DaemonMessage::InputAdmitted { .. }) && !sub.input_admitted {
+            return !sub.tx.is_closed();
+        }
         let delivered = sub.tx.send(msg.clone()).is_ok();
         if delivered && requester.is_some_and(|r| r.same_channel(&sub.tx)) {
             requester_reached = true;
@@ -193,6 +198,7 @@ impl ThreadObserver for DaemonObserver {
         subs.push(Subscriber {
             tx: request.tx,
             keeps_session_alive: request.keeps_session_alive,
+            input_admitted: request.input_admitted,
         });
     }
 }

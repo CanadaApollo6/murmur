@@ -244,6 +244,9 @@ pub enum ClientMessage {
         /// so that normal interactive clients keep sessions alive.
         #[serde(default = "default_true")]
         keeps_session_alive: bool,
+        /// Opt in to `InputAdmitted` events. Older readers cannot decode them.
+        #[serde(default)]
+        input_admitted: bool,
     },
     /// Connect to an existing session (optionally a specific thread).
     Connect {
@@ -254,6 +257,9 @@ pub enum ClientMessage {
         /// so that normal interactive clients keep sessions alive.
         #[serde(default = "default_true")]
         keeps_session_alive: bool,
+        /// Opt in to `InputAdmitted` events. Older readers cannot decode them.
+        #[serde(default)]
+        input_admitted: bool,
     },
     UserInput {
         thread_id: ThreadRef,
@@ -608,6 +614,32 @@ pub struct RemoteInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_connect_and_create_default_to_no_admission() {
+        let connect: ClientMessage = serde_json::from_value(serde_json::json!({
+            "Connect": { "root_thread_id": "root", "thread_id": null }
+        }))
+        .expect("legacy connect");
+        assert!(matches!(
+            connect,
+            ClientMessage::Connect {
+                input_admitted: false,
+                ..
+            }
+        ));
+        let create: ClientMessage = serde_json::from_value(serde_json::json!({
+            "CreateSession": { "cwd": "/tmp" }
+        }))
+        .expect("legacy create");
+        assert!(matches!(
+            create,
+            ClientMessage::CreateSession {
+                input_admitted: false,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn thread_ref_parse_local() {
