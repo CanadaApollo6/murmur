@@ -74,6 +74,34 @@ def proc_scan(needle, field):
                 pass
     return found
 
+def process_tree(parent):
+    table = {}
+    for proc in Path('/proc').iterdir():
+        if proc.name.isdigit():
+            try:
+                fields = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
+                table[int(proc.name)] = (int(fields[1]), fields[0], fields[19])
+            except (OSError, ValueError):
+                pass
+    descendants = {parent}
+    while True:
+        expanded = descendants | {pid for pid, row in table.items() if row[0] in descendants}
+        if expanded == descendants:
+            break
+        descendants = expanded
+    return {pid: table[pid][2] for pid in descendants if pid != parent and pid in table}
+
+def surviving(recorded):
+    alive = []
+    for pid, start in recorded.items():
+        try:
+            fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+            if fields[19] == start and fields[0] != 'Z':
+                alive.append(pid)
+        except OSError:
+            pass
+    return alive
+
 def wire_ready(name):
     p = root / name / 'wire.jsonl'
     return p.exists() and 'session/set_mode' in p.read_text()
@@ -115,6 +143,8 @@ try:
         assert all(row['isolation'] == 'bwrap+proxy' for row in ctl({'command': 'ls'}))
     if not baseline:
         wait(lambda: proc_scan(marker.encode(), 'cmdline'), 'detached descendant')
+    recorded = process_tree(daemon.pid)
+    assert recorded, 'no child processes captured for teardown check'
     daemon.send_signal(signal.SIGKILL if hard_exit else signal.SIGTERM)
     daemon.wait(timeout=10)
     if not hard_exit:
@@ -126,11 +156,11 @@ try:
     print('PASS own shim mail attributed to @a', flush=True)
     if not baseline:
         until = time.monotonic() + 5
-        while proc_scan(marker.encode(), 'cmdline') and time.monotonic() < until:
+        while (surviving(recorded) or proc_scan(marker.encode(), 'cmdline')) and time.monotonic() < until:
             time.sleep(.02)
         assert not proc_scan(marker.encode(), 'cmdline'), 'sandbox descendant survived agentd'
-        assert not proc_scan(str(root / 'a').encode(), 'environ'), 'ACP survived agentd'
-        print('PASS no sandboxed process survived agentd exit', flush=True)
+        assert not surviving(recorded), f'captured sandbox processes survived: {surviving(recorded)}'
+        print(f'PASS no sandboxed process survived agentd exit; checked {len(recorded)} host PIDs and start times', flush=True)
 finally:
     if daemon.poll() is None:
         daemon.terminate()
