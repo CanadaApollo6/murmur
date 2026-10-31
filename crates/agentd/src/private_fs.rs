@@ -11,7 +11,7 @@ use std::{
     path::{Component, Path},
 };
 
-pub(crate) const LIMIT: u64 = 64 * 1024;
+pub(crate) const LIMIT: u64 = 256 * 1024;
 pub(crate) struct Dir(OwnedFd);
 impl Dir {
     pub fn open(path: &Path, create: bool) -> io::Result<Self> {
@@ -79,18 +79,21 @@ impl Dir {
         ) {
             Ok(fd) => fd,
             Err(nix::errno::Errno::ENOENT) => return Ok(None),
+            Err(nix::errno::Errno::ELOOP) => {
+                return Err(io::Error::other("credential leaf must not be a symlink"));
+            }
             Err(e) => return Err(e.into()),
         };
         let file = File::from(fd);
         if !file.metadata()?.is_file() || file.metadata()?.len() > LIMIT {
             return Err(io::Error::other(
-                "credential must be a regular file under 64 KiB",
+                "credential must be a regular file under 256 KiB",
             ));
         }
         let mut bytes = Vec::new();
         file.take(LIMIT + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > LIMIT {
-            return Err(io::Error::other("credential exceeds 64 KiB"));
+            return Err(io::Error::other("credential exceeds 256 KiB"));
         }
         Ok(Some(bytes))
     }

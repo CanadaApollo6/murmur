@@ -22,6 +22,9 @@ struct Args {
     state_dir: Option<PathBuf>,
     #[arg(long)]
     socket: Option<PathBuf>,
+    /// Re-capture configured bind identities after validating their sources.
+    #[arg(long)]
+    repin_binds: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -87,6 +90,7 @@ async fn run(args: Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| state.join("mcp.sock"));
     let mut sandbox = cfg.bwrap.clone();
+    sandbox.repin_binds = args.repin_binds;
     let mut kinds = cfg.kinds()?;
     sandbox.validate(&state, &control_path, &mcp_path, &mut kinds)?;
     if kinds

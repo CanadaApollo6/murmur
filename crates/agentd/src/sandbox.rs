@@ -84,6 +84,8 @@ pub struct SandboxConfig {
     #[serde(skip)]
     pub protected: Vec<PathBuf>,
     #[serde(skip)]
+    pub repin_binds: bool,
+    #[serde(skip)]
     binds: Vec<(PinnedPath, PathBuf, bool)>,
     #[serde(skip)]
     bind_error: Option<String>,
@@ -109,6 +111,7 @@ impl Default for SandboxConfig {
             rw_binds: vec![],
             env: vec!["LANG".into(), "LC_ALL".into(), "TZ".into()],
             protected: vec![],
+            repin_binds: false,
             binds: vec![],
             bind_error: None,
             credential_paths: BTreeMap::new(),
@@ -181,7 +184,10 @@ impl SandboxConfig {
             || home.starts_with(&path)
             || Path::new("/run").starts_with(&path)
             || path.starts_with("/run")
-            || self.protected.iter().any(|p| p.starts_with(&path))
+            || self
+                .protected
+                .iter()
+                .any(|p| p.starts_with(&path) || resolved(p).is_ok_and(|p| p.starts_with(&path)))
         {
             return Err(format!("sandbox bind exposes protected paths: {}", path.display()).into());
         }
@@ -208,6 +214,9 @@ impl SandboxConfig {
                 return Err(format!("unsafe forwarded environment variable: {name}").into());
             }
         }
+        let uses_bwrap = kinds
+            .iter()
+            .any(|k| matches!(k.isolation, Isolation::Bwrap(_)));
         for kind in kinds {
             for name in kind.env.keys() {
                 if forbidden_env(name) {
@@ -231,21 +240,30 @@ impl SandboxConfig {
                         .into());
                     }
                     let parent = path.parent().ok_or("credential needs parent")?;
-                    let parent = std::fs::canonicalize(parent).map_err(|e| {
-                        format!(
-                            "kind {} credential parent {}: {e}",
-                            kind.name,
-                            parent.display()
-                        )
-                    })?;
-                    let host = parent.join(path.file_name().ok_or("credential needs name")?);
-                    crate::private_fs::Dir::open(&parent, false)
-                        .and_then(|dir| dir.read(host.file_name().expect("credential name")))
-                        .map_err(|e| {
-                            format!("kind {} credential {}: {e}", kind.name, host.display())
-                        })?;
-                    self.protected.extend([parent, host.clone()]);
-                    self.credential_paths.insert(path.clone(), host);
+                    self.protected.extend([parent.to_path_buf(), path.clone()]);
+                    match resolved(parent) {
+                        Ok(parent) => {
+                            self.protected.push(
+                                parent.join(path.file_name().ok_or("credential needs name")?),
+                            );
+                            self.protected.push(parent);
+                        }
+                        Err(error) => {
+                            tracing::warn!(kind=%kind.name, %error, "credential path unavailable; checked again at launch")
+                        }
+                    }
+                    match std::fs::canonicalize(parent) {
+                        Ok(parent) => {
+                            self.credential_paths.insert(
+                                path.clone(),
+                                parent.join(path.file_name().ok_or("credential needs name")?),
+                            );
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            tracing::warn!(kind=%kind.name, %error, "credential parent unavailable; checked again at launch")
+                        }
+                    }
                 }
                 for home in &sb.home {
                     if home.is_empty()
@@ -267,12 +285,16 @@ impl SandboxConfig {
                 }
             }
         }
-        self.validate_binds(state)?;
+        self.binds.clear();
+        self.bind_error = None;
+        if uses_bwrap {
+            self.validate_binds(state)?;
+        }
         Ok(())
     }
     fn validate_binds(&mut self, state: &Path) -> Result<()> {
         let file = state.join("sandbox-binds.json");
-        let previous: BTreeMap<PathBuf, PinnedPath> = match std::fs::read(&file) {
+        let previous_pins: BTreeMap<PathBuf, PinnedPath> = match std::fs::read(&file) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(e.into()),
@@ -283,14 +305,24 @@ impl SandboxConfig {
         for (paths, readonly) in [(&self.ro_binds, true), (&self.rw_binds, false)] {
             for path in paths {
                 let path = expand(path);
-                let pin = if let Some(pin) = previous.get(&path) {
-                    if let Err(error) = pin.open(self, state) {
-                        self.bind_error = Some(error.to_string());
+                let previous = previous_pins
+                    .get(&path)
+                    .filter(|p| p.identity.is_some() && !self.repin_binds);
+                let captured = match previous {
+                    Some(pin) => pin.open(self, state, false).map(|_| pin.clone()),
+                    None => PinnedPath::capture_bind(&path, self, state),
+                };
+                let pin = match captured {
+                    Ok(pin) => pin,
+                    Err(error) => {
+                        let error = self.bind_failure(&path, error);
+                        self.bind_error = Some(error.clone());
                         tracing::error!(%error, "configured sandbox bind unavailable");
+                        if let Some(pin) = previous_pins.get(&path) {
+                            current.insert(path.clone(), pin.clone());
+                        }
+                        continue;
                     }
-                    pin.clone()
-                } else {
-                    PinnedPath::capture(&path, self, state)?
                 };
                 current.insert(path.clone(), pin.clone());
                 self.binds.push((pin, path.clone(), readonly));
@@ -301,6 +333,20 @@ impl SandboxConfig {
         std::fs::rename(tmp, file)?;
         Ok(())
     }
+    fn bind_failure(&self, path: &Path, error: impl std::fmt::Display) -> String {
+        format!(
+            "sandbox-binds.json entry {}: {error}; validate configured sources and restart agentd with --repin-binds to authorize replacement",
+            path.display()
+        )
+    }
+    pub fn credential_host(&self, path: &Path) -> Result<PathBuf> {
+        if let Some(host) = self.credential_paths.get(path) {
+            return Ok(host.clone());
+        }
+        let parent = path.parent().ok_or("credential needs parent")?;
+        let parent = resolved(parent).map_err(|e| format!("credential {}: {e}", path.display()))?;
+        Ok(parent.join(path.file_name().ok_or("credential needs name")?))
+    }
     pub fn launch_mounts(&self, workspace: &PinnedPath, state: &Path) -> Result<Vec<PinnedMount>> {
         if let Some(error) = &self.bind_error {
             return Err(error.clone().into());
@@ -309,14 +355,14 @@ impl SandboxConfig {
             .iter()
             .map(|(pin, target, readonly)| {
                 Ok(PinnedMount {
-                    fd: Arc::new(pin.open(self, state)?),
+                    fd: Arc::new(pin.open(self, state, false).map_err(|e| self.bind_failure(target, e))?),
                     target: target.clone(),
                     readonly: *readonly,
                 })
             })
             .chain(std::iter::once_with(|| {
                 Ok(PinnedMount {
-                    fd: Arc::new(workspace.open(self, state)?),
+                    fd: Arc::new(workspace.open(self, state, true).map_err(|e| format!("{e}; recover with a human spawn of the failed agent name and a validated cwd"))?),
                     target: workspace.path.clone(),
                     readonly: false,
                 })
@@ -334,8 +380,37 @@ impl SandboxConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PinnedPath {
     pub path: PathBuf,
-    dev: u64,
+    #[serde(default)]
+    identity: Option<FilesystemIdentity>,
     ino: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum FilesystemIdentity {
+    Fsid([i32; 2]),
+    Device(u64),
+}
+impl FilesystemIdentity {
+    fn from_fsid(fsid: [i32; 2], dev: u64) -> Self {
+        if fsid == [0, 0] {
+            Self::Device(dev)
+        } else {
+            Self::Fsid(fsid)
+        }
+    }
+    fn read(fd: &OwnedFd, dev: u64) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let fsid = nix::sys::statfs::fstatfs(fd)?.filesystem_id();
+            // Linux fsid_t is two 32-bit words, with no padding or invalid bit patterns.
+            let fsid = unsafe { std::mem::transmute::<nix::libc::fsid_t, [i32; 2]>(fsid) };
+            Ok(Self::from_fsid(fsid, dev))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = fd;
+            Ok(Self::from_fsid([0, 0], dev))
+        }
+    }
 }
 impl PinnedPath {
     fn resolved_fd(fd: &OwnedFd, path: &Path) -> Result<PathBuf> {
@@ -353,37 +428,65 @@ impl PinnedPath {
             Ok(std::fs::canonicalize(path)?)
         }
     }
-    fn descriptor(path: &Path) -> Result<OwnedFd> {
+    fn descriptor(path: &Path, directory: bool) -> Result<OwnedFd> {
         #[cfg(target_os = "linux")]
         let flags = nix::fcntl::OFlag::O_PATH;
         #[cfg(not(target_os = "linux"))]
         let flags = nix::fcntl::OFlag::O_RDONLY;
+        let flags = if directory {
+            flags | nix::fcntl::OFlag::O_DIRECTORY
+        } else {
+            flags
+        };
         Ok(nix::fcntl::open(
             path,
-            flags | nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_CLOEXEC,
+            flags | nix::fcntl::OFlag::O_CLOEXEC,
             nix::sys::stat::Mode::empty(),
         )?)
     }
     pub fn capture(path: &Path, cfg: &SandboxConfig, state: &Path) -> Result<Self> {
+        Self::capture_source(path, cfg, state, true)
+    }
+    fn capture_bind(path: &Path, cfg: &SandboxConfig, state: &Path) -> Result<Self> {
+        Self::capture_source(path, cfg, state, false)
+    }
+    pub fn is_legacy(&self) -> bool {
+        self.identity.is_none()
+    }
+    fn capture_source(
+        path: &Path,
+        cfg: &SandboxConfig,
+        state: &Path,
+        directory: bool,
+    ) -> Result<Self> {
         cfg.check_bind(path, state)?;
-        let fd = Self::descriptor(path)
+        let fd = Self::descriptor(path, directory)
             .map_err(|e| format!("sandbox source {}: {e}", path.display()))?;
         let path = Self::resolved_fd(&fd, path)?;
         cfg.check_bind(&path, state)?;
         use std::os::unix::fs::MetadataExt;
         let stat = std::fs::File::from(fd.try_clone()?).metadata()?;
+        if !stat.is_file() && !stat.is_dir() {
+            return Err(format!(
+                "sandbox source {} must be a regular file or directory",
+                path.display()
+            )
+            .into());
+        }
         Ok(Self {
             path,
-            dev: stat.dev(),
+            identity: Some(FilesystemIdentity::read(&fd, stat.dev())?),
             ino: stat.ino(),
         })
     }
-    fn open(&self, cfg: &SandboxConfig, state: &Path) -> Result<OwnedFd> {
-        let fd = Self::descriptor(&self.path)
+    fn open(&self, cfg: &SandboxConfig, state: &Path, directory: bool) -> Result<OwnedFd> {
+        let fd = Self::descriptor(&self.path, directory)
             .map_err(|e| format!("sandbox source {}: {e}", self.path.display()))?;
         use std::os::unix::fs::MetadataExt;
         let stat = std::fs::File::from(fd.try_clone()?).metadata()?;
-        if (stat.dev(), stat.ino()) != (self.dev, self.ino) {
+        if self.identity.as_ref() != Some(&FilesystemIdentity::read(&fd, stat.dev())?)
+            || stat.ino() != self.ino
+        {
             return Err(format!("sandbox source identity changed: {}", self.path.display()).into());
         }
         let resolved = Self::resolved_fd(&fd, &self.path)?;
@@ -675,7 +778,7 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
         let help = String::from_utf8_lossy(&out.stdout);
         if !out.status.success() || !help.contains("--bind-fd ") || !help.contains("--ro-bind-fd ")
         {
-            return Err("bwrap preflight requires --bind-fd and --ro-bind-fd (bubblewrap >= 0.10.0); Ubuntu 24.04's 0.9.0 is too old".into());
+            return Err("bwrap preflight requires --bind-fd and --ro-bind-fd (bubblewrap >= 0.10.0); configure [bwrap] path = \"<bwrap >= 0.10.0>\" or sandbox = \"none\"".into());
         }
     }
     for kind in kinds {
@@ -705,7 +808,10 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
             let mut facts = facts;
             for (pin, target, readonly) in &cfg.binds {
                 facts.pinned.push(PinnedMount {
-                    fd: Arc::new(pin.open(cfg, state)?),
+                    fd: Arc::new(
+                        pin.open(cfg, state, false)
+                            .map_err(|e| cfg.bind_failure(target, e))?,
+                    ),
                     target: target.clone(),
                     readonly: *readonly,
                 });
@@ -803,6 +909,34 @@ pub async fn init(host_network: bool, cmd: Vec<OsString>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn sandbox_kinds() -> Vec<KindConfig> {
+        let mut kind = KindConfig::claude("cli");
+        kind.isolation = Isolation::Bwrap(KindSandbox {
+            home: vec![],
+            credentials: vec![],
+            egress: vec![],
+        });
+        vec![kind]
+    }
+    #[test]
+    fn fsid_identity_ignores_device_changes_and_falls_back_only_for_zero() {
+        assert_eq!(
+            FilesystemIdentity::from_fsid([12, 34], 1),
+            FilesystemIdentity::from_fsid([12, 34], 2)
+        );
+        assert_ne!(
+            FilesystemIdentity::from_fsid([12, 34], 1),
+            FilesystemIdentity::from_fsid([12, 35], 1)
+        );
+        assert_eq!(
+            FilesystemIdentity::from_fsid([0, 0], 7),
+            FilesystemIdentity::Device(7)
+        );
+        assert_ne!(
+            FilesystemIdentity::from_fsid([0, 0], 7),
+            FilesystemIdentity::from_fsid([0, 0], 8)
+        );
+    }
     #[test]
     fn golden_launches_and_token_free_identity() {
         for kind in [
@@ -925,10 +1059,11 @@ mod tests {
                     &state,
                     &state.join("agentd.sock"),
                     &state.join("mcp.sock"),
-                    &mut []
+                    &mut sandbox_kinds()
                 )
-                .is_err()
+                .is_ok()
             );
+            assert!(cfg.bind_error.is_some());
         }
         for name in [
             "AGENTD_MCP_TOKEN",
@@ -945,7 +1080,7 @@ mod tests {
                     &state,
                     &state.join("agentd.sock"),
                     &state.join("mcp.sock"),
-                    &mut []
+                    &mut sandbox_kinds()
                 )
                 .is_err()
             );
@@ -1050,14 +1185,14 @@ mod tests {
             &state,
             &state.join("a.sock"),
             &state.join("m.sock"),
-            &mut [],
+            &mut sandbox_kinds(),
         )
         .expect("validate");
         let pin = PinnedPath::capture(&work, &cfg, &state).expect("workspace");
         let restored: PinnedPath =
             serde_json::from_slice(&serde_json::to_vec(&pin).expect("serialize"))
                 .expect("persisted");
-        let fd = restored.open(&cfg, &state).expect("open");
+        let fd = restored.open(&cfg, &state, true).expect("open");
         assert!(
             nix::fcntl::FdFlag::from_bits_truncate(
                 nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_GETFD).expect("flags")
@@ -1068,7 +1203,7 @@ mod tests {
         std::os::unix::fs::symlink(&state, &work).expect("swap");
         assert!(
             restored
-                .open(&cfg, &state)
+                .open(&cfg, &state, true)
                 .expect_err("identity mismatch")
                 .to_string()
                 .contains("identity changed")
@@ -1081,7 +1216,7 @@ mod tests {
             &state,
             &state.join("a.sock"),
             &state.join("m.sock"),
-            &mut [],
+            &mut sandbox_kinds(),
         )
         .expect("daemon remains available");
         assert!(cfg.launch_mounts(&restored, &state).is_err());

@@ -300,8 +300,12 @@ impl Broker {
         }
         let mut agents = self.agents.lock().await;
         let id = self.mailroom.register(spec.name.clone()).await?;
-        if agents.get(&id).is_some_and(|h| !h.commands.is_closed()) {
-            return Err(Error::Rejected("agent already supervised".into()));
+        if let Some(handle) = agents.get(&id).filter(|h| !h.commands.is_closed()) {
+            if !restore && matches!(handle.phase(), Phase::Failed { .. }) {
+                handle.stop().await?;
+            } else {
+                return Err(Error::Rejected("agent already supervised".into()));
+            }
         }
         let (lease, incarnation, resume) = self.mailroom.claim_actor(id, spec.kind.clone()).await?;
         self.mailroom.save_spec(id, spec.clone()).await?;
@@ -545,7 +549,7 @@ impl AgentActor {
                 if let (crate::sandbox::Isolation::Bwrap(sb), Some((state, cfg))) =
                     (&self.kind.isolation, &self.isolation)
                 {
-                    if self.spec.workspace.is_none() {
+                    if self.spec.workspace.as_ref().is_none_or(|p| p.is_legacy()) {
                         let pin = crate::sandbox::PinnedPath::capture(&self.spec.cwd, cfg, state)?;
                         self.spec.cwd = pin.path.clone();
                         self.spec.workspace = Some(pin);
@@ -566,14 +570,14 @@ impl AgentActor {
                             &sb.credentials
                                 .iter()
                                 .map(|p| {
-                                    (
-                                        cfg.credential_paths.get(p).unwrap_or(p).clone(),
+                                    Ok((
+                                        cfg.credential_host(p)?,
                                         p.strip_prefix(crate::sandbox::host_home())
                                             .expect("validated credential path")
                                             .to_path_buf(),
-                                    )
+                                    ))
                                 })
-                                .collect::<Vec<_>>(),
+                                .collect::<crate::surfaces::Result<Vec<_>>>()?,
                             &paths.home,
                         )?;
                     let mut facts = crate::sandbox::Facts::collect()?;
@@ -601,7 +605,7 @@ impl AgentActor {
             .await;
             if let Err(error) = prepared {
                 mcp.revoke(self.id).await;
-                tracing::error!(agent=%self.id, %error, "sandbox preparation failed");
+                tracing::error!(agent=%self.id, kind=%self.kind.name, %error, "sandbox preparation failed");
                 self.phase(Phase::Failed {
                     last: error.to_string(),
                 });

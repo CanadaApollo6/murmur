@@ -53,11 +53,18 @@ impl Credentials {
         let private = Dir::open(home, false)?;
         let mut copies = vec![];
         for (host, relative) in paths {
-            let (dir, name) =
-                host_file(host).map_err(|e| format!("credential {}: {e}", host.display()))?;
-            let bytes = dir
-                .read(&name)
-                .map_err(|e| format!("credential {}: {e}", host.display()))?;
+            let bytes = match host_file(host) {
+                Ok((dir, name)) => dir.read(&name),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    Ok(None)
+                }
+                Err(error) => return Err(format!("credential {}: {error}", host.display()).into()),
+            }
+            .map_err(|e| format!("credential {}: {e}", host.display()))?;
             let (dir, name) = private.parent(relative, true)?;
             // Never trust persisted credentials from a previous incarnation.
             let old = dir.read(&name)?;
@@ -122,31 +129,39 @@ impl Credentials {
         {
             return Ok(());
         }
-        // Leave the digest on every rejection. A changed private file is reconsidered.
-        copy.rejected = Some(raw_digest);
-        copy.last_error = None;
-        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-        let baseline: serde_json::Value = serde_json::from_slice(
-            copy.baseline
-                .as_deref()
-                .ok_or("no credential baseline to replace")?,
-        )?;
-        let (Some(value_object), Some(baseline)) = (value.as_object(), baseline.as_object()) else {
-            return Err("credential refresh and baseline must be JSON objects".into());
-        };
-        if value_object.len() != baseline.len()
-            || value_object.keys().any(|key| !baseline.contains_key(key))
-        {
-            return Err("credential refresh must preserve the baseline top-level key set".into());
+        let content = (|| -> Result<()> {
+            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let baseline: serde_json::Value = serde_json::from_slice(
+                copy.baseline
+                    .as_deref()
+                    .ok_or("no credential baseline to replace")?,
+            )?;
+            let (Some(value_object), Some(baseline)) = (value.as_object(), baseline.as_object())
+            else {
+                return Err("credential refresh and baseline must be JSON objects".into());
+            };
+            if value_object.len() != baseline.len()
+                || value_object.keys().any(|key| !baseline.contains_key(key))
+            {
+                return Err(
+                    "credential refresh must preserve the baseline top-level key set".into(),
+                );
+            }
+            let canonical = digest(&serde_json::to_vec(&value)?);
+            if self
+                .retired
+                .get(&copy.host)
+                .is_some_and(|set| set.contains(&canonical))
+            {
+                return Err("refusing superseded credential bytes".into());
+            }
+            Ok(())
+        })();
+        if let Err(error) = content {
+            copy.rejected = Some(raw_digest);
+            return Err(error);
         }
-        let canonical = digest(&serde_json::to_vec(&value)?);
-        if self
-            .retired
-            .get(&copy.host)
-            .is_some_and(|set| set.contains(&canonical))
-        {
-            return Err("refusing superseded credential bytes".into());
-        }
+        copy.rejected = None;
         let (host, name) = host_file(&copy.host)?;
         if !host.replace(&name, copy.baseline.as_deref(), Some(&bytes))? {
             self.retire(copy);
@@ -171,6 +186,7 @@ impl Credentials {
         }
         copy.baseline = Some(bytes);
         copy.rejected = None;
+        copy.last_error = None;
         self.accepted.insert(id, std::time::Instant::now());
         Ok(())
     }
@@ -210,6 +226,36 @@ mod tests {
         let home = root.path().join("private");
         std::fs::create_dir(&home).expect("home");
         (root, human, host, home)
+    }
+    #[test]
+    fn host_io_and_cas_failures_retry_identical_valid_refresh_bytes() {
+        for failure in ["io", "cas"] {
+            let (_root, human, host, home) = fixture();
+            let id = AgentId::new();
+            let mut c = Credentials::default();
+            c.launch(id, "codex", &sources(&host, &human), &home)
+                .expect("launch");
+            let private = home.join(".codex/auth.json");
+            std::fs::write(&private, br#"{"token":1}"#).expect("refresh");
+            let parent = host.parent().expect("parent");
+            let moved = human.join("moved");
+            if failure == "io" {
+                std::fs::rename(parent, &moved).expect("unavailable host parent");
+            } else {
+                std::fs::write(&host, br#"{"token":2}"#).expect("external write");
+            }
+            c.sync(id);
+            if failure == "io" {
+                std::fs::rename(&moved, parent).expect("restore parent");
+            } else {
+                std::fs::write(&host, br#"{"token":0}"#).expect("restore baseline");
+            }
+            c.sync(id);
+            assert_eq!(
+                std::fs::read(&host).expect("retried host update"),
+                br#"{"token":1}"#
+            );
+        }
     }
     #[test]
     fn refresh_cas_propagates_and_refuses_stale_or_external_updates() {

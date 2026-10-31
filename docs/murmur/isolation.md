@@ -100,12 +100,13 @@ Unsandboxed launch still strips inherited `AGENTD_*` settings.
 
 Defaults are `~/.claude/.credentials.json` and `~/.codex/auth.json`. Each kind
 accepts at most one credential file under HOME, or `credentials = []`. At startup,
-agentd resolves the credential parent once, allowing symlinked CLI directories
-such as stow layouts. An unresolvable parent or symlink leaf fails startup with
-the kind and path in the error. Host I/O uses the resolved directory with
-no-follow traversal and a no-follow leaf. The source must be a regular file no
-larger than 64 KiB. A missing file permits launch without
-credentials. The copy goes into the private home at the same relative path.
+agentd resolves existing credential parents, allowing symlinked CLI directories
+such as stow layouts. Missing parents remain protected by their lexical path and
+resolved ancestors, and are resolved again at launch. Host I/O uses the resolved
+directory with no-follow traversal and a no-follow leaf. The source must be a regular file no
+larger than 256 KiB. These filesystem errors fail the affected launch with a named
+reason in the log and `agentctl ls`, while the daemon remains available. A missing
+file or parent permits launch without credentials. The copy goes into the private home at the same relative path.
 The human's CLI directory is never mounted. Settings, instructions, hooks, agents,
 plugins, new entries and late-created host files or sockets stay private.
 
@@ -217,18 +218,25 @@ any configured Bwrap credential file or its resolved parent. All paths under
 `/run` are rejected. Read-only grants receive the same checks because they permit
 UNIX socket connections. Workspace paths receive the same checks at spawn.
 Workspaces under HOME, such as `~/code/x`, remain allowed. At spawn the broker
-persists the canonical workspace path and its device and inode with the agent.
-Legacy rows capture identity at their next validated start. Configured directory
+persists the canonical workspace path with its filesystem ID from `fstatfs` and
+inode. An all-zero filesystem ID falls back to device and inode. Legacy rows
+capture identity at their next validated start. Configured file and directory
 bind identities are recorded at startup in `state/sandbox-binds.json` and retained
-across restarts. Remove the relevant entry only when deliberately replacing a
-trusted toolchain directory. Every launch opens each source with
-`O_PATH|O_DIRECTORY|O_CLOEXEC`, compares identity and rechecks the fd's resolved
+across restarts. A human `spawn` of a Failed agent's name with a validated cwd
+re-pins its workspace and replaces the failed actor, retaining its identity and
+mailbox. To authorize configured bind replacements, restart with `--repin-binds`.
+The flag validates all sources before capturing them. A failed re-pin retains any
+existing pin. Binds accept regular files and directories; workspaces require
+directories. Every launch opens each source with `O_PATH|O_CLOEXEC`, plus
+`O_DIRECTORY` for workspaces, compares identity and rechecks the fd's resolved
 path. Bubblewrap receives `--bind-fd` or `--ro-bind-fd`, verifies the mounted
 identity, and closes each fd before executing the child. Broker fds retain
 CLOEXEC; only the fork child clears it for these explicit mount fds.
 A mismatch fails the launch with a reason in the log and `agentctl ls`'s `error`
 field. An invalid restored workspace or bind does not abort the entire daemon.
-Bind failures disable sandboxed launches while unsandboxed kinds remain available.
+First-use and previously pinned bind failures disable sandboxed launches while
+unsandboxed kinds remain available. Bind capture is skipped when every kind uses
+`sandbox = "none"`.
 Private sockets bind via `/proc/self/fd`, so state-path length does not constrain
 their `sun_path`.
 Egress patterns cannot be IP literals. Wildcards need at least two suffix labels,
