@@ -584,7 +584,12 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
         mailroom.clone(),
         vec![{
             let mut kind = agentd::KindConfig::infinity(socket);
-            kind.cancel_timeout = Duration::from_millis(100);
+            kind.cancel_timeout =
+                if matches!(probe, ToolSettlementProbe::InterruptWriteFailure { .. }) {
+                    Duration::from_secs(4)
+                } else {
+                    Duration::from_millis(100)
+                };
             kind
         }],
         agentd::supervisor::Config {
@@ -740,7 +745,7 @@ async fn tool_settlement_probe(probe: ToolSettlementProbe) {
             .await
             .expect("queue human");
         let mut crashes = 0;
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match events.recv().await.expect("event") {
                     Event::PhaseChanged {
@@ -1015,7 +1020,7 @@ async fn queued_attachment_mail_probe(resume: bool) {
         mailroom.clone(),
         vec![{
             let mut kind = agentd::KindConfig::infinity(socket);
-            kind.request_timeout = Duration::from_millis(100);
+            kind.request_timeout = Duration::from_secs(2);
             kind
         }],
         agentd::supervisor::Config {
@@ -1068,7 +1073,7 @@ async fn queued_attachment_mail_probe(resume: bool) {
         .await
         .expect("inference starts");
     // The provider has accepted the request but intentionally sends no output or receipt.
-    let crashed = tokio::time::timeout(Duration::from_millis(350), async {
+    let crashed = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if matches!(
                 events.recv().await.expect("event"),
@@ -2280,6 +2285,559 @@ async fn r11a_detached_executor_panic() {
             h.ctrl.send_text("invalid duration handled");
             h.ctrl.finish();
             broker.shutdown().await.expect("shutdown");
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r12a_shutdown_recovery_with_usage_must_not_loop() {
+    r12a_shutdown_recovery_usage_case(true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r12a_shutdown_recovery_without_usage_control() {
+    r12a_shutdown_recovery_usage_case(false).await;
+}
+
+async fn r12a_shutdown_recovery_usage_case(report_usage: bool) {
+    use agentd::supervisor::Phase;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let port = r10a_waiting_server().await.expect("RAP tool");
+            rap_test_servers::write_rap_config(h.cwd.path(), port).expect("RAP config");
+            let (broker, agent, root) = r11_broker(&h).await;
+            h.client_tx
+                .send(ClientMessage::Connect {
+                    root_thread_id: root.clone(),
+                    thread_id: None,
+                    keeps_session_alive: true,
+                })
+                .expect("observer connect");
+            wait_for_message(&mut h.daemon_rx, |m| {
+                matches!(m, DaemonMessage::Replay { .. })
+            })
+            .await;
+            r11_send(&broker, agent.id, "start work before shutdown").await;
+            h.ctrl.next_request().await;
+            h.ctrl
+                .send_tool_call("pre-shutdown", "waiting_choice", serde_json::json!({}));
+            h.ctrl.finish();
+            wait_for_message(&mut h.daemon_rx, |m| {
+                matches!(m, DaemonMessage::ResponseDone { .. })
+            })
+            .await;
+            r11_send(&broker, agent.id, "mail pending during shutdown").await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            h.client_tx
+                .send(ClientMessage::ShutdownSession {
+                    root_thread_id: root.clone(),
+                })
+                .expect("one shutdown");
+            tokio::time::timeout(Duration::from_secs(2), h.ctrl.next_request())
+                .await
+                .expect("first recovery");
+            for round in 0..6 {
+                let status = h.manager.lock().await.list_sessions(None).await[&root]
+                    .status
+                    .clone();
+                eprintln!(
+                    "R12 recovery round={round}, daemon status={status:?}, agent phase={:?}",
+                    *agent.phases().borrow()
+                );
+                r11_send(
+                    &broker,
+                    agent.id,
+                    &format!("mail during healthy round {round}"),
+                )
+                .await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                h.ctrl.send_tool_call(
+                    &format!("post-shutdown-{round}"),
+                    "waiting_choice",
+                    serde_json::json!({}),
+                );
+                h.ctrl.finish_with_usage(report_usage.then_some(
+                    infinity_provider_protocol::Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        total_tokens: 15,
+                        ..Default::default()
+                    },
+                ));
+                wait_for_message(&mut h.daemon_rx, |message| {
+                    matches!(message, DaemonMessage::ResponseDone { .. })
+                })
+                .await;
+                assert_ne!(
+                    h.manager.lock().await.list_sessions(None).await[&root].status,
+                    SessionStatus::Stopped,
+                    "recovered live driver must stay resumed after token usage"
+                );
+                if tokio::time::timeout(Duration::from_secs(1), h.ctrl.next_request())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let phase = agent.phases().borrow().clone();
+            eprintln!(
+                "R12 after one shutdown and ordinary usage-bearing tool completions: {phase:?}"
+            );
+            broker.shutdown().await.expect("shutdown broker");
+            assert!(
+                !matches!(phase, Phase::Failed { .. }),
+                "one shutdown must not exhaust crash budget during healthy tool turns: {phase:?}"
+            );
+        })
+        .await;
+}
+
+mod r12o {
+    use super::*;
+    use agentd::mailroom::{Mailroom, NewMessage};
+    use agentd::model::*;
+    use agentd::supervisor::{AgentHandle, AgentSpec, Broker, Config, Event, Phase, TurnOutcome};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    pub(super) struct Rig {
+        pub broker: Broker,
+        pub agent: AgentHandle,
+        pub root: infinity_protocol::ThreadRef,
+        pub mailroom: Arc<Mailroom>,
+        pub log: Rc<RefCell<Vec<Event>>>,
+    }
+
+    pub(super) async fn wait_phase(
+        agent: &AgentHandle,
+        f: impl Fn(&Phase) -> bool,
+        t: Duration,
+    ) -> bool {
+        let mut phases = agent.phases();
+        tokio::time::timeout(t, async {
+            while !f(&phases.borrow_and_update()) {
+                phases.changed().await.expect("phase");
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    pub(super) async fn rig(
+        h: &TestHarness,
+        request: Duration,
+        cancel: Duration,
+        cfg: Config,
+        perm: Option<Duration>,
+    ) -> Rig {
+        let socket = h.cwd.path().join("r12o.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("socket");
+        let manager = h.manager.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                let (s, _) = listener.accept().await.expect("accept");
+                tokio::task::spawn_local(infinity_daemon::client_handler::handle_client(
+                    s,
+                    manager.clone(),
+                ));
+            }
+        });
+        let mailroom = Arc::new(
+            Mailroom::open(h.cwd.path().join("r12o.db"), Default::default())
+                .await
+                .expect("mailroom"),
+        );
+        let mut kind = agentd::KindConfig::infinity(socket);
+        kind.request_timeout = request;
+        kind.cancel_timeout = cancel;
+        let broker = Broker::new(mailroom.clone(), vec![kind], cfg).expect("broker");
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut events = broker.events();
+        let sink = log.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                match events.recv().await {
+                    Ok(e) => sink.borrow_mut().push(e),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        eprintln!("R12O lagged {n}")
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let agent = broker
+            .spawn(AgentSpec {
+                name: AgentName::parse("r12o").expect("name"),
+                kind: "infinity".into(),
+                cwd: h.cwd.path().into(),
+                model: None,
+                permissions: PermissionPolicy {
+                    timeout: perm,
+                    ..Default::default()
+                },
+                idle_after: None,
+            })
+            .await
+            .expect("spawn");
+        assert!(
+            wait_phase(&agent, |p| *p == Phase::Idle, Duration::from_secs(5)).await,
+            "initial idle"
+        );
+        let root = h
+            .manager
+            .lock()
+            .await
+            .list_sessions(None)
+            .await
+            .into_keys()
+            .next()
+            .expect("root");
+        Rig {
+            broker,
+            agent,
+            root,
+            mailroom,
+            log,
+        }
+    }
+
+    pub(super) async fn send(r: &Rig, text: &str) -> MessageId {
+        let (_, env) = r
+            .broker
+            .send(NewMessage {
+                from: Sender::Human,
+                to: r.agent.id,
+                body: Body::new(text).expect("body"),
+                reply_to: None,
+                client_key: ClientKey(text.into()),
+                act: agentd::swarm::Act::Inform,
+                task: None,
+            })
+            .await
+            .expect("mail");
+        env.id()
+    }
+
+    pub(super) fn summary(r: &Rig) -> String {
+        let log = r.log.borrow();
+        let n = |f: &dyn Fn(&Event) -> bool| log.iter().filter(|e| f(e)).count();
+        format!(
+            "crashed={} failed={} needs_recovery={} cancelled={} completed={} phase={:?}",
+            n(&|e| matches!(
+                e,
+                Event::PhaseChanged {
+                    phase: Phase::Crashed { .. },
+                    ..
+                }
+            )),
+            n(&|e| matches!(
+                e,
+                Event::PhaseChanged {
+                    phase: Phase::Failed { .. },
+                    ..
+                }
+            )),
+            n(&|e| matches!(
+                e,
+                Event::PhaseChanged {
+                    phase: Phase::NeedsRecovery { .. },
+                    ..
+                }
+            )),
+            n(&|e| matches!(
+                e,
+                Event::TurnEnded {
+                    outcome: TurnOutcome::Cancelled,
+                    ..
+                }
+            )),
+            n(&|e| matches!(
+                e,
+                Event::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                    ..
+                }
+            )),
+            r.agent.phase(),
+        )
+    }
+
+    pub(super) async fn drain(h: &mut TestHarness, dur: Duration) -> Vec<String> {
+        let mut out = Vec::new();
+        let end = tokio::time::Instant::now() + dur;
+        while let Ok(req) = tokio::time::timeout_at(end, h.ctrl.next_request()).await {
+            out.push(format!("{:?}", req.chat_history));
+            h.ctrl.send_text("ok");
+            h.ctrl.finish();
+        }
+        out
+    }
+
+    pub(super) fn slow_rap(h: &TestHarness) -> std::path::PathBuf {
+        let dir = h.cwd.path().join(".infinity");
+        std::fs::create_dir(&dir).expect("config dir");
+        let marker = h.cwd.path().join("invoked");
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/delayed_rap.py");
+        std::fs::write(
+            dir.join("rap.json"),
+            serde_json::json!({"tool_sets":[{"type":"toolset_command",
+                "command":format!("python3 '{}' '{}'", script.display(), marker.display())}]})
+            .to_string(),
+        )
+        .expect("rap config");
+        marker
+    }
+
+    pub(super) async fn invocations(marker: &std::path::Path) -> Vec<u16> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(s) = std::fs::read_to_string(marker) {
+                    let ports: Vec<u16> = s
+                        .lines()
+                        .map(|l| {
+                            l.split(' ')
+                                .next()
+                                .expect("port")
+                                .parse()
+                                .expect("port number")
+                        })
+                        .collect();
+                    if !ports.is_empty() {
+                        return ports;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("slow_work invoked")
+    }
+
+    pub(super) async fn port_dead(port: u16) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ShutdownSession kills the command RAP server");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r12o_dangling_choice_cancel_loop() {
+    use agentd::supervisor::{Event, Phase, TurnOutcome};
+    use infinity_agent_core::message::{InputMessage, InputMessageContent, UserChoiceRequired};
+    tokio::task::LocalSet::new().run_until(async {
+        let mut h = start_harness().await.expect("harness");
+        let cfg = agentd::supervisor::Config { backoff_initial: Duration::from_millis(10), backoff_max: Duration::from_millis(20), ..Default::default() };
+        let r = r12o::rig(&h, Duration::from_secs(1), Duration::from_millis(300), cfg, Some(Duration::from_millis(30))).await;
+        r12o::send(&r, "hello").await;
+        h.ctrl.next_request().await;
+        h.ctrl.send_text("hi");
+        h.ctrl.finish();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !r.log.borrow().iter().any(|e| matches!(e, Event::TurnEnded { outcome: TurnOutcome::Completed, .. })) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("first turn completes");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // A late RAP user_choice callback whose tool call already has a result.
+        assert!(h.manager.lock().await.send_input((InputMessage {
+            content: InputMessageContent::UserChoice(UserChoiceRequired {
+                content_type: "user_choice_required".into(), id: "late-choice".into(), call_id: None,
+                prompt: "Choose".into(), choices: vec!["A".into(), "B".into()], default: 0,
+                response_url: "http://127.0.0.1:9/choice".into(),
+            }),
+            group_id: r.root.id.clone(), metadata: None, synthetic: None, display_as: None, subscription: false,
+        }, None)).await);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        eprintln!("R12O dangling choice after 6s: {}", r12o::summary(&r));
+        let after = r12o::send(&r, "mail after choice").await;
+        let reqs = r12o::drain(&mut h, Duration::from_secs(4)).await;
+        eprintln!("R12O dangling choice after 10s: {} after={:?} inference_requests={}", r12o::summary(&r), r.mailroom.delivery(after).await.expect("after"), reqs.len());
+        h.client_tx.send(ClientMessage::Connect { root_thread_id: r.root.clone(), thread_id: None, keeps_session_alive: false }).expect("inspect");
+        let replay = wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::Replay { .. })).await;
+        if let DaemonMessage::Replay { pending_choices, idle, in_progress, .. } = replay {
+            eprintln!("R12O dangling choice replay: pending_choices={} idle={idle} in_progress={in_progress}", pending_choices.len());
+        }
+        let failed = r.log.borrow().iter().any(|e| matches!(e, Event::PhaseChanged { phase: Phase::Failed { .. }, .. }));
+        let cancelled = r.log.borrow().iter().any(|e| matches!(e, Event::TurnEnded { outcome: TurnOutcome::Cancelled, .. }));
+        assert!(cancelled && !failed && !reqs.is_empty(), "agent neither failed nor recovered: {}", r12o::summary(&r));
+        r.broker.shutdown().await.expect("shutdown");
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r12o_repeated_cli_quit_crash_budget() {
+    use agentd::supervisor::Phase;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let marker = r12o::slow_rap(&h);
+            let cfg = agentd::supervisor::Config {
+                backoff_initial: Duration::from_millis(10),
+                backoff_max: Duration::from_millis(20),
+                ..Default::default()
+            };
+            let r = r12o::rig(
+                &h,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                cfg,
+                None,
+            )
+            .await;
+            let mut quits = 0;
+            for i in 0..6 {
+                r12o::send(&r, &format!("work item {i}")).await;
+                let Ok(_) =
+                    tokio::time::timeout(Duration::from_secs(15), h.ctrl.next_request()).await
+                else {
+                    eprintln!(
+                        "R12O quit budget: no inference for item {i}; {}",
+                        r12o::summary(&r)
+                    );
+                    break;
+                };
+                h.ctrl
+                    .send_tool_call(&format!("slow-{i}"), "delayed_work", serde_json::json!({}));
+                h.ctrl.finish();
+                let port = r12o::invocations(&marker).await[0];
+                std::fs::remove_file(&marker).expect("clear invocation");
+                h.client_tx
+                    .send(ClientMessage::ShutdownSession {
+                        root_thread_id: r.root.clone(),
+                    })
+                    .expect("quit");
+                quits += 1;
+                r12o::port_dead(port).await;
+                let settled = r12o::wait_phase(
+                    &r.agent,
+                    |p| matches!(p, Phase::Idle | Phase::Failed { .. }),
+                    Duration::from_secs(10),
+                )
+                .await;
+                eprintln!(
+                    "R12O quit budget: after quit {quits} settled={settled} {}",
+                    r12o::summary(&r)
+                );
+                if matches!(r.agent.phase(), Phase::Failed { .. }) {
+                    break;
+                }
+            }
+            let failed = matches!(r.agent.phase(), Phase::Failed { .. });
+            eprintln!(
+                "R12O quit budget: quits={quits} failed={failed} {}",
+                r12o::summary(&r)
+            );
+            assert!(
+                !failed,
+                "routine CLI quits drove the agent to Failed after {quits} quits"
+            );
+            assert_eq!(quits, 6, "all six quits must recover");
+            r.broker.shutdown().await.expect("shutdown");
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r12o_quit_during_plain_completion() {
+    tokio::task::LocalSet::new().run_until(async {
+        let mut h = start_harness().await.expect("harness");
+        let cfg = agentd::supervisor::Config { backoff_initial: Duration::from_millis(10), backoff_max: Duration::from_millis(20), ..Default::default() };
+        let r = r12o::rig(&h, Duration::from_secs(1), Duration::from_secs(1), cfg, None).await;
+        let first = r12o::send(&r, "write a long answer").await;
+        h.ctrl.next_request().await;
+        h.ctrl.send_text("partial answer ");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.client_tx.send(ClientMessage::ShutdownSession { root_thread_id: r.root.clone() }).expect("quit");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        eprintln!("R12O plain quit after 3s: {} first={:?}", r12o::summary(&r), r.mailroom.delivery(first).await.expect("first"));
+        h.ctrl.send_text("rest of answer");
+        h.ctrl.finish();
+        let late = r12o::drain(&mut h, Duration::from_secs(2)).await;
+        let next = r12o::send(&r, "follow-up").await;
+        let reqs = r12o::drain(&mut h, Duration::from_secs(5)).await;
+        eprintln!(
+            "R12O plain quit: extra_requests_before_followup={} followup_requests={} followup_sees_rest={} followup_sees_partial={} next={:?} {}",
+            late.len(), reqs.len(),
+            reqs.last().is_some_and(|h| h.contains("rest of answer")),
+            reqs.last().is_some_and(|h| h.contains("partial answer")),
+            r.mailroom.delivery(next).await.expect("next"), r12o::summary(&r)
+        );
+        assert!(reqs.last().is_some_and(|history| history.contains("rest of answer")), "CLI quit abandoned the streaming reply");
+        assert!(!r.log.borrow().iter().any(|event| matches!(event, agentd::supervisor::Event::TurnEnded { outcome: agentd::supervisor::TurnOutcome::Cancelled, .. })), "CLI quit cancelled the live completion");
+        r.broker.shutdown().await.expect("shutdown");
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r12_post_shutdown_mail_does_not_wait_for_receipt_expiry() {
+    use agentd::supervisor::{Config, Phase};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut h = start_harness().await.expect("harness");
+            let marker = r12o::slow_rap(&h);
+            let r = r12o::rig(
+                &h,
+                Duration::from_secs(10),
+                Duration::from_secs(2),
+                Config {
+                    backoff_initial: Duration::from_millis(10),
+                    backoff_max: Duration::from_millis(20),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await;
+            r12o::send(&r, "start command").await;
+            h.ctrl.next_request().await;
+            h.ctrl
+                .send_tool_call("command", "delayed_work", serde_json::json!({}));
+            h.ctrl
+                .finish_with_usage(Some(infinity_provider_protocol::Usage {
+                    total_tokens: 15,
+                    ..Default::default()
+                }));
+            let port = r12o::invocations(&marker).await[0];
+            h.client_tx
+                .send(ClientMessage::ShutdownSession {
+                    root_thread_id: r.root.clone(),
+                })
+                .expect("quit");
+            r12o::port_dead(port).await;
+            assert!(
+                r12o::wait_phase(&r.agent, |p| *p == Phase::Idle, Duration::from_secs(5)).await
+            );
+            let id = r12o::send(&r, "follow-up after shutdown").await;
+            let request = tokio::time::timeout(Duration::from_secs(3), h.ctrl.next_request())
+                .await
+                .expect("follow-up before ten-second receipt expiry");
+            assert!(format!("{:?}", request.chat_history).contains("follow-up after shutdown"));
+            h.ctrl.send_text("delivered promptly");
+            h.ctrl
+                .finish_with_usage(Some(infinity_provider_protocol::Usage {
+                    total_tokens: 30,
+                    ..Default::default()
+                }));
+            assert!(
+                r12o::wait_phase(&r.agent, |p| *p == Phase::Idle, Duration::from_secs(5)).await
+            );
+            let delivery = r.mailroom.delivery(id).await.expect("delivery");
+            assert_eq!(delivery.state, agentd::model::DeliveryState::Consumed);
+            assert_eq!(delivery.attempts, 1);
+            assert!(!matches!(
+                h.manager.lock().await.list_sessions(None).await[&r.root].status,
+                SessionStatus::Stopped
+            ));
+            r.broker.shutdown().await.expect("shutdown");
         })
         .await;
 }

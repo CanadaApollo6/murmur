@@ -349,7 +349,14 @@ async fn route_loop<C, S, H, O, F>(
         }
 
         if matches!(msg, RoutedMessage::Interrupt(_)) {
-            continue;
+            match inner.conversation_store.thread_exists(&thread_id).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!(%thread_id, %error, "cannot interrupt an unknown thread");
+                    continue;
+                }
+            }
         }
 
         // Admission: event-style input cannot create or resume a thread. User
@@ -442,7 +449,11 @@ async fn route_loop<C, S, H, O, F>(
         });
 
         match msg {
-            RoutedMessage::Interrupt(_) => unreachable!("bug: interrupt spawned a driver"),
+            RoutedMessage::Interrupt(_) => {
+                worker_interrupt_tx
+                    .send(())
+                    .expect("bug: new driver interrupt channel closed");
+            }
             RoutedMessage::Input(input, id) => {
                 let _ = input_tx.send((*input, id));
             }

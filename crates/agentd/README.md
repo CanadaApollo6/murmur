@@ -82,9 +82,11 @@ The daemon includes a random process boot ID in `Welcome`. The adapter saves it
 in the resume token. When a reopened root has a different boot ID and
 `Replay.idle` is false, agentd sends one `Interrupt`. It uses the same rule after
 a driver-failure protocol error from the root or any child on the connection.
-A stopped root also ends the attachment and records that it needs an interrupt.
-Reconnect clears shutdown and interrupts busy replay. This can interrupt a plain
-completion running when the CLI user quits. Its unconsumed mail is re-queued.
+A stopped root ends the attachment without spending the crash budget and records
+that it needs an interrupt. Connect clears and persists shutdown even when the
+driver is still live. Recovery interrupts busy replay unless `in_progress` shows
+a surviving model completion. CLI quit kills RAP servers but lets that completion
+finish. Pending non-passive tool calls still require interruption.
 An archived root requires recovery instead of reconnecting. Core settles the call
 durably and removes pending choices. Recovery never invokes the tool again.
 Only agentd-attached threads auto-recover after a daemon restart. An executor
@@ -95,7 +97,8 @@ before a task starts. The adapter persists its recovery marker when it changes,
 including when idle or a new completion clears it, so an unclean agentd exit
 does not restore a cleared marker.
 
-Cancellation has a deadline. Reconnects reissue an outstanding cancellation when
+An Interrupt starts a driver even for an orphaned pending choice. Cancellation
+has a deadline. Reconnects reissue an outstanding cancellation when
 replay is busy. A later `StartOutput` or `ThinkingStart` acknowledges cancellation
 and clears its deadline while the new completion continues. Core preserves
 accepted real results during settlement. It also persists leading results that
@@ -108,10 +111,13 @@ interrupt, and a five-second timer. Closed channels release a Held driver during
 shutdown. A failed choice write enters this same bounded settlement path, so a
 call cannot wait forever for a prompt that was never saved. RAP cancellation
 notifications have a two-second bound. Retaining accepted results during a
-storage outage requires the daemon to remain alive. Receipt and interrupt
-deadlines, and exhausted or held settlement errors, reconnect without spending
-the crash budget. Mailroom `max_attempts` still bounds unreceipted delivery and
-moves exhausted mail to Held. Repairing storage permits automatic recovery.
+storage outage requires the daemon to remain alive. Receipt deadlines and
+exhausted or held settlement errors reconnect without spending the crash budget.
+Interrupt deadlines also retry, but `crash_limit` expiries without a committed
+input, completed turn, or cancellation acknowledgment enter `NeedsRecovery`.
+Successful attachment alone does not reset retry backoff. Mailroom `max_attempts`
+still bounds unreceipted delivery and moves exhausted mail to Held. Repairing
+storage permits automatic recovery until the interrupt retry limit is reached.
 
 The receipt deadline starts when submission begins on an idle root. A later
 completion start clears it, so inference may outlast the receipt timeout. A new

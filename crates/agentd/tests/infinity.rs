@@ -1386,3 +1386,67 @@ async fn r11_cleared_recovery_marker_survives_unclean_exit() {
         "a settled recovery must not interrupt newer CLI work after agentd dies"
     );
 }
+
+#[tokio::test]
+async fn r12_repeated_interrupt_expiry_is_bounded_without_receipts() {
+    let mut t = Test::new().await;
+    let id = t.send(false, "stuck work").await;
+    let input = t.daemon.next().await;
+    input.emit(fake::start());
+    t.event(|e| matches!(e, Event::Started { .. })).await;
+    t.daemon.state.lock().expect("state").manual_replay = true;
+    t.agent.cancel().await.expect("cancel");
+    assert!(matches!(
+        t.daemon.next().await.message,
+        ClientMessage::Interrupt { .. }
+    ));
+    for attempt in 1..5 {
+        let event = t
+            .event(|e| {
+                matches!(
+                    e,
+                    Event::PhaseChanged {
+                        phase: Phase::Crashed { .. },
+                        ..
+                    }
+                )
+            })
+            .await;
+        assert!(
+            matches!(event, Event::PhaseChanged { phase: Phase::Crashed { attempt: actual, .. }, .. } if actual == attempt),
+            "successful open must not reset backoff: {event:?}"
+        );
+        let connect = t.daemon.next().await;
+        assert!(matches!(connect.message, ClientMessage::Connect { .. }));
+        connect.emit(DaemonMessage::Replay {
+            history: vec![],
+            pending_choices: vec![],
+            views: Default::default(),
+            in_progress: false,
+            idle: false,
+        });
+        assert!(matches!(
+            t.daemon.next().await.message,
+            ClientMessage::Interrupt { .. }
+        ));
+    }
+    t.event(|e| {
+        matches!(
+            e,
+            Event::PhaseChanged {
+                phase: Phase::NeedsRecovery { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    assert_ne!(
+        t.mailroom.delivery(id).await.expect("delivery").state,
+        DeliveryState::Consumed
+    );
+    let queued = t.send(false, "waiting for operator recovery").await;
+    let delivery = t.mailroom.delivery(queued).await.expect("queued delivery");
+    assert_eq!(delivery.state, DeliveryState::Queued);
+    assert_eq!(delivery.attempts, 0);
+    t.finish().await;
+}
