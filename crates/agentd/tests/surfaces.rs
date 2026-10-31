@@ -27,6 +27,7 @@ impl Daemon {
         let fake = env!("CARGO_BIN_EXE_agentd-fake-acp");
         let config = format!(
             r#"
+sandbox = "none"
 [kind.claude]
 command = [{}]
 mode = "default"
@@ -370,15 +371,6 @@ async fn malformed_mcp_json_returns_parse_error_and_shim_continues() {
 #[tokio::test]
 async fn agent_children_do_not_inherit_agentd_environment() {
     let mut d = Daemon::new(None).await;
-    d.stop(nix::sys::signal::Signal::SIGTERM).await;
-    let path = d.root.path().join("kinds.toml");
-    let config = std::fs::read_to_string(&path).expect("config").replace(
-        "[kind.claude.env]",
-        "[kind.claude.env]\nAGENTD_SOCKET = '/configured/control.sock'\nAGENTD_OVERRIDE = 'configured'",
-    );
-    std::fs::write(path, config).expect("config overrides");
-    d.child = Daemon::start(&d.root);
-    d.ready().await;
     d.spawn("a", "claude", Some("hold")).await;
     let wire = d.wait_wire("a", |v| !prompts(v).is_empty()).await;
     assert_eq!(
@@ -941,6 +933,7 @@ fn stall_timeout_config_is_per_kind_and_zero_disables() {
     std::fs::write(
         &path,
         r#"
+sandbox = "none"
 [kind.claude]
 command = ["claude-agent-acp"]
 stall_timeout_secs = 0

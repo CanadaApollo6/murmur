@@ -50,6 +50,7 @@ fn spec(root: &Path, kind: &str, policy: PermissionPolicy) -> AgentSpec {
         model: None,
         permissions: policy,
         idle_after: None,
+        egress: Vec::new(),
     }
 }
 fn config() -> Config {

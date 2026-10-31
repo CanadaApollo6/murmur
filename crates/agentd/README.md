@@ -25,6 +25,9 @@ agentctl watch
 The default state directory is `~/.local/state/agentd/`. `--state-dir` overrides it.
 The daemon reads `kinds.toml` there when present. An explicit `--config` must exist.
 Without a config, commands default to `claude-agent-acp` and `codex-acp` on PATH.
+Both kinds are preflighted inside bubblewrap. Install both commands or explicitly
+set `sandbox = "none"` for kinds you do not intend to sandbox. An Infinity-only
+configuration can set top-level `sandbox = "none"` because Infinity remains on the host.
 
 ```toml
 # Optional. Paths are relative to the daemon's working directory.
@@ -242,18 +245,47 @@ Agent specs, resume handles and mail survive daemon restarts. SIGINT and SIGTERM
 stop connections, shut down broker actors, then drain and close the mailroom.
 Stale sockets are reclaimed; live sockets and regular files are preserved.
 
-## V1 limitations
+## Agent isolation
 
-Any process running as the same OS user, including an agent with shell access,
-can use the control socket as the human. It can also read sibling shims' tokens
-from `/proc` and impersonate other agents. Agent isolation is best-effort until
-agents run under separate UIDs or a sandbox with a private `/proc`.
+On Linux, ACP agents run in per-incarnation bubblewrap sandboxes by default.
+Each has private user, PID, mount, network, IPC, UTS and cgroup namespaces.
+The control socket, state database and sibling processes are absent. Identity
+comes from a per-agent MCP socket, with no broker token in argv or environment.
+A private network namespace routes HTTPS CONNECT through an allowlist proxy.
+Missing bubblewrap, unavailable namespaces or missing commands fail startup preflight.
+
+See [the isolation design and configuration reference](../../docs/murmur/isolation.md)
+for `[bwrap]`, per-kind `home`, `credentials`, `egress`, env-token examples and gates.
+Existing CLI permission modes still apply inside the sandbox. `agentctl ls` shows
+`isolation` as `bwrap+proxy`, `bwrap+host` or `none`.
+
+Set top-level or per-kind `sandbox = "none"` for the unsandboxed escape hatch.
+`[bwrap] network = "host"` keeps filesystem and PID confinement but restores
+host loopback and unrestricted egress. It is degraded debugging mode.
+Infinity agents are currently unsandboxed because their shared daemon runs on
+the host. Mixed configurations warn at startup. An unsandboxed agent can act
+as the human and reach every agent's socket.
+
+Credential refresh uses directory binds so temporary-file replacement can reach
+the host. Existing noncredential siblings are shadowed with private state.
+The real parent directory remains writable, including new unshadowed entries.
+Use `credentials = []` and `CLAUDE_CODE_OAUTH_TOKEN` or `OPENAI_API_KEY` in
+`kind.env` to avoid exposing that directory and the human's refresh token.
+The OAuth hosts listed in the design are unverified. The default allowlist
+excludes account connectors at `mcp-proxy.anthropic.com`.
+
+Writable workspaces can still plant scripts the human runs later. Toolchain
+binds and `/etc` expose their readable contents. Kernel hardening, credential
+forwarding and resource budgets remain future work. Proxy-unaware tools fail
+closed. A denial names the agent in its HTTP 403 response.
+
+## Other V1 limitations
 
 There is no per-sender mail quota. An agent can flood another agent's queue
 because leaving out `reply_to` restarts the hop count. A per-sender cap and a
 per-turn batch limit are follow-up work.
 
-Token redaction in activity output works per frame and is best-effort. A token
+For unsandboxed agents, token redaction in activity output works per frame and is best-effort. A token
 split across frames may appear without redaction.
 
 Infinity recovery through command-backed RAP tool servers is tested on Linux

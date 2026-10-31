@@ -18,6 +18,7 @@ fn spec(root: &std::path::Path) -> AgentSpec {
         model: None,
         permissions: Default::default(),
         idle_after: None,
+        egress: Vec::new(),
     }
 }
 

@@ -8,7 +8,8 @@ use tokio::sync::Semaphore;
 use agentd::mailroom::Mailroom;
 use agentd::supervisor::Broker;
 use agentd::surfaces::{
-    Bindings, ControlApi, FileConfig, Result, Socket, default_state_dir, mcp_stdio, private_dir,
+    Bindings, BoundListener, ControlApi, FileConfig, Result, Socket, Surface, default_state_dir,
+    mcp_stdio, private_dir,
 };
 use clap::{Parser, Subcommand};
 
@@ -26,7 +27,14 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// MCP stdio relay. The broker injects AGENTD_MCP_TOKEN per session.
+    /// MCP stdio relay. Sandboxed identity comes from the socket.
+    #[command(hide = true)]
+    SandboxInit {
+        #[arg(long)]
+        host_network: bool,
+        #[arg(last = true, required = true)]
+        cmd: Vec<std::ffi::OsString>,
+    },
     Mcp {
         #[arg(long)]
         socket: PathBuf,
@@ -44,9 +52,14 @@ async fn main() {
     }
 }
 async fn run(args: Args) -> Result<()> {
-    if let Some(Command::Mcp { socket }) = args.command {
-        let token = std::env::var("AGENTD_MCP_TOKEN").map_err(|_| "missing MCP session binding")?;
-        return mcp_stdio(&socket, &token).await;
+    match args.command {
+        Some(Command::Mcp { socket }) => {
+            return mcp_stdio(&socket, std::env::var("AGENTD_MCP_TOKEN").ok().as_deref()).await;
+        }
+        Some(Command::SandboxInit { host_network, cmd }) => {
+            return agentd::sandbox::init(host_network, cmd).await;
+        }
+        None => {}
     }
     let initial_state = args.state_dir.clone().unwrap_or_else(default_state_dir);
     let config_path = args
@@ -73,12 +86,36 @@ async fn run(args: Args) -> Result<()> {
         .mcp_socket
         .clone()
         .unwrap_or_else(|| state.join("mcp.sock"));
+    let mut sandbox = cfg.bwrap.clone();
     let kinds = cfg.kinds()?;
+    sandbox.validate(&state, &kinds)?;
+    if kinds
+        .iter()
+        .any(|k| matches!(k.isolation, agentd::sandbox::Isolation::Bwrap(_)))
+    {
+        for kind in &kinds {
+            if matches!(kind.isolation, agentd::sandbox::Isolation::None) {
+                eprintln!(
+                    "agentd: WARNING mixed isolation: kind {} is unsandboxed and its agents can act as the human and as any agent",
+                    kind.name
+                );
+            }
+        }
+    }
+    agentd::sandbox::preflight(&sandbox, &kinds, &state).await?;
+    let (bound_tx, bound_rx) = tokio::sync::mpsc::unbounded_channel();
     let mailroom = Arc::new(Mailroom::open(state.join("mail.db"), Default::default()).await?);
-    let bindings = Arc::new(Bindings::new(mcp_path.clone(), std::env::current_exe()?));
+    let bindings = Arc::new(Bindings::new(
+        mcp_path.clone(),
+        std::env::current_exe()?,
+        bound_tx,
+    ));
     let broker = Arc::new(
-        Broker::new(Arc::clone(&mailroom), kinds, Default::default())?
-            .with_mcp(Arc::clone(&bindings)),
+        Broker::new(Arc::clone(&mailroom), kinds, Default::default())?.with_mcp(
+            Arc::clone(&bindings),
+            state.clone(),
+            sandbox,
+        ),
     );
     let result = serve(
         &control_path,
@@ -86,6 +123,7 @@ async fn run(args: Args) -> Result<()> {
         Arc::clone(&broker),
         Arc::clone(&mailroom),
         bindings,
+        bound_rx,
     )
     .await;
     let shutdown = broker.shutdown().await;
@@ -105,6 +143,7 @@ async fn serve(
     broker: Arc<Broker>,
     mailroom: Arc<Mailroom>,
     bindings: Arc<Bindings>,
+    mut bound: tokio::sync::mpsc::UnboundedReceiver<BoundListener>,
 ) -> Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -121,8 +160,18 @@ async fn serve(
     let control_slots = Arc::new(Semaphore::new(64));
     let mcp_slots = Arc::new(Semaphore::new(64));
     let mut connections = tokio::task::JoinSet::new();
+    let mut listeners = tokio::task::JoinSet::new();
     let result = loop {
         let accepted = tokio::select! {
+            Some(listener) = bound.recv() => {
+                let api = Arc::clone(&api);
+                listeners.spawn(async move { serve_agent(api,listener).await });
+                continue;
+            }
+            done = listeners.join_next(), if !listeners.is_empty() => {
+                if let Some(result) = done {match result {Ok(Ok(()))=>{},other=>eprintln!("agentd: per-agent listener stopped: {other:?}")}}
+                continue;
+            }
             _ = interrupt.recv() => break Ok(()),
             _ = terminate.recv() => break Ok(()),
             stream = control.listener.accept() => stream.map(|(s,_)|(s,false)),
@@ -156,9 +205,40 @@ async fn serve(
         let api = Arc::clone(&api);
         connections.spawn(async move {
             let _permit = permit;
-            api.connection(stream, is_mcp).await
+            api.connection(
+                stream,
+                if is_mcp {
+                    Surface::SharedMcp
+                } else {
+                    Surface::Control
+                },
+            )
+            .await
         });
     };
+    listeners.shutdown().await;
     connections.shutdown().await;
     result
+}
+
+async fn serve_agent(api: Arc<ControlApi>, bound: BoundListener) -> Result<()> {
+    let slots = Arc::new(Semaphore::new(64));
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = bound.cancel.cancelled() => break,
+            accepted = bound.socket.listener.accept() => {
+                let (stream,_) = accepted?;
+                if let Err(error) = Socket::check_peer(&stream) {eprintln!("agentd: {error}"); continue;}
+                let Ok(permit) = slots.clone().try_acquire_owned() else {continue;};
+                let api = api.clone(); let surface = Surface::AgentMcp(bound.identity.clone());
+                connections.spawn(async move {let _permit = permit; api.connection(stream,surface).await});
+            }
+            result = connections.join_next(), if !connections.is_empty() => {
+                if let Some(result) = result {match result {Ok(Ok(()))=>{},other=>tracing::debug!(?other,"agent MCP connection closed")}}
+            }
+        }
+    }
+    connections.shutdown().await;
+    Ok(())
 }

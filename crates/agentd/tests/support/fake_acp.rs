@@ -163,7 +163,7 @@ fn main() {
                     .as_array()
                     .and_then(|a| a.iter().find(|v| v["name"] == "agentd"))
                 {
-                    broker_token = entry["env"][0]["value"].as_str().expect("token").to_owned();
+                    broker_token = entry["env"][0]["value"].as_str().unwrap_or("").to_owned();
                     mcp = Some(Mcp::open(entry));
                 }
                 reply(id, json!({"sessionId":session}));
@@ -173,7 +173,7 @@ fn main() {
                     .as_array()
                     .and_then(|a| a.iter().find(|v| v["name"] == "agentd"))
                 {
-                    broker_token = entry["env"][0]["value"].as_str().expect("token").to_owned();
+                    broker_token = entry["env"][0]["value"].as_str().unwrap_or("").to_owned();
                     mcp = Some(Mcp::open(entry));
                 }
                 assert_eq!(msg["params"]["sessionId"], session);
@@ -205,6 +205,14 @@ fn main() {
                 count += 1;
                 File::create(root.join(format!("prompt-{count}"))).expect("prompt marker");
                 let text = msg["params"]["prompt"].to_string();
+                if text.contains("isolation-probe") {
+                    let status = std::process::Command::new("/usr/bin/python3")
+                        .arg(root.join("probe.py"))
+                        .arg(&root)
+                        .status()
+                        .expect("probe");
+                    assert!(status.success(), "isolation probe failed");
+                }
                 if text.contains("mcp-send") {
                     let mcp = mcp.as_mut().expect("broker MCP entry");
                     let request = json!({"jsonrpc":"2.0","id":"peer-send","method":"tools/call","params":{"name":"send_message","arguments":{"to":"@b","body":"peer payload"}}});

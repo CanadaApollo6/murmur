@@ -21,6 +21,8 @@ pub struct AgentSpec {
     pub model: Option<String>,
     pub permissions: PermissionPolicy,
     pub idle_after: Option<Duration>,
+    #[serde(default)]
+    pub egress: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +40,11 @@ pub enum Phase {
 
 #[derive(Clone, Debug)]
 pub enum Event {
+    EgressDenied {
+        agent: AgentId,
+        host: String,
+        port: u16,
+    },
     PhaseChanged {
         agent: AgentId,
         incarnation: Incarnation,
@@ -188,6 +195,7 @@ pub struct Broker {
     events: broadcast::Sender<Event>,
     config: Config,
     mcp: Option<Arc<crate::surfaces::Bindings>>,
+    isolation: Option<(PathBuf, crate::sandbox::SandboxConfig)>,
 }
 impl Broker {
     pub fn new(mailroom: Arc<Mailroom>, kinds: Vec<KindConfig>, config: Config) -> Result<Self> {
@@ -225,11 +233,25 @@ impl Broker {
             events,
             config,
             mcp: None,
+            isolation: None,
         })
     }
-    pub fn with_mcp(mut self, bindings: Arc<crate::surfaces::Bindings>) -> Self {
+    pub fn with_mcp(
+        mut self,
+        bindings: Arc<crate::surfaces::Bindings>,
+        state: PathBuf,
+        sandbox: crate::sandbox::SandboxConfig,
+    ) -> Self {
+        self.isolation = Some((state, sandbox));
         self.mcp = Some(bindings);
         self
+    }
+    pub fn isolation_label(&self, kind: &str) -> &str {
+        self.kinds.get(kind).map_or("none", |k| {
+            self.isolation
+                .as_ref()
+                .map_or("none", |(_, cfg)| cfg.label(&k.isolation))
+        })
     }
     pub async fn handle(&self, id: AgentId) -> Option<AgentHandle> {
         self.agents.lock().await.get(&id).cloned()
@@ -249,6 +271,25 @@ impl Broker {
             .get(&spec.kind)
             .ok_or_else(|| Error::Rejected("unknown kind".into()))?
             .clone();
+        if let Some((state, _)) = &self.isolation
+            && matches!(kind.isolation, crate::sandbox::Isolation::Bwrap(_))
+        {
+            let cwd =
+                std::fs::canonicalize(&spec.cwd).map_err(|e| Error::Rejected(e.to_string()))?;
+            let state = std::fs::canonicalize(state).map_err(|e| Error::Rejected(e.to_string()))?;
+            if state.starts_with(&cwd)
+                || cwd.starts_with(&state)
+                || cwd == crate::sandbox::host_home()
+                || cwd.starts_with("/run/user")
+            {
+                return Err(Error::Rejected(
+                    "workspace exposes protected host paths".into(),
+                ));
+            }
+            if !spec.egress.iter().all(|h| crate::sandbox::host_pattern(h)) {
+                return Err(Error::Rejected("invalid egress hostname".into()));
+            }
+        }
         let model_agent = matches!(kind.wire, Wire::Infinity { .. });
         let mut spec = spec;
         if spec.model.is_none() {
@@ -271,6 +312,8 @@ impl Broker {
         let actor = AgentActor {
             _lease: lease,
             mcp: self.mcp.clone(),
+            isolation: self.isolation.clone(),
+            kind: kind.clone(),
             id,
             idle_after: if model_agent {
                 None
@@ -345,6 +388,8 @@ impl Broker {
 }
 
 struct AgentActor {
+    isolation: Option<(PathBuf, crate::sandbox::SandboxConfig)>,
+    kind: KindConfig,
     mcp: Option<Arc<crate::surfaces::Bindings>>,
     _lease: crate::mailroom::ActorLease,
     id: AgentId,
@@ -474,14 +519,42 @@ impl AgentActor {
     }
     async fn start(&mut self) -> Result<()> {
         self.phase(Phase::Starting);
-        let mcp_server = match &self.mcp {
-            Some(mcp) => Some(
-                mcp.mint(self.id, self.incarnation)
-                    .await
-                    .map_err(|e| Error::Rejected(e.to_string()))?,
-            ),
-            None => None,
-        };
+        let mut launch = crate::sandbox::direct(&self.kind, &self.spec);
+        if let Some(mcp) = &self.mcp {
+            let prepared = async {
+                if let (crate::sandbox::Isolation::Bwrap(sb), Some((state, cfg))) =
+                    (&self.kind.isolation, &self.isolation)
+                {
+                    let paths = crate::sandbox::AgentPaths::new(state, self.id);
+                    crate::sandbox::seed(sb, &paths.home)?;
+                    let facts = crate::sandbox::Facts::collect(sb, &paths)?;
+                    launch = crate::sandbox::plan(cfg, &self.kind, &self.spec, &paths, &facts);
+                    launch.mcp_server = Some(
+                        mcp.bind(
+                            crate::surfaces::SessionIdentity {
+                                agent: self.id,
+                                incarnation: self.incarnation,
+                            },
+                            &paths,
+                            cfg,
+                            sb,
+                            &self.spec,
+                            self.events.clone(),
+                        )
+                        .await?,
+                    );
+                } else if !self.model_agent {
+                    launch.mcp_server = Some(mcp.mint(self.id, self.incarnation).await?);
+                }
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            }
+            .await;
+            if let Err(error) = prepared {
+                mcp.revoke(self.id).await;
+                self.crash(error.to_string());
+                return Ok(());
+            }
+        }
         match self
             .adapter
             .open(OpenRequest {
@@ -489,7 +562,7 @@ impl AgentActor {
                 spec: &self.spec,
                 resume: self.resume.as_ref(),
                 incarnation: self.incarnation,
-                mcp_server,
+                launch,
             })
             .await
         {

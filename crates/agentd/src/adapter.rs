@@ -9,6 +9,7 @@ use crate::supervisor::AgentSpec;
 #[derive(Clone, Debug)]
 pub struct KindConfig {
     pub wire: Wire,
+    pub isolation: crate::sandbox::Isolation,
     pub model: Option<String>,
     pub name: String,
     pub command: String,
@@ -41,6 +42,7 @@ impl KindConfig {
             socket: socket.into(),
         };
         kind.idle_after = None;
+        kind.isolation = crate::sandbox::Isolation::None;
         kind
     }
     pub fn claude(command: impl Into<String>) -> Self {
@@ -52,6 +54,9 @@ impl KindConfig {
     fn new(name: &str, command: String, mode: &str) -> Self {
         Self {
             wire: Wire::Acp,
+            isolation: crate::sandbox::Isolation::Bwrap(crate::sandbox::KindSandbox::defaults(
+                name,
+            )),
             model: None,
             name: name.into(),
             command,
@@ -114,7 +119,7 @@ pub(crate) struct OpenRequest<'a> {
     pub spec: &'a AgentSpec,
     pub resume: Option<&'a ResumeToken>,
     pub incarnation: Incarnation,
-    pub mcp_server: Option<serde_json::Value>,
+    pub launch: crate::sandbox::Launch,
 }
 
 #[async_trait]

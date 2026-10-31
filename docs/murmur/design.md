@@ -339,4 +339,4 @@ This does not pause the stall timer.
 
 ## Next implementation step
 
-The mailroom, the ACP adapter for Claude and Codex, the supervisor actors, `agentctl`, the bound MCP messaging tools and the Infinity adapter are done. Next, in order: per-agent isolation (one bwrap sandbox per agent, with only the agent's MCP and egress sockets shared), mail limits (per-sender quota, per-pair undelivered cap, per-turn batch limit), `infinity-provider-local`, a RAP toolset so Infinity model agents can send mail, the WebSocket event bus and graph UI, then the swarm layer.
+The mailroom, the ACP adapter for Claude and Codex, the supervisor actors, `agentctl`, the bound MCP messaging tools, the Infinity adapter and [ACP per-agent isolation](isolation.md) are done. Infinity remains unsandboxed. Next, in order: mail limits (per-sender quota, per-pair undelivered cap, per-turn batch limit), `infinity-provider-local`, a RAP toolset so Infinity model agents can send mail, the WebSocket event bus and graph UI, then the swarm layer.

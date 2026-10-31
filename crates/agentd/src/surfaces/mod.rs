@@ -31,6 +31,10 @@ pub fn default_state_dir() -> PathBuf {
 pub struct FileConfig {
     pub state_dir: Option<PathBuf>,
     #[serde(default)]
+    pub sandbox: crate::sandbox::SandboxMode,
+    #[serde(default)]
+    pub bwrap: crate::sandbox::SandboxConfig,
+    #[serde(default)]
     pub listen: ListenConfig,
     #[serde(default)]
     kind: BTreeMap<String, KindFile>,
@@ -44,6 +48,10 @@ pub struct ListenConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KindFile {
+    sandbox: Option<crate::sandbox::SandboxMode>,
+    home: Option<Vec<String>>,
+    credentials: Option<Vec<PathBuf>>,
+    egress: Option<Vec<String>>,
     wire: Option<String>,
     #[serde(default)]
     command: Vec<String>,
@@ -68,6 +76,7 @@ impl FileConfig {
             ("claude".to_owned(), KindConfig::claude("claude-agent-acp")),
             ("codex".to_owned(), KindConfig::codex("codex-acp")),
         ]);
+        let mut overrides = Vec::new();
         for (name, entry) in self.kind {
             let mut kind = match entry.wire.as_deref() {
                 Some("infinity") => {
@@ -103,6 +112,42 @@ impl FileConfig {
                 }
                 Some(_) => return Err("unknown adapter wire".into()),
             };
+            if entry.sandbox == Some(crate::sandbox::SandboxMode::Bwrap) {
+                overrides.push(name.clone());
+            }
+            if matches!(kind.wire, crate::Wire::Infinity { .. }) {
+                if entry.sandbox == Some(crate::sandbox::SandboxMode::Bwrap)
+                    || entry.credentials.is_some()
+                    || entry.home.is_some()
+                    || entry.egress.is_some()
+                {
+                    return Err(
+                        "Infinity is unsandboxed; configure the shared daemon separately".into(),
+                    );
+                }
+            } else if entry.sandbox == Some(crate::sandbox::SandboxMode::None) {
+                kind.isolation = crate::sandbox::Isolation::None;
+            } else if let crate::sandbox::Isolation::Bwrap(sb) = &mut kind.isolation {
+                if let Some(home) = entry.home {
+                    sb.home = home;
+                }
+                if let Some(credentials) = entry.credentials {
+                    sb.credentials = credentials
+                        .iter()
+                        .map(|p| crate::sandbox::expand(p))
+                        .collect();
+                }
+                if let Some(egress) = entry.egress {
+                    sb.egress = egress;
+                }
+            }
+            let effective_none = entry.sandbox == Some(crate::sandbox::SandboxMode::None)
+                || (entry.sandbox.is_none() && self.sandbox == crate::sandbox::SandboxMode::None);
+            if effective_none && matches!(kind.wire, crate::Wire::Acp) {
+                eprintln!(
+                    "agentd: kind {name} is unsandboxed; home, credentials and egress settings are ignored"
+                );
+            }
             kind.name = name.clone();
             kind.model = entry.model;
             kind.env = entry.env;
@@ -128,13 +173,26 @@ impl FileConfig {
             kind.sandbox_args = entry.sandbox_args;
             kinds.insert(name, kind);
         }
+        for kind in kinds.values_mut() {
+            if self.sandbox == crate::sandbox::SandboxMode::None && !overrides.contains(&kind.name)
+            {
+                kind.isolation = crate::sandbox::Isolation::None;
+            }
+        }
         Ok(kinds.into_values().collect())
     }
 }
 
 mod bindings;
 use bindings::AuthenticatedSender;
-pub use bindings::Bindings;
+pub use bindings::{Bindings, BoundListener, SessionIdentity};
+
+#[derive(Clone)]
+pub enum Surface {
+    Control,
+    SharedMcp,
+    AgentMcp(SessionIdentity),
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -186,7 +244,7 @@ impl ControlApi {
                 .map_or(Phase::Ended, |h| h.phase());
             rows.push(
                 json!({"id":format!("agent:{id}"),"name":format!("@{}",spec.name.as_str()),
-                "kind":spec.kind,"phase":phase_name(&phase),
+                "kind":spec.kind,"isolation":self.broker.isolation_label(&spec.kind),"phase":phase_name(&phase),
                 "queued":self.mailroom.pending_for(id).await?.len()}),
             );
         }
@@ -305,9 +363,23 @@ impl ControlApi {
             ControlRequest::Watch => Err("watch requires streaming".into()),
         }
     }
-    async fn mcp(&self, bearer: &str, session: &str, request: Value) -> Value {
+    async fn mcp(
+        &self,
+        surface: &Surface,
+        bearer: Option<&str>,
+        session: &str,
+        request: Value,
+    ) -> Value {
         let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let Some(binding) = self.bindings.authenticate_mcp(bearer).await else {
+        if matches!(surface, Surface::AgentMcp(_)) && bearer.is_some() {
+            return rpc_error(id, -32600, "token on per-agent listener");
+        }
+        let binding = match surface {
+            Surface::AgentMcp(identity) => self.bindings.authenticate_agent(identity).await,
+            Surface::SharedMcp => self.bindings.authenticate_mcp(bearer.unwrap_or("")).await,
+            Surface::Control => None,
+        };
+        let Some(binding) = binding else {
             return rpc_error(id, -32001, "unknown or revoked MCP token");
         };
         if session.len() != 64 || !session.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -361,16 +433,18 @@ impl ControlApi {
             Err(e) => rpc_error(id, -32601, e),
         }
     }
-    pub async fn connection(&self, stream: UnixStream, mcp: bool) -> Result<()> {
+    pub async fn connection(&self, stream: UnixStream, surface: Surface) -> Result<()> {
         let (read, mut write) = stream.into_split();
         let mut read = BufReader::new(read);
         while let Some(line) = read_frame(&mut read).await? {
-            if mcp {
+            if !matches!(surface, Surface::Control) {
                 let value: Value =
                     serde_json::from_slice(&line).map_err(|_| "invalid MCP relay frame")?;
-                let token = value["token"].as_str().unwrap_or("");
+                let token = value.get("token").map(|v| v.as_str().unwrap_or(""));
                 let session = value["session"].as_str().unwrap_or("");
-                let response = self.mcp(token, session, value["request"].clone()).await;
+                let response = self
+                    .mcp(&surface, token, session, value["request"].clone())
+                    .await;
                 write_frame(&mut write, &response).await?;
                 continue;
             }
@@ -448,6 +522,9 @@ fn phase_name(phase: &Phase) -> &'static str {
 fn event_json(event: crate::supervisor::Event) -> Value {
     use crate::supervisor::Event;
     match event {
+        Event::EgressDenied { agent, host, port } => {
+            json!({"event":"egress_denied","agent":agent,"host":host,"port":port})
+        }
         Event::PhaseChanged {
             agent,
             incarnation,
@@ -493,6 +570,20 @@ pub async fn write_frame(
     Ok(())
 }
 
+#[derive(Clone)]
+pub struct SocketIdentity {
+    path: PathBuf,
+    inode: u64,
+}
+impl SocketIdentity {
+    pub fn unlink(&self) {
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.ino() == self.inode)
+            && let Err(error) = std::fs::remove_file(&self.path)
+        {
+            tracing::error!(%error,"socket cleanup failed");
+        }
+    }
+}
 pub struct Socket {
     pub listener: UnixListener,
     path: PathBuf,
@@ -526,6 +617,12 @@ impl Socket {
             inode,
         })
     }
+    pub fn identity(&self) -> SocketIdentity {
+        SocketIdentity {
+            path: self.path.clone(),
+            inode: self.inode,
+        }
+    }
     pub fn check_peer(stream: &UnixStream) -> Result<()> {
         if stream.peer_cred()?.uid() != nix::unistd::geteuid().as_raw() {
             return Err("socket peer belongs to another user".into());
@@ -535,11 +632,7 @@ impl Socket {
 }
 impl Drop for Socket {
     fn drop(&mut self) {
-        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.ino() == self.inode)
-            && let Err(e) = std::fs::remove_file(&self.path)
-        {
-            tracing::error!(%e,"socket cleanup failed");
-        }
+        self.identity().unlink();
     }
 }
 pub fn private_dir(path: &Path) -> Result<()> {
@@ -561,7 +654,7 @@ pub fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn mcp_stdio(socket: &Path, token: &str) -> Result<()> {
+pub async fn mcp_stdio(socket: &Path, token: Option<&str>) -> Result<()> {
     let session = bindings::random_namespace()?;
     let mut input = BufReader::new(tokio::io::stdin());
     let mut output = tokio::io::stdout();
@@ -579,11 +672,11 @@ pub async fn mcp_stdio(socket: &Path, token: &str) -> Result<()> {
         let stream = UnixStream::connect(socket).await?;
         Socket::check_peer(&stream)?;
         let (read, mut write) = stream.into_split();
-        write_frame(
-            &mut write,
-            &json!({"token":token,"session":session,"request":request}),
-        )
-        .await?;
+        let mut frame = json!({"session":session,"request":request});
+        if let Some(token) = token {
+            frame["token"] = json!(token);
+        }
+        write_frame(&mut write, &frame).await?;
         let response = read_frame(&mut BufReader::new(read))
             .await?
             .ok_or("MCP relay closed")?;
@@ -591,4 +684,73 @@ pub async fn mcp_stdio(socket: &Path, token: &str) -> Result<()> {
         output.flush().await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    use crate::sandbox::{Isolation, SandboxConfig};
+    #[test]
+    fn isolation_defaults_overrides_and_infinity() {
+        let config: FileConfig = toml::from_str(
+            r#"
+sandbox = "none"
+[kind.claude]
+command = ["claude-agent-acp"]
+sandbox = "bwrap"
+credentials = []
+[kind.infinity]
+wire = "infinity"
+socket = "/host/infinity.sock"
+"#,
+        )
+        .expect("config");
+        let kinds = config.kinds().expect("kinds");
+        assert!(matches!(
+            kinds
+                .iter()
+                .find(|k| k.name == "claude")
+                .expect("claude")
+                .isolation,
+            Isolation::Bwrap(_)
+        ));
+        for name in ["codex", "infinity"] {
+            assert!(matches!(
+                kinds
+                    .iter()
+                    .find(|k| k.name == name)
+                    .expect("kind")
+                    .isolation,
+                Isolation::None
+            ));
+        }
+        let config: FileConfig = toml::from_str(
+            r#"[kind.infinity]
+wire = "infinity"
+socket = "/host/infinity.sock"
+sandbox = "bwrap"
+"#,
+        )
+        .expect("config");
+        assert!(config.kinds().is_err());
+    }
+    #[test]
+    fn configured_control_environment_is_rejected() {
+        for name in [
+            "AGENTD_OVERRIDE",
+            "SSH_AUTH_SOCK",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ] {
+            let config: FileConfig = toml::from_str(&format!(
+                "[kind.claude]\ncommand = ['cli']\n[kind.claude.env]\n{name} = 'host-control'\n"
+            ))
+            .expect("config");
+            let kinds = config.kinds().expect("kinds");
+            assert!(
+                SandboxConfig::default()
+                    .validate(Path::new("/state"), &kinds)
+                    .is_err()
+            );
+        }
+    }
 }

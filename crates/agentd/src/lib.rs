@@ -12,3 +12,6 @@ pub use adapter::{KindConfig, SandboxArgs, Wire};
 
 #[cfg(unix)]
 pub mod surfaces;
+
+pub mod egress;
+pub mod sandbox;

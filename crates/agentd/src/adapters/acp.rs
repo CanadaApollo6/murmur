@@ -62,32 +62,34 @@ fn protocol(e: impl std::fmt::Display) -> AdapterError {
 impl Adapter for AcpAdapter {
     async fn open(&self, req: OpenRequest<'_>) -> Result<Box<dyn Session>, AdapterError> {
         let secret = req
+            .launch
             .mcp_server
             .as_ref()
             .and_then(|v| v["env"][0]["value"].as_str())
             .map(str::to_owned);
-        let mut cmd = Command::new(&self.0.command);
-        cmd.args(&self.0.args)
-            .envs(&self.0.env)
+        let mut cmd = Command::new(&req.launch.program);
+        cmd.args(&req.launch.args)
             .current_dir(&req.spec.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        // Control settings belong to the daemon, including configured overrides.
-        for name in std::env::vars_os()
-            .map(|(name, _)| name)
-            .chain(self.0.env.keys().map(Into::into))
-        {
-            if name.to_string_lossy().starts_with("AGENTD_") {
-                cmd.env_remove(name);
+        match &req.launch.env {
+            crate::sandbox::Env::Clear(env) => {
+                cmd.env_clear().envs(env.iter().cloned());
+            }
+            crate::sandbox::Env::Inherit(env) => {
+                cmd.envs(env);
+                for name in std::env::vars_os()
+                    .map(|(name, _)| name)
+                    .chain(env.keys().map(Into::into))
+                {
+                    if name.to_string_lossy().starts_with("AGENTD_") {
+                        cmd.env_remove(name);
+                    }
+                }
             }
         }
-        cmd.args(match req.spec.permissions.sandbox {
-            SandboxLevel::ReadOnly => &self.0.sandbox_args.read_only,
-            SandboxLevel::WorkspaceWrite => &self.0.sandbox_args.workspace_write,
-            SandboxLevel::FullAccess => &self.0.sandbox_args.full_access,
-        });
         #[cfg(unix)]
         cmd.process_group(0);
         let mut child = cmd
@@ -240,7 +242,7 @@ impl AcpSession {
             .as_bool()
             .unwrap_or(false);
         let mut servers = self.kind.mcp_servers.clone();
-        servers.extend(req.mcp_server.clone());
+        servers.extend(req.launch.mcp_server.clone());
         let mut params = json!({"cwd":req.spec.cwd,"mcpServers":servers});
         if let Some(token) = req.resume {
             let saved: AcpResume = token.decode().map_err(protocol)?;
