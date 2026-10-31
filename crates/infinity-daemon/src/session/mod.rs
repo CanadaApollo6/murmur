@@ -482,13 +482,19 @@ impl SessionManager {
 
     /// Resume a persisted session, recovering its cwd from the session store.
     /// Does NOT boot the agent loop — that happens lazily on first user input
-    /// via `send_input`. This just emits `Connected` so the client can attach.
+    /// via `send_input`. Clears shutdown and emits `Connected` for attachment.
     pub async fn resume_session(
         &self,
         session_id: &ThreadId<str>,
         thread_id: &ThreadId<str>,
         emit: &mut impl AsyncFnMut(DaemonMessage),
     ) -> Result<(), BoxError> {
+        {
+            let mut store = self.session_store.lock().await;
+            if store.clear_shut_down(session_id) {
+                store.save()?;
+            }
+        }
         emit(self.build_connected(session_id, thread_id)).await;
         Ok(())
     }

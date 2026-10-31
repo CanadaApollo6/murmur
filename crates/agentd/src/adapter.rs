@@ -148,6 +148,7 @@ pub(crate) enum TurnItem {
 pub(crate) enum SessionEvent {
     ResumeUpdated,
     CancelComplete,
+    CancelTimedOut,
     TurnStarted { ids: Vec<MessageId> },
     Committed { ids: Vec<MessageId> },
     Activity(String),

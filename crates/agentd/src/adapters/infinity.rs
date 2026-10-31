@@ -242,6 +242,14 @@ impl InfinitySession {
                 .ok_or(AdapterError::Ended)?
                 .map_err(protocol)?;
             let replay = matches!(message, DaemonMessage::Replay { .. });
+            // Shutdown kills RAP servers, but a streaming completion survives.
+            let streaming = matches!(
+                message,
+                DaemonMessage::Replay {
+                    in_progress: true,
+                    ..
+                }
+            );
             self.receive(message)?;
             if replay {
                 if saved
@@ -250,7 +258,9 @@ impl InfinitySession {
                     && self.thread_busy
                 {
                     self.needs_interrupt = true;
-                    self.cancel().await?;
+                    if !streaming {
+                        self.cancel().await?;
+                    }
                 }
                 return Ok(());
             }
@@ -425,7 +435,9 @@ impl InfinitySession {
                     match session.status {
                         infinity_protocol::SessionStatus::Stopped => {
                             self.needs_interrupt = true;
-                            return Err(protocol("Infinity root thread stopped"));
+                            return Err(AdapterError::Unavailable(
+                                "Infinity root thread stopped".into(),
+                            ));
                         }
                         infinity_protocol::SessionStatus::Archived => {
                             return Err(AdapterError::ResumeFailed(
@@ -562,8 +574,12 @@ impl Session for InfinitySession {
                     None => std::future::pending().await,
                 } } => {
                     self.ended = true;
-                    return Some(SessionEvent::Unavailable {
-                        reason: "Infinity receipt or interrupt deadline exceeded".into(),
+                    return Some(if self.cancel_deadline.is_some() {
+                        SessionEvent::CancelTimedOut
+                    } else {
+                        SessionEvent::Unavailable {
+                            reason: "Infinity receipt deadline exceeded".into(),
+                        }
                     });
                 },
                 msg = self.rx.recv() => msg.unwrap_or_else(|| Err("Infinity daemon connection closed".into())),
@@ -571,7 +587,7 @@ impl Session for InfinitySession {
             let needs_interrupt = self.needs_interrupt;
             let result = incoming.map_err(protocol).and_then(|msg| self.receive(msg));
             if needs_interrupt != self.needs_interrupt {
-                self.events.push_back(SessionEvent::ResumeUpdated);
+                self.events.push_front(SessionEvent::ResumeUpdated);
             }
             if let Err(error) = result {
                 self.ended = true;

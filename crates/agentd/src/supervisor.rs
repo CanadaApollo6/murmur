@@ -291,6 +291,7 @@ impl Broker {
             pending: HashMap::new(),
             crashes: VecDeque::new(),
             unavailable_attempts: 0,
+            interrupt_timeouts: 0,
             idle_since: Instant::now(),
         };
         tokio::spawn(actor.run());
@@ -343,6 +344,7 @@ struct AgentActor {
     pending: HashMap<PermissionId, (PermissionRequest, Option<Instant>)>,
     crashes: VecDeque<Instant>,
     unavailable_attempts: u32,
+    interrupt_timeouts: usize,
     idle_since: Instant,
 }
 
@@ -431,13 +433,6 @@ impl AgentActor {
                     },
                 },
                 event = async { match &mut self.session { Some(s) => s.next_event().await, None => std::future::pending().await } } => {
-                    if self.model_agent && let Some(session) = &self.session {
-                        let token = session.resume_token();
-                        if self.resume.as_ref() != Some(&token) {
-                            self.mailroom.save_resume(self.id, token.clone()).await?;
-                            self.resume = Some(token);
-                        }
-                    }
                     self.on_event(event.unwrap_or(SessionEvent::Ended { reason: "session event stream closed".into() })).await?;
                 },
                 () = async { match deadline { Some(d) => tokio::time::sleep_until(d).await, None => std::future::pending().await } } => self.timer().await?,
@@ -466,7 +461,6 @@ impl AgentActor {
             .await
         {
             Ok(mut session) => {
-                self.unavailable_attempts = 0;
                 let busy = session.busy();
                 if self.cancelling {
                     if busy {
@@ -576,6 +570,8 @@ impl AgentActor {
             }
             SessionEvent::Committed { ids } => {
                 self.validate_ids(&ids)?;
+                self.unavailable_attempts = 0;
+                self.interrupt_timeouts = 0;
                 self.mailroom.mark_consumed(&ids, self.incarnation).await?;
                 self.offered.retain(|id| !ids.contains(id));
                 self.emit(Event::Consumed {
@@ -584,6 +580,8 @@ impl AgentActor {
                 });
             }
             SessionEvent::CancelComplete => {
+                self.unavailable_attempts = 0;
+                self.interrupt_timeouts = 0;
                 self.cancelling = false;
                 self.clear_pending();
                 self.emit(Event::TurnEnded {
@@ -596,6 +594,8 @@ impl AgentActor {
                 if !self.offered.is_empty() {
                     self.end("turn ended without receipt".into()).await?;
                 } else {
+                    self.unavailable_attempts = 0;
+                    self.interrupt_timeouts = 0;
                     self.cancelling = false;
                     self.clear_pending();
                     self.emit(Event::TurnEnded {
@@ -616,7 +616,26 @@ impl AgentActor {
                 }
                 self.permission(request).await?;
             }
-            SessionEvent::ResumeUpdated => {}
+            SessionEvent::ResumeUpdated => {
+                if let Some(session) = &self.session {
+                    let token = session.resume_token();
+                    self.mailroom.save_resume(self.id, token.clone()).await?;
+                    self.resume = Some(token);
+                }
+            }
+            SessionEvent::CancelTimedOut => {
+                self.stop_session().await?;
+                self.unavailable_attempts = self.unavailable_attempts.saturating_add(1);
+                self.interrupt_timeouts = self.interrupt_timeouts.saturating_add(1);
+                if self.interrupt_timeouts >= self.config.crash_limit {
+                    self.phase(Phase::NeedsRecovery {
+                        reason: "Infinity interrupt deadline repeatedly exceeded without progress"
+                            .into(),
+                    });
+                } else {
+                    self.retry(self.unavailable_attempts);
+                }
+            }
             SessionEvent::Ended { reason } => self.end(reason).await?,
             SessionEvent::ResumeFailed { reason } => {
                 self.stop_session().await?;
