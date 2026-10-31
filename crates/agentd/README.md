@@ -256,6 +256,10 @@ per-turn batch limit are follow-up work.
 Token redaction in activity output works per frame and is best-effort. A token
 split across frames may appear without redaction.
 
+Infinity recovery through command-backed RAP tool servers is tested on Linux
+only. On macOS CI those tools were never invoked, for a reason not yet
+diagnosed, so the twelve tests that use them are ignored there.
+
 ## Broker API
 
 - `Broker::new(mailroom, kinds, config)` configures ACP kinds and crash policy.

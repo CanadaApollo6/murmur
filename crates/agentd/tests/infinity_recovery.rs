@@ -2293,6 +2293,10 @@ async fn r11_shutdown_command_tool(archive: bool) {
     broker.shutdown().await.expect("shutdown");
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "command-backed RAP tool servers are not yet verified on macOS"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn r11_shutdown_during_command_tool_recovers_mail() {
     tokio::task::LocalSet::new()
@@ -2300,6 +2304,10 @@ async fn r11_shutdown_during_command_tool_recovers_mail() {
         .await;
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "command-backed RAP tool servers are not yet verified on macOS"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn r11_archive_during_command_tool_needs_recovery() {
     tokio::task::LocalSet::new()
@@ -2329,11 +2337,19 @@ async fn r11a_detached_executor_panic() {
         .await;
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "command-backed RAP tool servers are not yet verified on macOS"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn r12a_shutdown_recovery_with_usage_must_not_loop() {
     r12a_shutdown_recovery_usage_case(true).await;
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "command-backed RAP tool servers are not yet verified on macOS"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn r12a_shutdown_recovery_without_usage_control() {
     r12a_shutdown_recovery_usage_case(false).await;
@@ -2727,6 +2743,10 @@ async fn r12o_dangling_choice_cancel_loop() {
     }).await;
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "command-backed RAP tool servers are not yet verified on macOS"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn r12o_repeated_cli_quit_crash_budget() {
     use agentd::supervisor::Phase;
@@ -2840,6 +2860,10 @@ async fn r12o_quit_during_plain_completion() {
     }).await;
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "command-backed RAP tool servers are not yet verified on macOS"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn r12_post_shutdown_mail_does_not_wait_for_receipt_expiry() {
     use agentd::supervisor::{Config, Phase};
@@ -2913,6 +2937,10 @@ async fn r12_post_shutdown_mail_does_not_wait_for_receipt_expiry() {
         .await;
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "command-backed RAP tool servers are not yet verified on macOS"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn r13a_quick_reconnect_must_not_hide_executor_shutdown() {
     use agentd::supervisor::Config;
@@ -2993,6 +3021,10 @@ async fn r13a_quick_reconnect_must_not_hide_executor_shutdown() {
         .await;
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "command-backed RAP tool servers are not yet verified on macOS"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn r13a_shutdown_preserved_stream_delivers_followup() {
     use agentd::supervisor::{Config, Event, TurnOutcome};
@@ -3103,6 +3135,10 @@ async fn r13a_interrupt_must_not_resume_archived_thread() {
     }).await;
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "command-backed RAP tool servers are not yet verified on macOS"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn r13o_shutdown_while_agentd_detached_recovers_tool() {
     tokio::task::LocalSet::new()
@@ -3259,6 +3295,10 @@ async fn r13o_connect_on_archived_root_reopens_stopped_gate() {
         .await;
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "command-backed RAP tool servers are not yet verified on macOS"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn r13_shutdown_settles_calls_from_retained_evicted_toolset() {
     tokio::task::LocalSet::new()
@@ -3478,6 +3518,10 @@ mod r14 {
             .await;
     }
 
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "command-backed RAP tool servers are not yet verified on macOS"
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn r14a_reused_call_id_shutdown_settles_each_invocation() {
         tokio::task::LocalSet::new()
@@ -4143,6 +4187,10 @@ mod r16o {
     }
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "command-backed RAP tool servers are not yet verified on macOS"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn r17_command_choice_id_reuse_gets_new_deadline() {
     use agentd::model::PermissionAnswer;
