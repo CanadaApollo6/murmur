@@ -1335,3 +1335,113 @@ mod r15o {
         t.finish().await;
     }
 }
+
+#[tokio::test]
+async fn r17_cancelled_send_still_arms_timer_for_durable_mail() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    struct BlockingAccept {
+        entered: Arc<tokio::sync::Notify>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl agentd::mailroom::Interceptor for BlockingAccept {
+        fn name(&self) -> &'static str {
+            "block-cancelled-send"
+        }
+        fn inspect(
+            &self,
+            envelope: &Envelope,
+            _: &agentd::mailroom::ConversationView,
+        ) -> agentd::mailroom::Verdict {
+            if envelope.body().as_str() == "response-only" {
+                self.entered.notify_one();
+                self.release
+                    .lock()
+                    .expect("release lock")
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("release acceptance");
+            }
+            agentd::mailroom::Verdict::Deliver
+        }
+    }
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (release, released) = std::sync::mpsc::channel();
+    let root = tempfile::tempdir().expect("tempdir");
+    let mailroom = Arc::new(
+        Mailroom::open(
+            root.path().join("mail.db"),
+            agentd::mailroom::Config {
+                interceptors: vec![Box::new(BlockingAccept {
+                    entered: entered.clone(),
+                    release: std::sync::Mutex::new(released),
+                })],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("mailroom"),
+    );
+    let mut k = kind(root.path(), false);
+    k.stall_timeout = Duration::from_millis(300);
+    let broker = Broker::new(mailroom.clone(), vec![k], config()).expect("broker");
+    let events = broker.events();
+    let agent = broker
+        .spawn(spec(root.path(), "claude", Default::default()))
+        .await
+        .expect("spawn");
+    let mut t = Test {
+        root,
+        mailroom,
+        broker,
+        events,
+        agent,
+    };
+    let first = t.send("hold").await;
+    t.started(first).await;
+    let message = NewMessage {
+        from: Sender::Human,
+        to: t.agent.id,
+        body: Body::new("response-only").expect("body"),
+        reply_to: None,
+        client_key: ClientKey("cancelled-send".into()),
+        act: Act::Inform,
+        task: None,
+    };
+    let mut send = Box::pin(t.broker.send(message));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        matches!(send.as_mut().poll(&mut cx), Poll::Pending),
+        "probe must cancel while mailroom accept awaits its worker"
+    );
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("acceptance reached worker");
+    drop(send);
+    release.send(()).expect("unblock acceptance");
+    let queued = t.mailroom.pending_for(t.agent.id).await.expect("queued");
+    assert_eq!(
+        queued.len(),
+        1,
+        "mailroom worker committed the cancelled send"
+    );
+    let waiting = queued[0].id();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let cancelled = t.wire().iter().any(|m| m["method"] == "session/cancel");
+    let state = t.mailroom.delivery(waiting).await.expect("delivery").state;
+    eprintln!(
+        "R17 cancelled Broker::send: elapsed=1200ms stall=300ms cancellation={cancelled} mail={state:?} phase={:?}",
+        t.agent.phase()
+    );
+    t.agent
+        .pending_permissions()
+        .await
+        .expect("unrelated command");
+    t.event(|e| matches!(e, Event::Activity { text, .. } if text.contains("mail-starvation stall timeout"))).await;
+    t.consumed(waiting).await;
+    eprintln!("R17 wakeup control confirms waiting mail is eventually consumed");
+    t.finish().await;
+    assert!(
+        cancelled,
+        "durably accepted mail must arm starvation even if the send caller disappears"
+    );
+}

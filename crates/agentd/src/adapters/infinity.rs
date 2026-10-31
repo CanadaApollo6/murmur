@@ -27,7 +27,8 @@ struct InfinityResume {
 
 struct Choice {
     wire_id: infinity_protocol::ChoiceId,
-    count: usize,
+    // Keep answered identity until daemon dismissal, without accepting another answer.
+    count: Option<usize>,
 }
 
 struct InfinitySession {
@@ -279,6 +280,17 @@ impl InfinitySession {
         }
     }
 
+    fn settle_choice(&mut self, id: PermissionId) {
+        let choice = self
+            .choices
+            .remove(&id)
+            .expect("bug: missing settled choice");
+        self.events.push_back(SessionEvent::PermissionSettled {
+            id,
+            key: choice.wire_id.to_string(),
+        });
+    }
+
     fn finish_input(&mut self) {
         if self.thread_busy || !self.choices.is_empty() || !self.pending.is_empty() {
             return;
@@ -336,10 +348,18 @@ impl InfinitySession {
                 }
                 self.started()
             }
-            DaemonMessage::ResponseDone { thread_id, .. }
-            | DaemonMessage::ThinkingEnd { thread_id }
-                if self.root_event(&thread_id) =>
-            {
+            DaemonMessage::ResponseDone { thread_id, .. } if self.root_event(&thread_id) => {
+                self.events
+                    .push_back(SessionEvent::Activity("completion finished".into()));
+                // Core emits receipts before ResponseDone. These offers were not
+                // included in this completion and may be waiting behind its tools.
+                if !self.pending.is_empty() {
+                    self.events.push_back(SessionEvent::Waiting {
+                        ids: self.pending.keys().copied().collect(),
+                    });
+                }
+            }
+            DaemonMessage::ThinkingEnd { thread_id } if self.root_event(&thread_id) => {
                 self.events
                     .push_back(SessionEvent::Activity("completion finished".into()));
             }
@@ -370,6 +390,10 @@ impl InfinitySession {
             DaemonMessage::ThreadIdle { thread_id } if self.root_event(&thread_id) => {
                 self.thread_busy = false;
                 self.needs_interrupt = false;
+                // Authoritative idle also settles retained answered identities.
+                for id in self.choices.keys().copied().collect::<Vec<_>>() {
+                    self.settle_choice(id);
+                }
                 self.receipt_deadline =
                     (!self.pending.is_empty()).then(|| Instant::now() + self.kind.request_timeout);
                 self.finish_input();
@@ -382,10 +406,18 @@ impl InfinitySession {
                 ..
             } if self.root_event(&thread_id) => {
                 self.started();
-                if self.cancel_deadline.is_some()
-                    || self.choices.values().any(|choice| choice.wire_id == id)
-                {
+                if self.cancel_deadline.is_some() {
                     return Ok(());
+                }
+                if let Some((&previous, choice)) =
+                    self.choices.iter().find(|(_, choice)| choice.wire_id == id)
+                {
+                    if choice.count.is_some() {
+                        return Ok(());
+                    }
+                    // A live new question replaces the answered one. Replay below
+                    // restores identities separately and preserves their deadlines.
+                    self.settle_choice(previous);
                 }
                 let permission = PermissionId::new();
                 let options = choices
@@ -403,7 +435,7 @@ impl InfinitySession {
                     permission,
                     Choice {
                         wire_id: id,
-                        count: choices.len(),
+                        count: Some(choices.len()),
                     },
                 );
                 self.events
@@ -424,8 +456,7 @@ impl InfinitySession {
                     .filter_map(|(id, choice)| (choice.wire_id == choice_id).then_some(*id))
                     .collect::<Vec<_>>();
                 for id in settled {
-                    self.choices.remove(&id);
-                    self.events.push_back(SessionEvent::PermissionSettled(id));
+                    self.settle_choice(id);
                 }
             }
             DaemonMessage::Replay {
@@ -435,6 +466,7 @@ impl InfinitySession {
             } => {
                 // Replay restores core liveness, never delivery evidence.
                 self.thread_busy = !idle;
+                self.choices.clear();
                 let mut restored = Vec::new();
                 for choice in pending_choices {
                     let start = self.events.len();
@@ -573,14 +605,17 @@ impl Session for InfinitySession {
     async fn answer_permission(&mut self, id: PermissionId, key: &str) -> Result<(), AdapterError> {
         let choice = self.choices.get(&id).ok_or(AdapterError::StaleChoice)?;
         let selected: usize = key.parse().map_err(protocol)?;
-        if selected >= choice.count {
+        if selected >= choice.count.ok_or(AdapterError::StaleChoice)? {
             return Err(protocol("invalid Infinity choice"));
         }
         self.send(ClientMessage::UserChoiceAnswered {
             choice_id: choice.wire_id.clone(),
             selected,
         })?;
-        self.choices.remove(&id);
+        self.choices
+            .get_mut(&id)
+            .expect("bug: answered choice missing")
+            .count = None;
         Ok(())
     }
     async fn next_event(&mut self) -> Option<SessionEvent> {
