@@ -1790,7 +1790,6 @@ where
 
                 let chunk = match res {
                     Ok(c) => {
-                        retry_count = 0;
                         // The model produced output for this request, so its
                         // context accepted the inputs: they are now safe to
                         // persist.
@@ -2030,6 +2029,7 @@ where
                             yield CompletionEvent::ThinkingChunk(reasoning);
                         }
                         StreamChunk::Final(r) => {
+                            retry_count = 0;
                             if is_thinking {
                                 yield CompletionEvent::ThinkingEnd;
                             }
@@ -4729,6 +4729,51 @@ mod tests {
             ErrorClass::ContextOverflow,
             "input is too long for the model",
         )
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn partial_stream_errors_exhaust_retry_budget_and_validate_inputs() {
+        struct PartialProvider(std::sync::atomic::AtomicU32);
+        #[async_trait::async_trait]
+        impl ModelProvider for PartialProvider {
+            async fn list_models(
+                &self,
+            ) -> Result<Vec<infinity_provider_protocol::ModelEntry>, BoxError> {
+                Ok(vec![])
+            }
+            async fn invoke_model(
+                &self,
+                _: &str,
+                _: CompletionRequest,
+            ) -> Result<infinity_provider_protocol::ModelStream, CompletionError> {
+                let attempt = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    attempt <= MAX_COMPLETION_RETRIES,
+                    "partial output must not reset the retry budget"
+                );
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(StreamChunk::Text("partial".into())),
+                    Err(CompletionError::provider(
+                        ErrorClass::Transient,
+                        "broken stream",
+                    )),
+                ])))
+            }
+        }
+        let provider = PartialProvider(std::sync::atomic::AtomicU32::new(0));
+        let store = InMemoryConversationStore::new();
+        let hm = make_history(&store, vec![]).await;
+        add_user_input(&hm, "accepted input", "input");
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let events = collect_completion_events(&provider, &hm, cancel_rx).await;
+        assert_eq!(
+            provider.0.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_COMPLETION_RETRIES + 1
+        );
+        assert!(events.iter().any(|e| e.contains("broken stream")));
+        assert_eq!(hm.unvalidated_len(), 0);
+        hm.sync().await.expect("persist validated input");
+        assert!(persisted(&store).contains("accepted input"));
     }
 
     /// An oversized *user input* cannot be shrunk: on a context-overflow
