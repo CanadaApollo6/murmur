@@ -1,0 +1,32 @@
+[package]
+name = "infinity-provider-local"
+version = "0.2.0"
+edition = "2024"
+repository = { workspace = true }
+license = "Apache-2.0"
+description = "Loopback inference provider for Infinity"
+
+[dependencies]
+infinity-provider-protocol = { path = "../infinity-provider-protocol", version = "^0.2.0", features = ["remote"] }
+async-trait = { workspace = true }
+async-stream = "0.3"
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+uuid = { workspace = true }
+regex = "1"
+
+[dev-dependencies]
+axum = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+insta = { workspace = true }
+
+[lints]
+workspace = true
