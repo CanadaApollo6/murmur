@@ -1618,3 +1618,158 @@ async fn bwrap_without_mcp_context_is_rejected_before_launch() {
     );
     assert!(!root.path().join("wire.jsonl").exists());
 }
+
+#[tokio::test]
+async fn per_turn_limit_drains_queued_mail_on_idle_without_new_sends() {
+    bounded_turns(false).await;
+}
+
+#[tokio::test]
+async fn exhausted_batch_does_not_strand_later_queued_mail() {
+    bounded_turns(true).await;
+}
+
+async fn bounded_turns(exhausted_prefix: bool) {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut exhausted = Vec::new();
+    if exhausted_prefix {
+        let mailroom = Mailroom::open(
+            root.path().join("mail.db"),
+            agentd::mailroom::Config {
+                max_attempts: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("initial mailroom");
+        let id = mailroom
+            .register(AgentName::parse("worker").expect("name"))
+            .await
+            .expect("recipient");
+        for i in 0..2 {
+            exhausted.push(
+                mailroom
+                    .accept(NewMessage {
+                        from: Sender::Human,
+                        to: id,
+                        body: Body::new("previous attempt").expect("body"),
+                        reply_to: None,
+                        client_key: ClientKey(format!("old-{i}")),
+                        act: Act::Inform,
+                        task: None,
+                    })
+                    .await
+                    .expect("old mail")
+                    .1
+                    .id(),
+            );
+        }
+        mailroom
+            .mark_offered(&exhausted, Incarnation(0))
+            .await
+            .expect("first attempt");
+        mailroom
+            .session_ended(id, Incarnation(0), false)
+            .await
+            .expect("requeue");
+        mailroom
+            .close()
+            .await
+            .expect("close before lowering attempt cap");
+    }
+    let mailroom = Arc::new(
+        Mailroom::open(
+            root.path().join("mail.db"),
+            agentd::mailroom::Config {
+                max_attempts: 1,
+                limits: agentd::mailroom::MailLimits {
+                    per_turn: std::num::NonZeroU32::new(2),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("mailroom"),
+    );
+    let id = mailroom
+        .register(AgentName::parse("worker").expect("name"))
+        .await
+        .expect("recipient");
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        ids.push(
+            mailroom
+                .accept(NewMessage {
+                    from: Sender::Human,
+                    to: id,
+                    body: Body::new(format!("mail-{i}")).expect("body"),
+                    reply_to: None,
+                    client_key: ClientKey(format!("batch-{i}")),
+                    act: Act::Inform,
+                    task: None,
+                })
+                .await
+                .expect("queue before spawn")
+                .1
+                .id(),
+        );
+    }
+    let broker =
+        Broker::new(mailroom.clone(), vec![kind(root.path(), false)], config()).expect("broker");
+    let events = broker.events();
+    let agent = broker
+        .spawn(spec(root.path(), "claude", Default::default()))
+        .await
+        .expect("spawn");
+    let mut t = Test {
+        root,
+        mailroom,
+        broker,
+        events,
+        agent,
+    };
+    for batch in [&ids[..2], &ids[2..4], &ids[4..]] {
+        let event = t.event(|e| matches!(e, Event::Offered { .. })).await;
+        let Event::Offered { ids, .. } = event else {
+            unreachable!()
+        };
+        assert_eq!(ids, batch);
+        t.consumed(*batch.last().expect("bug: nonempty batch"))
+            .await;
+    }
+    for id in ids {
+        assert_eq!(
+            t.mailroom.delivery(id).await.expect("delivery").state,
+            DeliveryState::Consumed
+        );
+    }
+    for id in exhausted {
+        assert!(matches!(
+            t.mailroom.delivery(id).await.expect("delivery").state,
+            DeliveryState::Held { .. }
+        ));
+    }
+    let wire = t.wire();
+    let prompts = wire
+        .iter()
+        .filter(|m| m["method"] == "session/prompt")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        prompts
+            .iter()
+            .map(|p| p["params"]["prompt"].as_array().expect("blocks").len())
+            .collect::<Vec<_>>(),
+        vec![2, 2, 1]
+    );
+    let texts = prompts
+        .iter()
+        .flat_map(|p| p["params"]["prompt"].as_array().expect("blocks"))
+        .map(|b| b["text"].as_str().expect("text"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        vec!["mail-0", "mail-1", "mail-2", "mail-3", "mail-4"]
+    );
+    t.finish().await;
+}

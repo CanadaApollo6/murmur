@@ -15,7 +15,7 @@ only delivery authority.
 | Mailroom, ACP supervisor, `agentctl`, bound MCP tools, Infinity adapter | Merged (#3 to #6) |
 | [ACP per-agent isolation](isolation.md): bubblewrap, egress proxy, credential sync | Done on `feat/agentd-isolation`, not merged |
 | v1 swarm schema: `Act` on every envelope, task ledger with budgets, `Report` outcomes, exposure log | Built in the mailroom |
-| Mail limits | Not built |
+| Mail limits | Done on `feat/agentd-mail-limits`, not merged |
 | Infinity model agents sending mail | Not built. They receive mail but have no `send_message` tool |
 | `infinity-provider-local` | Not built |
 | Event bus and graph UI | Not built. `agentctl watch` streams events |

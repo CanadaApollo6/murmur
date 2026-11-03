@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use time::OffsetDateTime;
 
 use crate::model::*;
@@ -28,6 +29,8 @@ pub enum Error {
     NotFound(String),
     #[error("rejected: {0}")]
     Rejected(String),
+    #[error("mail limit: {0}")]
+    MailLimit(String),
     #[error("illegal delivery transition from {0:?}")]
     Transition(DeliveryState),
     #[error("task budget exceeded")]
@@ -109,8 +112,40 @@ impl Interceptor for HopLimit {
     }
 }
 
+/// Bounds on mail one agent can queue and one turn can carry. `None` disables a limit.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MailLimits {
+    /// Undelivered mail from one agent across all recipients.
+    #[serde(deserialize_with = "mail_limit")]
+    pub per_sender: Option<NonZeroU32>,
+    /// Undelivered mail from one agent to one recipient.
+    #[serde(deserialize_with = "mail_limit")]
+    pub per_pair: Option<NonZeroU32>,
+    /// Envelopes offered to a session in one pump.
+    #[serde(deserialize_with = "mail_limit")]
+    pub per_turn: Option<NonZeroU32>,
+}
+
+impl Default for MailLimits {
+    fn default() -> Self {
+        Self {
+            per_sender: NonZeroU32::new(64),
+            per_pair: NonZeroU32::new(16),
+            per_turn: NonZeroU32::new(16),
+        }
+    }
+}
+
+fn mail_limit<'de, D: Deserializer<'de>>(
+    de: D,
+) -> std::result::Result<Option<NonZeroU32>, D::Error> {
+    Ok(NonZeroU32::new(u32::deserialize(de)?))
+}
+
 pub struct Config {
     pub max_attempts: u32,
+    pub limits: MailLimits,
     pub interceptors: Vec<Box<dyn Interceptor>>,
 }
 
@@ -118,6 +153,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             max_attempts: 5,
+            limits: MailLimits::default(),
             interceptors: vec![Box::new(HopLimit { max: 24 })],
         }
     }
@@ -355,6 +391,17 @@ impl Mailroom {
 
     pub async fn pending_for(&self, agent: AgentId) -> Result<Vec<Envelope>> {
         self.call(move |s| envelopes(&s.db, "SELECT m.* FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.recipient=? AND d.state='queued' ORDER BY m.seq", [json(&agent)?])).await
+    }
+
+    pub async fn next_batch(&self, agent: AgentId) -> Result<Vec<Envelope>> {
+        self.call(move |s| {
+            let limit = s.config.limits.per_turn.map_or(-1, |n| i64::from(n.get()));
+            envelopes(&s.db, "SELECT m.* FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.recipient=? AND d.state='queued' ORDER BY m.seq LIMIT ?", params![json(&agent)?, limit])
+        }).await
+    }
+
+    pub(crate) async fn has_pending(&self, agent: AgentId) -> Result<bool> {
+        self.call(move |s| Ok(s.db.query_row("SELECT EXISTS(SELECT 1 FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.recipient=? AND d.state='queued')", [json(&agent)?], |r| r.get(0))?)).await
     }
 
     pub async fn delivery(&self, id: MessageId) -> Result<Delivery> {
@@ -637,6 +684,29 @@ impl Store {
         active(&tx, msg.to)?;
         if let Sender::Agent(id) = msg.from {
             active(&tx, id)?;
+            if let Some(limit) = self.config.limits.per_sender {
+                let count: u64 = tx.query_row(
+                    "SELECT COUNT(*) FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.sender=? AND d.state IN ('queued','offered','uncertain','held')",
+                    [&sender], |r| r.get(0),
+                )?;
+                if count >= u64::from(limit.get()) {
+                    return Err(Error::MailLimit(format!(
+                        "per_sender cap {limit} reached with {count} undelivered messages; wait for delivery before sending more"
+                    )));
+                }
+            }
+            if let Some(limit) = self.config.limits.per_pair {
+                let count: u64 = tx.query_row(
+                    "SELECT COUNT(*) FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.sender=? AND m.recipient=? AND d.state IN ('queued','offered','uncertain','held')",
+                    params![sender, json(&msg.to)?], |r| r.get(0),
+                )?;
+                if count >= u64::from(limit.get()) {
+                    return Err(Error::MailLimit(format!(
+                        "per_pair cap {limit} reached with {count} undelivered messages to {}; wait for delivery before sending more",
+                        msg.to
+                    )));
+                }
+            }
         }
         let parent = msg.reply_to.map(|id| message(&tx, id)).transpose()?;
         if let Some(parent) = &parent {

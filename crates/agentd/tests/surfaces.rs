@@ -15,6 +15,9 @@ struct Daemon {
 }
 impl Daemon {
     async fn new(live: Option<&str>) -> Self {
+        Self::with_mail(live, "").await
+    }
+    async fn with_mail(live: Option<&str>, mail: &str) -> Self {
         let root = tempfile::tempdir().expect("root");
         for name in ["a", "b", "state"] {
             std::fs::create_dir(root.path().join(name)).expect("dir");
@@ -28,6 +31,7 @@ impl Daemon {
         let config = format!(
             r#"
 sandbox = "none"
+{mail}
 [kind.claude]
 command = [{}]
 mode = "default"
@@ -972,4 +976,92 @@ stall_timeout_secs = 27
             .stall_timeout,
         Duration::from_secs(600)
     );
+}
+
+#[tokio::test]
+async fn mcp_send_returns_mail_limit_text_from_configured_daemon() {
+    let mut d = Daemon::with_mail(None, "[mail]\nper_pair = 1\n").await;
+    d.spawn("b", "codex", Some("hold")).await;
+    d.wait_wire("b", |v| !prompts(v).is_empty()).await;
+    d.spawn("a", "claude", Some("hold")).await;
+    let wire = d.wait_wire("a", |v| !prompts(v).is_empty()).await;
+    let responses = shim_exchange(
+        &d,
+        session_token(&wire),
+        &[
+            send_call(json!(1)).to_string(),
+            send_call(json!(2)).to_string(),
+            send_call(json!(1)).to_string(),
+        ],
+    )
+    .await;
+    assert_eq!(responses[0]["result"]["isError"], false);
+    assert_eq!(responses[1]["result"]["isError"], true);
+    let text = responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("limit text");
+    assert!(
+        text.contains("mail limit: per_pair")
+            && text.contains("1 undelivered")
+            && text.contains("wait for delivery"),
+        "{text}"
+    );
+    assert_eq!(responses[2]["result"]["isError"], false);
+    assert!(
+        responses[2]["result"]["content"][0]["text"]
+            .as_str()
+            .expect("duplicate text")
+            .contains("Already queued")
+    );
+    d.stop(nix::sys::signal::Signal::SIGTERM).await;
+}
+
+#[test]
+fn mail_config_defaults_overrides_zero_and_invalid_values() {
+    use agentd::mailroom::MailLimits;
+    use agentd::surfaces::FileConfig;
+    use std::num::NonZeroU32;
+
+    let defaults = FileConfig::default().mail;
+    assert_eq!(defaults.per_sender, NonZeroU32::new(64));
+    assert_eq!(defaults.per_pair, NonZeroU32::new(16));
+    assert_eq!(defaults.per_turn, NonZeroU32::new(16));
+    let empty: FileConfig = toml::from_str("").expect("empty config");
+    assert_eq!(empty.mail, defaults);
+    let partial: FileConfig = toml::from_str("[mail]\nper_pair = 3").expect("partial config");
+    assert_eq!(
+        partial.mail,
+        MailLimits {
+            per_pair: NonZeroU32::new(3),
+            ..defaults
+        }
+    );
+    let limits: FileConfig =
+        toml::from_str("[mail]\nper_sender = 5\nper_pair = 2\nper_turn = 1").expect("mail config");
+    assert_eq!(
+        limits.mail,
+        MailLimits {
+            per_sender: NonZeroU32::new(5),
+            per_pair: NonZeroU32::new(2),
+            per_turn: NonZeroU32::new(1)
+        }
+    );
+    let disabled: FileConfig = toml::from_str("[mail]\nper_sender = 0\nper_pair = 0\nper_turn = 0")
+        .expect("disabled config");
+    assert_eq!(
+        disabled.mail,
+        MailLimits {
+            per_sender: None,
+            per_pair: None,
+            per_turn: None
+        }
+    );
+    for invalid in [
+        "[mail]\nunknown = 1",
+        "[mail]\nper_pair = -1",
+        "[mail]\nper_turn = 4294967296",
+        "[mail]\nper_sender = 1.5",
+    ] {
+        assert!(toml::from_str::<FileConfig>(invalid).is_err(), "{invalid}");
+    }
 }

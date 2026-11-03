@@ -532,7 +532,7 @@ impl AgentActor {
                 command = self.commands.recv() => {
                     // A full command queue can coalesce a nudge. Observe queued mail
                     // on every command without adding database reads per stream chunk.
-                    self.deferred_mail = !self.mailroom.pending_for(self.id).await?.is_empty();
+                    self.deferred_mail = self.mailroom.has_pending(self.id).await?;
                     match command {
                     None => return Ok(()),
                     Some(Command::Stop(reply)) => {
@@ -683,7 +683,7 @@ impl AgentActor {
                 self.mailroom.save_resume(self.id, token.clone()).await?;
                 self.resume = Some(token);
                 self.idle_since = Instant::now();
-                self.deferred_mail = !self.mailroom.pending_for(self.id).await?.is_empty();
+                self.deferred_mail = self.mailroom.has_pending(self.id).await?;
                 self.phase(if busy { Phase::Busy } else { Phase::Idle });
             }
             Err(error @ (AdapterError::ResumeFailed(_) | AdapterError::ResumeUnsupported)) => self
@@ -720,57 +720,60 @@ impl AgentActor {
         if !matches!(self.phase, Phase::Idle | Phase::Dormant) && !busy_delivery {
             return Ok(());
         }
-        let mail = self.mailroom.pending_for(self.id).await?;
-        self.deferred_mail = false;
-        if mail.is_empty() {
-            return Ok(());
-        }
-        if self.phase == Phase::Dormant {
-            self.reopen().await?;
-            if self.phase != Phase::Idle {
+        loop {
+            let mail = self.mailroom.next_batch(self.id).await?;
+            self.deferred_mail = false;
+            if mail.is_empty() {
                 return Ok(());
             }
-        }
-        let ids = mail.iter().map(Envelope::id).collect::<Vec<_>>();
-        let outcome = self.mailroom.mark_offered(&ids, self.incarnation).await?;
-        let mut items = Vec::new();
-        for envelope in mail {
-            if !outcome.offered.contains(&envelope.id()) {
+            if self.phase == Phase::Dormant {
+                self.reopen().await?;
+                if self.phase != Phase::Idle {
+                    return Ok(());
+                }
+            }
+            let ids = mail.iter().map(Envelope::id).collect::<Vec<_>>();
+            let outcome = self.mailroom.mark_offered(&ids, self.incarnation).await?;
+            self.deferred_mail = self.mailroom.has_pending(self.id).await?;
+            let mut items = Vec::new();
+            for envelope in mail {
+                if !outcome.offered.contains(&envelope.id()) {
+                    continue;
+                }
+                items.push(match envelope.class() {
+                    DeliveryClass::UserTurn => TurnItem::User(envelope),
+                    DeliveryClass::PeerEvent => {
+                        let Sender::Agent(from) = envelope.from() else {
+                            return Err(Error::Rejected("invalid delivery class".into()));
+                        };
+                        let (name, kind) = self.mailroom.sender_label(*from).await?;
+                        let rendered = render_peer(&envelope, &name, &kind);
+                        TurnItem::Peer { envelope, rendered }
+                    }
+                });
+            }
+            if items.is_empty() {
                 continue;
             }
-            items.push(match envelope.class() {
-                DeliveryClass::UserTurn => TurnItem::User(envelope),
-                DeliveryClass::PeerEvent => {
-                    let Sender::Agent(from) = envelope.from() else {
-                        return Err(Error::Rejected("invalid delivery class".into()));
-                    };
-                    let (name, kind) = self.mailroom.sender_label(*from).await?;
-                    let rendered = render_peer(&envelope, &name, &kind);
-                    TurnItem::Peer { envelope, rendered }
-                }
+            let behind_work =
+                self.phase == Phase::Busy || self.session.as_ref().is_some_and(|s| s.busy());
+            if behind_work {
+                self.waiting_offers.extend(&outcome.offered);
+            }
+            self.offered.extend(&outcome.offered);
+            self.emit(Event::Offered {
+                agent: self.id,
+                ids: outcome.offered,
             });
-        }
-        if items.is_empty() {
+            if !behind_work {
+                self.last_activity = Instant::now();
+            }
+            self.phase(Phase::Busy);
+            if let Err(error) = self.session()?.submit(Turn { items }).await {
+                self.end(error.to_string()).await?;
+            }
             return Ok(());
         }
-        let behind_work =
-            self.phase == Phase::Busy || self.session.as_ref().is_some_and(|s| s.busy());
-        if behind_work {
-            self.waiting_offers.extend(&outcome.offered);
-        }
-        self.offered.extend(&outcome.offered);
-        self.emit(Event::Offered {
-            agent: self.id,
-            ids: outcome.offered,
-        });
-        if !behind_work {
-            self.last_activity = Instant::now();
-        }
-        self.phase(Phase::Busy);
-        if let Err(error) = self.session()?.submit(Turn { items }).await {
-            self.end(error.to_string()).await?;
-        }
-        Ok(())
     }
     async fn on_event(&mut self, event: SessionEvent) -> Result<()> {
         if matches!(

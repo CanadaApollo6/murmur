@@ -940,3 +940,282 @@ async fn repeated_offers_and_receipts_are_no_ops() {
     );
     mail.close().await.expect("close");
 }
+
+#[tokio::test]
+async fn per_pair_limit_rejects_without_writing_and_consumption_frees_a_slot() {
+    let (dir, mail, a, b) = setup(Config::default()).await;
+    let mut ids = Vec::new();
+    for _ in 0..16 {
+        ids.push(
+            mail.accept(send(Sender::Agent(a), b))
+                .await
+                .expect("accept")
+                .1
+                .id(),
+        );
+    }
+    let rejected = send(Sender::Agent(a), b);
+    let key = rejected.client_key.clone();
+    let error = mail.accept(rejected).await.expect_err("pair full");
+    assert!(matches!(error, Error::MailLimit(_)));
+    let text = error.to_string();
+    assert!(
+        text.contains("per_pair")
+            && text.contains("16")
+            && text.contains(&b.to_string())
+            && text.contains("wait for delivery"),
+        "{text}"
+    );
+    assert_eq!(mail.pending_for(b).await.expect("pending").len(), 16);
+    mail.close().await.expect("close");
+    let db = rusqlite::Connection::open(dir.path().join("broker.db")).expect("inspect");
+    for table in ["messages", "deliveries"] {
+        assert_eq!(
+            db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                .get::<_, u32>(0))
+                .expect("count"),
+            16
+        );
+    }
+    db.close().expect("close inspector");
+    let mail = Mailroom::open(dir.path().join("broker.db"), Config::default())
+        .await
+        .expect("reopen");
+    mail.mark_offered(&[ids[0]], Incarnation(1))
+        .await
+        .expect("offer");
+    assert!(
+        matches!(
+            mail.accept(send(Sender::Agent(a), b)).await,
+            Err(Error::MailLimit(_))
+        ),
+        "offered mail still counts"
+    );
+    mail.mark_consumed(&[ids[0]], Incarnation(1))
+        .await
+        .expect("consume");
+    let mut retry = send(Sender::Agent(a), b);
+    retry.client_key = key;
+    assert!(matches!(
+        mail.accept(retry).await.expect("slot freed").0,
+        SendOutcome::Queued { .. }
+    ));
+    mail.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn per_sender_limit_counts_across_recipients_and_conversations() {
+    let (_dir, mail, a, b) = setup(Config::default()).await;
+    let mut recipients = vec![b];
+    for name in ["carol", "dave", "eve", "frank"] {
+        recipients.push(
+            mail.register(AgentName::parse(name).expect("name"))
+                .await
+                .expect("recipient"),
+        );
+    }
+    let mut last = None;
+    for &to in &recipients[..4] {
+        for _ in 0..16 {
+            let msg = send(Sender::Agent(a), to);
+            let key = msg.client_key.clone();
+            let (_, env) = mail.accept(msg).await.expect("accept");
+            last = Some((key, env));
+        }
+    }
+    let (key, env) = last.expect("bug: sent mail");
+    let mut retry = send(Sender::Agent(a), env.to());
+    retry.client_key = key;
+    assert_eq!(
+        mail.accept(retry)
+            .await
+            .expect("duplicate at both limits")
+            .0,
+        SendOutcome::Duplicate { id: env.id() }
+    );
+    let error = mail
+        .accept(send(Sender::Agent(a), recipients[4]))
+        .await
+        .expect_err("sender full");
+    assert!(matches!(error, Error::MailLimit(_)));
+    assert!(error.to_string().contains("per_sender") && error.to_string().contains("64"));
+    mail.accept(send(Sender::Agent(b), recipients[4]))
+        .await
+        .expect("another sender has its own limit");
+    mail.mark_offered(&[env.id()], Incarnation(1))
+        .await
+        .expect("offer");
+    mail.mark_consumed(&[env.id()], Incarnation(1))
+        .await
+        .expect("consume");
+    mail.accept(send(Sender::Agent(a), recipients[4]))
+        .await
+        .expect("sender slot freed");
+    mail.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn held_and_uncertain_count_against_both_limits_but_dead_does_not() {
+    for sender_limit in [false, true] {
+        for state in ["held", "uncertain"] {
+            let mut config = tagged_config();
+            config.limits.per_sender =
+                sender_limit.then(|| std::num::NonZeroU32::new(1).expect("positive"));
+            config.limits.per_pair =
+                (!sender_limit).then(|| std::num::NonZeroU32::new(1).expect("positive"));
+            let (_dir, mail, a, b) = setup(config).await;
+            let mut msg = send(Sender::Agent(a), b);
+            if state == "held" {
+                msg.body = Body::new("hold").expect("body");
+            }
+            let (_, env) = mail.accept(msg).await.expect("accept");
+            if state == "uncertain" {
+                mail.mark_offered(&[env.id()], Incarnation(1))
+                    .await
+                    .expect("offer");
+                mail.session_ended(b, Incarnation(1), true)
+                    .await
+                    .expect("uncertain");
+            }
+            let mut retry = send(Sender::Agent(a), b);
+            retry.client_key = ClientKey("rejected-key".into());
+            assert!(
+                matches!(mail.accept(retry).await, Err(Error::MailLimit(_))),
+                "{sender_limit} {state}"
+            );
+            assert_eq!(mail.held(Some(b)).await.expect("held").len(), 1);
+            mail.drop_held(env.id(), "operator dropped")
+                .await
+                .expect("drop");
+            mail.accept(send(Sender::Agent(a), b))
+                .await
+                .expect("dead frees slot");
+            mail.close().await.expect("close");
+        }
+    }
+}
+
+#[tokio::test]
+async fn duplicate_at_pair_limit_and_human_mail_are_exempt() {
+    let (_dir, mail, a, b) = setup(Config::default()).await;
+    let msg = send(Sender::Agent(a), b);
+    let key = msg.client_key.clone();
+    let (_, env) = mail.accept(msg).await.expect("first");
+    for _ in 1..16 {
+        mail.accept(send(Sender::Agent(a), b))
+            .await
+            .expect("accept");
+    }
+    let mut retry = send(Sender::Agent(a), b);
+    retry.client_key = key;
+    assert_eq!(
+        mail.accept(retry).await.expect("retry").0,
+        SendOutcome::Duplicate { id: env.id() }
+    );
+    for _ in 0..65 {
+        mail.accept(send(Sender::Human, b))
+            .await
+            .expect("human exempt");
+    }
+    assert_eq!(mail.pending_for(b).await.expect("pending").len(), 81);
+    mail.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn none_disables_each_mail_limit_independently() {
+    for disabled in ["per_sender", "per_pair", "per_turn"] {
+        let mut config = Config::default();
+        match disabled {
+            "per_sender" => config.limits.per_sender = None,
+            "per_pair" => config.limits.per_pair = None,
+            "per_turn" => config.limits.per_turn = None,
+            _ => unreachable!(),
+        }
+        let (_dir, mail, a, b) = setup(config).await;
+        if disabled == "per_sender" {
+            for name in ["bob", "carol", "dave", "eve", "frank"] {
+                let to = mail
+                    .register(AgentName::parse(name).expect("name"))
+                    .await
+                    .expect("register");
+                for _ in 0..16 {
+                    mail.accept(send(Sender::Agent(a), to))
+                        .await
+                        .expect("sender unlimited");
+                }
+            }
+        } else {
+            let from = if disabled == "per_turn" {
+                Sender::Human
+            } else {
+                Sender::Agent(a)
+            };
+            for _ in 0..20 {
+                mail.accept(send(from.clone(), b)).await.expect("unlimited");
+            }
+            if disabled == "per_turn" {
+                assert_eq!(mail.next_batch(b).await.expect("batch").len(), 20);
+            }
+        }
+        mail.close().await.expect("close");
+    }
+}
+
+#[tokio::test]
+async fn next_batch_caps_and_orders_only_queued_mail() {
+    for cap in [2, 16] {
+        let config = Config {
+            limits: MailLimits {
+                per_turn: std::num::NonZeroU32::new(cap),
+                ..Default::default()
+            },
+            ..tagged_config()
+        };
+        let (_dir, mail, a, b) = setup(config).await;
+        let mut queued = Vec::new();
+        seed(&mail, a, "held").await;
+        seed(&mail, a, "consumed").await;
+        seed(&mail, a, "uncertain").await;
+        for _ in 0..20 {
+            queued.push(seed(&mail, a, "queued").await);
+            seed(&mail, b, "queued").await;
+        }
+        let first = mail.next_batch(a).await.expect("first batch");
+        assert_eq!(first, queued[..cap as usize]);
+        let ids = first.iter().map(Envelope::id).collect::<Vec<_>>();
+        mail.mark_offered(&ids, Incarnation(2))
+            .await
+            .expect("offer");
+        let end = (2 * cap as usize).min(queued.len());
+        assert_eq!(
+            mail.next_batch(a).await.expect("next batch"),
+            queued[cap as usize..end]
+        );
+        mail.close().await.expect("close");
+    }
+}
+
+#[tokio::test]
+async fn concurrent_sends_cannot_overrun_the_last_slot() {
+    let (_dir, mail, a, b) = setup(Config {
+        limits: MailLimits {
+            per_pair: std::num::NonZeroU32::new(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    let (one, two) = tokio::join!(
+        mail.accept(send(Sender::Agent(a), b)),
+        mail.accept(send(Sender::Agent(a), b))
+    );
+    assert!(
+        matches!(
+            (&one, &two),
+            (Ok(_), Err(Error::MailLimit(_))) | (Err(Error::MailLimit(_)), Ok(_))
+        ),
+        "{one:?} {two:?}"
+    );
+    assert_eq!(mail.pending_for(b).await.expect("pending").len(), 1);
+    mail.close().await.expect("close");
+}

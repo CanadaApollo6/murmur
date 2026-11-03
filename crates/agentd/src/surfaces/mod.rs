@@ -31,6 +31,8 @@ pub fn default_state_dir() -> PathBuf {
 pub struct FileConfig {
     pub state_dir: Option<PathBuf>,
     #[serde(default)]
+    pub mail: crate::mailroom::MailLimits,
+    #[serde(default)]
     pub sandbox: crate::sandbox::SandboxMode,
     #[serde(default)]
     pub bwrap: crate::sandbox::SandboxConfig,

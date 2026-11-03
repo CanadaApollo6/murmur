@@ -91,6 +91,10 @@ async fn run(args: Args) -> Result<()> {
         .unwrap_or_else(|| state.join("mcp.sock"));
     let mut sandbox = cfg.bwrap.clone();
     sandbox.repin_binds = args.repin_binds;
+    let mail_config = agentd::mailroom::Config {
+        limits: cfg.mail.clone(),
+        ..Default::default()
+    };
     let mut kinds = cfg.kinds()?;
     sandbox.validate(&state, &control_path, &mcp_path, &mut kinds)?;
     if kinds
@@ -118,7 +122,7 @@ async fn run(args: Args) -> Result<()> {
     }
     agentd::sandbox::preflight(&sandbox, &kinds, &state).await?;
     let (bound_tx, bound_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mailroom = Arc::new(Mailroom::open(state.join("mail.db"), Default::default()).await?);
+    let mailroom = Arc::new(Mailroom::open(state.join("mail.db"), mail_config).await?);
     let bindings = Arc::new(Bindings::new(
         mcp_path.clone(),
         std::env::current_exe()?,

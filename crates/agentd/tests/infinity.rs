@@ -40,11 +40,18 @@ impl Test {
         Self::with_stall(policy, Duration::from_secs(600)).await
     }
     async fn with_stall(policy: PermissionPolicy, stall: Duration) -> Self {
+        Self::with_mail(policy, stall, Default::default()).await
+    }
+    async fn with_mail(
+        policy: PermissionPolicy,
+        stall: Duration,
+        mail: agentd::mailroom::Config,
+    ) -> Self {
         let root = tempfile::tempdir().expect("tempdir");
         let socket = root.path().join("daemon.sock");
         let daemon = fake::FakeDaemon::bind(&socket);
         let mailroom = Arc::new(
-            Mailroom::open(root.path().join("mail.db"), Default::default())
+            Mailroom::open(root.path().join("mail.db"), mail)
                 .await
                 .expect("mailroom"),
         );
@@ -2317,6 +2324,86 @@ async fn r19_legacy_daemon_without_admission_keeps_waiting_until_receipt() {
     t.consumed(id).await;
     offer.emit(fake::round_done());
     offer.emit(fake::idle());
+    t.idle().await;
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn busy_delivery_drains_bounded_batches_without_new_sends_or_idle() {
+    let mut t = Test::with_mail(
+        Default::default(),
+        Duration::from_secs(600),
+        agentd::mailroom::Config {
+            limits: agentd::mailroom::MailLimits {
+                per_turn: std::num::NonZeroU32::new(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    let first = t.send(false, "existing work").await;
+    let request = t.daemon.next().await;
+    request.emit(fake::start());
+    request.emit(fake::receipt(format!("peer-{first}")));
+    t.consumed(first).await;
+    assert_eq!(t.agent.phase(), Phase::Busy);
+    let sender = t
+        .mailroom
+        .register(AgentName::parse("sender").expect("name"))
+        .await
+        .expect("sender");
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        ids.push(
+            t.mailroom
+                .accept(NewMessage {
+                    from: Sender::Agent(sender),
+                    to: t.agent.id,
+                    body: Body::new(format!("queued-{i}")).expect("body"),
+                    reply_to: None,
+                    client_key: ClientKey(format!("batch-{i}")),
+                    act: Act::Inform,
+                    task: None,
+                })
+                .await
+                .expect("queue without nudge")
+                .1
+                .id(),
+        );
+    }
+    request.emit(DaemonMessage::Info {
+        thread_id: fake::thread(),
+        text: "wake batching".into(),
+    });
+    for batch in [&ids[..2], &ids[2..4], &ids[4..]] {
+        let Event::Offered { ids: offered, .. } =
+            t.event(|e| matches!(e, Event::Offered { .. })).await
+        else {
+            unreachable!()
+        };
+        assert_eq!(offered, batch);
+        for id in batch {
+            let delivery = t.daemon.next().await;
+            assert!(
+                matches!(&delivery.message, ClientMessage::DeliverPeerMessage { message_id, .. } if message_id == &id.to_string())
+            );
+            delivery.emit(fake::receipt(format!("peer-{id}")));
+        }
+    }
+    t.consumed(ids[4]).await;
+    assert_eq!(
+        t.agent.phase(),
+        Phase::Busy,
+        "all batches drain without idle"
+    );
+    for id in ids {
+        assert_eq!(
+            t.mailroom.delivery(id).await.expect("delivery").state,
+            DeliveryState::Consumed
+        );
+    }
+    request.emit(fake::idle());
     t.idle().await;
     t.finish().await;
 }

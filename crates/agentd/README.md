@@ -39,6 +39,12 @@ state_dir = "/home/me/.local/state/agentd"
 control_socket = "/home/me/.local/state/agentd/agentd.sock"
 mcp_socket = "/home/me/.local/state/agentd/mcp.sock"
 
+[mail]
+# Omitted values keep these defaults. 0 disables a limit.
+per_sender = 64 # Undelivered mail from one agent across all recipients.
+per_pair = 16   # Undelivered mail from one agent to one recipient.
+per_turn = 16   # Envelopes offered to a session in one pump.
+
 [kind.claude]
 wire = "acp"
 command = ["claude-agent-acp"]
@@ -59,6 +65,11 @@ idle_after_secs = 600
 [kind.codex.env]
 INITIAL_AGENT_MODE = "read-only"
 ```
+
+Queued, offered, uncertain, and held mail count toward the sender and pair limits.
+Consumed and dead mail free a slot. Human sends are exempt from both limits.
+A send at the limit returns an error asking the agent to wait for delivery.
+Mail beyond a batch stays queued for a later pump.
 
 Infinity connects to an already running `infinity daemon`. Add a kind with its
 absolute Unix socket path. The model uses `provider/model` syntax. `spawn --model`
