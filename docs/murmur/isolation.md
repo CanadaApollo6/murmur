@@ -265,6 +265,11 @@ and rechecks the fd's resolved
 path. Bubblewrap receives `--bind-fd` or `--ro-bind-fd`, verifies the mounted
 identity, and closes each fd before executing the child. Broker fds retain
 CLOEXEC; only the fork child clears it for these explicit bwrap fds.
+Before launch, the broker creates and checks mount destination components
+through no-follow directory descriptors in the private home and earlier mounted
+trees. Symlink parents and leaves fail the affected launch. This includes
+workspaces and file binds. The internal helper and socket mounts are installed
+after configured mounts, so those mounts cannot hide them.
 The seccomp filter uses the same FD inheritance path. Bubblewrap closes its FD
 before executing the child.
 A mismatch fails the launch with a reason in the log and `agentctl ls`'s `error`

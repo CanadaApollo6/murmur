@@ -2,7 +2,6 @@
 import json
 import os
 from pathlib import Path
-import shutil
 import socket
 import subprocess
 import sys
@@ -10,15 +9,15 @@ import tempfile
 import time
 
 
-def driver(binary, fake):
+def driver(binary, fake, scenario="socket-depth"):
     with tempfile.TemporaryDirectory(prefix='agentd-relaunch-') as temporary:
         root = Path(temporary)
         home = root / 'human'
         home.mkdir()
-        work = root / 'work'
-        work.mkdir()
+        work = home / 'code' / 'agentd' if scenario == 'home-destination' else root / 'work'
+        work.mkdir(parents=True)
         state = root / 'state'
-        (work / 'probe.py').write_text('''
+        probe = '''
 from pathlib import Path
 import sys
 socket = Path('/run/agentd/io/mcp.sock')
@@ -28,7 +27,23 @@ for _ in range(40):
     nested /= 'd'
 nested.mkdir(parents=True)
 (Path(sys.argv[1]) / 'planted').touch()
-''')
+'''
+        if scenario == 'home-destination':
+            probe = '''
+import os
+from pathlib import Path
+import sys
+work = Path(sys.argv[1])
+(work / 'bin').mkdir()
+helper = work / 'bin/agentd'
+helper.write_text('#!/bin/sh\\nprintf hijacked > ' + str(work / 'hijacked') + '\\nexec /bin/sleep 60\\n')
+helper.chmod(0o700)
+(work / 'planted').touch()
+home = Path.home()
+(home / 'code').rename(home / 'code.saved')
+(home / 'code').symlink_to('/run')
+'''
+        (work / 'probe.py').write_text(probe)
         config = '[bwrap]\nro_binds = [' + json.dumps(str(Path(fake).parent)) + ']\n'
         for kind in ['claude', 'codex']:
             config += f'[kind.{kind}]\ncommand = [{json.dumps(fake)}]\ncredentials = []\n'
@@ -72,13 +87,15 @@ nested.mkdir(parents=True)
                 ctl({'command': 'send', 'to': '@attacker', 'body': 'isolation-probe', 'key': 'plant'})
                 wait(lambda: (work / 'planted').exists())
                 ctl({'command': 'send', 'to': '@attacker', 'body': 'die-before', 'key': 'crash'})
-                failed = wait(lambda: phase('attacker', 'failed'))
-                assert 'socket cleanup exceeds' in failed['error'], failed
+                failed = wait(lambda: phase('attacker', 'failed') or (work / 'hijacked').exists())
+                assert not (work / 'hijacked').exists(), 'planted helper executed instead of sandbox-init'
+                expected = 'socket cleanup exceeds' if scenario == 'socket-depth' else 'sandbox mount destination'
+                assert expected in failed['error'], failed
                 healthy = root / 'healthy'
                 healthy.mkdir()
                 spawn('healthy', healthy)
                 wait(lambda: phase('healthy', 'idle'))
-                print('PASS oversized planted socket tree rejects relaunch; broker and another sandboxed agent remain available', flush=True)
+                print(f'PASS {scenario} rejects relaunch; broker and another sandboxed agent remain available', flush=True)
             finally:
                 daemon.terminate()
                 try:

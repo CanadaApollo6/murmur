@@ -711,7 +711,45 @@ impl Facts {
         }
         Ok(facts)
     }
+    pub fn validate_destinations(&self, paths: &AgentPaths) -> Result<()> {
+        use crate::private_fs::Dir;
+        let mut trees = vec![(self.home.clone(), Dir::open(&paths.home, false)?, false)];
+        for (target, source, readonly) in self
+            .mounts
+            .iter()
+            .map(|m| {
+                (
+                    &m.target,
+                    PinnedPath::descriptor(&m.source, false),
+                    m.readonly,
+                )
+            })
+            .chain(
+                self.pinned
+                    .iter()
+                    .map(|m| (&m.target, m.fd.try_clone().map_err(Into::into), m.readonly)),
+            )
+        {
+            let source = source?;
+            let directory = std::fs::File::from(source.try_clone()?)
+                .metadata()?
+                .is_dir();
+            if let Some((root, dir, readonly)) = trees
+                .iter()
+                .rev()
+                .find(|(root, _, _)| target.starts_with(root))
+            {
+                dir.mount_target(target.strip_prefix(root)?, directory, !readonly)
+                    .map_err(|e| format!("sandbox mount destination {}: {e}", target.display()))?;
+            }
+            if directory {
+                trees.push((target.clone(), Dir::from_fd(&source)?, readonly));
+            }
+        }
+        Ok(())
+    }
 }
+
 pub fn seed(kind: &KindSandbox, home: &Path) -> Result<()> {
     let dir = crate::private_fs::Dir::open(home, true)?;
     for entry in &kind.home {
@@ -782,16 +820,6 @@ pub fn plan(
         paths.home.as_os_str(),
         facts.home.as_os_str(),
     ]);
-    push(&[
-        "--ro-bind".as_ref(),
-        facts.exe.as_os_str(),
-        "/run/agentd/bin/agentd".as_ref(),
-    ]);
-    push(&[
-        "--bind".as_ref(),
-        paths.io.as_os_str(),
-        "/run/agentd/io".as_ref(),
-    ]);
     for m in &facts.mounts {
         push(&[
             if m.readonly { "--ro-bind" } else { "--bind" }.as_ref(),
@@ -811,6 +839,16 @@ pub fn plan(
             mount.target.as_os_str(),
         ]);
     }
+    push(&[
+        "--ro-bind".as_ref(),
+        facts.exe.as_os_str(),
+        "/run/agentd/bin/agentd".as_ref(),
+    ]);
+    push(&[
+        "--bind".as_ref(),
+        paths.io.as_os_str(),
+        "/run/agentd/io".as_ref(),
+    ]);
     push(&[
         "--add-seccomp-fd".as_ref(),
         facts.seccomp_fd.as_raw_fd().to_string().as_ref(),
@@ -937,6 +975,7 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
                     readonly: *readonly,
                 });
             }
+            facts.validate_destinations(&paths)?;
             let mut launch = plan(cfg, kind, &spec, &paths, &facts);
             let pos = launch
                 .args
@@ -1164,7 +1203,7 @@ mod tests {
                     ""
                 };
                 let expected = format!(
-                    "--unshare-user\n--unshare-pid\n--unshare-ipc\n--unshare-uts\n--unshare-cgroup\n--die-with-parent\n--new-session\n{net}--ro-bind\n/usr\n/usr\n--ro-bind\n/etc\n/etc\n--symlink\nusr/bin\n/bin\n--proc\n/proc\n--dev\n/dev\n--tmpfs\n/tmp\n--tmpfs\n/run\n--bind\n/state/agents/id/home\n/home/person\n--ro-bind\n/host/agentd\n/run/agentd/bin/agentd\n--bind\n/state/agents/id/io\n/run/agentd/io\n--bind\n/state/agents/id/home/private\n/home/person/private\n--add-seccomp-fd\n{}\n--chdir\n/workspace\n--\n/run/agentd/bin/agentd\nsandbox-init\n{host}--\n{}",
+                    "--unshare-user\n--unshare-pid\n--unshare-ipc\n--unshare-uts\n--unshare-cgroup\n--die-with-parent\n--new-session\n{net}--ro-bind\n/usr\n/usr\n--ro-bind\n/etc\n/etc\n--symlink\nusr/bin\n/bin\n--proc\n/proc\n--dev\n/dev\n--tmpfs\n/tmp\n--tmpfs\n/run\n--bind\n/state/agents/id/home\n/home/person\n--bind\n/state/agents/id/home/private\n/home/person/private\n--ro-bind\n/host/agentd\n/run/agentd/bin/agentd\n--bind\n/state/agents/id/io\n/run/agentd/io\n--add-seccomp-fd\n{}\n--chdir\n/workspace\n--\n/run/agentd/bin/agentd\nsandbox-init\n{host}--\n{}",
                     facts.seccomp_fd.as_raw_fd(),
                     kind.command
                 );
@@ -1261,6 +1300,66 @@ mod tests {
         assert!(!host_pattern("127.0.0.1"));
         assert!(!host_pattern("*.com/evil"));
         assert!(host_pattern("*.example.com"));
+    }
+    #[test]
+    fn mount_destinations_reject_symlinks_in_home_and_prior_binds() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().expect("root");
+        let paths = AgentPaths {
+            home: root.path().join("private"),
+            io: root.path().join("io"),
+        };
+        std::fs::create_dir(&paths.home).expect("private home");
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).expect("source");
+        let file = root.path().join("file");
+        std::fs::write(&file, "bind data").expect("file source");
+        let mut facts = Facts::collect().expect("facts");
+        facts.home = "/home/person".into();
+        facts.mounts.clear();
+        symlink("/run", paths.home.join("code")).expect("planted home parent");
+        for (source, target) in [
+            (&source, "/home/person/code/agentd"),
+            (&file, "/home/person/code/file"),
+        ] {
+            facts.pinned = vec![PinnedMount {
+                fd: Arc::new(PinnedPath::descriptor(source, false).expect("source fd")),
+                target: target.into(),
+                readonly: false,
+            }];
+            assert!(facts.validate_destinations(&paths).is_err());
+        }
+        std::fs::remove_file(paths.home.join("code")).expect("remove link");
+        facts.pinned.clear();
+        facts.pinned.push(PinnedMount {
+            fd: Arc::new(PinnedPath::descriptor(&source, true).expect("directory fd")),
+            target: "/shared".into(),
+            readonly: false,
+        });
+        facts.pinned.push(PinnedMount {
+            fd: Arc::new(PinnedPath::descriptor(&file, false).expect("file fd")),
+            target: "/shared/nested/file".into(),
+            readonly: true,
+        });
+        facts
+            .validate_destinations(&paths)
+            .expect("create safe destination parents");
+        assert!(source.join("nested").is_dir());
+        symlink("/run/agentd/bin/agentd", source.join("nested/file")).expect("planted file leaf");
+        assert!(facts.validate_destinations(&paths).is_err());
+        std::fs::remove_file(source.join("nested/file")).expect("remove leaf");
+        facts.pinned[0].readonly = true;
+        facts.pinned[1].target = "/shared/missing/file".into();
+        assert!(facts.validate_destinations(&paths).is_err());
+        assert!(
+            !source.join("missing").exists(),
+            "read-only grant must not create host paths"
+        );
+        facts.pinned[0].readonly = false;
+        facts.pinned[1].target = "/shared/nested/file".into();
+        std::fs::remove_dir(source.join("nested")).expect("remove parent");
+        symlink("/run", source.join("nested")).expect("planted nested parent");
+        assert!(facts.validate_destinations(&paths).is_err());
     }
     #[test]
     fn config_rejects_loader_hooks_in_forwarded_and_kind_environment() {

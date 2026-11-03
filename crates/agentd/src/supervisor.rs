@@ -617,6 +617,7 @@ impl AgentActor {
                         )?;
                     let mut facts = crate::sandbox::Facts::collect()?;
                     facts.pinned = mounts;
+                    facts.validate_destinations(&paths)?;
                     launch = crate::sandbox::plan(cfg, &self.kind, &self.spec, &paths, &facts);
                     launch.mcp_server = Some(
                         mcp.bind(

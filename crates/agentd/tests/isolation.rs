@@ -245,3 +245,28 @@ fn real_sandbox_relaunch_bounds_planted_socket_cleanup() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn real_sandbox_relaunch_rejects_home_destination_symlink() {
+    if !supported() {
+        return;
+    }
+    let output = Command::new("python3")
+        .arg(format!(
+            "{}/tests/support/isolation_relaunch_driver.py",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .args([
+            env!("CARGO_BIN_EXE_agentd"),
+            env!("CARGO_BIN_EXE_agentd-fake-acp"),
+            "home-destination",
+        ])
+        .output()
+        .expect("destination driver");
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

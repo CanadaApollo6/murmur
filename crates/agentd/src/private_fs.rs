@@ -43,6 +43,37 @@ impl Dir {
         }
         Ok(Self(fd))
     }
+    pub fn from_fd(fd: &OwnedFd) -> io::Result<Self> {
+        Ok(Self(openat(
+            fd,
+            ".",
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?))
+    }
+    pub fn mount_target(&self, path: &Path, directory: bool, create: bool) -> io::Result<()> {
+        if directory {
+            self.descend(path, create)?;
+        } else {
+            let (parent, name) = self.parent(path, create)?;
+            match nix::sys::stat::fstatat(
+                &parent.0,
+                name.as_os_str(),
+                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) {
+                Ok(stat)
+                    if nix::sys::stat::SFlag::from_bits_truncate(stat.st_mode)
+                        .contains(nix::sys::stat::SFlag::S_IFLNK) =>
+                {
+                    return Err(io::Error::other("mount destination must not be a symlink"));
+                }
+                Ok(_) => {}
+                Err(nix::errno::Errno::ENOENT) if create => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
     pub fn parent(&self, path: &Path, create: bool) -> io::Result<(Self, std::ffi::OsString)> {
         let name = path
             .file_name()
