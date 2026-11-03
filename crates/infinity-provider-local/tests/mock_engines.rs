@@ -38,6 +38,7 @@ struct EngineState {
     discovery_delay: AtomicU64,
     missing_context: bool,
     no_models_route: std::sync::atomic::AtomicBool,
+    auxiliary_status: AtomicU64,
 }
 fn event(value: Value) -> String {
     format!("data: {value}\n\n")
@@ -71,10 +72,21 @@ async fn models(State(s): State<Arc<EngineState>>) -> Result<Json<Value>, axum::
     }).collect::<Vec<_>>()}),
     ))
 }
-async fn auxiliary(State(s): State<Arc<EngineState>>) -> Json<Value> {
-    Json(
+async fn auxiliary(
+    State(s): State<Arc<EngineState>>,
+) -> Result<Json<Value>, axum::http::StatusCode> {
+    match s.auxiliary_status.load(Ordering::SeqCst) {
+        0 => {}
+        status => {
+            return Err(axum::http::StatusCode::from_u16(
+                u16::try_from(status).expect("bug: test status fits u16"),
+            )
+            .expect("bug: valid test status"));
+        }
+    }
+    Ok(Json(
         json!({"default_generation_settings":{"n_ctx":s.context.load(Ordering::SeqCst)},"total_slots":1,"max_batch_size":1,"max_running_requests":1}),
-    )
+    ))
 }
 async fn chat(State(s): State<Arc<EngineState>>, Json(body): Json<Value>) -> Response<Body> {
     s.requests.lock().expect("requests").push(body);
@@ -131,6 +143,7 @@ impl Harness {
             discovery_delay: AtomicU64::new(0),
             missing_context: python,
             no_models_route: std::sync::atomic::AtomicBool::new(false),
+            auxiliary_status: AtomicU64::new(0),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -655,6 +668,34 @@ async fn configured_model_survives_a_missing_models_route() {
         h.run(request())
             .await
             .expect_err("vLLM context comes from /v1/models")
+            .class(),
+        ErrorClass::Transient
+    );
+}
+#[tokio::test]
+async fn slot_routes_tolerate_only_absence() {
+    for engine in ["sglang", "tensorfold"] {
+        let h = Harness::new(engine, false, "").await;
+        h.state.auxiliary_status.store(404, Ordering::SeqCst);
+        h.run(request()).await.expect("absent slot route");
+        let h = Harness::new(engine, false, "").await;
+        h.state.auxiliary_status.store(500, Ordering::SeqCst);
+        assert_eq!(
+            h.run(request())
+                .await
+                .expect_err("failing slot route")
+                .class(),
+            ErrorClass::Transient
+        );
+        h.state.auxiliary_status.store(0, Ordering::SeqCst);
+        h.run(request()).await.expect("retried discovery");
+    }
+    let h = Harness::new("llama.cpp", false, "").await;
+    h.state.auxiliary_status.store(404, Ordering::SeqCst);
+    assert_eq!(
+        h.run(request())
+            .await
+            .expect_err("/props is required")
             .class(),
         ErrorClass::Transient
     );

@@ -101,11 +101,22 @@ impl Server {
         )
     }
     async fn get(&self, path: &str) -> Result<Value, CompletionError> {
-        self.client
+        self.fetch(path, false).await
+    }
+    /// With `absent_ok`, a 404 yields `Value::Null`; any other failure is still
+    /// Transient, so discovery retries instead of losing the route's data.
+    async fn fetch(&self, path: &str, absent_ok: bool) -> Result<Value, CompletionError> {
+        let response = self
+            .client
             .get(self.url(path))
             .send()
             .await
-            .map_err(|e| transient(format!("{} discovery {path}: {e}", self.config.name)))?
+            .map_err(|e| transient(format!("{} discovery {path}: {e}", self.config.name)))?;
+        if absent_ok && response.status() == reqwest::StatusCode::NOT_FOUND {
+            tracing::warn!(server = self.config.name, path, "discovery route is absent");
+            return Ok(Value::Null);
+        }
+        response
             .error_for_status()
             .map_err(|e| transient(format!("{} discovery {path}: {e}", self.config.name)))?
             .json()
@@ -171,17 +182,12 @@ impl Server {
                 .find(|v| v["id"].as_str() == Some(&model))
                 .unwrap_or(&Value::Null);
             // llama.cpp's /props carries the context check, so it is required.
-            // SGLang's /server_info and TensorFold's /health carry only slots.
-            let optional = |path: &'static str| async move {
-                self.get(path).await.unwrap_or_else(|error| {
-                    tracing::warn!(server = self.config.name, %error, "slot discovery failed");
-                    Value::Null
-                })
-            };
+            // SGLang's /server_info and TensorFold's /health carry only slots, so
+            // only an absent route is tolerated; the gate size is set once.
             let auxiliary = match self.config.engine {
                 Engine::LlamaCpp => self.get("/props").await?,
-                Engine::Sglang => optional("/server_info").await,
-                Engine::TensorFold => optional("/health").await,
+                Engine::Sglang => self.fetch("/server_info", true).await?,
+                Engine::TensorFold => self.fetch("/health", true).await?,
                 _ => Value::Null,
             };
             Ok((model, self.config.engine.discover(model_info, &auxiliary)))

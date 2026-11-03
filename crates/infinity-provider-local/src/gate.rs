@@ -60,6 +60,15 @@ impl Gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn initial_resize_grows_and_shrinks_the_gate() {
+        let gate = Gate::new(1);
+        gate.resize_initial(1, 3);
+        assert_eq!(gate.permits.available_permits(), 3);
+        let gate = Gate::new(4);
+        gate.resize_initial(4, 1);
+        assert_eq!(gate.permits.available_permits(), 1);
+    }
     #[tokio::test]
     async fn fifo_queue_is_bounded_and_cancelled_waiters_are_pruned() {
         let gate = Arc::new(Gate::new(1));
