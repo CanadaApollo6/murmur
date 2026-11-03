@@ -141,7 +141,8 @@ the running build streams.
 ## SGLang
 
 Use SGLang 0.5.23. Start with `--tool-call-parser X --reasoning-parser Y`, selecting
-parsers for the model. Discovery reads `/v1/models` and `/server_info`.
+parsers for the model. Discovery reads `/v1/models` and `/server_info`. If
+`/server_info` returns 404, the gate uses `slots` from the config, or one slot.
 
 ```toml
 [[server]]
