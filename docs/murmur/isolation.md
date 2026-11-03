@@ -139,8 +139,9 @@ baseline still match the old bytes. The broker remembers SHA-256 digests of norm
 lifetime, including across agent restarts. Whitespace and key order cannot
 re-admit a retired value. Each host path has at most 1024 digests. Once full,
 copy-back stops for that path and warns once; history is never evicted. Each
-agent can copy back at most once per 30 seconds, across incarnations, and the
-next tick after that interval reads the latest private value. Unchanged rejected
+agent can copy back at most once per 30 seconds during supervision, across
+incarnations. The next tick after that interval reads the latest private value.
+The final sync bypasses this interval and keeps all content and CAS checks. Unchanged rejected
 private bytes are remembered and are not parsed or logged again.
 
 An agent can replace values within the baseline's top-level key set in the

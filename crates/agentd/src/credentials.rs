@@ -85,11 +85,14 @@ impl Credentials {
         Ok(())
     }
     pub fn sync(&mut self, id: AgentId) {
+        self.sync_copies(id, false);
+    }
+    fn sync_copies(&mut self, id: AgentId, final_sync: bool) {
         let Some(mut copies) = self.copies.remove(&id) else {
             return;
         };
         for copy in &mut copies {
-            if let Err(error) = self.refresh(id, copy) {
+            if let Err(error) = self.refresh(id, copy, final_sync) {
                 let message = error.to_string();
                 if copy.last_error.as_ref() != Some(&message) {
                     tracing::warn!(%id, %error, "credential sync skipped");
@@ -99,7 +102,7 @@ impl Credentials {
         }
         self.copies.insert(id, copies);
     }
-    fn refresh(&mut self, id: AgentId, copy: &mut Copy) -> Result<()> {
+    fn refresh(&mut self, id: AgentId, copy: &mut Copy, final_sync: bool) -> Result<()> {
         let private = Dir::open(&copy.home, false)?;
         let (dir, name) = private.parent(&copy.relative, false)?;
         let Some(bytes) = dir.read(&name)? else {
@@ -122,10 +125,11 @@ impl Credentials {
             }
             return Ok(());
         }
-        if self
-            .accepted
-            .get(&id)
-            .is_some_and(|at| at.elapsed() < COPY_INTERVAL)
+        if !final_sync
+            && self
+                .accepted
+                .get(&id)
+                .is_some_and(|at| at.elapsed() < COPY_INTERVAL)
         {
             return Ok(());
         }
@@ -199,7 +203,7 @@ impl Credentials {
         }
     }
     pub fn finish(&mut self, id: AgentId) {
-        self.sync(id);
+        self.sync_copies(id, true);
         if let Some(copies) = self.copies.remove(&id) {
             for copy in copies {
                 self.retire(&copy);
@@ -352,6 +356,51 @@ mod tests {
         std::fs::write(&private, br#"{"token":20}"#).expect("write");
         c.sync(id);
         assert_eq!(std::fs::read(&host).expect("host"), br#"{"token":19}"#);
+    }
+    #[test]
+    fn finish_preserves_latest_refresh_inside_rate_window() {
+        let (_root, human, host, home) = fixture();
+        let id = AgentId::new();
+        let mut c = Credentials::default();
+        c.launch(id, "codex", &sources(&host, &human), &home)
+            .expect("launch");
+        let private = home.join(".codex/auth.json");
+        std::fs::write(&private, br#"{"token":1}"#).expect("first rotation");
+        c.sync(id);
+        std::fs::write(&private, br#"{"token":2}"#).expect("final rotation");
+        c.sync(id);
+        assert_eq!(
+            std::fs::read(&host).expect("rate limited host"),
+            br#"{"token":1}"#
+        );
+        c.finish(id);
+        assert_eq!(std::fs::read(&host).expect("final host"), br#"{"token":2}"#);
+        c.launch(id, "codex", &sources(&host, &human), &home)
+            .expect("relaunch");
+        assert_eq!(
+            std::fs::read(&private).expect("relaunch token"),
+            br#"{"token":2}"#
+        );
+    }
+    #[test]
+    fn final_sync_keeps_content_guards_after_recent_acceptance() {
+        for invalid in [
+            br#"{"token":2,"extra":3}"#.to_vec(),
+            vec![b' '; crate::private_fs::LIMIT as usize + 1],
+            br#"{"token":0}"#.to_vec(),
+        ] {
+            let (_root, human, host, home) = fixture();
+            let id = AgentId::new();
+            let mut c = Credentials::default();
+            c.launch(id, "codex", &sources(&host, &human), &home)
+                .expect("launch");
+            let private = home.join(".codex/auth.json");
+            std::fs::write(&private, br#"{"token":1}"#).expect("rotation");
+            c.sync(id);
+            std::fs::write(&private, invalid).expect("invalid final rotation");
+            c.finish(id);
+            assert_eq!(std::fs::read(&host).expect("host"), br#"{"token":1}"#);
+        }
     }
     #[test]
     fn history_is_bounded_without_eviction_and_bad_content_is_remembered() {
