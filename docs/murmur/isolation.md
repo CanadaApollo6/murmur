@@ -33,7 +33,9 @@ Every sandboxed launch also installs one seccomp-BPF filter through bubblewrap's
 `AF_VSOCK`. Vsock can cross network namespaces when `net.vsock.ns_mode` is
 `global`, bypassing the CONNECT proxy. The filter returns `ENOSYS` for `keyctl`,
 `add_key` and `request_key`. Session keyrings survive fork and exec, including
-bubblewrap's `--new-session`. It also returns `ENOSYS` for `io_uring_setup`,
+bubblewrap's `--new-session`. It returns `EAFNOSUPPORT` for `AF_ALG` sockets too.
+`AF_ALG` can load a keyring key by serial without `keyctl`, and a keyed hash such
+as GHASH can return the key. It also returns `ENOSYS` for `io_uring_setup`,
 `io_uring_enter` and `io_uring_register`. io_uring can create sockets without
 calling `socket`.
 
@@ -335,7 +337,7 @@ evidence. The implementation handoff report records local run results separately
 - R4. Host-network mode restores loopback, abstract UNIX sockets and unrestricted
   network access. It is a debugging escape hatch, not equivalent confinement.
 - R5. Nested user namespaces expose kernel code. The seccomp filter blocks vsock,
-  keyring operations and io_uring. Broader seccomp hardening is still later work.
+  AF_ALG, keyring operations and io_uring. Broader seccomp hardening is still later work.
 - R6. Infinity and `none` agents can use host control and per-agent sockets. Isolation
   holds only when no untrusted host process or unsandboxed agent can do that.
 - R7. Toolchain binds expose their full contents. Defaults bind `~/.cargo/bin`, not

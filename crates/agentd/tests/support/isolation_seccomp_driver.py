@@ -37,6 +37,14 @@ def read_key(key):
     return result
 
 
+def af_alg_socket():
+    try:
+        with socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0):
+            return {'errno': 0}
+    except OSError as error:
+        return {'errno': error.errno}
+
+
 def probe(root):
     config = json.loads((root / 'probe-input.json').read_text())
     mode = config['mode']
@@ -66,6 +74,7 @@ def probe(root):
         result = {'ring': read_key(-3), 'key': read_key(config['key'])}
         result['add_key'] = syscall('add_key', b'user', b'sandbox-key', b'x', 1, ctypes.c_long(-3))
         result['request_key'] = syscall('request_key', b'user', b'agentd-seccomp-dummy', None, 0)
+        result['af_alg'] = af_alg_socket()
     else:
         params = ctypes.create_string_buffer(120)
         result = {'io_uring_setup': syscall('io_uring_setup', 1, params)}
@@ -99,6 +108,16 @@ def driver(binary, fake, mode):
         config['key'] = key['ret']
         assert read_key(key['ret'])['data'] == payload.hex()
         assert read_key(-3)['ret'] > 0
+        # AF_ALG can read keyring keys by serial; it must work on the host for the check to mean anything.
+        host_af_alg = af_alg_socket()
+        assert host_af_alg['errno'] == 0, f'host cannot create an AF_ALG socket: {host_af_alg}'
+    if mode == 'io_uring':
+        params = ctypes.create_string_buffer(120)
+        baseline = syscall('io_uring_setup', 1, params)
+        if baseline['ret'] < 0:
+            print(f'SKIP io_uring: unfiltered host io_uring_setup failed: {baseline}', flush=True)
+            return
+        os.close(baseline['ret'])
     with tempfile.TemporaryDirectory(prefix='agentd-seccomp-') as temporary:
         root = Path(temporary)
         work = root / 'work'
@@ -151,6 +170,8 @@ def driver(binary, fake, mode):
                     for call in ['socket', 'socketpair']:
                         assert result[call]['errno'] == errno.EAFNOSUPPORT, result
                 else:
+                    if mode == 'keyring':
+                        assert result.pop('af_alg')['errno'] == errno.EAFNOSUPPORT, result
                     for call, outcome in result.items():
                         assert outcome['ret'] == -1 and outcome['errno'] == errno.ENOSYS, (call, result)
                 print(f'PASS {mode} through real agentd launch', flush=True)

@@ -60,6 +60,18 @@ mod native {
             argument: Some((0, libc::AF_VSOCK as u32)),
             errno: libc::EAFNOSUPPORT,
         },
+        // AF_ALG can load a possessed keyring key by serial (ALG_SET_KEY_BY_KEY_SERIAL)
+        // without keyctl, and keyed hashes such as GHASH can return the key.
+        DeniedSyscall {
+            number: libc::SYS_socket,
+            argument: Some((0, libc::AF_ALG as u32)),
+            errno: libc::EAFNOSUPPORT,
+        },
+        DeniedSyscall {
+            number: libc::SYS_socketpair,
+            argument: Some((0, libc::AF_ALG as u32)),
+            errno: libc::EAFNOSUPPORT,
+        },
         DeniedSyscall {
             number: libc::SYS_io_uring_setup,
             argument: None,
@@ -235,7 +247,7 @@ mod native {
                         libc::SECCOMP_RET_ALLOW
                     );
                 }
-                for domain in [40, 0xffff_ffff_0000_0028] {
+                for domain in [40, 0xffff_ffff_0000_0028, 38] {
                     assert_eq!(
                         action(AUDIT_ARCH, number as u32, domain),
                         libc::SECCOMP_RET_ERRNO | libc::EAFNOSUPPORT as u32
