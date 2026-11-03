@@ -274,7 +274,7 @@ pub async fn handle_client(stream: UnixStream, session_manager: SharedSessionMan
     // Spawn the core handler
     let mgr = session_manager.clone();
     tokio::pin! {
-        let handler = handle_client_channels(client_msg_rx, daemon_msg_tx, mgr);
+        let handler = handle_client_channels_inner(client_msg_rx, daemon_msg_tx, mgr, true);
     }
 
     // Bridge: framed socket <-> channels
@@ -321,9 +321,18 @@ pub async fn handle_client(stream: UnixStream, session_manager: SharedSessionMan
 /// Handle a client over raw mpsc channels (for in-memory mode, no serialization).
 #[tracing::instrument(skip_all)]
 pub async fn handle_client_channels(
+    client_rx: mpsc::UnboundedReceiver<ClientMessage>,
+    daemon_tx: mpsc::UnboundedSender<DaemonMessage>,
+    session_manager: SharedSessionManager,
+) {
+    handle_client_channels_inner(client_rx, daemon_tx, session_manager, false).await;
+}
+
+async fn handle_client_channels_inner(
     mut client_rx: mpsc::UnboundedReceiver<ClientMessage>,
     daemon_tx: mpsc::UnboundedSender<DaemonMessage>,
     session_manager: SharedSessionManager,
+    trusted_unix: bool,
 ) {
     let (mut client_tx, mut client_tx_rx) = mpsc::unbounded_channel::<DaemonMessage>();
     let mut attached_session_id: Option<ThreadId> = None;
@@ -344,6 +353,7 @@ pub async fn handle_client_channels(
         let default_entry = mgr.catalog.default_entry();
         let _ = daemon_tx.send(DaemonMessage::Welcome {
             boot_id: mgr.boot_id.clone(),
+            websocket_enabled: mgr.websocket_enabled,
             sessions: mgr.list_sessions(Some(daemon_tx.clone())).await,
             available_models: mgr
                 .catalog
@@ -400,6 +410,18 @@ pub async fn handle_client_channels(
                 };
                 tracing::info!(?msg, "Received client message");
 
+                if let ClientMessage::ClaimRapInvocation { invocation } = msg {
+                    let record = if trusted_unix {
+                        uuid::Uuid::parse_str(&invocation).ok()
+                    } else { None };
+                    let record = match record {
+                        Some(id) => session_manager.lock().await.rap_manager.claim_rap_invocation(&id),
+                        None => None,
+                    };
+                    if daemon_tx.send(DaemonMessage::RapInvocationClaim { invocation, record }).is_err() { break; }
+                    continue;
+                }
+
                 // If connected to a remote session, forward most messages there
                 if let Some(ref proxy_tx) = remote_proxy_tx {
                     match &msg {
@@ -441,6 +463,7 @@ pub async fn handle_client_channels(
                 }
 
                     match msg {
+                        ClientMessage::ClaimRapInvocation { .. } => unreachable!("bug: claims handled before session routing"),
                         ClientMessage::CreateSession { cwd, location, model, keeps_session_alive, input_admitted } => {
                             if let Some(rname) = location {
                                 let rd = {

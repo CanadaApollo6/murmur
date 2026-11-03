@@ -118,6 +118,7 @@ fn daemon_msg_to_display(msg: DaemonMessage) -> Option<(Option<ThreadRef>, Displ
         | DaemonMessage::InputCommitted { .. }
         | DaemonMessage::InputAdmitted { .. }
         | DaemonMessage::Welcome { .. }
+        | DaemonMessage::RapInvocationClaim { .. }
         | DaemonMessage::Replay { .. }
         | DaemonMessage::SessionsUpdated { .. }
         | DaemonMessage::ModelSwitched { .. }
@@ -360,7 +361,7 @@ pub async fn run_headless(message: String) -> Result<(), BoxError> {
 
     // Read Welcome (must be first message).
     match recv(&mut framed).await? {
-        DaemonMessage::Welcome { .. } => {}
+        DaemonMessage::Welcome { .. } | DaemonMessage::RapInvocationClaim { .. } => {}
         DaemonMessage::Error { text, .. } => return Err(text.into()),
         _ => return Err("expected Welcome from daemon".into()),
     }

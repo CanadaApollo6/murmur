@@ -48,6 +48,7 @@ async fn r10b_shutdown_session_strands_mail() {
         .arg("daemon")
         .env("HOME", root.path())
         .env("INFINITY_WS_PORT", "0")
+        .env("INFINITY_WS", "off")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
@@ -121,9 +122,13 @@ async fn r10b_shutdown_session_strands_mail() {
         tokio_util::codec::Framed::new(stream, infinity_protocol::length_delimited_codec());
     let session = loop {
         let bytes = cli.next().await.expect("frame").expect("bytes");
-        if let DaemonMessage::Welcome { sessions, .. } =
-            serde_json::from_slice(&bytes).expect("json")
+        if let DaemonMessage::Welcome {
+            sessions,
+            websocket_enabled,
+            ..
+        } = serde_json::from_slice(&bytes).expect("json")
         {
+            assert!(!websocket_enabled, "INFINITY_WS=off disables the listener");
             break sessions.keys().next().expect("one session").clone();
         }
     };

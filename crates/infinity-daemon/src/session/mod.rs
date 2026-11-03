@@ -76,6 +76,7 @@ pub struct SessionManagerConfig {
 /// invocation) and flagging it in the session store.
 pub struct SessionManager {
     pub boot_id: String,
+    pub websocket_enabled: bool,
     pub session_store: SessionStoreHandle,
     conversation_store: PersistentConversationStore,
     state_store: PersistentStateStore,
@@ -384,6 +385,7 @@ impl SessionManager {
         }
 
         Ok(Self {
+            websocket_enabled: false,
             boot_id: uuid::Uuid::new_v4().to_string(),
             session_store,
             conversation_store,

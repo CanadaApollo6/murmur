@@ -228,6 +228,10 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
+    /// Read a daemon-owned RAP dispatch. Only Unix clients receive records.
+    ClaimRapInvocation {
+        invocation: String,
+    },
     /// Create a new session with the given working directory.
     CreateSession {
         cwd: PathBuf,
@@ -350,8 +354,28 @@ pub enum ClientMessage {
 
 // ── Daemon → Client ─────────────────────────────────────────────────────────
 
+/// Canonical dispatch data. Provider IDs are audit data, not invocation identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RapClaimRecord {
+    pub thread_stack: Vec<ThreadRef>,
+    pub operation: String,
+    pub arguments: serde_json::Value,
+    pub endpoint: String,
+    pub callback_url: String,
+    pub id: ToolCallId,
+    pub call_id: Option<ProviderCallId>,
+}
+
+fn websocket_enabled_default() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DaemonMessage {
+    RapInvocationClaim {
+        invocation: String,
+        record: Option<RapClaimRecord>,
+    },
     /// Input included in a completion, without confirming durability.
     InputAdmitted {
         thread_id: Option<ThreadRef>,
@@ -485,6 +509,8 @@ pub enum DaemonMessage {
         /// Random daemon-lifetime identity, shared by every connection.
         #[serde(default)]
         boot_id: String,
+        #[serde(default = "websocket_enabled_default")]
+        websocket_enabled: bool,
         sessions: HashMap<ThreadRef, SessionInfo>,
         available_models: Vec<ModelInfo>,
         default_model_name: String,

@@ -59,6 +59,9 @@ struct PendingCall {
     invocation: uuid::Uuid,
     context: ToolContext<ChannelSender>,
     call_id: Option<rap_protocol::ProviderCallId>,
+    operation: String,
+    arguments: serde_json::Value,
+    endpoint: String,
 }
 
 #[derive(Clone)]
@@ -561,8 +564,11 @@ impl Tool<ChannelSender> for ManagedRapTool {
             return Err("archived session cannot dispatch RAP calls".into());
         }
         let key = (context.group_id.clone(), id.clone());
-        let invocation =
-            matches!(self.server.spec, ServerSpec::Command { .. }).then(uuid::Uuid::new_v4);
+        let invocation = matches!(
+            self.server.spec,
+            ServerSpec::Command { .. } | ServerSpec::External { .. }
+        )
+        .then(uuid::Uuid::new_v4);
         if let Some(invocation) = invocation {
             self.server
                 .pending
@@ -575,6 +581,9 @@ impl Tool<ChannelSender> for ManagedRapTool {
                         invocation,
                         context: context.clone(),
                         call_id: call_id.clone(),
+                        operation: self.descriptor.name.clone(),
+                        arguments: args.clone(),
+                        endpoint: manifest.endpoint.clone(),
                     },
                 );
         }
@@ -693,6 +702,35 @@ impl SessionRapManager {
             pending: PendingCalls::default(),
             servers: Rc::default(),
         }
+    }
+
+    /// Read a dispatch without consuming its callback authority.
+    pub fn claim_rap_invocation(
+        &self,
+        invocation: &uuid::Uuid,
+    ) -> Option<infinity_protocol::RapClaimRecord> {
+        let pending = self.pending.lock().expect("bug: pending calls poisoned");
+        let ((_, id), call) = pending
+            .iter()
+            .find(|(_, call)| &call.invocation == invocation)?;
+        Some(infinity_protocol::RapClaimRecord {
+            thread_stack: call
+                .context
+                .thread_stack
+                .iter()
+                .cloned()
+                .map(infinity_protocol::ThreadRef::local)
+                .collect(),
+            operation: call.operation.clone(),
+            arguments: call.arguments.clone(),
+            endpoint: call.endpoint.clone(),
+            callback_url: format!(
+                "{}/managed/{invocation}",
+                call.context.callback_url.trim_end_matches('/')
+            ),
+            id: id.clone(),
+            call_id: call.call_id.clone(),
+        })
     }
 
     pub(crate) fn callback_sender(&self, sender: ChannelSender) -> RapInputSender {
@@ -1133,5 +1171,128 @@ mod r14a_registry {
     #[tokio::test(flavor = "current_thread")]
     async fn r14a_cancelled_command_calls_retire() {
         cancellation_case(true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_dispatch_claim_is_repeatable_and_unix_only() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let port = r10a_waiting_server().await.expect("server");
+                let mut h = start_harness().await.expect("harness");
+                rap_test_servers::write_rap_config(h.cwd.path(), port).expect("RAP config");
+                let root = create_session_and_chat(&mut h).await;
+                h.client_tx
+                    .send(ClientMessage::UserInput {
+                        thread_id: root.clone(),
+                        text: "use tool".into(),
+                    })
+                    .expect("input");
+                h.ctrl.next_request().await;
+                h.ctrl.send_tool_call(
+                    "audit-id",
+                    "waiting_choice",
+                    serde_json::json!({"canonical":true}),
+                );
+                h.ctrl.finish();
+                let invocation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if let Some(id) = h
+                            .manager
+                            .lock()
+                            .await
+                            .rap_manager
+                            .pending
+                            .lock()
+                            .expect("registry")
+                            .values()
+                            .next()
+                            .map(|call| call.invocation)
+                        {
+                            break id;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("dispatch")
+                .to_string();
+                let (unix, server) = tokio::net::UnixStream::pair().expect("Unix pair");
+                tokio::task::spawn_local(crate::client_handler::handle_client(
+                    server,
+                    h.manager.clone(),
+                ));
+                use futures_util::{SinkExt, StreamExt};
+                let mut unix = tokio_util::codec::Framed::new(
+                    unix,
+                    infinity_protocol::length_delimited_codec(),
+                );
+                unix.next().await.expect("welcome").expect("welcome frame");
+                for _ in 0..2 {
+                    unix.send(
+                        serde_json::to_vec(&ClientMessage::ClaimRapInvocation {
+                            invocation: invocation.clone(),
+                        })
+                        .expect("claim JSON")
+                        .into(),
+                    )
+                    .await
+                    .expect("claim");
+                    let bytes = unix.next().await.expect("reply").expect("frame");
+                    let DaemonMessage::RapInvocationClaim {
+                        record: Some(record),
+                        ..
+                    } = serde_json::from_slice(&bytes).expect("record")
+                    else {
+                        panic!("expected trusted claim")
+                    };
+                    assert_eq!(record.thread_stack, vec![root.clone()]);
+                    assert_eq!(record.arguments, serde_json::json!({"canonical":true}));
+                    assert_eq!(record.id.as_str(), "audit-id");
+                    assert_eq!(record.endpoint, format!("http://127.0.0.1:{port}/invoke"));
+                    assert!(
+                        record
+                            .callback_url
+                            .ends_with(&format!("/managed/{invocation}"))
+                    );
+                }
+                h.client_tx
+                    .send(ClientMessage::ClaimRapInvocation {
+                        invocation: invocation.clone(),
+                    })
+                    .expect("untrusted claim");
+                let msg = wait_for_message(&mut h.daemon_rx, |m| {
+                    matches!(m, DaemonMessage::RapInvocationClaim { .. })
+                })
+                .await;
+                assert!(matches!(
+                    msg,
+                    DaemonMessage::RapInvocationClaim { record: None, .. }
+                ));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("WS listener");
+                let addr = listener.local_addr().expect("address");
+                let task =
+                    tokio::task::spawn_local(crate::ws_handler::serve(listener, h.manager.clone()));
+                let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+                    .await
+                    .expect("WebSocket");
+                ws.next().await.expect("WS welcome").expect("welcome");
+                ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::to_string(&ClientMessage::ClaimRapInvocation { invocation })
+                        .expect("JSON")
+                        .into(),
+                ))
+                .await
+                .expect("WS claim");
+                let reply = ws.next().await.expect("WS reply").expect("reply");
+                let reply: DaemonMessage =
+                    serde_json::from_str(reply.to_text().expect("text")).expect("reply JSON");
+                assert!(matches!(
+                    reply,
+                    DaemonMessage::RapInvocationClaim { record: None, .. }
+                ));
+                task.abort();
+            })
+            .await;
     }
 }

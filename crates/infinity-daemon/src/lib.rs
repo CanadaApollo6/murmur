@@ -83,10 +83,21 @@ pub async fn run_daemon(
         .and_then(|s| s.parse().ok())
         .unwrap_or(8080);
     let ws_bind_addr = std::env::var("INFINITY_WS_BIND").unwrap_or_else(|_| "127.0.0.1".to_owned());
-    let ws_listener = TcpListener::bind((&*ws_bind_addr, ws_port)).await?;
-    tracing::info!("websocket server listening on {ws_bind_addr}:{ws_port}");
-
-    let ws_accept = ws_handler::serve(ws_listener, session_manager.clone());
+    let ws_listener = if std::env::var("INFINITY_WS").as_deref() == Ok("off") {
+        None
+    } else {
+        Some(TcpListener::bind((&*ws_bind_addr, ws_port)).await?)
+    };
+    session_manager.lock().await.websocket_enabled = ws_listener.is_some();
+    let ws_accept = async {
+        if let Some(listener) = ws_listener {
+            tracing::info!("websocket server listening on {}", listener.local_addr()?);
+            ws_handler::serve(listener, session_manager.clone()).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+        Ok::<(), std::io::Error>(())
+    };
 
     let shutdown = async {
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
