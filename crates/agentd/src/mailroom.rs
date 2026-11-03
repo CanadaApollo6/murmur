@@ -302,6 +302,20 @@ impl Mailroom {
         .await
     }
 
+    /// Resume tokens of agents that are not retired. An agent keeps its token
+    /// across restarts, replacement and recovery.
+    pub(crate) async fn live_resume_tokens(&self) -> Result<Vec<crate::adapter::ResumeToken>> {
+        self.call(|s| {
+            let mut q = s.db.prepare(
+                "SELECT resume FROM actor_state JOIN agents ON agent=agents.id \
+                 WHERE retired=0 AND resume IS NOT NULL",
+            )?;
+            Ok(q.query_map([], |r| json_col(r, 0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+    }
+
     pub(crate) async fn save_resume(
         &self,
         agent: AgentId,

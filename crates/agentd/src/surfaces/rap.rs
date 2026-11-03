@@ -234,9 +234,27 @@ impl RapServer {
                 {
                     verified = Some((socket.clone(), record, binding));
                     break;
-                } else {
-                    return Err(TemporarilyUnavailable.into());
                 }
+                let root = record
+                    .thread_stack
+                    .first()
+                    .expect("bug: checked that the claim has a root");
+                return Err(match api.mailroom.live_resume_tokens().await {
+                    // A live agent owns this root but has not bound it yet:
+                    // startup restore, replacement, or recovery.
+                    Ok(tokens)
+                        if tokens.iter().any(|token| {
+                            crate::adapters::infinity::resumes_root(token, socket, root)
+                        }) =>
+                    {
+                        TemporarilyUnavailable.into()
+                    }
+                    Ok(_) => "no live agent hosts this root".into(),
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot read agent roots");
+                        TemporarilyUnavailable.into()
+                    }
+                });
             }
             if verified.is_none() && !claim_errors.is_empty() {
                 tracing::warn!(errors=?claim_errors, "RAP claim temporarily unavailable");
@@ -300,14 +318,7 @@ impl RapServer {
         let api = api.clone();
         let http = http.clone();
         tokio::spawn(async move {
-            let remaining = Duration::from_secs(600).saturating_sub(result.finished.elapsed());
-            match tokio::time::timeout(remaining, api.bindings.rap_delivery_slots.acquire()).await {
-                Ok(Ok(_permit)) => Self::deliver(&http, id, &result).await,
-                Ok(Err(error)) => tracing::error!(%id, %error, "RAP delivery semaphore closed"),
-                Err(error) => {
-                    tracing::error!(%id, %error, "RAP callback expired waiting for delivery slot")
-                }
-            }
+            Self::deliver(&http, &api.bindings.rap_delivery_slots, id, &result).await;
             if let Some(Execution::Completed {
                 delivering,
                 result: current,
@@ -319,7 +330,15 @@ impl RapServer {
             }
         });
     }
-    async fn deliver(http: &reqwest::Client, id: Uuid, completed: &Completed) {
+    /// Posts the callback until the daemon accepts it or the result expires.
+    /// A delivery slot is held only for each POST, never across backoff, so
+    /// failing destinations cannot starve healthy ones.
+    async fn deliver(
+        http: &reqwest::Client,
+        slots: &tokio::sync::Semaphore,
+        id: Uuid,
+        completed: &Completed,
+    ) {
         let mut backoff = Duration::from_millis(100);
         loop {
             if completed.finished.elapsed() >= Duration::from_secs(600) {
@@ -327,14 +346,28 @@ impl RapServer {
                 return;
             }
             let remaining = Duration::from_secs(600).saturating_sub(completed.finished.elapsed());
-            match tokio::time::timeout(
-                remaining.min(Duration::from_secs(2)),
-                http.post(&completed.callback_url)
-                    .json(&completed.result)
-                    .send(),
-            )
-            .await
-            {
+            let attempt = tokio::time::timeout(remaining, async {
+                let _permit = slots.acquire().await?;
+                Ok::<_, tokio::sync::AcquireError>(
+                    tokio::time::timeout(
+                        remaining.min(Duration::from_secs(2)),
+                        http.post(&completed.callback_url)
+                            .json(&completed.result)
+                            .send(),
+                    )
+                    .await,
+                )
+            })
+            .await;
+            let attempt = match attempt {
+                Ok(Ok(attempt)) => attempt,
+                Ok(Err(error)) => {
+                    tracing::error!(%id, %error, "RAP delivery semaphore closed");
+                    return;
+                }
+                Err(_) => continue,
+            };
+            match attempt {
                 Ok(Ok(response)) if response.status().is_success() => return,
                 Ok(Ok(response)) => {
                     tracing::warn!(%id, status=%response.status(), "RAP callback rejected")

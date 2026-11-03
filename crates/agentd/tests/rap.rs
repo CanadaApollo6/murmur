@@ -81,6 +81,10 @@ impl Test {
                                 let tx = tx.clone(); let status = status.clone();
                                 async move {
                                     use http_body_util::BodyExt;
+                                    // Destinations under /stuck/ always fail and are not reported.
+                                    if req.uri().path().starts_with("/stuck/") {
+                                        return Ok(hyper::Response::builder().status(503).body(http_body_util::Full::new(bytes::Bytes::new())).expect("response"));
+                                    }
                                     let body = req.into_body().collect().await.expect("callback body").to_bytes();
                                     if tx.send(serde_json::from_slice(&body).expect("callback JSON")).is_err() { return Err("callback receiver closed"); }
                                     if status.load(Ordering::SeqCst) == 0 { std::future::pending::<()>().await; }
@@ -388,11 +392,7 @@ async fn rap_unverified_calls_and_revoked_bindings_cannot_send() {
             .expect("state")
             .claims
             .insert(id.to_string(), record);
-        assert_eq!(
-            t.invoke(id).await,
-            if change == "root" { 503 } else { 403 },
-            "{change}"
-        );
+        assert_eq!(t.invoke(id).await, 403, "{change}");
     }
     let (cached_id, _) = t.record(false, "accepted before revocation");
     assert_eq!(t.invoke(cached_id).await, 200);
@@ -1024,10 +1024,10 @@ async fn rap_delivery_workers_have_a_global_cap() {
 }
 
 #[tokio::test]
-async fn rap_live_claim_without_root_binding_is_retryable() {
+async fn rap_claim_for_a_root_no_agent_hosts_is_rejected() {
     let t = Test::new("").await;
-    let (id, mut record) = t.record(false, "restore pending");
-    record.thread_stack[0] = ThreadRef::local("restoring-root".into());
+    let (id, mut record) = t.record(false, "never hosted");
+    record.thread_stack[0] = ThreadRef::local("never-hosted-root".into());
     t.daemon
         .state
         .lock()
@@ -1036,8 +1036,43 @@ async fn rap_live_claim_without_root_binding_is_retryable() {
         .insert(id.to_string(), record);
     assert_eq!(
         t.invoke(id).await,
-        503,
-        "a trusted dispatch can outlive the binding startup window"
+        403,
+        "a root no live agent owns cannot become bound, so retrying cannot help"
     );
     assert!(t.rows().is_empty());
+}
+
+#[tokio::test]
+async fn rap_failing_destinations_do_not_starve_healthy_delivery() {
+    let mut t = Test::new("[mail]\nper_pair = 0").await;
+    for _ in 0..32 {
+        let (id, mut record) = t.record(false, "stuck destination");
+        record.callback_url = format!("{}/stuck/managed/{id}", t.callback_base);
+        t.daemon
+            .state
+            .lock()
+            .expect("state")
+            .claims
+            .insert(id.to_string(), record);
+        assert_eq!(t.invoke(id).await, 200);
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while t.rows().len() < 32 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stuck sends accepted");
+    let (id, _) = t.record(false, "healthy destination");
+    assert_eq!(t.invoke(id).await, 200);
+    let callback = tokio::time::timeout(Duration::from_secs(3), t.callbacks.recv())
+        .await
+        .expect("healthy callback delivered while 32 destinations fail")
+        .expect("callback");
+    assert!(
+        callback["text"]
+            .as_str()
+            .expect("text")
+            .starts_with("Queued")
+    );
 }

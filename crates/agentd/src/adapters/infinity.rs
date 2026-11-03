@@ -25,6 +25,17 @@ struct InfinityResume {
     needs_interrupt: bool,
 }
 
+/// Whether `token` resumes an Infinity session rooted at `root` on `socket`.
+pub(crate) fn resumes_root(
+    token: &ResumeToken,
+    socket: &std::path::Path,
+    root: &ThreadRef,
+) -> bool {
+    token
+        .decode::<InfinityResume>()
+        .is_ok_and(|saved| saved.socket == socket && &saved.root == root)
+}
+
 struct Choice {
     wire_id: infinity_protocol::ChoiceId,
     // Keep answered identity until daemon dismissal, without accepting another answer.
