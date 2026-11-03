@@ -16,3 +16,7 @@ pub(super) fn reasoning_fields() -> &'static [&'static str] {
 pub(super) fn success_finishes() -> &'static [&'static str] {
     &["stop", "tool_calls"]
 }
+
+pub(super) fn default_reply_cap() -> Option<u64> {
+    None
+}

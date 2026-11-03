@@ -18,3 +18,7 @@ pub(super) fn success_finishes() -> &'static [&'static str] {
     &["stop", "tool_calls"]
 }
 // An omitted output cap is assumed to clamp to remaining room until the SGLang live probe runs.
+
+pub(super) fn default_reply_cap() -> Option<u64> {
+    None
+}

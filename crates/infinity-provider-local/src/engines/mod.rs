@@ -66,8 +66,61 @@ impl Engine {
     }
     pub(crate) fn default_reply_cap(self) -> Option<u64> {
         match self {
-            Self::TensorFold => Some(4096),
-            _ => None,
+            Self::LlamaCpp => llama_cpp::default_reply_cap(),
+            Self::Vllm => vllm::default_reply_cap(),
+            Self::Sglang => sglang::default_reply_cap(),
+            Self::TensorFold => tensorfold::default_reply_cap(),
+            Self::Generic => generic::default_reply_cap(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn discovery_shapes_and_missing_values() {
+        // llama.cpp a0e6dc7 tools/server/server-context.cpp:5133,5141.
+        let llama = Engine::LlamaCpp.discover(
+            &Value::Null,
+            &json!({"default_generation_settings":{"n_ctx":32768},"total_slots":2}),
+        );
+        assert_eq!(llama.context, Some(32768));
+        assert_eq!(llama.slots, Some(2));
+        // vLLM v0.30.0 entrypoints/openai/models/serving.py and SGLang v0.5.23 http_server.py:2003-2006.
+        assert_eq!(
+            Engine::Vllm
+                .discover(&json!({"max_model_len":8192}), &Value::Null)
+                .context,
+            Some(8192)
+        );
+        let sg = Engine::Sglang.discover(
+            &json!({"max_model_len":8192}),
+            &json!({"max_running_requests":null}),
+        );
+        assert_eq!(sg.slots, None);
+        // TensorFold Python server/app.py:health and server/http.py:104-118, native status_routes.zig:35,89.
+        let tf = Engine::TensorFold.discover(
+            &json!({"id":"weights"}),
+            &json!({"status":"ok","max_batch_size":4}),
+        );
+        assert_eq!(tf.context, None);
+        assert_eq!(tf.slots, Some(4));
+        let native =
+            Engine::TensorFold.discover(&json!({"context_length":16384}), &json!({"status":"ok"}));
+        assert_eq!(native.context, Some(16384));
+        assert_eq!(native.slots, None);
+        for e in [
+            Engine::LlamaCpp,
+            Engine::Vllm,
+            Engine::Sglang,
+            Engine::TensorFold,
+            Engine::Generic,
+        ] {
+            let d=e.discover(&json!({"max_model_len":0,"context_length":0}),&json!({"total_slots":0,"max_batch_size":null,"max_running_requests":0,"default_generation_settings":{"n_ctx":0}}));
+            assert_eq!(d.context, None);
+            assert_eq!(d.slots, None);
         }
     }
 }
