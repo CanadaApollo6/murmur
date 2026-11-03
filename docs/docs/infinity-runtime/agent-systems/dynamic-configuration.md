@@ -190,6 +190,7 @@ struct SelectedModel {
     model_id: String,
     context_window: usize,
     supports_image_input: bool,
+    keeps_unsigned_reasoning: bool,
 }
 
 struct TenantModelSource<C> {
@@ -231,6 +232,7 @@ where
             model_id: model.model_id,
             context_window: model.context_window,
             supports_image_input: model.supports_image_input,
+            keeps_unsigned_reasoning: model.keeps_unsigned_reasoning,
         })
     }
 }

@@ -54,6 +54,8 @@ pub struct ModelEntry {
     /// tool results). When `false`, the runtime replaces image content with
     /// a text placeholder before invoking the model.
     pub supports_image_input: bool,
+    /// Whether unsigned reasoning is retained and sent back to this model.
+    pub keeps_unsigned_reasoning: bool,
 }
 ```
 
@@ -84,6 +86,7 @@ let provider = RigCompletionModel::new(model).into_provider(ModelEntry {
     context_window: 200_000,
     max_output_tokens: Some(64_000),
     supports_image_input: true,
+    keeps_unsigned_reasoning: false,
 });
 # let _ = provider;
 ```

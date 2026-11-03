@@ -142,15 +142,42 @@ One actor per agent, one state machine for every kind: `Dormant → Starting →
 
 ### 5. Local inference
 
-New `infinity-provider-local` binary, registered in `providers.json`, hand-written against `infinity-provider-protocol` (no rig base-URL assumption):
+`infinity-provider-local --config <path>` serves TensorFold native and Python,
+llama.cpp, vLLM, SGLang, and generic OpenAI-compatible loopback servers through
+`infinity-provider-protocol`. It does not manage inference processes.
 
-- `CompletionRequest` → OpenAI `chat/completions` with `parallel_tool_calls=false`; a response with several tool calls is a protocol error.
-- SSE → `StreamChunk`, accumulating tool-call fragments into one complete `ToolCall`; `Final{usage}`, counting usage with the server's `/tokenize` endpoint if the server omits it.
-- `ErrorClass` from llama.cpp/vLLM errors: context length → `ContextOverflow`, queue full → `Throttled`, transport → `Transient`, bad model or tools → `Fatal`.
-- Sampling lives in **profiles**: several `model_id`s over the same resident weights.
-- The context window is **read from the running server** (llama.cpp per-slot `n_ctx` from `/props`, vLLM `max_model_len`), never configured.
-- **GPU sharing:** one resident model per GPU. A `GpuGate` sized to the server's slot count, with a bounded FIFO wait queue (32; overflow is `Throttled`). The patched `handle_invoke` races each invocation and its stream against client disconnect, so a cancelled request leaves the queue or frees its slot immediately.
-- Sizing example, a budget and not a measurement: a ~30B MoE coder at Q4 with `--parallel 2 -c 65536` and q8 KV, about 22 GB, leaving a 2 GB margin on the 24 GB card. Qualify peak memory before adopting a profile.
+- Profiles expose `<server>/<profile>` model IDs over resident weights. The
+  catalog comes entirely from validated TOML, including the configured context
+  window. Discovery verifies that the running engine can honor that window.
+  Context or model changes require restarting the daemon.
+- The shared converter produces streaming `chat/completions` requests, preserves
+  reasoning, translates compacted summaries, separates batched user inputs, and
+  requests one tool call. The first returned tool index wins.
+- SSE text streams immediately. Tool arguments accumulate until a successful
+  finish, then one unsigned reasoning block, one call, and `Final` carry the
+  completed turn. Usage remains absent when the server supplies none.
+- Each server owns a FIFO gate with its resolved slot count and at most 32
+  waiters. There is no cross-server or GPU gate. Dropping a queued request or
+  stream releases its queue position or permit and HTTP response.
+- Connect, first-token, discovery, and progress timeouts are separate. Queued
+  time is excluded. Comments, role deltas, and usage do not count as generation.
+- Overflow with an output cap retries once without that cap, through the same
+  permit and before any chunk reaches core. This drops the reply bound for that
+  turn. Uncapped overflow rechecks discovery and TensorFold's refusal limit.
+  A server smaller than the configured context is an actionable `Fatal`, so core
+  does not discard fresh input to compensate for incorrect configuration.
+- A `length` finish is `Fatal`. Usage distinguishes a full context window from
+  an output cap when possible. It never invokes core's input-dropping overflow
+  recovery for a reply that filled the window.
+- Local models opt into unsigned reasoning. Core strips whole unsigned blocks
+  when switching to models that do not accept them. Retries remain bounded even
+  after partial output, while the first accepted chunk still validates inputs.
+- TensorFold requests use fresh seeds unless a profile pins one. Its omitted
+  reply cap defaults to 4096 tokens. Python can silently strip malformed tool
+  calls. Its parser reliability and the RTX 3090 profile remain unqualified.
+
+See [Run local inference](local-inference.md) for configuration, engine flags,
+limits, probes, and the qualification procedure.
 
 ### 6. Fork footprint
 

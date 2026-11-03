@@ -34,8 +34,12 @@ Each milestone ends in a merged PR with its tests in `./check.bash`.
 3. **Infinity agents send mail.** Done on `feat/agentd-rap-send`. A RAP toolset
    provides `send_message` through daemon-owned invocation claims and live root
    bindings. Child threads share their root agent's sender and mail limits.
-4. **Local inference.** `infinity-provider-local` against llama.cpp, with the
-   `GpuGate` queue and a profile qualified on this machine's RTX 3090.
+4. **Local inference.** Implemented on `feat/local-inference` for TensorFold,
+   llama.cpp, vLLM, SGLang, and generic loopback servers. Configured profiles,
+   per-server gates, streaming tools and reasoning, bounded retries, and overflow
+   guards have deterministic and mock-engine coverage. Live engine probes and
+   the RTX 3090 agent qualification remain pending. See
+   [Run local inference](local-inference.md).
 5. **Event bus and graph UI.** `/events` over WebSocket: a snapshot at a cursor,
    then agent, message and permission events.
 6. **Close the v1 swarm loop.** A verifier from another model family checks each
