@@ -4918,6 +4918,64 @@ mod tests {
         assert!(persisted(&store).contains("accepted input"));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn context_configuration_fatal_preserves_fresh_user_and_tool_inputs() {
+        for tool_result in [false, true] {
+            let (provider, mut ctrl) = mock_provider();
+            let store = InMemoryConversationStore::new();
+            let hm = make_history(
+                &store,
+                if tool_result {
+                    vec![
+                        Message::user("read"),
+                        tool_call_msg("call", "read", serde_json::json!({})),
+                    ]
+                } else {
+                    vec![]
+                },
+            )
+            .await;
+            if tool_result {
+                add_tool_result_input(&hm, "call", "fresh oversized result", "result");
+            } else {
+                add_user_input(&hm, "fresh user input", "user");
+            }
+            let before = hm.get_history(false, true);
+            let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+            let (events, ()) = tokio::join!(
+                collect_completion_events(&provider, &hm, cancel_rx),
+                async {
+                    ctrl.next_request().await;
+                    ctrl.send_error(CompletionError::provider(
+                        ErrorClass::Fatal,
+                        "server context 64 is smaller than configured context_window 128",
+                    ));
+                    ctrl.drop_stream();
+                }
+            );
+            assert!(events.iter().any(|e| e.contains("context_window 128")));
+            assert_eq!(hm.get_history(false, true), before);
+            assert_eq!(hm.unvalidated_len(), 1);
+            let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+            let (events, ()) = tokio::join!(
+                collect_completion_events(&provider, &hm, cancel_rx),
+                async {
+                    let request = ctrl.next_request().await;
+                    assert_eq!(request.chat_history, before);
+                    ctrl.send_text("corrected server accepted the original input");
+                    ctrl.finish();
+                }
+            );
+            assert!(events.contains(&"done".to_owned()));
+            hm.sync().await.expect("persist accepted original input");
+            assert!(persisted(&store).contains(if tool_result {
+                "fresh oversized result"
+            } else {
+                "fresh user input"
+            }));
+        }
+    }
+
     /// An oversized *user input* cannot be shrunk: on a context-overflow
     /// error it must be dropped from the in-memory history and never
     /// persisted, so the thread does not permanently hang on a poison

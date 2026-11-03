@@ -550,7 +550,7 @@ mod reasoning_tests {
     use infinity_agent_core::system::ModelSource;
     #[tokio::test]
     async fn catalog_resolves_unsigned_reasoning_capability() {
-        let (model, _ctrl) = infinity_provider_protocol::mock::mock_model();
+        let (model, mut ctrl) = infinity_provider_protocol::mock::mock_model();
         let entry = ModelEntry {
             model_id: "local".into(),
             display_name: "local".into(),
@@ -589,5 +589,37 @@ mod reasoning_tests {
                 .expect("resolve")
                 .keeps_unsigned_reasoning
         );
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let running = infinity_agent_core::system::AgentSystemBuilder::new_local(
+                    source.conversation_store.clone(),
+                    infinity_agent_core::stores::InMemoryStateStore::new(),
+                    source,
+                )
+                .start_with_observer(|_| infinity_agent_core::system::EventCollector::default());
+                running
+                    .send_user_text(ThreadId::from_ref("thread"), "think")
+                    .await;
+                ctrl.next_request().await;
+                ctrl.send_chunk(infinity_provider_protocol::StreamChunk::Reasoning(
+                    infinity_provider_protocol::Reasoning::new_with_signature(
+                        "local thought",
+                        None,
+                    ),
+                ));
+                ctrl.send_text("answer");
+                ctrl.finish();
+                running
+                    .send_user_text(ThreadId::from_ref("thread"), "continue")
+                    .await;
+                let next = tokio::time::timeout(Duration::from_secs(2), ctrl.next_request())
+                    .await
+                    .expect("next round");
+                assert!(format!("{:?}", next.chat_history).contains("local thought"));
+                ctrl.send_text("done");
+                ctrl.finish();
+                running.shutdown().await;
+            })
+            .await;
     }
 }
