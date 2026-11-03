@@ -112,7 +112,10 @@ Values travel in the OS environment instead of bubblewrap `--setenv` arguments,
 so an optional provider env token does not enter argv.
 
 Configuration rejects `AGENTD_*`, display, runtime bus, SSH agent and loader
-injection variables. Inherited host variables outside the allowlist disappear.
+injection variables. This includes all `LD_*` and `MALLOC_*` names, `GCONV_PATH`,
+`GLIBC_TUNABLES` and `LOCPATH`. The same validated environment reaches the
+host-side bubblewrap process and its sandboxed child. Inherited host variables
+outside the allowlist disappear.
 Unsandboxed launch still strips inherited `AGENTD_*` settings.
 
 ## Credential refresh and exposure

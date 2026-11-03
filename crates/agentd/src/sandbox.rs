@@ -127,6 +127,8 @@ pub fn host_home() -> PathBuf {
 }
 pub fn forbidden_env(name: &str) -> bool {
     name.starts_with("AGENTD_")
+        || name.starts_with("LD_")
+        || name.starts_with("MALLOC_")
         || matches!(
             name,
             "XDG_RUNTIME_DIR"
@@ -138,8 +140,9 @@ pub fn forbidden_env(name: &str) -> bool {
                 | "DISPLAY"
                 | "BASH_ENV"
                 | "ENV"
-                | "LD_PRELOAD"
-                | "LD_LIBRARY_PATH"
+                | "GCONV_PATH"
+                | "GLIBC_TUNABLES"
+                | "LOCPATH"
         )
 }
 pub fn host_pattern(host: &str) -> bool {
@@ -1258,6 +1261,45 @@ mod tests {
         assert!(!host_pattern("127.0.0.1"));
         assert!(!host_pattern("*.com/evil"));
         assert!(host_pattern("*.example.com"));
+    }
+    #[test]
+    fn config_rejects_loader_hooks_in_forwarded_and_kind_environment() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        std::fs::create_dir(&state).expect("state");
+        for name in [
+            "LD_AUDIT",
+            "LD_DEBUG",
+            "GCONV_PATH",
+            "MALLOC_TRACE",
+            "GLIBC_TUNABLES",
+            "LOCPATH",
+        ] {
+            for forwarded in [true, false] {
+                let mut kinds = sandbox_kinds();
+                let mut cfg = SandboxConfig {
+                    ro_binds: vec![],
+                    ..Default::default()
+                };
+                if forwarded {
+                    cfg.env.push(name.into());
+                } else {
+                    kinds[0]
+                        .env
+                        .insert(name.into(), "/workspace/agent-library".into());
+                }
+                let result = cfg.validate(
+                    &state,
+                    &state.join("agentd.sock"),
+                    &state.join("mcp.sock"),
+                    &mut kinds,
+                );
+                let error = result
+                    .expect_err("loader hook must fail configuration")
+                    .to_string();
+                assert!(error.contains(name), "{error}");
+            }
+        }
     }
     #[test]
     fn seed_rejects_symlink_components_and_never_writes_through_leaf_links() {
