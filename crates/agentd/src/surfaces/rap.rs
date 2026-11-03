@@ -52,6 +52,7 @@ pub(super) enum Execution {
     Completed {
         call: VerifiedCall,
         result: Box<Completed>,
+        delivering: bool,
     },
 }
 impl Execution {
@@ -60,13 +61,17 @@ impl Execution {
             Self::InFlight { call, .. } | Self::Completed { call, .. } => call,
         }
     }
-    pub(super) fn identity(&self) -> &SessionIdentity {
-        &self.call().identity
+    pub(super) fn retain_on_revoke(&self, agent: crate::model::AgentId) -> bool {
+        matches!(self, Self::Completed { .. }) || self.call().identity.agent != agent
     }
     fn expired(&self) -> bool {
         matches!(self, Self::Completed { result, .. } if result.finished.elapsed() >= Duration::from_secs(600))
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("RAP binding or daemon temporarily unavailable")]
+struct TemporarilyUnavailable;
 
 pub struct RapServer {
     listener: TcpListener,
@@ -165,7 +170,14 @@ impl RapServer {
             Ok(Ok(())) => response(StatusCode::OK, "OK"),
             Ok(Err(error)) => {
                 tracing::warn!(%error, "unverified RAP invocation");
-                response(StatusCode::FORBIDDEN, "Unverified RAP invocation")
+                if error.is::<TemporarilyUnavailable>() {
+                    response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "RAP binding temporarily unavailable",
+                    )
+                } else {
+                    response(StatusCode::FORBIDDEN, "Unverified RAP invocation")
+                }
             }
             Err(error) => {
                 tracing::warn!(%error, "RAP invocation timed out");
@@ -180,14 +192,18 @@ impl RapServer {
             calls.get(&id).cloned()
         };
         let execution = if let Some(cached) = cached {
+            if let Execution::Completed { .. } = cached {
+                Self::start_delivery(&self.http, &api, id).await;
+                return Ok(());
+            }
             let call = cached.call();
             let binding = api
                 .bindings
                 .authenticate_rap(&call.socket, &self.endpoint, &call.record)
                 .await
-                .ok_or("binding revoked")?;
+                .ok_or(TemporarilyUnavailable)?;
             if binding.identity() != &call.identity {
-                return Err("binding replaced".into());
+                return Err(TemporarilyUnavailable.into());
             }
             cached
         } else {
@@ -202,6 +218,15 @@ impl RapServer {
                         continue;
                     }
                 };
+                if record.endpoint != self.endpoint
+                    || record.operation != "send_message"
+                    || record
+                        .thread_stack
+                        .first()
+                        .is_none_or(|root| root.remote.is_some())
+                {
+                    continue;
+                }
                 if let Some(binding) = api
                     .bindings
                     .authenticate_rap(socket, &self.endpoint, &record)
@@ -209,7 +234,13 @@ impl RapServer {
                 {
                     verified = Some((socket.clone(), record, binding));
                     break;
+                } else {
+                    return Err(TemporarilyUnavailable.into());
                 }
+            }
+            if verified.is_none() && !claim_errors.is_empty() {
+                tracing::warn!(errors=?claim_errors, "RAP claim temporarily unavailable");
+                return Err(TemporarilyUnavailable.into());
             }
             let (socket, record, binding) = verified.ok_or_else(|| {
                 format!(
@@ -237,50 +268,64 @@ impl RapServer {
                             id,
                             Execution::Completed {
                                 call: call.clone(),
-                                result: Box::new(result.clone()),
+                                result: Box::new(result),
+                                delivering: false,
                             },
                         );
                         drop(binding);
-                        Self::deliver(&http, &api, id, &call, &result).await;
+                        Self::start_delivery(&http, &api, id).await;
                     });
                     execution
                 }
             }
         };
-        if let Execution::Completed { call, result } = execution {
-            let api = api.clone();
-            let http = self.http.clone();
-            tokio::spawn(async move {
-                Self::deliver(&http, &api, id, &call, &result).await;
-            });
+        if let Execution::Completed { .. } = execution {
+            Self::start_delivery(&self.http, &api, id).await;
         }
         Ok(())
     }
-    async fn deliver(
-        http: &reqwest::Client,
-        api: &ControlApi,
-        id: Uuid,
-        call: &VerifiedCall,
-        completed: &Completed,
-    ) {
+    async fn start_delivery(http: &reqwest::Client, api: &Arc<ControlApi>, id: Uuid) {
+        let result = {
+            let mut calls = api.bindings.rap_calls.lock().await;
+            match calls.get_mut(&id) {
+                Some(Execution::Completed {
+                    result, delivering, ..
+                }) if !*delivering => {
+                    *delivering = true;
+                    result.clone()
+                }
+                _ => return,
+            }
+        };
+        let api = api.clone();
+        let http = http.clone();
+        tokio::spawn(async move {
+            let remaining = Duration::from_secs(600).saturating_sub(result.finished.elapsed());
+            match tokio::time::timeout(remaining, api.bindings.rap_delivery_slots.acquire()).await {
+                Ok(Ok(_permit)) => Self::deliver(&http, id, &result).await,
+                Ok(Err(error)) => tracing::error!(%id, %error, "RAP delivery semaphore closed"),
+                Err(error) => {
+                    tracing::error!(%id, %error, "RAP callback expired waiting for delivery slot")
+                }
+            }
+            if let Some(Execution::Completed {
+                delivering,
+                result: current,
+                ..
+            }) = api.bindings.rap_calls.lock().await.get_mut(&id)
+                && current.finished == result.finished
+            {
+                *delivering = false;
+            }
+        });
+    }
+    async fn deliver(http: &reqwest::Client, id: Uuid, completed: &Completed) {
         let mut backoff = Duration::from_millis(100);
         loop {
             if completed.finished.elapsed() >= Duration::from_secs(600) {
                 tracing::error!(%id, is_error=completed.is_error, "RAP callback delivery expired");
                 return;
             }
-            let binding = api
-                .bindings
-                .authenticate_rap(&call.socket, &call.record.endpoint, &call.record)
-                .await;
-            if binding
-                .as_ref()
-                .is_none_or(|binding| binding.identity() != &call.identity)
-            {
-                tracing::warn!(%id, "RAP callback delivery stopped after binding revocation");
-                return;
-            }
-            drop(binding);
             let remaining = Duration::from_secs(600).saturating_sub(completed.finished.elapsed());
             match tokio::time::timeout(
                 remaining.min(Duration::from_secs(2)),

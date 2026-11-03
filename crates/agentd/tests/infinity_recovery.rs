@@ -3898,6 +3898,11 @@ async fn command_invocation_scope_rejects_late_callback_with_reused_id() {
 async fn external_transport_failure_after_reused_callback_id_settles() {
     tokio::task::LocalSet::new().run_until(async {
         let mut h = start_harness().await.expect("harness");
+        h.manager.lock().await.rap_manager.set_external_rap_policy(infinity_daemon::rap_servers::ExternalRapPolicy {
+            retry_budget: Duration::from_millis(250), backoff: Duration::from_millis(20),
+            max_backoff: Duration::from_millis(50), recovery_interval: Duration::from_secs(30),
+            deadline: Duration::from_secs(600),
+        });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("server");
         let port = listener.local_addr().expect("address").port();
         let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3942,13 +3947,13 @@ async fn external_transport_failure_after_reused_callback_id_settles() {
         failing.store(true, std::sync::atomic::Ordering::SeqCst);
         h.ctrl.send_tool_call("reused", "work", serde_json::json!({})); h.ctrl.finish();
         let started = tokio::time::Instant::now();
-        let request = tokio::time::timeout(Duration::from_secs(65), h.ctrl.next_request()).await.expect("exhausted transport retries must settle reused ID");
+        let request = tokio::time::timeout(Duration::from_secs(3), h.ctrl.next_request()).await.expect("exhausted transport retries must settle reused ID");
         let history = format!("{:?}", request.chat_history);
-        assert!(started.elapsed() >= Duration::from_secs(59), "allow the transport retry window before reporting uncertainty");
-        assert!(history.contains("Outcome unknown: the message may have been sent"), "{history}");
+        assert!(started.elapsed() >= Duration::from_millis(200), "allow the transport retry window before reporting uncertainty");
+        assert!(history.contains("The outcome is unknown: the operation may have been performed"), "{history}");
         assert!(!history.contains("Error: Tool call failed"), "{history}");
         assert_eq!(history.matches("real external result").count(), 1);
-        assert_eq!(history.matches("Outcome unknown:").count(), 1);
+        assert_eq!(history.matches("The outcome is unknown:").count(), 1);
         h.ctrl.send_text("finished"); h.ctrl.finish();
         server.abort();
     }).await;

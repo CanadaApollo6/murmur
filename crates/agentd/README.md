@@ -247,22 +247,28 @@ to the live agent incarnation. Child threads send as that root agent and share
 its mail limits. HTTP arguments and ancestry do not grant authority.
 
 Duplicate invocations share one send. Completed results remain cached for ten
-minutes or until the binding is revoked. A retry after agentd restarts recovers
+minutes, including across binding revocation or replacement. A retry after agentd restarts recovers
 the existing mail receipt through the invocation's mailroom key.
 
 HTTP 200 acknowledges the invocation before the send finishes. The spawned task
 owns execution and callback delivery. Verified send errors also use the callback.
-Non-2xx responses reject unverified invocations.
+HTTP 403 rejects invalid invocation UUIDs or claims. A valid claim without a
+restored binding, or a temporarily unreachable daemon, receives HTTP 503.
 
-The Infinity daemon retries external invocation POSTs after transport errors for
-up to 60 seconds. Every attempt uses the same UUID and body. HTTP error statuses
-fail immediately. Exhausted transport retries produce this result text.
+The Infinity daemon retries transport errors and HTTP 503 for up to 60 seconds.
+Every attempt uses the same UUID and body. After an ambiguous attempt, later
+HTTP rejections cannot establish failure. Exhaustion produces this result text.
 
-> Outcome unknown: the message may have been sent. Delivery could not be confirmed. Retrying as a new call may send it twice.
+> The outcome is unknown: the operation may have been performed. Check before repeating it.
 
-Callback POSTs have no redirects. Delivery retries with exponential backoff capped
-at three seconds until the daemon acknowledges, the entry expires after ten
-minutes, or the binding is revoked. Each expired or revoked delivery logs its UUID.
+After HTTP acknowledgment, the daemon waits 30 seconds for a callback, then
+re-POSTs the same invocation. Recovery continues with backoff until the callback
+settles it or the ten-minute total deadline produces the outcome-unknown result.
+
+Callback POSTs have no redirects. One delivery worker per completed invocation
+retries with exponential backoff capped at three seconds until acknowledgment
+or ten-minute expiry. At most 32 workers send callbacks concurrently. Revocation
+and rebinds preserve the verified callback destination and result.
 
 Start the separate Infinity daemon with `INFINITY_WS=off` to disable its
 unauthenticated WebSocket listener. `INFINITY_WS_PORT=0` still selects an

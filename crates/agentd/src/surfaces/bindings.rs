@@ -68,6 +68,7 @@ impl Drop for AgentListeners {
 pub struct Bindings {
     tokens: std::sync::Arc<RwLock<HashMap<BindingKey, Binding>>>,
     pub(super) rap_calls: tokio::sync::Mutex<HashMap<uuid::Uuid, super::rap::Execution>>,
+    pub(super) rap_delivery_slots: tokio::sync::Semaphore,
     socket: PathBuf,
     executable: PathBuf,
     listeners: tokio::sync::Mutex<HashMap<AgentId, AgentListeners>>,
@@ -82,6 +83,7 @@ impl Bindings {
         Self {
             tokens: Default::default(),
             rap_calls: Default::default(),
+            rap_delivery_slots: tokio::sync::Semaphore::new(32),
             listeners: Default::default(),
             bound,
             socket,
@@ -243,7 +245,7 @@ impl Bindings {
         self.rap_calls
             .lock()
             .await
-            .retain(|_, call| call.identity().agent != agent);
+            .retain(|_, call| call.retain_on_revoke(agent));
         self.listeners.lock().await.remove(&agent);
     }
 }

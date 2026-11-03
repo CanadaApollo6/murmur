@@ -54,7 +54,15 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 type PendingCalls = Arc<Mutex<HashMap<(ThreadId, rap_protocol::ToolCallId), PendingCall>>>;
 
+struct CallLifetime(tokio_util::sync::CancellationToken);
+impl Drop for CallLifetime {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 struct PendingCall {
+    _lifetime: CallLifetime,
     server_id: uuid::Uuid,
     invocation: uuid::Uuid,
     settling: bool,
@@ -155,10 +163,117 @@ impl InputSender for RapInputSender {
     }
 }
 
+/// Timing for external invocation retries and callback recovery.
+#[derive(Clone, Copy)]
+pub struct ExternalRapPolicy {
+    pub retry_budget: std::time::Duration,
+    pub backoff: std::time::Duration,
+    pub max_backoff: std::time::Duration,
+    pub recovery_interval: std::time::Duration,
+    pub deadline: std::time::Duration,
+}
+impl Default for ExternalRapPolicy {
+    fn default() -> Self {
+        Self {
+            retry_budget: std::time::Duration::from_secs(60),
+            backoff: std::time::Duration::from_millis(100),
+            max_backoff: std::time::Duration::from_secs(3),
+            recovery_interval: std::time::Duration::from_secs(30),
+            deadline: std::time::Duration::from_secs(600),
+        }
+    }
+}
+
+const OUTCOME_UNKNOWN: &str =
+    "The outcome is unknown: the operation may have been performed. Check before repeating it.";
+
+#[derive(Clone)]
+struct ExternalRetry {
+    pending: PendingCalls,
+    invocation: uuid::Uuid,
+    retired: tokio_util::sync::CancellationToken,
+    policy: ExternalRapPolicy,
+}
+impl ExternalRetry {
+    async fn recover(
+        self,
+        http: SimpleHttpClient,
+        url: String,
+        body: String,
+        deadline: tokio::time::Instant,
+    ) {
+        let mut delay = self.policy.recovery_interval;
+        let mut backoff = self.policy.backoff;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::select! {
+                _ = self.retired.cancelled() => return,
+                _ = tokio::time::sleep(delay.min(remaining)) => {}
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let result = tokio::select! {
+                _ = self.retired.cancelled() => return,
+                result = tokio::time::timeout(remaining.min(std::time::Duration::from_secs(10)), http.post(&url, &body)) => result,
+            };
+            match result {
+                Ok(Ok(status)) if (200..300).contains(&status) => {
+                    delay = self.policy.recovery_interval;
+                    backoff = self.policy.backoff;
+                }
+                result => {
+                    tracing::warn!(invocation=%self.invocation, ?result, "external RAP callback recovery retry");
+                    delay = backoff;
+                    backoff = (backoff * 2).min(self.policy.max_backoff);
+                }
+            }
+        }
+        let call = {
+            let pending = self.pending.lock().expect("bug: pending calls poisoned");
+            pending
+                .iter()
+                .find(|(_, call)| call.invocation == self.invocation)
+                .map(|((_, id), call)| (id.clone(), call.context.clone(), call.call_id.clone()))
+        };
+        if let Some((id, context, call_id)) = call {
+            let infinity_rap_bridge::CallbackDelivery::Input { message, dedup_id } =
+                infinity_rap_bridge::prepare_callback(rap_protocol::RapCallback::ToolResult(
+                    rap_protocol::RapToolResult {
+                        group_id: context.group_id,
+                        id,
+                        call_id,
+                        text: Some(OUTCOME_UNKNOWN.into()),
+                        content: None,
+                        display_as: None,
+                        subscription: None,
+                    },
+                ))
+            else {
+                unreachable!()
+            };
+            let sender = RapInputSender {
+                sender: context.message_sender,
+                pending: self.pending,
+                invocation: Some(self.invocation),
+                #[cfg(test)]
+                enqueue_probe: None,
+            };
+            if let Err(error) = sender.send_to_input_queue(*message, &dedup_id).await {
+                tracing::error!(invocation=%self.invocation, %error, "failed to settle expired external RAP invocation");
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct InvocationHttp {
     http: SimpleHttpClient,
-    retry: Option<(PendingCalls, uuid::Uuid)>,
+    retry: Option<ExternalRetry>,
 }
 
 #[async_trait]
@@ -166,43 +281,54 @@ impl HttpClient for InvocationHttp {
     type Error = std::io::Error;
 
     async fn post(&self, url: &str, body: &str) -> Result<u16, Self::Error> {
-        let Some((pending, invocation)) = &self.retry else {
+        let Some(retry) = &self.retry else {
             return self
                 .http
                 .post(url, body)
                 .await
                 .map_err(std::io::Error::other);
         };
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut backoff = std::time::Duration::from_millis(100);
+        let started = tokio::time::Instant::now();
+        let deadline = started + retry.policy.retry_budget.min(retry.policy.deadline);
+        let mut backoff = retry.policy.backoff;
+        let mut ambiguous = false;
         loop {
-            if !pending
-                .lock()
-                .expect("bug: pending calls poisoned")
-                .values()
-                .any(|call| call.invocation == *invocation)
-            {
-                return Ok(200);
-            }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let attempt = tokio::time::timeout(
-                remaining.min(std::time::Duration::from_secs(10)),
-                self.http.post(url, body),
-            )
-            .await;
-            let error = match attempt {
-                Ok(Ok(status)) => return Ok(status),
-                Ok(Err(error)) => std::io::Error::other(error),
-                Err(error) => std::io::Error::new(std::io::ErrorKind::TimedOut, error),
-            };
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                tracing::error!(%invocation, %error, "external RAP transport retries exhausted");
-                return Err(error);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "external RAP retries exhausted",
+                ));
             }
-            tracing::warn!(%invocation, %error, "retrying external RAP invocation after transport loss");
-            tokio::time::sleep(backoff.min(remaining)).await;
-            backoff = (backoff * 2).min(std::time::Duration::from_secs(3));
+            let attempt = tokio::select! {
+                _ = retry.retired.cancelled() => return Ok(200),
+                attempt = tokio::time::timeout(remaining.min(std::time::Duration::from_secs(10)), self.http.post(url, body)) => attempt,
+            };
+            match attempt {
+                Ok(Ok(status)) if (200..300).contains(&status) => {
+                    tokio::spawn(retry.clone().recover(
+                        self.http.clone(),
+                        url.to_owned(),
+                        body.to_owned(),
+                        started + retry.policy.deadline,
+                    ));
+                    return Ok(status);
+                }
+                Ok(Ok(status)) if status != 503 && !ambiguous => return Ok(status),
+                Ok(Ok(status)) => {
+                    ambiguous = true;
+                    tracing::warn!(invocation=%retry.invocation, status, "retrying ambiguous external RAP invocation");
+                }
+                error => {
+                    ambiguous = true;
+                    tracing::warn!(invocation=%retry.invocation, ?error, "retrying external RAP invocation after transport loss");
+                }
+            }
+            tokio::select! {
+                _ = retry.retired.cancelled() => return Ok(200),
+                _ = tokio::time::sleep(backoff.min(deadline.saturating_duration_since(tokio::time::Instant::now()))) => {}
+            }
+            backoff = (backoff * 2).min(retry.policy.max_backoff);
         }
     }
 
@@ -275,6 +401,7 @@ pub struct ManagedRapServer {
     id: uuid::Uuid,
     pending: PendingCalls,
     session_store: Option<SessionStoreHandle>,
+    external_policy: ExternalRapPolicy,
 }
 
 impl ManagedRapServer {
@@ -286,6 +413,7 @@ impl ManagedRapServer {
             state: tokio::sync::Mutex::new(ServerState::Down),
             id: uuid::Uuid::new_v4(),
             session_store: None,
+            external_policy: ExternalRapPolicy::default(),
             pending: PendingCalls::default(),
         }
     }
@@ -652,6 +780,7 @@ impl Tool<ChannelSender> for ManagedRapTool {
             ServerSpec::Command { .. } | ServerSpec::External { .. }
         )
         .then(uuid::Uuid::new_v4);
+        let retired = tokio_util::sync::CancellationToken::new();
         if let Some(invocation) = invocation {
             self.server
                 .pending
@@ -660,6 +789,7 @@ impl Tool<ChannelSender> for ManagedRapTool {
                 .insert(
                     key,
                     PendingCall {
+                        _lifetime: CallLifetime(retired.clone()),
                         server_id: self.server.id,
                         invocation,
                         settling: false,
@@ -698,9 +828,12 @@ impl Tool<ChannelSender> for ManagedRapTool {
         let external = matches!(self.server.spec, ServerSpec::External { .. });
         let http = InvocationHttp {
             http: self.http_client.clone(),
-            retry: invocation
-                .filter(|_| external)
-                .map(|id| (self.server.pending.clone(), id)),
+            retry: invocation.filter(|_| external).map(|id| ExternalRetry {
+                pending: self.server.pending.clone(),
+                invocation: id,
+                retired,
+                policy: self.server.external_policy,
+            }),
         };
         let result = invoke_rap_tool(
             &http,
@@ -725,11 +858,14 @@ impl Tool<ChannelSender> for ManagedRapTool {
                         group_id: context.group_id.clone(),
                         id,
                         call_id,
-                        text: Some(if external {
-                            "Outcome unknown: the message may have been sent. Delivery could not be confirmed. Retrying as a new call may send it twice."
-                        } else {
-                            "Error: Tool call failed"
-                        }.into()),
+                        text: Some(
+                            if external {
+                                OUTCOME_UNKNOWN
+                            } else {
+                                "Error: Tool call failed"
+                            }
+                            .into(),
+                        ),
                         content: None,
                         display_as: None,
                         subscription: None,
@@ -780,6 +916,7 @@ pub struct SessionRapManager {
     shutdown_log: Rc<std::cell::RefCell<Vec<ThreadId>>>,
     pending: PendingCalls,
     servers: Rc<std::cell::RefCell<Vec<Weak<ManagedRapServer>>>>,
+    external_policy: Rc<std::cell::Cell<ExternalRapPolicy>>,
 }
 
 impl SessionRapManager {
@@ -798,7 +935,13 @@ impl SessionRapManager {
             shutdown_log: Rc::new(std::cell::RefCell::new(Vec::new())),
             pending: PendingCalls::default(),
             servers: Rc::default(),
+            external_policy: Rc::new(std::cell::Cell::new(ExternalRapPolicy::default())),
         }
+    }
+
+    /// Configure timing before resolving any session's toolset.
+    pub fn set_external_rap_policy(&self, policy: ExternalRapPolicy) {
+        self.external_policy.set(policy);
     }
 
     /// Read a dispatch without consuming its callback authority.
@@ -872,6 +1015,7 @@ impl SessionRapManager {
                 self.info(session_id, source_info);
                 for mut server in specs {
                     server.pending = self.pending.clone();
+                    server.external_policy = self.external_policy.get();
                     server.session_store = Some(self.session_store.clone());
                     servers.push(Arc::new(server));
                 }
@@ -1412,6 +1556,7 @@ mod r14a_registry {
                 sender.pending.lock().expect("registry").insert(
                     key,
                     PendingCall {
+                        _lifetime: CallLifetime(tokio_util::sync::CancellationToken::new()),
                         server_id: uuid::Uuid::new_v4(),
                         invocation,
                         settling: false,
@@ -1474,6 +1619,117 @@ mod r14a_registry {
                 );
             })
             .await;
+    }
+
+    async fn external_recovery_case(statuses: Vec<u16>, succeed: bool) {
+        tokio::task::LocalSet::new().run_until(async {
+            use http_body_util::BodyExt;
+            let definite = statuses == vec![403];
+            let mut h = start_harness().await.expect("harness");
+            h.manager.lock().await.rap_manager.set_external_rap_policy(super::ExternalRapPolicy {
+                retry_budget: Duration::from_millis(250), backoff: Duration::from_millis(20),
+                max_backoff: Duration::from_millis(50), recovery_interval: Duration::from_millis(100),
+                deadline: Duration::from_millis(650),
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("listener");
+            let port = listener.local_addr().expect("address").port();
+            let (tx, mut requests) = mpsc::unbounded_channel();
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let server = tokio::task::spawn_local(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let tx = tx.clone(); let counter = counter.clone(); let statuses = statuses.clone();
+                    tokio::task::spawn_local(async move {
+                        let service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                            let tx = tx.clone(); let counter = counter.clone(); let statuses = statuses.clone();
+                            async move {
+                                if request.uri().path() == "/.well-known/rap-toolset" {
+                                    return Ok::<_, std::io::Error>(hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from(
+                                        serde_json::json!({"name":"recovery", "endpoint":format!("http://127.0.0.1:{port}/invoke"), "tools":[{"name":"other_operation","description":"work","inputSchema":{"type":"object"}}]}).to_string()))));
+                                }
+                                let body = request.into_body().collect().await.expect("body").to_bytes();
+                                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                let status = statuses[n.min(statuses.len()-1)];
+                                tx.send((body.clone(), status)).expect("observe POST");
+                                if status == 999 { std::future::pending::<()>().await; }
+                                if status == 0 { return Err(std::io::Error::other("accepted but lost acknowledgment")); }
+                                if succeed && n >= statuses.len()-1 {
+                                    let invocation: rap_protocol::RapInvocation = serde_json::from_slice(&body).expect("invocation");
+                                    let response = reqwest::Client::new().post(&invocation.callback_url).json(&rap_protocol::RapCallback::ToolResult(rap_protocol::RapToolResult {
+                                        group_id:invocation.group_id, id:invocation.id, call_id:invocation.call_id, text:Some("recovered operation".into()), content:None, display_as:None, subscription:None,
+                                    })).send().await.expect("callback");
+                                    assert!(response.status().is_success());
+                                }
+                                Ok(hyper::Response::builder().status(status).body(http_body_util::Full::new(bytes::Bytes::new())).expect("response"))
+                            }
+                        });
+                        if let Err(error) = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), service).await {
+                            eprintln!("injected transport loss: {error}");
+                        }
+                    });
+                }
+            });
+            rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
+            let root = create_session_and_chat(&mut h).await;
+            h.client_tx.send(ClientMessage::UserInput { thread_id:root, text:"perform operation".into() }).expect("input");
+            h.ctrl.next_request().await;
+            h.ctrl.send_tool_call("recover-call", "other_operation", serde_json::json!({"value":"once"})); h.ctrl.finish();
+            let request = tokio::time::timeout(Duration::from_secs(3), h.ctrl.next_request()).await.expect("pending call settles within configured budget");
+            let history = format!("{:?}", request.chat_history);
+            if succeed { assert!(history.contains("recovered operation"), "{history}"); }
+            else if definite { assert!(history.contains("HTTP 403"), "{history}"); }
+            else { assert!(history.contains("The outcome is unknown: the operation may have been performed. Check before repeating it."), "{history}"); }
+            assert_eq!(history.matches("ToolResult { id:").count(), 1, "one model result");
+            if !definite { assert!(!history.contains("failed:"), "{history}"); }
+            let first = requests.recv().await.expect("first POST").0;
+            while let Ok((body, _)) = requests.try_recv() { assert_eq!(first, body, "same invocation and body across every retry"); }
+            h.ctrl.send_text("done"); h.ctrl.finish();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(requests.try_recv().is_err(), "settled call stops reposting");
+            server.abort();
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_recovery_loss_then_403_then_success() {
+        external_recovery_case(vec![0, 403, 200], true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_recovery_loss_then_503_then_success() {
+        external_recovery_case(vec![0, 503, 200], true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_recovery_503_then_success() {
+        external_recovery_case(vec![503, 200], true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_recovery_loss_then_403_exhausts_unknown() {
+        external_recovery_case(vec![0, 403], false).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_recovery_ack_then_repost_success() {
+        external_recovery_case(vec![200, 200], true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_recovery_ack_deadline_is_unknown() {
+        external_recovery_case(vec![200], false).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_recovery_transport_budget_is_short_and_generic() {
+        external_recovery_case(vec![0], false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_recovery_definite_403_fails_once() {
+        external_recovery_case(vec![403], false).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_recovery_ack_then_403_stays_unknown() {
+        external_recovery_case(vec![200, 403], false).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_recovery_deadline_bounds_hung_post() {
+        external_recovery_case(vec![200, 999], false).await;
     }
 
     #[tokio::test(flavor = "current_thread")]

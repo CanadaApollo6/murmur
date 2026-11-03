@@ -102,6 +102,7 @@ socket = {}
                                     use http_body_util::BodyExt;
                                     let body = req.into_body().collect().await.expect("callback body").to_bytes();
                                     if tx.send(serde_json::from_slice(&body).expect("callback JSON")).is_err() { return Err("callback receiver closed"); }
+                                    if status.load(Ordering::SeqCst) == 0 { std::future::pending::<()>().await; }
                                     Ok(hyper::Response::builder().status(status.load(Ordering::SeqCst)).body(http_body_util::Full::new(bytes::Bytes::new())).expect("response"))
                                 }
                             });
@@ -351,7 +352,11 @@ async fn rap_unverified_calls_and_revoked_bindings_cannot_send() {
             .expect("state")
             .claims
             .insert(id.to_string(), record);
-        assert_eq!(t.invoke(id).await, 403, "{change}");
+        assert_eq!(
+            t.invoke(id).await,
+            if change == "root" { 503 } else { 403 },
+            "{change}"
+        );
     }
     let (cached_id, _) = t.record(false, "accepted before revocation");
     assert_eq!(t.invoke(cached_id).await, 200);
@@ -386,10 +391,15 @@ async fn rap_unverified_calls_and_revoked_bindings_cannot_send() {
     })
     .await
     .expect("binding revoked");
-    assert_eq!(t.invoke(id).await, 403);
-    assert_eq!(t.invoke(cached_id).await, 403);
+    assert_eq!(t.invoke(id).await, 503);
+    assert_eq!(t.invoke(cached_id).await, 200);
+    assert!(
+        t.callback().await["text"]
+            .as_str()
+            .expect("text")
+            .starts_with("Queued")
+    );
     assert_eq!(t.rows().len(), 1);
-    assert!(t.callbacks.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -612,6 +622,15 @@ fn real_daemon_crash_child() {
             )
             .await
             .expect("real SessionManager");
+            manager.rap_manager.set_external_rap_policy(
+                infinity_daemon::rap_servers::ExternalRapPolicy {
+                    retry_budget: Duration::from_secs(3),
+                    backoff: Duration::from_millis(50),
+                    max_backoff: Duration::from_millis(200),
+                    recovery_interval: Duration::from_millis(200),
+                    deadline: Duration::from_secs(12),
+                },
+            );
             let manager = infinity_daemon::rap_callback::serve_callbacks(bridge, manager);
             let callback_dir = directory.clone();
             tokio::task::spawn_local(async move {
@@ -697,6 +716,11 @@ fn real_daemon_crash_child() {
                 "model must receive recovered success: {history}"
             );
             assert!(!history.contains("Tool call failed"), "{history}");
+            assert_eq!(
+                history.matches("Already queued").count(),
+                1,
+                "one model result"
+            );
             ctrl.send_text("done");
             ctrl.finish();
             std::fs::write(directory.join("real-daemon-success"), history)
@@ -707,8 +731,27 @@ fn real_daemon_crash_child() {
 
 #[tokio::test]
 async fn rap_real_daemon_retries_after_agentd_dies_with_mail_accepted() {
+    real_daemon_restart_case(false, None).await;
+}
+
+#[tokio::test]
+async fn rap_real_daemon_recovers_acknowledged_call_after_agentd_crash() {
+    real_daemon_restart_case(true, None).await;
+}
+
+#[tokio::test]
+async fn rap_real_daemon_lost_ack_403_window_recovers_success() {
+    real_daemon_restart_case(false, Some(403)).await;
+}
+
+#[tokio::test]
+async fn rap_real_daemon_lost_ack_503_window_recovers_success() {
+    real_daemon_restart_case(false, Some(503)).await;
+}
+
+async fn real_daemon_restart_case(acknowledged: bool, window_status: Option<u16>) {
     use http_body_util::BodyExt;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
     let mut t = Test::new("").await;
     t.child.kill().await.expect("stop initial agentd");
     t.child.wait().await.expect("reap");
@@ -722,7 +765,7 @@ async fn rap_real_daemon_retries_after_agentd_dies_with_mail_accepted() {
     let (accepted, mut acceptance) = mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Notify::new());
     let unblock = release.clone();
-    let first = Arc::new(AtomicBool::new(true));
+    let attempts = Arc::new(AtomicUsize::new(0));
     let proxy_task = tokio::spawn(async move {
         let http = reqwest::Client::builder()
             .no_proxy()
@@ -732,18 +775,23 @@ async fn rap_real_daemon_retries_after_agentd_dies_with_mail_accepted() {
         loop {
             tokio::select! {
                 stream=proxy.accept()=>{
-                    let (stream,_)=stream.expect("proxy accept");let http=http.clone();let accepted=accepted.clone();let release=release.clone();let first=first.clone();
+                    let (stream,_)=stream.expect("proxy accept");let http=http.clone();let accepted=accepted.clone();let release=release.clone();let attempts=attempts.clone();
                     connections.spawn(async move {
                         let service=hyper::service::service_fn(move |req:hyper::Request<hyper::body::Incoming>| {
-                            let http=http.clone();let accepted=accepted.clone();let release=release.clone();let first=first.clone();
+                            let http=http.clone();let accepted=accepted.clone();let release=release.clone();let attempts=attempts.clone();
                             async move {
                                 let invoke=req.uri().path()=="/invoke";
                                 let url=req.uri().to_string();let method=req.method().clone();
                                 let body=req.into_body().collect().await.map_err(std::io::Error::other)?.to_bytes();
+                                let n = if invoke { attempts.fetch_add(1, Ordering::SeqCst) } else { usize::MAX };
+                                if n == 1 && let Some(status) = window_status {
+                                    return Ok(hyper::Response::builder().status(status).body(http_body_util::Full::new(bytes::Bytes::new())).expect("window response"));
+                                }
                                 let response=http.request(method,url).header("content-type","application/json").body(body).send().await.map_err(std::io::Error::other)?;
-                                if invoke && first.swap(false,Ordering::SeqCst) {
-                                    assert!(response.status().is_success());accepted.send(()).expect("acceptance signal");release.notified().await;
-                                    return Err(std::io::Error::other("agentd died before acknowledgment reached Infinity"));
+                                if invoke && n == 0 {
+                                    assert!(response.status().is_success());accepted.send(()).expect("acceptance signal");
+                                    if !acknowledged { release.notified().await;
+                                    return Err(std::io::Error::other("agentd died before acknowledgment reached Infinity")); }
                                 }
                                 let status=response.status();let body=response.bytes().await.map_err(std::io::Error::other)?;
                                 Ok(hyper::Response::builder().status(status).body(http_body_util::Full::new(body)).expect("response"))
@@ -804,6 +852,9 @@ async fn rap_real_daemon_retries_after_agentd_dies_with_mail_accepted() {
     })
     .await
     .expect("durable acceptance");
+    if acknowledged {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     t.child
         .kill()
         .await
@@ -838,4 +889,119 @@ async fn rap_real_daemon_retries_after_agentd_dies_with_mail_accepted() {
     daemon.kill().await.expect("kill test daemon");
     daemon.wait().await.expect("reap daemon");
     proxy_task.abort();
+}
+
+#[tokio::test]
+async fn rap_completed_delivery_survives_revocation() {
+    let mut t = Test::new("").await;
+    t.callback_status.store(503, Ordering::SeqCst);
+    let (id, _) = t.record(false, "completed before rebind");
+    assert_eq!(t.invoke(id).await, 200);
+    let first = t.callback().await;
+    let session = loop {
+        let request = t.daemon.next().await;
+        if matches!(request.message, ClientMessage::CreateSession { .. }) {
+            break request;
+        }
+    };
+    session.emit(infinity_protocol::DaemonMessage::SessionsUpdated {
+        sessions: std::collections::HashMap::from([(
+            fake::root(),
+            infinity_protocol::SessionInfo {
+                title: None,
+                last_updated: String::new(),
+                total_tokens_used: 0,
+                status: infinity_protocol::SessionStatus::Archived,
+                threads: vec![],
+                remote: None,
+            },
+        )]),
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if t.ctl(json!({"command":"ls"})).await["result"][0]["phase"] == "needs-recovery" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("binding revoked");
+    while t.callbacks.try_recv().is_ok() {}
+    t.callback_status.store(200, Ordering::SeqCst);
+    assert_eq!(
+        t.callback().await,
+        first,
+        "pinned completion survives identity replacement"
+    );
+    assert_eq!(t.rows().len(), 1);
+}
+
+#[tokio::test]
+async fn rap_completed_replays_have_one_delivery_worker() {
+    let mut t = Test::new("").await;
+    t.callback_status.store(503, Ordering::SeqCst);
+    let (id, _) = t.record(false, "replay flood");
+    assert_eq!(t.invoke(id).await, 200);
+    t.callback().await;
+    let started = std::time::Instant::now();
+    for _ in 0..100 {
+        assert_eq!(t.invoke(id).await, 200);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut attempts = 1;
+    while t.callbacks.try_recv().is_ok() {
+        attempts += 1;
+    }
+    assert!(
+        attempts <= started.elapsed().as_secs() / 3 + 7,
+        "100 replays must not multiply callback loops, observed {attempts}"
+    );
+    assert_eq!(t.rows().len(), 1);
+}
+
+#[tokio::test]
+async fn rap_delivery_workers_have_a_global_cap() {
+    let mut t = Test::new("[mail]\nper_pair = 0").await;
+    t.callback_status.store(0, Ordering::SeqCst);
+    for _ in 0..33 {
+        let (id, _) = t.record(false, "bounded delivery");
+        assert_eq!(t.invoke(id).await, 200);
+    }
+    for _ in 0..32 {
+        tokio::time::timeout(Duration::from_secs(1), t.callbacks.recv())
+            .await
+            .expect("delivery slot active")
+            .expect("callback");
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), t.callbacks.recv())
+            .await
+            .is_err(),
+        "only 32 delivery workers may hold an active POST"
+    );
+    assert_eq!(
+        t.rows().len(),
+        33,
+        "queued callbacks do not block durable execution"
+    );
+}
+
+#[tokio::test]
+async fn rap_live_claim_without_root_binding_is_retryable() {
+    let t = Test::new("").await;
+    let (id, mut record) = t.record(false, "restore pending");
+    record.thread_stack[0] = ThreadRef::local("restoring-root".into());
+    t.daemon
+        .state
+        .lock()
+        .expect("state")
+        .claims
+        .insert(id.to_string(), record);
+    assert_eq!(
+        t.invoke(id).await,
+        503,
+        "a trusted dispatch can outlive the binding startup window"
+    );
+    assert!(t.rows().is_empty());
 }
