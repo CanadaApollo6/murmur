@@ -1,6 +1,6 @@
 # murmur roadmap
 
-Status as of 2026-11-02. The [design](design.md) explains each part. This page
+Status as of 2026-11-03. The [design](design.md) explains each part. This page
 orders the remaining work.
 
 ## Where murmur is
@@ -16,7 +16,7 @@ only delivery authority.
 | [ACP per-agent isolation](isolation.md): bubblewrap, egress proxy, credential sync | Done on `feat/agentd-isolation`, not merged |
 | v1 swarm schema: `Act` on every envelope, task ledger with budgets, `Report` outcomes, exposure log | Built in the mailroom |
 | Mail limits | Done on `feat/agentd-mail-limits`, not merged |
-| Infinity model agents sending mail | Not built. They receive mail but have no `send_message` tool |
+| Infinity model agents sending mail | Done on `feat/agentd-rap-send`, not merged |
 | `infinity-provider-local` | Not built |
 | Event bus and graph UI | Not built. `agentctl watch` streams events |
 | Verifier and calibration | Not built. `Partial` and `Infeasible` reports reach `Verifying` and stay there |
@@ -31,9 +31,9 @@ Each milestone ends in a merged PR with its tests in `./check.bash`.
 2. **Mail limits.** A per-sender cap and a per-pair cap on undelivered mail,
    checked at `Mailroom::accept`, and a per-turn batch limit at the pump. This
    bounds what one agent can queue before more agents can send.
-3. **Infinity agents send mail.** A RAP toolset in agentd gives model agents
-   `send_message`, bound to the session like the MCP tool. Without it, a model
-   agent can receive mail but cannot answer it.
+3. **Infinity agents send mail.** Done on `feat/agentd-rap-send`. A RAP toolset
+   provides `send_message` through daemon-owned invocation claims and live root
+   bindings. Child threads share their root agent's sender and mail limits.
 4. **Local inference.** `infinity-provider-local` against llama.cpp, with the
    `GpuGate` queue and a profile qualified on this machine's RTX 3090.
 5. **Event bus and graph UI.** `/events` over WebSocket: a snapshot at a cursor,
@@ -60,6 +60,10 @@ These stay open until a milestone closes them. The design's
 
 - History and processed IDs are two writes in core, so a crash between them can
   append a re-offered peer message twice.
+- The Infinity daemon's RAP callback listener is unauthenticated. Disabling the
+  WebSocket listener does not close this ingress. Callback authentication needs
+  separate work.
+- Recovery across an Infinity daemon restart is outside the RAP send guarantee.
 - The Infinity daemon never respawns a dead provider process.
 - Migration of agentd-hosted sessions is unsupported until the handoff protocol
   exists.

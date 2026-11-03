@@ -357,6 +357,9 @@ evidence. The implementation handoff report records local run results separately
   AF_ALG, keyring operations and io_uring. Broader seccomp hardening is still later work.
 - R6. Infinity and `none` agents can use host control and per-agent sockets. Isolation
   holds only when no untrusted host process or unsandboxed agent can do that.
+  With the Infinity WebSocket listener enabled, any local process can drive
+  Infinity sessions. Start the separate daemon with `INFINITY_WS=off` to disable
+  that listener. agentd warns on attach but does not refuse the connection.
 - R7. Toolchain binds expose their full contents. Defaults bind `~/.cargo/bin`, not
   `~/.cargo`, which can contain registry credentials. Review custom binds.
 - R8. Proxy-unaware tools fail closed. Agents may describe that as an environment error.

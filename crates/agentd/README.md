@@ -216,8 +216,48 @@ launch settings in Infinity kind config. `UserChoiceRequired` becomes an
 incarnation-tagged approval under `infinity.user_choice`. Options use zero-based
 index keys and preserve the daemon's labels. Infinity does not supply tool names
 or authorization effects, so allow/deny rules cannot auto-select these choices.
-A timeout interrupts the turn instead of guessing an answer. The inbound adapter
-does not install `send_message`. That requires a separate authenticated RAP toolset.
+A timeout interrupts the turn instead of guessing an answer.
+
+### Give Infinity agents `send_message`
+
+When an Infinity kind is configured, agentd starts a RAP server. Set its fixed
+loopback address in `kinds.toml`. The default is `127.0.0.1:7433`. A bind failure
+stops startup. Port 0 and non-loopback addresses are rejected.
+
+```toml
+[rap]
+listen = "127.0.0.1:7433"
+```
+
+Add this server to `~/.infinity/rap.json` by hand. Keep any existing entries.
+No other toolset may offer `send_message`.
+
+```json
+{
+  "tool_sets": [
+    { "type": "toolset_server", "server_url": "http://127.0.0.1:7433" }
+  ]
+}
+```
+
+The toolset advertises only `send_message`. agentd claims each invocation over a
+separate Unix connection to the configured Infinity daemon. The daemon supplies
+the arguments, callback URL, and root-first thread stack. agentd binds the root
+to the live agent incarnation. Child threads send as that root agent and share
+its mail limits. HTTP arguments and ancestry do not grant authority.
+
+Duplicate invocations share one send. Completed results remain cached for ten
+minutes or until the binding is revoked. A retry after agentd restarts recovers
+the existing mail receipt through the invocation's mailroom key. Callback POSTs
+have no redirects and use bounded retries. Failed callbacks retain their cached
+result so another invocation can retry delivery.
+
+Start the separate Infinity daemon with `INFINITY_WS=off` to disable its
+unauthenticated WebSocket listener. `INFINITY_WS_PORT=0` still selects an
+OS-assigned port. agentd warns on each attach when the listener is enabled.
+Any local process can drive Infinity sessions through that listener. The RAP
+callback listener also remains unauthenticated. These limits are recorded in
+[the roadmap](../../docs/murmur/roadmap.md#carried-risks).
 
 Each kind can also provide `[kind.<name>.sandbox_args]` with `read_only`,
 `workspace_write`, and `full_access` argument arrays. `--sandbox` selects the

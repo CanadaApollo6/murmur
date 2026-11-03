@@ -3,7 +3,7 @@ use crate::model::*;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tokio::sync::{RwLock, RwLockReadGuard};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
 #[derive(Clone)]
 pub(super) struct AuthenticatedSender(Sender);
@@ -12,20 +12,23 @@ impl AuthenticatedSender {
         self.0.clone()
     }
 }
-pub(super) struct SessionBinding<'a> {
-    _guard: RwLockReadGuard<'a, HashMap<BindingKey, Binding>>,
+pub(super) struct SessionBinding {
+    _guard: OwnedRwLockReadGuard<HashMap<BindingKey, Binding>>,
     binding: Binding,
 }
-impl SessionBinding<'_> {
+impl SessionBinding {
     pub(super) fn sender(&self) -> AuthenticatedSender {
         AuthenticatedSender(Sender::Agent(self.binding.agent))
+    }
+    pub(super) fn identity(&self) -> &SessionIdentity {
+        &self.binding
     }
     pub(super) fn key(&self, session: &str, id: &Value) -> ClientKey {
         ClientKey(format!("mcp:{}:{session}:{id}", self.binding.incarnation.0))
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionIdentity {
     pub agent: AgentId,
     pub incarnation: Incarnation,
@@ -35,6 +38,10 @@ type Binding = SessionIdentity;
 enum BindingKey {
     Token(String),
     Agent(AgentId),
+    Infinity {
+        socket: PathBuf,
+        root: infinity_protocol::ThreadRef,
+    },
 }
 
 pub struct BoundListener {
@@ -59,7 +66,8 @@ impl Drop for AgentListeners {
     }
 }
 pub struct Bindings {
-    tokens: RwLock<HashMap<BindingKey, Binding>>,
+    tokens: std::sync::Arc<RwLock<HashMap<BindingKey, Binding>>>,
+    pub(super) rap_calls: tokio::sync::Mutex<HashMap<uuid::Uuid, super::rap::Execution>>,
     socket: PathBuf,
     executable: PathBuf,
     listeners: tokio::sync::Mutex<HashMap<AgentId, AgentListeners>>,
@@ -72,7 +80,8 @@ impl Bindings {
         bound: tokio::sync::mpsc::UnboundedSender<BoundListener>,
     ) -> Self {
         Self {
-            tokens: RwLock::new(HashMap::new()),
+            tokens: Default::default(),
+            rap_calls: Default::default(),
             listeners: Default::default(),
             bound,
             socket,
@@ -160,8 +169,8 @@ impl Bindings {
     pub(super) async fn authenticate_agent(
         &self,
         identity: &SessionIdentity,
-    ) -> Option<SessionBinding<'_>> {
-        let guard = self.tokens.read().await;
+    ) -> Option<SessionBinding> {
+        let guard = self.tokens.clone().read_owned().await;
         let binding = guard.get(&BindingKey::Agent(identity.agent))?.clone();
         if binding.incarnation != identity.incarnation {
             return None;
@@ -174,16 +183,63 @@ impl Bindings {
     pub(super) fn human() -> AuthenticatedSender {
         AuthenticatedSender(Sender::Human)
     }
-    pub(super) async fn authenticate_mcp(&self, token: &str) -> Option<SessionBinding<'_>> {
-        let guard = self.tokens.read().await;
+    pub(super) async fn authenticate_mcp(&self, token: &str) -> Option<SessionBinding> {
+        let guard = self.tokens.clone().read_owned().await;
         let binding = guard.get(&BindingKey::Token(token.to_owned()))?.clone();
         Some(SessionBinding {
             _guard: guard,
             binding,
         })
     }
+    pub(crate) async fn bind_infinity(
+        &self,
+        socket: &std::path::Path,
+        root: infinity_protocol::ThreadRef,
+        agent: AgentId,
+        incarnation: Incarnation,
+    ) {
+        self.revoke(agent).await;
+        self.tokens.write().await.insert(
+            BindingKey::Infinity {
+                socket: socket.into(),
+                root,
+            },
+            Binding { agent, incarnation },
+        );
+    }
+
+    pub(super) async fn authenticate_rap(
+        &self,
+        socket: &std::path::Path,
+        endpoint: &str,
+        record: &infinity_protocol::RapClaimRecord,
+    ) -> Option<SessionBinding> {
+        if record.endpoint != endpoint || record.operation != "send_message" {
+            return None;
+        }
+        let root = record.thread_stack.first()?;
+        if root.remote.is_some() {
+            return None;
+        }
+        let guard = self.tokens.clone().read_owned().await;
+        let binding = guard
+            .get(&BindingKey::Infinity {
+                socket: socket.into(),
+                root: root.clone(),
+            })?
+            .clone();
+        Some(SessionBinding {
+            _guard: guard,
+            binding,
+        })
+    }
+
     pub(crate) async fn revoke(&self, agent: AgentId) {
         self.tokens.write().await.retain(|_, b| b.agent != agent);
+        self.rap_calls
+            .lock()
+            .await
+            .retain(|_, call| call.identity().agent != agent);
         self.listeners.lock().await.remove(&agent);
     }
 }

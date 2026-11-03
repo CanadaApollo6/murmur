@@ -95,7 +95,20 @@ async fn run(args: Args) -> Result<()> {
         limits: cfg.mail.clone(),
         ..Default::default()
     };
+    let rap_config = cfg.rap.clone();
     let mut kinds = cfg.kinds()?;
+    let infinity_sockets: Vec<_> = kinds
+        .iter()
+        .filter_map(|kind| match &kind.wire {
+            agentd::Wire::Infinity { socket } => Some(socket.clone()),
+            _ => None,
+        })
+        .collect();
+    let rap = if infinity_sockets.is_empty() {
+        None
+    } else {
+        Some(agentd::surfaces::rap::RapServer::bind(&rap_config, infinity_sockets).await?)
+    };
     sandbox.validate(&state, &control_path, &mcp_path, &mut kinds)?;
     if kinds
         .iter()
@@ -142,6 +155,7 @@ async fn run(args: Args) -> Result<()> {
         Arc::clone(&mailroom),
         bindings,
         bound_rx,
+        rap,
     )
     .await;
     let shutdown = broker.shutdown().await;
@@ -162,6 +176,7 @@ async fn serve(
     mailroom: Arc<Mailroom>,
     bindings: Arc<Bindings>,
     mut bound: tokio::sync::mpsc::UnboundedReceiver<BoundListener>,
+    rap: Option<agentd::surfaces::rap::RapServer>,
 ) -> Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -179,8 +194,17 @@ async fn serve(
     let mcp_slots = Arc::new(Semaphore::new(64));
     let mut connections = tokio::task::JoinSet::new();
     let mut listeners = tokio::task::JoinSet::new();
+    let rap_api = api.clone();
+    let rap_server = async move {
+        match rap {
+            Some(rap) => rap.serve(rap_api).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(rap_server);
     let result = loop {
         let accepted = tokio::select! {
+            result = &mut rap_server => break result,
             Some(listener) = bound.recv() => {
                 let api = Arc::clone(&api);
                 listeners.spawn(async move { serve_agent(api,listener).await });

@@ -20,6 +20,8 @@ use crate::swarm::Act;
 type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub mod rap;
+
 pub fn default_state_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
@@ -38,6 +40,8 @@ pub struct FileConfig {
     pub bwrap: crate::sandbox::SandboxConfig,
     #[serde(default)]
     pub listen: ListenConfig,
+    #[serde(default)]
+    pub rap: rap::RapConfig,
     #[serde(default)]
     kind: BTreeMap<String, KindFile>,
 }

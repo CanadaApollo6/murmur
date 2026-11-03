@@ -146,8 +146,16 @@ impl InfinitySession {
                 .map_err(protocol)?
             {
                 DaemonMessage::Welcome {
-                    sessions, boot_id, ..
+                    sessions,
+                    boot_id,
+                    websocket_enabled,
+                    ..
                 } => {
+                    if websocket_enabled {
+                        tracing::warn!(
+                            "Infinity daemon WebSocket is enabled; any local process can drive Infinity sessions (risk R6)"
+                        );
+                    }
                     self.boot_id = boot_id;
                     break sessions;
                 }
@@ -535,6 +543,9 @@ impl InfinitySession {
 
 #[async_trait]
 impl Session for InfinitySession {
+    fn infinity_root(&self) -> Option<ThreadRef> {
+        Some(self.root.clone())
+    }
     fn resume_token(&self) -> ResumeToken {
         let Wire::Infinity { socket } = &self.kind.wire else {
             unreachable!()

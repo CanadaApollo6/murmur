@@ -35,6 +35,7 @@ impl Request {
 #[derive(Default)]
 pub struct State {
     pub boot_id: String,
+    pub claims: HashMap<String, infinity_protocol::RapClaimRecord>,
     pub created: bool,
     pub manual_replay: bool,
     pub fail_resume: bool,
@@ -87,6 +88,9 @@ impl FakeDaemon {
                                         let Some(frame) = frame else { break };
                                         let message: ClientMessage = serde_json::from_slice(&frame.expect("frame")).expect("client JSON");
                                         let automatic = match &message {
+                                            ClientMessage::ClaimRapInvocation { invocation } => Some(DaemonMessage::RapInvocationClaim {
+                                                invocation: invocation.clone(), record: state.lock().expect("state").claims.get(invocation).cloned(),
+                                            }),
                                             ClientMessage::CreateSession { .. } => {
                                                 state.lock().expect("state").created = true;
                                                 Some(connected())

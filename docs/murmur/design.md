@@ -32,7 +32,11 @@ agentctl cancel @planner     # real cancel, not fake user text
 agentctl watch               # live agent/message stream (the graph UI's feed)
 ```
 
-Every agent sends with the same `send_message` tool. Infinity agents get it from agentd's RAP toolset; CLI agents get it from agentd's MCP server, attached at session start. Sender identity comes from the session binding, never from an argument.
+Every agent sends with the same `send_message` tool. CLI agents get it from agentd's MCP server at session start. Infinity agents get it from agentd's fixed loopback RAP toolset. The daemon mints a UUID for each dispatch and keeps its canonical arguments, endpoint, callback URL, provider IDs, and root-first thread stack. agentd reads that record over a separate Unix connection. Other transports cannot read claims.
+
+agentd accepts `send_message` only when the claimed endpoint matches its own and the root has a live agent binding. Child threads send as the bound root agent and share its mail limits. HTTP arguments and ancestry never supply authority. agentd serializes duplicate invocations and caches their callback results for ten minutes or until revocation. After an agentd restart, the stable `rap:{uuid}` mailroom key recovers the accepted receipt. Callback delivery uses the record's URL, bounded retries, and no redirects. Unverified calls receive HTTP 403 without a callback.
+
+Configure the RAP entry by hand as described in the [agentd README](../../crates/agentd/README.md#give-infinity-agents-send_message). No other toolset may offer `send_message`. Disable the Infinity WebSocket listener with `INFINITY_WS=off`. With that listener enabled, any local process can drive Infinity sessions. agentd warns but still attaches. The daemon's RAP callback listener remains unauthenticated.
 
 ```json
 {"name": "send_message", "arguments": {"to": "@reviewer", "body": "Plan attached: ...", "reply_to": null}}

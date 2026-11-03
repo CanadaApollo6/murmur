@@ -678,6 +678,13 @@ impl AgentActor {
                         self.cancelling = false;
                     }
                 }
+                if let (Some(bindings), Wire::Infinity { socket }, Some(root)) =
+                    (&self.mcp, &self.kind.wire, session.infinity_root())
+                {
+                    bindings
+                        .bind_infinity(socket, root, self.id, self.incarnation)
+                        .await;
+                }
                 let token = session.resume_token();
                 self.session = Some(session);
                 self.mailroom.save_resume(self.id, token.clone()).await?;
