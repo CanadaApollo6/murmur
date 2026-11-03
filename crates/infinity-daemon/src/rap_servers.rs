@@ -968,6 +968,7 @@ mod r14a_registry {
     use crate::ids::SequentialIdSource;
     use crate::rap_callback;
     use crate::session::{SessionManager, SessionManagerConfig, SharedSessionManager};
+    use infinity_agent_core::traits::InputSender;
     use infinity_protocol::{ClientMessage, DaemonMessage};
     use infinity_provider_protocol::mock::{MockModelController, mock_model};
     use infinity_provider_protocol::{ModelEntry, ModelProvider, SingleModelProvider};
@@ -1294,5 +1295,89 @@ mod r14a_registry {
                 task.abort();
             })
             .await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_callback_enqueue_keeps_the_managed_claim() {
+        let local = tokio::task::LocalSet::new();
+        let (sender, invocation) = local
+            .run_until(async {
+                let port = r10a_waiting_server().await.expect("server");
+                let mut h = start_harness().await.expect("harness");
+                rap_test_servers::write_rap_config(h.cwd.path(), port).expect("RAP config");
+                let root = create_session_and_chat(&mut h).await;
+                h.client_tx
+                    .send(ClientMessage::UserInput {
+                        thread_id: root,
+                        text: "use tool".into(),
+                    })
+                    .expect("input");
+                h.ctrl.next_request().await;
+                h.ctrl
+                    .send_tool_call("enqueue-failure", "waiting_choice", serde_json::json!({}));
+                h.ctrl.finish();
+                let invocation = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Some(id) = h
+                            .manager
+                            .lock()
+                            .await
+                            .rap_manager
+                            .pending
+                            .lock()
+                            .expect("registry")
+                            .values()
+                            .next()
+                            .map(|call| call.invocation)
+                        {
+                            break id;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("dispatch");
+                let manager = h.manager.lock().await;
+                (
+                    manager.rap_manager.callback_sender(manager.input_sender()),
+                    invocation,
+                )
+            })
+            .await;
+        drop(local);
+        let group = sender
+            .pending
+            .lock()
+            .expect("registry")
+            .keys()
+            .next()
+            .expect("pending call")
+            .0
+            .clone();
+        let infinity_rap_bridge::CallbackDelivery::Input { message, dedup_id } =
+            infinity_rap_bridge::prepare_callback(rap_protocol::RapCallback::ToolResult(
+                rap_protocol::RapToolResult {
+                    group_id: group,
+                    id: "enqueue-failure".into(),
+                    call_id: None,
+                    text: Some("done".into()),
+                    content: None,
+                    display_as: None,
+                    subscription: None,
+                },
+            ))
+        else {
+            panic!("expected tool result")
+        };
+        assert!(
+            sender
+                .send_to_input_queue(*message, &format!("managed:{invocation}:{dedup_id}"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sender.pending.lock().expect("registry").len(),
+            1,
+            "failed enqueue must preserve the pending invocation for retry"
+        );
     }
 }
