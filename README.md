@@ -6,13 +6,11 @@ The long-term target is large agent swarms that work across machines without spr
 
 ## Status
 
-Design stage. Nothing in this repository runs as murmur yet.
+`agentd` runs on one machine. It hosts Claude and Codex agents over ACP and Infinity model agents, and every message goes through its SQLite mailroom. The [roadmap](docs/murmur/roadmap.md) lists what is built and what comes next.
 
 - [Design](docs/murmur/design.md): the `agentd` broker, CLI adapters, local inference on one GPU, and the swarm layer.
-- [Type sketch](docs/murmur/sketch/lib.rs): Rust signatures with `todo!()` bodies.
-- [Grounding notes](docs/murmur/grounding/03-constraints.md): what the Infinity code does today, with file and line references.
-
-The first implementation step is the peer-message change to the Infinity core described in the design's "Next implementation step".
+- [Isolation](docs/murmur/isolation.md): the bubblewrap sandbox for ACP agents and its remaining risks.
+- [agentd usage](crates/agentd/README.md): running `agentd` and `agentctl`.
 
 ## Agent credential sharing
 
