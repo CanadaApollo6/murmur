@@ -66,6 +66,7 @@ impl E2eHarness {
             context_window: 100_000,
             max_output_tokens: None,
             supports_image_input: true,
+            keeps_unsigned_reasoning: false,
         };
         let harness = Self::spawn_with_providers(
             cols,
@@ -414,6 +415,7 @@ async fn spawn_two_provider_harness(
                         context_window: 100_000,
                         max_output_tokens: None,
                         supports_image_input: true,
+                        keeps_unsigned_reasoning: false,
                     },
                     model1,
                 )) as Arc<dyn ModelProvider>,
@@ -427,6 +429,7 @@ async fn spawn_two_provider_harness(
                         context_window: 200_000,
                         max_output_tokens: None,
                         supports_image_input: true,
+                        keeps_unsigned_reasoning: false,
                     },
                     model2,
                 )) as Arc<dyn ModelProvider>,

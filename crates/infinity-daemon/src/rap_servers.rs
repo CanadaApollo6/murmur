@@ -1238,6 +1238,7 @@ mod r14a_registry {
             context_window: 100_000,
             max_output_tokens: None,
             supports_image_input: false,
+            keeps_unsigned_reasoning: false,
         };
         let state_dir = tempfile::tempdir()?;
         let cwd = tempfile::tempdir()?;

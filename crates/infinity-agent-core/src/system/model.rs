@@ -20,6 +20,7 @@ pub struct ResolvedModel {
     /// Whether the model accepts image inputs. When `false`, image tool
     /// results are replaced with a text placeholder before invocation.
     pub supports_image_input: bool,
+    pub keeps_unsigned_reasoning: bool,
 }
 
 /// Chooses the model for each completion round of each thread.
@@ -58,6 +59,7 @@ impl StaticModel {
                 model_id: entry.model_id.clone(),
                 context_window: entry.context_window,
                 supports_image_input: entry.supports_image_input,
+                keeps_unsigned_reasoning: entry.keeps_unsigned_reasoning,
             },
         }
     }

@@ -431,3 +431,40 @@ mod tests {
         assert!(empty.is_empty());
     }
 }
+
+#[cfg(test)]
+mod model_switch_tests {
+    use super::*;
+    use infinity_agent_core::{
+        event_processor::HistoryManager,
+        stores::{InMemoryConversationStore, InMemoryStateStore},
+    };
+    use infinity_provider_protocol::StreamChunk;
+
+    #[tokio::test]
+    async fn local_history_switches_to_bedrock_without_unsigned_reasoning() {
+        let history = HistoryManager::new_with_history(
+            InMemoryConversationStore::new(),
+            InMemoryStateStore::new(),
+            "switch".into(),
+        )
+        .await
+        .expect("create history");
+        history.handle_completion(
+            &StreamChunk::Reasoning(Reasoning::new_with_signature("local thought", None)),
+            "thought".into(),
+            None,
+        );
+        history.handle_completion(&StreamChunk::Text("answer".into()), "answer".into(), None);
+        history.flush_turn();
+        assert!(
+            matches!(&history.get_history(false, true)[0], Message::Assistant { content } if matches!(&content[0], AssistantContent::Reasoning(_)))
+        );
+        let converted =
+            messages(history.get_history(false, false)).expect("convert switched history");
+        assert_eq!(converted.len(), 1);
+        assert!(
+            matches!(&converted[0].content()[0], bedrock::ContentBlock::Text(t) if t == "answer")
+        );
+    }
+}

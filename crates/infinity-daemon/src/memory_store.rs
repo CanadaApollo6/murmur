@@ -1436,7 +1436,7 @@ mod tests {
                 if fail_payload { std::fs::remove_file(&blocked).expect("remove snapshot"); }
                 std::fs::create_dir(&blocked).expect("block write");
                 let (model, mut ctrl) = infinity_provider_protocol::mock::mock_model();
-                let entry = ModelEntry { model_id: "mock".into(), display_name: "mock".into(), context_window: 0, max_output_tokens: None, supports_image_input: false };
+                let entry = ModelEntry { model_id: "mock".into(), display_name: "mock".into(), context_window: 0, max_output_tokens: None, supports_image_input: false, keeps_unsigned_reasoning: false, };
                 let model = StaticModel::from_entry(Arc::new(SingleModelProvider::new(entry.clone(), model)), &entry);
                 let (events_tx, mut events) = mpsc::unbounded_channel();
                 let (dispatch_tx, mut dispatch) = mpsc::unbounded_channel();

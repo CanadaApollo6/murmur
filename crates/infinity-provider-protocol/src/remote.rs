@@ -385,6 +385,7 @@ mod tests {
             context_window: 100,
             max_output_tokens: None,
             supports_image_input: true,
+            keeps_unsigned_reasoning: false,
         }
     }
 

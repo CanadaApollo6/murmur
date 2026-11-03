@@ -37,6 +37,7 @@ async fn start_harness() -> Result<TestHarness, BoxError> {
         context_window: 100_000,
         max_output_tokens: None,
         supports_image_input: false,
+        keeps_unsigned_reasoning: false,
     };
     let state_dir = tempfile::tempdir()?;
     let cwd = tempfile::tempdir()?;
@@ -359,7 +360,7 @@ async fn r10_driver_failure_is_a_protocol_error() {
     }
     tokio::task::LocalSet::new().run_until(async {
         let state = tempfile::tempdir().expect("state");
-        let entry = ModelEntry { model_id:"panic".into(), display_name:"panic".into(), context_window:1000, max_output_tokens:None, supports_image_input:false };
+        let entry = ModelEntry { model_id:"panic".into(), display_name:"panic".into(), context_window:1000, max_output_tokens:None, supports_image_input:false, keeps_unsigned_reasoning: false, };
         let manager = SessionManager::with_providers(SessionManagerConfig {
             state_dir:state.path().into(), callback_url:String::new(), user_rap_config:None, id_source:Arc::new(SequentialIdSource::new()),
         }, vec![("panic".into(), Arc::new(SingleModelProvider::new(entry, PanickingModel)) as Arc<dyn ModelProvider>)], vec![]).await.expect("manager");

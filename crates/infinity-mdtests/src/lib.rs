@@ -48,6 +48,7 @@ impl ModelProvider for MockProvider {
                 context_window: 200_000,
                 max_output_tokens: None,
                 supports_image_input: false,
+                keeps_unsigned_reasoning: false,
             })
             .collect())
     }

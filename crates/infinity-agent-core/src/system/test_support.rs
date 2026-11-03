@@ -64,6 +64,7 @@ pub(crate) fn model_source(ctrl_entry: Option<ModelEntry>) -> (StaticModel, Mock
         context_window: 0,
         max_output_tokens: None,
         supports_image_input: false,
+        keeps_unsigned_reasoning: false,
     });
     let provider = infinity_provider_protocol::SingleModelProvider::new(entry.clone(), model);
     (StaticModel::from_entry(Arc::new(provider), &entry), ctrl)
@@ -334,6 +335,7 @@ pub(crate) fn small_context_entry() -> ModelEntry {
         context_window: 100,
         max_output_tokens: None,
         supports_image_input: false,
+        keeps_unsigned_reasoning: false,
     }
 }
 

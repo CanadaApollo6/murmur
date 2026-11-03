@@ -33,3 +33,4 @@ live-tests = []
 futures-util = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+infinity-agent-core = { path = "../infinity-agent-core" }

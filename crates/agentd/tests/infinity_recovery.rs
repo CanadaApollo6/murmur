@@ -166,6 +166,7 @@ async fn start_harness_at(
         context_window: 100_000,
         max_output_tokens: None,
         supports_image_input: false,
+        keeps_unsigned_reasoning: false,
     };
 
     let bridge = infinity_rap_bridge::RapCallbackBridge::bind().await?;

@@ -49,6 +49,7 @@ async fn two_model_catalog(
         context_window: 0,
         max_output_tokens: None,
         supports_image_input: false,
+        keeps_unsigned_reasoning: false,
     };
     Arc::new(
         ModelCatalog::new(vec![
@@ -594,6 +595,7 @@ async fn child_pending_choice_updates_root_session_status() {
                 context_window: 100_000,
                 max_output_tokens: None,
                 supports_image_input: false,
+                keeps_unsigned_reasoning: false,
             };
             let state_dir = tempfile::tempdir().expect("create daemon state dir");
             let cwd = tempfile::tempdir().expect("create session cwd");

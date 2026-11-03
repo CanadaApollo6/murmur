@@ -248,6 +248,7 @@ async fn main() {
                 context_window: 0,
                 max_output_tokens: None,
                 supports_image_input: false,
+                keeps_unsigned_reasoning: false,
             };
             let provider = Arc::new(SingleModelProvider::new(entry.clone(), ScriptedModel));
             let model = StaticModel::from_entry(provider, &entry);

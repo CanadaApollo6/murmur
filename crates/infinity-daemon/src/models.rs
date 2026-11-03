@@ -410,6 +410,7 @@ impl infinity_agent_core::system::ModelSource for CatalogModelSource {
             model_id: model_ref.model_id,
             context_window: entry.context_window,
             supports_image_input: entry.supports_image_input,
+            keeps_unsigned_reasoning: entry.keeps_unsigned_reasoning,
         })
     }
 }
@@ -540,5 +541,53 @@ mod tests {
 
         std::fs::write(&path, "not json").expect("write config");
         assert!(load_providers_config(&path).is_err(), "invalid json");
+    }
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::*;
+    use infinity_agent_core::system::ModelSource;
+    #[tokio::test]
+    async fn catalog_resolves_unsigned_reasoning_capability() {
+        let (model, _ctrl) = infinity_provider_protocol::mock::mock_model();
+        let entry = ModelEntry {
+            model_id: "local".into(),
+            display_name: "local".into(),
+            context_window: 128,
+            max_output_tokens: None,
+            supports_image_input: false,
+            keeps_unsigned_reasoning: true,
+        };
+        let provider = Arc::new(infinity_provider_protocol::SingleModelProvider::new(
+            entry, model,
+        ));
+        let catalog = Arc::new(
+            ModelCatalog::new(vec![("local".into(), provider)])
+                .await
+                .expect("catalog"),
+        );
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = CatalogModelSource {
+            conversation_store: crate::memory_store::PersistentConversationStore::new_with_dir(
+                dir.path(),
+                catalog.default_ref().clone(),
+                Arc::new(crate::ids::UuidIdSource),
+            ),
+            catalog,
+        };
+        infinity_agent_core::traits::ConversationStore::ensure_root_thread(
+            &source.conversation_store,
+            ThreadId::from_ref("thread"),
+        )
+        .await
+        .expect("create thread");
+        assert!(
+            source
+                .resolve(ThreadId::from_ref("thread"))
+                .await
+                .expect("resolve")
+                .keeps_unsigned_reasoning
+        );
     }
 }

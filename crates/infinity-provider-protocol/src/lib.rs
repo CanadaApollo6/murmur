@@ -56,6 +56,9 @@ pub struct ModelEntry {
     /// a text placeholder before invoking the model.
     #[serde(default)]
     pub supports_image_input: bool,
+    /// Preserve unsigned reasoning in history for models that accept it.
+    #[serde(default)]
+    pub keeps_unsigned_reasoning: bool,
 }
 
 /// A backend that can list and invoke completion models.

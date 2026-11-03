@@ -147,6 +147,7 @@ pub(crate) async fn function_handler(event: LambdaEvent<SqsEvent>) -> Result<(),
                     context_window: 0,
                     max_output_tokens: None,
                     supports_image_input: false,
+                    keeps_unsigned_reasoning: false,
                 },
             )
         }

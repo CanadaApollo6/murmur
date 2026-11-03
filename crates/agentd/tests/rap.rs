@@ -650,6 +650,7 @@ fn real_daemon_crash_child() {
                             context_window: 100000,
                             max_output_tokens: None,
                             supports_image_input: false,
+                            keeps_unsigned_reasoning: false,
                         },
                         model,
                     )) as Arc<dyn ModelProvider>,

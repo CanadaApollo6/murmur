@@ -778,16 +778,25 @@ impl<C: ConversationStore, S: StateStore> HistoryManager<C, S> {
     /// Build the model-facing chat history. When `supports_image_input` is
     /// `false`, image tool-result content is replaced with a text placeholder
     /// so the history can be sent to models without image support.
-    pub fn get_history(&self, supports_image_input: bool) -> Vec<Message> {
+    pub fn get_history(
+        &self,
+        supports_image_input: bool,
+        keeps_unsigned_reasoning: bool,
+    ) -> Vec<Message> {
         self.history
             .borrow()
             .iter()
             .flat_map(|m| m.clone().into_messages())
-            .map(|mut msg| {
+            .filter_map(|mut msg| {
+                if !keeps_unsigned_reasoning
+                    && let Message::Assistant { content } = &mut msg {
+                    content.retain(|c| !matches!(c, AssistantContent::Reasoning(r) if r.first_signature().is_none()));
+                    if content.is_empty() { return None; }
+                }
                 if !supports_image_input {
                     strip_image_tool_results(&mut msg);
                 }
-                msg
+                Some(msg)
             })
             .collect()
     }
@@ -1459,15 +1468,18 @@ where
             } else if let SyntheticKind::Tagged(TaggedSyntheticKind::PeerMessage { from }) = synth {
                 format!("message from {from}")
             } else {
-                let orig_call = current_history.get_history(true).into_iter().find(|h| {
-                    if let Message::Assistant { content, .. } = h
-                        && let Some(AssistantContent::ToolCall(c)) = content.first()
-                    {
-                        c.id == synth.tool_call_id().as_str()
-                    } else {
-                        false
-                    }
-                });
+                let orig_call = current_history
+                    .get_history(true, true)
+                    .into_iter()
+                    .find(|h| {
+                        if let Message::Assistant { content, .. } = h
+                            && let Some(AssistantContent::ToolCall(c)) = content.first()
+                        {
+                            c.id == synth.tool_call_id().as_str()
+                        } else {
+                            false
+                        }
+                    });
                 if let Some(Message::Assistant { content, .. }) = orig_call
                     && let Some(AssistantContent::ToolCall(c)) = content.first()
                 {
@@ -1610,6 +1622,7 @@ pub fn run_completion<'a: 'b, 'b, P, C, S, M>(
     // When `false`, image tool results are replaced with a text placeholder
     // before the model is invoked.
     supports_image_input: bool,
+    keeps_unsigned_reasoning: bool,
     history: &'a HistoryManager<C, S>,
     tool_names: &'a HashSet<String>,
     tools: &'a [ToolDefinition],
@@ -1651,7 +1664,7 @@ where
             let stream_result = provider
                 .invoke_model(model_id, CompletionRequest {
                     preamble: Some(preamble.clone()),
-                    chat_history: history.get_history(supports_image_input),
+                    chat_history: history.get_history(supports_image_input, keeps_unsigned_reasoning),
                     tools: tools.to_vec(),
                     max_tokens: None,
                     additional_params: None,
@@ -1862,7 +1875,7 @@ where
 
                 // Skip incomplete reasoning chunks
                 if let StreamChunk::Reasoning(ref r) = chunk
-                    && r.first_signature().is_none() { continue; }
+                    && r.first_signature().is_none() && !keeps_unsigned_reasoning { continue; }
 
                 let completion_id = format!("{}-{}-completion-{}", group_id, message_id, completion_counter);
                 completion_counter += 1;
@@ -2973,6 +2986,7 @@ mod tests {
                         &provider,
                         "mock",
                         false,
+                        false,
                         &hm,
                         &tool_names,
                         &tool_defs,
@@ -3034,6 +3048,7 @@ mod tests {
                     let stream = run_completion(
                         &provider,
                         "mock",
+                        false,
                         false,
                         &hm,
                         &tool_names,
@@ -3099,6 +3114,7 @@ mod tests {
                     let stream = run_completion(
                         &provider,
                         "mock",
+                        false,
                         false,
                         &hm,
                         &tool_names,
@@ -3185,6 +3201,7 @@ mod tests {
                     let stream = run_completion(
                         &provider,
                         "mock",
+                        false,
                         false,
                         &hm,
                         &tool_names,
@@ -3303,6 +3320,7 @@ mod tests {
                     let stream = run_completion(
                         &provider,
                         "mock",
+                        false,
                         false,
                         &hm,
                         &tool_names,
@@ -3432,6 +3450,7 @@ mod tests {
                         &provider,
                         "mock",
                         true,
+                        false,
                         &hm,
                         &tool_names,
                         &tool_defs,
@@ -3480,6 +3499,7 @@ mod tests {
                     let stream = run_completion(
                         &provider,
                         "mock",
+                        false,
                         false,
                         &hm,
                         &tool_names,
@@ -3539,6 +3559,7 @@ mod tests {
                     let stream = run_completion(
                         &provider,
                         "mock",
+                        false,
                         false,
                         &hm,
                         &tool_names,
@@ -3644,6 +3665,7 @@ mod tests {
                         &provider,
                         "mock",
                         false,
+                        false,
                         &hm,
                         &tool_names,
                         &tool_defs,
@@ -3746,6 +3768,7 @@ mod tests {
                     let stream = run_completion(
                         &provider,
                         "mock",
+                        false,
                         false,
                         &hm,
                         &tool_names,
@@ -3875,6 +3898,7 @@ mod tests {
                         &provider,
                         "mock",
                         false,
+                        false,
                         &hm,
                         &tool_names,
                         &tool_defs,
@@ -3940,6 +3964,7 @@ mod tests {
                     let stream = run_completion(
                         &provider,
                         "mock",
+                        false,
                         false,
                         &hm,
                         &tool_names,
@@ -4015,6 +4040,7 @@ mod tests {
                     let stream = run_completion(
                         &provider,
                         "mock",
+                        false,
                         false,
                         &hm_task,
                         &tool_names,
@@ -4102,6 +4128,7 @@ mod tests {
                         &provider,
                         "mock",
                         false,
+                        false,
                         &hm,
                         &tool_names,
                         &tool_defs,
@@ -4176,6 +4203,7 @@ mod tests {
                     let stream = run_completion(
                         &provider,
                         "mock",
+                        false,
                         false,
                         &hm,
                         &tool_names,
@@ -4293,6 +4321,7 @@ mod tests {
                         &provider,
                         "mock",
                         false,
+                        false,
                         &hm_task,
                         &tool_names,
                         &tool_defs,
@@ -4378,7 +4407,8 @@ mod tests {
                 let handle = tokio::task::spawn_local(async move {
                     let thread_id = ThreadId::from("thread-1");
                     let stream = run_completion(
-                        &provider, "mock", false, &hm, &tool_names, &tool_defs, &tool_registry,
+                        &provider, "mock", false,
+                        false, &hm, &tool_names, &tool_defs, &tool_registry,
                         &ctx, &thread_id, "msg-1", None, cancel_rx,
                     );
                     tokio::pin!(stream);
@@ -4688,6 +4718,7 @@ mod tests {
             provider,
             "mock",
             false,
+            false,
             hm,
             &tool_names,
             &tool_defs,
@@ -4729,6 +4760,117 @@ mod tests {
             ErrorClass::ContextOverflow,
             "input is too long for the model",
         )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_reasoning_survives_then_is_stripped_on_model_switch() {
+        use crate::system::{ModelSource, StaticModel};
+        use infinity_provider_protocol::{ModelEntry, Reasoning, ReasoningContent};
+        let (provider, mut ctrl) = mock_provider();
+        let entry = ModelEntry {
+            model_id: "mock".into(),
+            display_name: "local".into(),
+            context_window: 0,
+            max_output_tokens: None,
+            supports_image_input: false,
+            keeps_unsigned_reasoning: true,
+        };
+        let source = StaticModel::from_entry(std::sync::Arc::new(provider), &entry);
+        let model = source
+            .resolve(ThreadId::from_ref("thread-1"))
+            .await
+            .expect("resolve local model");
+        let store = InMemoryConversationStore::new();
+        let hm = make_history(&store, vec![]).await;
+        add_user_input(&hm, "think", "input");
+        let (names, defs, registry) = no_tools();
+        let ctx = tool_context();
+        let thread = ThreadId::from("thread-1");
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let consume = async {
+            let stream = run_completion(
+                model.provider.as_ref(),
+                &model.model_id,
+                model.supports_image_input,
+                model.keeps_unsigned_reasoning,
+                &hm,
+                &names,
+                &defs,
+                &registry,
+                &ctx,
+                &thread,
+                "turn",
+                None,
+                cancel_rx,
+            );
+            tokio::pin!(stream);
+            while let Some(event) = stream.next().await {
+                event.expect("completion event");
+            }
+        };
+        let feed = async {
+            ctrl.next_request().await;
+            ctrl.send_chunk(StreamChunk::Reasoning(Reasoning::new_with_signature(
+                "local thought",
+                None,
+            )));
+            ctrl.send_text("answer");
+            ctrl.finish();
+        };
+        tokio::join!(consume, feed);
+        let local_history = hm.get_history(false, true);
+        assert!(
+            format!("{local_history:?}").contains("local thought"),
+            "local round trip must retain unsigned reasoning"
+        );
+        let switched = hm.get_history(false, false);
+        assert!(
+            !format!("{switched:?}").contains("local thought"),
+            "model switch must strip unsigned reasoning"
+        );
+        assert!(format!("{switched:?}").contains("answer"));
+
+        let signed = Reasoning {
+            id: None,
+            content: vec![
+                ReasoningContent::Summary("signed block companion".into()),
+                ReasoningContent::Text {
+                    text: "signed thought".into(),
+                    signature: Some("sig".into()),
+                },
+            ],
+        };
+        let hm = make_history(
+            &store,
+            vec![
+                Message::Assistant {
+                    content: vec![AssistantContent::Reasoning(Reasoning::new_with_signature(
+                        "remove whole block",
+                        None,
+                    ))],
+                },
+                Message::Assistant {
+                    content: vec![AssistantContent::Reasoning(signed.clone())],
+                },
+            ],
+        )
+        .await;
+        assert_eq!(
+            hm.get_history(false, false),
+            vec![Message::Assistant {
+                content: vec![AssistantContent::Reasoning(signed)]
+            }]
+        );
+        let hm = make_history(
+            &store,
+            vec![Message::Assistant {
+                content: vec![AssistantContent::Reasoning(Reasoning::new_with_signature(
+                    "alone", None,
+                ))],
+            }],
+        )
+        .await;
+        assert!(hm.get_history(false, false).is_empty());
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

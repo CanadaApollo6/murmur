@@ -27,6 +27,7 @@ pub(crate) fn mock_provider_with_image_support(
         context_window: 0,
         max_output_tokens: None,
         supports_image_input,
+        keeps_unsigned_reasoning: false,
     };
     (SingleModelProvider::new(entry, model), ctrl)
 }

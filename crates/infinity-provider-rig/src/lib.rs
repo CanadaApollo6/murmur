@@ -21,6 +21,7 @@
 //!     context_window: 200_000,
 //!     max_output_tokens: Some(64_000),
 //!     supports_image_input: true,
+//!     keeps_unsigned_reasoning: false,
 //! });
 //! # let _ = provider;
 //! # }

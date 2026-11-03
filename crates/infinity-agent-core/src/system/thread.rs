@@ -676,6 +676,7 @@ where
                 model.provider.as_ref(),
                 &model.model_id,
                 model.supports_image_input,
+                model.keeps_unsigned_reasoning,
                 &self.history,
                 &tool_names,
                 &tool_defs,

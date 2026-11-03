@@ -69,6 +69,7 @@ async fn start_daemon(model: MockCompletionModel) -> Result<TestDaemon, BoxError
         context_window: 100_000,
         max_output_tokens: None,
         supports_image_input: true,
+        keeps_unsigned_reasoning: false,
     };
     start_daemon_with_providers(vec![(
         "mock".to_owned(),
@@ -569,6 +570,7 @@ fn two_mock_providers() -> (ProviderList, MockModelController, MockModelControll
                     context_window: 100_000,
                     max_output_tokens: None,
                     supports_image_input: true,
+                    keeps_unsigned_reasoning: false,
                 },
                 model1,
             )) as Arc<dyn ModelProvider>,
@@ -582,6 +584,7 @@ fn two_mock_providers() -> (ProviderList, MockModelController, MockModelControll
                     context_window: 200_000,
                     max_output_tokens: None,
                     supports_image_input: true,
+                    keeps_unsigned_reasoning: false,
                 },
                 model2,
             )) as Arc<dyn ModelProvider>,
