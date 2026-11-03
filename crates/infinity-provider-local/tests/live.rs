@@ -89,15 +89,23 @@ async fn probe(engine: &str, prefix: &str) {
             .timeout(std::time::Duration::from_secs(600))
             .build()
             .expect("probe client");
-        let models: serde_json::Value = client
-            .get(format!("{}/v1/models", url.trim_end_matches('/')))
+        let mut discovery = client.get(format!("{}/v1/models", url.trim_end_matches('/')));
+        if let Ok(key) = std::env::var(&api_env) {
+            discovery = discovery.bearer_auth(key);
+        }
+        let models: serde_json::Value = discovery
             .send()
             .await
             .expect("models")
+            .error_for_status()
+            .expect("model-list status")
             .json()
             .await
             .expect("model list");
-        let mut request=client.post(format!("{}/v1/chat/completions",url.trim_end_matches('/'))).json(&json!({"model":models["data"][0]["id"],"messages":[{"role":"user","content":"Think through 17 * 19 step by step."}],"stream":true,"chat_template_kwargs":{"enable_thinking":true}}));
+        let raw_model = std::env::var(format!("LOCAL_PROBE_{prefix}_MODEL"))
+            .map(serde_json::Value::String)
+            .unwrap_or_else(|_| models["data"][0]["id"].clone());
+        let mut request=client.post(format!("{}/v1/chat/completions",url.trim_end_matches('/'))).json(&json!({"model":raw_model,"messages":[{"role":"user","content":"Think through 17 * 19 step by step."}],"stream":true,"chat_template_kwargs":{"enable_thinking":true}}));
         if let Ok(key) = std::env::var(&api_env) {
             request = request.bearer_auth(key);
         }
