@@ -224,7 +224,9 @@ upgrade at their next validated start only if the canonical path and inode still
 match the recorded pin. Configured file and directory bind identities are recorded
 at startup in `state/sandbox-binds.json` and retained
 across restarts. Spawn and re-spawn reject symlinks inside any agent's pinned
-workspace or a writable bind, naming the link and its canonical target. Symlinks
+workspace or a writable bind, naming the link and its canonical target. A tree
+is matched by path prefix and by filesystem ID and inode, so a bind-mount alias
+of a pinned tree is caught too. Symlinks
 outside those trees remain allowed. A human `spawn` of a Failed agent's name
 re-pins its workspace only if the cwd still resolves to the pinned canonical path,
 retaining its identity and mailbox. A different canonical cwd requires a new name.

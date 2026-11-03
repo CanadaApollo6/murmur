@@ -217,11 +217,15 @@ fn resolve_path(path: &Path, mut symlink: impl FnMut(&Path) -> Result<()>) -> Re
 impl SandboxConfig {
     pub fn spawn_cwd(&self, path: &Path, workspaces: &[&PinnedPath]) -> Result<PathBuf> {
         resolve_path(path, |link| {
-            if workspaces.iter().any(|p| link.starts_with(&p.path))
+            // Match by identity too: a bind-mount alias of a writable tree has another path prefix.
+            let inside = |p: &PinnedPath| {
+                link.starts_with(&p.path) || link.ancestors().skip(1).any(|a| p.identifies(a))
+            };
+            if workspaces.iter().any(|p| inside(p))
                 || self
                     .binds
                     .iter()
-                    .any(|(p, _, readonly)| !readonly && link.starts_with(&p.path))
+                    .any(|(p, _, readonly)| !readonly && inside(p))
             {
                 return Err(format!(
                     "cwd traverses agent-writable symlink {} -> {}; re-issue knowingly with the canonical path",
@@ -514,6 +518,25 @@ impl PinnedPath {
     }
     fn capture_bind(path: &Path, cfg: &SandboxConfig, state: &Path) -> Result<Self> {
         Self::capture_source(path, cfg, state, false)
+    }
+    /// Whether `path` is this pinned object, reached by any path (including bind-mount aliases).
+    fn identifies(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Some(identity) = &self.identity else {
+            return false;
+        };
+        let Ok(fd) = Self::descriptor(path, true) else {
+            return false;
+        };
+        let Ok(stat) = fd
+            .try_clone()
+            .map(std::fs::File::from)
+            .and_then(|f| f.metadata())
+        else {
+            return false;
+        };
+        stat.ino() == self.ino
+            && FilesystemIdentity::read(&fd, stat.dev()).is_ok_and(|i| &i == identity)
     }
     pub fn is_legacy(&self) -> bool {
         self.identity.is_none()
@@ -1041,6 +1064,14 @@ mod tests {
             assert!(error.contains(&target.display().to_string()), "{error}");
         }
         assert_eq!(cfg.spawn_cwd(&alias, &[]).expect("outside alias"), tree);
+        assert!(
+            cfg.binds[0].0.identifies(&tree),
+            "pin identifies its own tree"
+        );
+        assert!(
+            !cfg.binds[0].0.identifies(&target),
+            "pin rejects another tree"
+        );
         cfg.binds[0].2 = true;
         assert_eq!(cfg.spawn_cwd(&link, &[]).expect("read-only link"), target);
     }
