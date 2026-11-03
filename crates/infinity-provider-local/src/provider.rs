@@ -122,10 +122,29 @@ impl Server {
         }
         state.passed = false;
         let attempt = async {
-            let models = self.get("/v1/models").await?;
-            let data = models["data"]
-                .as_array()
-                .ok_or_else(|| transient("discovery /v1/models has no data array"))?;
+            // With a configured model, llama.cpp and generic need nothing from
+            // /v1/models (llama.cpp's context comes from /props), so a server
+            // without the route still serves chat.
+            let models_optional = self.config.model.is_some()
+                && matches!(self.config.engine, Engine::LlamaCpp | Engine::Generic);
+            let models = match self.get("/v1/models").await {
+                Ok(models) => models,
+                Err(error) if models_optional => {
+                    tracing::warn!(
+                        server = self.config.name,
+                        %error,
+                        "cannot list models; using the configured model"
+                    );
+                    Value::Null
+                }
+                Err(error) => return Err(error),
+            };
+            let empty = Vec::new();
+            let data = match models["data"].as_array() {
+                Some(data) => data,
+                None if models_optional => &empty,
+                None => return Err(transient("discovery /v1/models has no data array")),
+            };
             let ids: Vec<_> = data.iter().filter_map(|v| v["id"].as_str()).collect();
             let model = match &self.config.model {
                 Some(model) => {
@@ -151,10 +170,18 @@ impl Server {
                 .iter()
                 .find(|v| v["id"].as_str() == Some(&model))
                 .unwrap_or(&Value::Null);
+            // llama.cpp's /props carries the context check, so it is required.
+            // SGLang's /server_info and TensorFold's /health carry only slots.
+            let optional = |path: &'static str| async move {
+                self.get(path).await.unwrap_or_else(|error| {
+                    tracing::warn!(server = self.config.name, %error, "slot discovery failed");
+                    Value::Null
+                })
+            };
             let auxiliary = match self.config.engine {
                 Engine::LlamaCpp => self.get("/props").await?,
-                Engine::Sglang => self.get("/server_info").await?,
-                Engine::TensorFold => self.get("/health").await?,
+                Engine::Sglang => optional("/server_info").await,
+                Engine::TensorFold => optional("/health").await,
                 _ => Value::Null,
             };
             Ok((model, self.config.engine.discover(model_info, &auxiliary)))
@@ -212,8 +239,11 @@ impl Server {
             if self.config.engine == Engine::TensorFold
                 && let Some(n) = tensorfold_context_limit(&error.message)
             {
-                self.state.lock().await.actual_context = Some(n);
+                let mut state = self.state.lock().await;
+                state.actual_context = Some(n);
                 if n < self.config.context_window as u64 {
+                    // A mismatch is never cached as passed: the next invocation rechecks.
+                    state.passed = false;
                     return mismatch(&self.config, n);
                 }
             }

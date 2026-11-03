@@ -37,6 +37,7 @@ struct EngineState {
     replies: Mutex<VecDeque<Reply>>,
     discovery_delay: AtomicU64,
     missing_context: bool,
+    no_models_route: std::sync::atomic::AtomicBool,
 }
 fn event(value: Value) -> String {
     format!("data: {value}\n\n")
@@ -54,18 +55,21 @@ fn successful() -> Reply {
         (0, "data: [DONE]\n\n".into()),
     ])
 }
-async fn models(State(s): State<Arc<EngineState>>) -> Json<Value> {
+async fn models(State(s): State<Arc<EngineState>>) -> Result<Json<Value>, axum::http::StatusCode> {
     tokio::time::sleep(Duration::from_millis(
         s.discovery_delay.load(Ordering::SeqCst),
     ))
     .await;
-    Json(
+    if s.no_models_route.load(Ordering::SeqCst) {
+        return Err(axum::http::StatusCode::NOT_FOUND);
+    }
+    Ok(Json(
         json!({"data":s.models.lock().expect("models").iter().map(|id| {
         let mut model=json!({"id":id});
         if !s.missing_context { model["max_model_len"]=json!(s.context.load(Ordering::SeqCst)); model["context_length"]=json!(s.context.load(Ordering::SeqCst)); }
         model
     }).collect::<Vec<_>>()}),
-    )
+    ))
 }
 async fn auxiliary(State(s): State<Arc<EngineState>>) -> Json<Value> {
     Json(
@@ -126,6 +130,7 @@ impl Harness {
             replies: Mutex::new(VecDeque::new()),
             discovery_delay: AtomicU64::new(0),
             missing_context: python,
+            no_models_route: std::sync::atomic::AtomicBool::new(false),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -574,4 +579,83 @@ fn invalid_binary_config_exits_before_printing_a_socket_path() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(!output.stderr.is_empty());
+}
+#[tokio::test]
+async fn parsed_tensorfold_mismatch_is_rechecked_on_the_next_invocation() {
+    let h = Harness::new("tensorfold", true, "").await;
+    // TensorFold Python cuda/server.py:251-253. Formatted request and context values.
+    h.replies([Reply::Http(400,json!({"error":{"message":"the rendered prompt has 100 tokens and requests 1 reply tokens, exceeding the server's 64-token context window; reduce the prompt or reply length"}}))]);
+    let err = h.run(request()).await.expect_err("undersized server");
+    assert_eq!(err.class(), ErrorClass::Fatal);
+    assert!(err.to_string().contains("64") && err.to_string().contains("128"));
+    // A cached pass would skip discovery and dispatch; a recheck hits the slow route.
+    h.state.discovery_delay.store(1500, Ordering::SeqCst);
+    assert_eq!(
+        h.run(request())
+            .await
+            .expect_err("discovery runs again")
+            .class(),
+        ErrorClass::Transient
+    );
+    assert_eq!(h.state.requests.lock().expect("requests").len(), 1);
+}
+#[tokio::test]
+async fn capped_overflow_after_emitted_output_is_not_retried() {
+    for delta in [
+        json!({"content":"partial"}),
+        json!({"reasoning_content":"think"}),
+    ] {
+        let h = Harness::new("vllm", false, "").await;
+        // vLLM v0.30.0 vllm/v1/engine/input_processor.py:481-484, sent in-stream.
+        h.replies([Reply::Sse(vec![
+            (0, event(json!({"choices":[{"delta":delta}]}))),
+            (0, event(json!({"error":{"message":"The decoder prompt (length 200) plus the number of requested output tokens (at least 1) is longer than the maximum model length of 256. Make sure that `max_model_len` is no smaller than the number of text tokens (prompt + requested output tokens)."}}))),
+        ])]);
+        let mut req = request();
+        req.max_tokens = Some(100);
+        let err = h.run(req).await.expect_err("no retry after output");
+        assert_eq!(err.class(), ErrorClass::ContextOverflow);
+        assert_eq!(h.state.requests.lock().expect("requests").len(), 1);
+    }
+}
+#[tokio::test]
+async fn configured_model_not_found_names_the_config() {
+    let h = Harness::new("vllm", false, "model='weights'").await;
+    h.replies([Reply::Http(
+        404,
+        json!({"error":{"message":"The model `weights` does not exist.","type":"NotFoundError"}}),
+    )]);
+    let err = h.run(request()).await.expect_err("model gone");
+    assert_eq!(err.class(), ErrorClass::Fatal);
+    assert!(err.to_string().contains("fix model in the config"));
+}
+#[tokio::test]
+async fn configured_model_survives_a_missing_models_route() {
+    for engine in ["generic", "llama.cpp"] {
+        let h = Harness::new(engine, false, "model='weights'").await;
+        h.state.no_models_route.store(true, Ordering::SeqCst);
+        h.run(request()).await.expect("chat without /v1/models");
+        assert_eq!(
+            h.state.requests.lock().expect("requests")[0]["model"],
+            "weights"
+        );
+    }
+    let h = Harness::new("generic", false, "").await;
+    h.state.no_models_route.store(true, Ordering::SeqCst);
+    assert_eq!(
+        h.run(request())
+            .await
+            .expect_err("no model to resolve")
+            .class(),
+        ErrorClass::Transient
+    );
+    let h = Harness::new("vllm", false, "model='weights'").await;
+    h.state.no_models_route.store(true, Ordering::SeqCst);
+    assert_eq!(
+        h.run(request())
+            .await
+            .expect_err("vLLM context comes from /v1/models")
+            .class(),
+        ErrorClass::Transient
+    );
 }
