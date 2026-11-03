@@ -13,7 +13,7 @@ pub(crate) fn check_arch() -> Result<()> {
         Ok(())
     } else {
         Err(format!(
-            "sandbox seccomp requires little-endian Linux x86_64 or aarch64; unsupported architecture {} on {}",
+            "sandbox seccomp requires little-endian Linux x86_64 or aarch64; unsupported architecture {} on {}; set sandbox = \"none\" to run agents unsandboxed",
             std::env::consts::ARCH,
             std::env::consts::OS
         )

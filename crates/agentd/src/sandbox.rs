@@ -285,6 +285,10 @@ impl SandboxConfig {
         let uses_bwrap = kinds
             .iter()
             .any(|k| matches!(k.isolation, Isolation::Bwrap(_)));
+        // A bare name would be resolved through PATH, which agents may be able to write.
+        if uses_bwrap && !self.path.is_absolute() {
+            return Err(format!("[bwrap] path must be absolute: {}", self.path.display()).into());
+        }
         for kind in kinds {
             for name in kind.env.keys() {
                 if forbidden_env(name) {
@@ -1360,6 +1364,27 @@ mod tests {
         std::fs::remove_dir(source.join("nested")).expect("remove parent");
         symlink("/run", source.join("nested")).expect("planted nested parent");
         assert!(facts.validate_destinations(&paths).is_err());
+    }
+    #[test]
+    fn config_rejects_relative_bwrap_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        std::fs::create_dir(&state).expect("state");
+        let mut cfg = SandboxConfig {
+            path: "bwrap".into(),
+            ro_binds: vec![],
+            ..Default::default()
+        };
+        let error = cfg
+            .validate(
+                &state,
+                &state.join("agentd.sock"),
+                &state.join("mcp.sock"),
+                &mut sandbox_kinds(),
+            )
+            .expect_err("relative bwrap path must fail configuration")
+            .to_string();
+        assert!(error.contains("must be absolute"), "{error}");
     }
     #[test]
     fn config_rejects_loader_hooks_in_forwarded_and_kind_environment() {

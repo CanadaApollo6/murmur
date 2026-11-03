@@ -270,6 +270,12 @@ through no-follow directory descriptors in the private home and earlier mounted
 trees. Symlink parents and leaves fail the affected launch. This includes
 workspaces and file binds. The internal helper and socket mounts are installed
 after configured mounts, so those mounts cannot hide them.
+This check is not atomic with bubblewrap's mounts. A relaunched agent cannot
+race it, because the broker stops the old session and its PID namespace first.
+A sibling agent that shares a writable tree and is still running can change a
+component in that window. The result is a misplaced grant or a failed launch,
+not a substituted helper, because the internal mounts come last. Do not share
+writable trees between agents that must not affect each other's launches.
 The seccomp filter uses the same FD inheritance path. Bubblewrap closes its FD
 before executing the child.
 A mismatch fails the launch with a reason in the log and `agentctl ls`'s `error`
