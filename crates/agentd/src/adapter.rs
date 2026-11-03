@@ -122,14 +122,12 @@ pub(crate) struct OpenRequest<'a> {
     pub resume: Option<&'a ResumeToken>,
     pub incarnation: Incarnation,
     pub launch: crate::sandbox::Launch,
+    pub bindings: Option<&'a crate::surfaces::Bindings>,
 }
 
 #[async_trait]
 pub(crate) trait Session: Send {
     fn resume_token(&self) -> ResumeToken;
-    fn infinity_root(&self) -> Option<infinity_protocol::ThreadRef> {
-        None
-    }
     fn resumable(&self) -> bool;
     fn busy(&self) -> bool {
         false

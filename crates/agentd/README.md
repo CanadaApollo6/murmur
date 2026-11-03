@@ -248,9 +248,21 @@ its mail limits. HTTP arguments and ancestry do not grant authority.
 
 Duplicate invocations share one send. Completed results remain cached for ten
 minutes or until the binding is revoked. A retry after agentd restarts recovers
-the existing mail receipt through the invocation's mailroom key. Callback POSTs
-have no redirects and use bounded retries. Failed callbacks retain their cached
-result so another invocation can retry delivery.
+the existing mail receipt through the invocation's mailroom key.
+
+HTTP 200 acknowledges the invocation before the send finishes. The spawned task
+owns execution and callback delivery. Verified send errors also use the callback.
+Non-2xx responses reject unverified invocations.
+
+The Infinity daemon retries external invocation POSTs after transport errors for
+up to 60 seconds. Every attempt uses the same UUID and body. HTTP error statuses
+fail immediately. Exhausted transport retries produce this result text.
+
+> Outcome unknown: the message may have been sent. Delivery could not be confirmed. Retrying as a new call may send it twice.
+
+Callback POSTs have no redirects. Delivery retries with exponential backoff capped
+at three seconds until the daemon acknowledges, the entry expires after ten
+minutes, or the binding is revoked. Each expired or revoked delivery logs its UUID.
 
 Start the separate Infinity daemon with `INFINITY_WS=off` to disable its
 unauthenticated WebSocket listener. `INFINITY_WS_PORT=0` still selects an

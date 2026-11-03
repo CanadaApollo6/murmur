@@ -11,7 +11,6 @@ use hyper::{Method, Request, Response, StatusCode, body::Incoming};
 use infinity_protocol::{ClientMessage, DaemonMessage, RapClaimRecord};
 use serde::Deserialize;
 use tokio::net::{TcpListener, UnixStream};
-use tokio::sync::watch;
 use tokio_util::codec::Framed;
 use uuid::Uuid;
 
@@ -49,11 +48,10 @@ pub(super) struct Completed {
 pub(super) enum Execution {
     InFlight {
         call: VerifiedCall,
-        completion: watch::Receiver<Option<Completed>>,
     },
     Completed {
         call: VerifiedCall,
-        result: Completed,
+        result: Box<Completed>,
     },
 }
 impl Execution {
@@ -101,8 +99,15 @@ impl RapServer {
         let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
-                accepted = server.listener.accept() => {
-                    let (stream, _) = accepted?;
+                accepted = server.listener.accept(), if connections.len() < 64 => {
+                    let (stream, _) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            tracing::warn!(%error, "RAP accept failed");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
                     let server = server.clone();
                     let api = api.clone();
                     connections.spawn(async move {
@@ -111,9 +116,13 @@ impl RapServer {
                             let api = api.clone();
                             async move { Ok::<_, Infallible>(server.handle(request, api).await) }
                         });
-                        if let Err(error) = hyper::server::conn::http1::Builder::new()
-                            .serve_connection(hyper_util::rt::TokioIo::new(stream), service).await {
-                            tracing::debug!(%error, "RAP connection closed");
+                        let mut builder = hyper::server::conn::http1::Builder::new();
+                        builder.timer(hyper_util::rt::TokioTimer::new())
+                            .header_read_timeout(Duration::from_secs(5)).keep_alive(false);
+                        match tokio::time::timeout(Duration::from_secs(30), builder.serve_connection(hyper_util::rt::TokioIo::new(stream), service)).await {
+                            Ok(Ok(())) => {},
+                            Ok(Err(error)) => tracing::debug!(%error, "RAP connection closed"),
+                            Err(error) => tracing::debug!(%error, "RAP connection idle timeout"),
                         }
                     });
                 }
@@ -218,62 +227,82 @@ impl RapServer {
             match calls.entry(id) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let (completion, receiver) = watch::channel(None);
-                    let execution = Execution::InFlight {
-                        call: call.clone(),
-                        completion: receiver,
-                    };
+                    let execution = Execution::InFlight { call: call.clone() };
                     entry.insert(execution.clone());
                     let api = api.clone();
+                    let http = self.http.clone();
                     tokio::spawn(async move {
                         let result = execute(&api, id, &call.record, &binding).await;
                         api.bindings.rap_calls.lock().await.insert(
                             id,
                             Execution::Completed {
-                                call,
-                                result: result.clone(),
+                                call: call.clone(),
+                                result: Box::new(result.clone()),
                             },
                         );
-                        completion.send_replace(Some(result));
                         drop(binding);
+                        Self::deliver(&http, &api, id, &call, &result).await;
                     });
                     execution
                 }
             }
         };
-        let completed = match execution {
-            Execution::Completed { result, .. } => result,
-            Execution::InFlight { mut completion, .. } => tokio::time::timeout(
-                Duration::from_secs(15),
-                completion.wait_for(|value| value.is_some()),
-            )
-            .await??
-            .clone()
-            .ok_or("execution stopped before completion")?,
-        };
-        self.deliver(&completed).await;
+        if let Execution::Completed { call, result } = execution {
+            let api = api.clone();
+            let http = self.http.clone();
+            tokio::spawn(async move {
+                Self::deliver(&http, &api, id, &call, &result).await;
+            });
+        }
         Ok(())
     }
-    async fn deliver(&self, completed: &Completed) {
-        for attempt in 0..3 {
-            match self
-                .http
-                .post(&completed.callback_url)
-                .json(&completed.result)
-                .send()
-                .await
+    async fn deliver(
+        http: &reqwest::Client,
+        api: &ControlApi,
+        id: Uuid,
+        call: &VerifiedCall,
+        completed: &Completed,
+    ) {
+        let mut backoff = Duration::from_millis(100);
+        loop {
+            if completed.finished.elapsed() >= Duration::from_secs(600) {
+                tracing::error!(%id, is_error=completed.is_error, "RAP callback delivery expired");
+                return;
+            }
+            let binding = api
+                .bindings
+                .authenticate_rap(&call.socket, &call.record.endpoint, &call.record)
+                .await;
+            if binding
+                .as_ref()
+                .is_none_or(|binding| binding.identity() != &call.identity)
             {
-                Ok(response) if response.status().is_success() => return,
-                Ok(response) => {
-                    tracing::warn!(status=%response.status(), attempt, "RAP callback rejected")
+                tracing::warn!(%id, "RAP callback delivery stopped after binding revocation");
+                return;
+            }
+            drop(binding);
+            let remaining = Duration::from_secs(600).saturating_sub(completed.finished.elapsed());
+            match tokio::time::timeout(
+                remaining.min(Duration::from_secs(2)),
+                http.post(&completed.callback_url)
+                    .json(&completed.result)
+                    .send(),
+            )
+            .await
+            {
+                Ok(Ok(response)) if response.status().is_success() => return,
+                Ok(Ok(response)) => {
+                    tracing::warn!(%id, status=%response.status(), "RAP callback rejected")
                 }
-                Err(error) => tracing::warn!(%error, attempt, "RAP callback delivery failed"),
+                Ok(Err(error)) => tracing::warn!(%id, %error, "RAP callback delivery failed"),
+                Err(error) => tracing::warn!(%id, %error, "RAP callback delivery timed out"),
             }
-            if attempt < 2 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            tokio::time::sleep(
+                backoff.min(Duration::from_secs(600).saturating_sub(completed.finished.elapsed())),
+            )
+            .await;
+            backoff = (backoff * 2).min(Duration::from_secs(3));
         }
-        tracing::error!(callback_url=%completed.callback_url, is_error=completed.is_error, "RAP callback retries exhausted; result retained");
     }
 }
 
@@ -358,4 +387,133 @@ fn response(status: StatusCode, text: impl Into<String>) -> Response<Full<Bytes>
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(text.into())))
         .expect("bug: valid HTTP response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        mailroom::Mailroom,
+        model::{AgentName, Incarnation},
+        supervisor::Broker,
+    };
+
+    #[tokio::test]
+    async fn verified_invocation_acknowledges_before_slow_send_finishes() {
+        let dir = tempfile::tempdir().expect("directory");
+        let room = Arc::new(
+            Mailroom::open(dir.path().join("mail.db"), Default::default())
+                .await
+                .expect("mailroom"),
+        );
+        let agent = room
+            .register(AgentName::parse("sender").expect("sender"))
+            .await
+            .expect("register");
+        let receiver = room
+            .register(AgentName::parse("receiver").expect("receiver"))
+            .await
+            .expect("register");
+        let (bound, _) = tokio::sync::mpsc::unbounded_channel();
+        let bindings = Arc::new(super::super::Bindings::new(
+            dir.path().join("mcp.sock"),
+            "agentd".into(),
+            bound,
+        ));
+        let broker =
+            Arc::new(Broker::new(room.clone(), vec![], Default::default()).expect("broker"));
+        let api = Arc::new(ControlApi {
+            mailroom: room.clone(),
+            broker: broker.clone(),
+            bindings: bindings.clone(),
+        });
+        let socket = dir.path().join("daemon.sock");
+        let unix = tokio::net::UnixListener::bind(&socket).expect("Unix listener");
+        let root = infinity_protocol::ThreadRef::local("root".into());
+        bindings
+            .bind_infinity(&socket, root.clone(), agent, Incarnation(1))
+            .await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let callback = TcpListener::bind("127.0.0.1:0").await.expect("callback");
+        let id = Uuid::new_v4();
+        let record = RapClaimRecord {
+            thread_stack: vec![root],
+            operation: "send_message".into(),
+            arguments: serde_json::json!({"to":"@receiver","body":"slow once"}),
+            endpoint: format!("http://{}/invoke", listener.local_addr().expect("address")),
+            callback_url: format!(
+                "http://{}/managed/{id}",
+                callback.local_addr().expect("callback address")
+            ),
+            id: "slow-call".into(),
+            call_id: None,
+        };
+        let claim_record = record.clone();
+        let claims = tokio::spawn(async move {
+            let (stream, _) = unix.accept().await.expect("claim connection");
+            let mut wire = Framed::new(stream, infinity_protocol::length_delimited_codec());
+            wire.next().await.expect("claim").expect("frame");
+            wire.send(
+                serde_json::to_vec(&DaemonMessage::RapInvocationClaim {
+                    invocation: id.to_string(),
+                    record: Some(claim_record),
+                })
+                .expect("claim JSON")
+                .into(),
+            )
+            .await
+            .expect("claim response");
+        });
+        let server = RapServer {
+            listener,
+            endpoint: record.endpoint.clone(),
+            sockets: vec![socket],
+            http: reqwest::Client::new(),
+        };
+        let pause = broker.pause_sends().await;
+        let ack = tokio::time::timeout(Duration::from_secs(1), server.invoke(api, id)).await;
+        assert!(
+            ack.is_ok(),
+            "verified invocation must acknowledge before execution completes"
+        );
+        ack.expect("ack").expect("verified");
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        assert_eq!(
+            room.pending_for(receiver).await.expect("pending").len(),
+            1,
+            "one durable message while completion is blocked"
+        );
+        drop(pause);
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(3), callback.accept())
+            .await
+            .expect("late callback timeout")
+            .expect("callback");
+        let service = hyper::service::service_fn(|request: Request<Incoming>| async move {
+            let body = request
+                .into_body()
+                .collect()
+                .await
+                .expect("callback body")
+                .to_bytes();
+            let value: serde_json::Value = serde_json::from_slice(&body).expect("callback JSON");
+            assert!(
+                value["text"]
+                    .as_str()
+                    .expect("result text")
+                    .starts_with("Queued")
+            );
+            Ok::<_, Infallible>(response(StatusCode::OK, "OK"))
+        });
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service),
+        )
+        .await
+        .expect("callback completes")
+        .expect("connection");
+        claims.await.expect("claims task");
+        assert_eq!(room.pending_for(receiver).await.expect("pending").len(), 1);
+    }
 }

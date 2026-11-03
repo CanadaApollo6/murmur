@@ -399,8 +399,10 @@ async fn rap_concurrent_duplicates_replay_and_restart_recover_the_receipt() {
     let (a, b, c) = tokio::join!(t.invoke(id), t.invoke(id), t.invoke(id));
     assert_eq!((a, b, c), (200, 200, 200));
     let first = t.callback().await;
-    assert_eq!(t.callback().await, first);
-    assert_eq!(t.callback().await, first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while let Ok(callback) = t.callbacks.try_recv() {
+        assert_eq!(callback, first);
+    }
     // The daemon has settled and no longer has a claim. The completed cache still retries.
     t.daemon
         .state
@@ -483,7 +485,7 @@ async fn rap_mail_rejections_return_model_visible_error_text() {
 }
 
 #[tokio::test]
-async fn rap_callback_exhaustion_retains_the_completed_result() {
+async fn rap_callback_recovers_without_another_invocation() {
     let mut t = Test::new("").await;
     let (id, _) = t.record(false, "accepted despite failed callbacks");
     t.callback_status.store(503, Ordering::SeqCst);
@@ -498,7 +500,6 @@ async fn rap_callback_exhaustion_retains_the_completed_result() {
         .claims
         .remove(&id.to_string());
     t.callback_status.store(200, Ordering::SeqCst);
-    assert_eq!(t.invoke(id).await, 200);
     assert_eq!(t.callback().await, result);
     assert_eq!(t.rows().len(), 1);
 }
@@ -528,4 +529,313 @@ async fn rap_configuration_rejects_unsafe_addresses_extra_keys_and_bind_conflict
         panic!("must fail to bind")
     };
     assert!(error.to_string().contains("cannot bind RAP listener"));
+}
+
+#[tokio::test]
+async fn rap_idle_connections_expire_and_control_remains_live() {
+    let mut t = Test::new("").await;
+    let mut idle = Vec::new();
+    for _ in 0..80 {
+        idle.push(
+            tokio::net::TcpStream::connect(t.base.trim_start_matches("http://"))
+                .await
+                .expect("idle connection"),
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(1), t.ctl(json!({"command":"ls"})))
+        .await
+        .expect("control remains live");
+    let (id, _) = t.record(false, "after idle timeout");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(12), t.invoke(id))
+            .await
+            .expect("slot frees"),
+        200
+    );
+    t.callback().await;
+    use tokio::io::AsyncReadExt;
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), idle[0].read(&mut byte))
+            .await
+            .expect("idle connection is closed")
+            .expect("read"),
+        0
+    );
+}
+
+#[test]
+fn real_daemon_crash_child() {
+    let Some(directory) = std::env::var_os("M3_REAL_DAEMON_DIR") else {
+        return;
+    };
+    let directory = std::path::PathBuf::from(directory);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(tokio::task::LocalSet::new().run_until(async {
+            use infinity_daemon::session::{SessionManager, SessionManagerConfig};
+            use infinity_provider_protocol::{
+                ModelEntry, ModelProvider, SingleModelProvider, mock::mock_model,
+            };
+            let (model, mut ctrl) = mock_model();
+            let bridge = infinity_rap_bridge::RapCallbackBridge::bind()
+                .await
+                .expect("bridge");
+            let destination = bridge.callback_url().to_owned();
+            let callback = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("callback proxy");
+            let callback_url = format!("http://{}", callback.local_addr().expect("address"));
+            let manager = SessionManager::with_providers(
+                SessionManagerConfig {
+                    state_dir: directory.join("real-daemon-state"),
+                    callback_url,
+                    user_rap_config: None,
+                    id_source: Arc::new(infinity_daemon::ids::SequentialIdSource::new()),
+                },
+                vec![(
+                    "mock".into(),
+                    Arc::new(SingleModelProvider::new(
+                        ModelEntry {
+                            model_id: "mock".into(),
+                            display_name: "mock".into(),
+                            context_window: 100000,
+                            max_output_tokens: None,
+                            supports_image_input: false,
+                        },
+                        model,
+                    )) as Arc<dyn ModelProvider>,
+                )],
+                vec![],
+            )
+            .await
+            .expect("real SessionManager");
+            let manager = infinity_daemon::rap_callback::serve_callbacks(bridge, manager);
+            let callback_dir = directory.clone();
+            tokio::task::spawn_local(async move {
+                let http = reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .expect("direct HTTP");
+                loop {
+                    let (stream, _) = callback.accept().await.expect("callback accept");
+                    let http = http.clone();
+                    let destination = destination.clone();
+                    let directory = callback_dir.clone();
+                    tokio::task::spawn_local(async move {
+                        let service = hyper::service::service_fn(
+                            move |req: hyper::Request<hyper::body::Incoming>| {
+                                let http = http.clone();
+                                let destination = destination.clone();
+                                let directory = directory.clone();
+                                async move {
+                                    use http_body_util::BodyExt;
+                                    let path = req.uri().path().to_owned();
+                                    let body = req
+                                        .into_body()
+                                        .collect()
+                                        .await
+                                        .expect("callback body")
+                                        .to_bytes();
+                                    let status = if directory.join("allow-callback").exists() {
+                                        http.post(format!("{destination}{path}"))
+                                            .header("content-type", "application/json")
+                                            .body(body)
+                                            .send()
+                                            .await
+                                            .expect("real callback route")
+                                            .status()
+                                            .as_u16()
+                                    } else {
+                                        503
+                                    };
+                                    Ok::<_, std::convert::Infallible>(
+                                        hyper::Response::builder()
+                                            .status(status)
+                                            .body(http_body_util::Full::new(bytes::Bytes::new()))
+                                            .expect("response"),
+                                    )
+                                }
+                            },
+                        );
+                        if let Err(error) = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                            .await
+                        {
+                            eprintln!("callback proxy: {error}");
+                        }
+                    });
+                }
+            });
+            let unix = tokio::net::UnixListener::bind(directory.join("infinity.sock"))
+                .expect("daemon socket");
+            tokio::task::spawn_local(async move {
+                loop {
+                    let (stream, _) = unix.accept().await.expect("Unix accept");
+                    tokio::task::spawn_local(infinity_daemon::client_handler::handle_client(
+                        stream,
+                        manager.clone(),
+                    ));
+                }
+            });
+            std::fs::write(directory.join("real-daemon-ready"), "ready").expect("ready");
+            ctrl.next_request().await;
+            ctrl.send_tool_call(
+                "crash-call",
+                "send_message",
+                json!({"to":"@receiver","body":"one durable crash message"}),
+            );
+            ctrl.finish();
+            let request = tokio::time::timeout(Duration::from_secs(15), ctrl.next_request())
+                .await
+                .expect("result arrives after agentd restart");
+            let history = format!("{:?}", request.chat_history);
+            assert!(
+                history.contains("Already queued"),
+                "model must receive recovered success: {history}"
+            );
+            assert!(!history.contains("Tool call failed"), "{history}");
+            ctrl.send_text("done");
+            ctrl.finish();
+            std::fs::write(directory.join("real-daemon-success"), history)
+                .expect("success evidence");
+            std::future::pending::<()>().await;
+        }));
+}
+
+#[tokio::test]
+async fn rap_real_daemon_retries_after_agentd_dies_with_mail_accepted() {
+    use http_body_util::BodyExt;
+    use std::sync::atomic::AtomicBool;
+    let mut t = Test::new("").await;
+    t.child.kill().await.expect("stop initial agentd");
+    t.child.wait().await.expect("reap");
+    std::fs::remove_file(t.dir.path().join("infinity.sock")).expect("unlink fake daemon socket");
+    rusqlite::Connection::open(t.dir.path().join("state/mail.db"))
+        .expect("DB")
+        .execute("DELETE FROM actor_state", [])
+        .expect("clear fake root token");
+    let proxy = TcpListener::bind("127.0.0.1:0").await.expect("HTTP proxy");
+    let proxy_url = format!("http://{}", proxy.local_addr().expect("proxy address"));
+    let (accepted, mut acceptance) = mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let unblock = release.clone();
+    let first = Arc::new(AtomicBool::new(true));
+    let proxy_task = tokio::spawn(async move {
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("direct HTTP");
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                stream=proxy.accept()=>{
+                    let (stream,_)=stream.expect("proxy accept");let http=http.clone();let accepted=accepted.clone();let release=release.clone();let first=first.clone();
+                    connections.spawn(async move {
+                        let service=hyper::service::service_fn(move |req:hyper::Request<hyper::body::Incoming>| {
+                            let http=http.clone();let accepted=accepted.clone();let release=release.clone();let first=first.clone();
+                            async move {
+                                let invoke=req.uri().path()=="/invoke";
+                                let url=req.uri().to_string();let method=req.method().clone();
+                                let body=req.into_body().collect().await.map_err(std::io::Error::other)?.to_bytes();
+                                let response=http.request(method,url).header("content-type","application/json").body(body).send().await.map_err(std::io::Error::other)?;
+                                if invoke && first.swap(false,Ordering::SeqCst) {
+                                    assert!(response.status().is_success());accepted.send(()).expect("acceptance signal");release.notified().await;
+                                    return Err(std::io::Error::other("agentd died before acknowledgment reached Infinity"));
+                                }
+                                let status=response.status();let body=response.bytes().await.map_err(std::io::Error::other)?;
+                                Ok(hyper::Response::builder().status(status).body(http_body_util::Full::new(body)).expect("response"))
+                            }
+                        });
+                        if let Err(error)=hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream),service).await {eprintln!("injected proxy loss: {error}");}
+                    });
+                }
+                result=connections.join_next(),if !connections.is_empty()=>{result.expect("connection").expect("proxy task");}
+            }
+        }
+    });
+    rap_test_servers::write_rap_config(
+        t.dir.path(),
+        t.base
+            .rsplit(':')
+            .next()
+            .expect("port")
+            .parse()
+            .expect("port number"),
+    )
+    .expect("RAP config");
+    let child_log = std::fs::File::create(t.dir.path().join("real-daemon.log")).expect("log");
+    let mut daemon = Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "real_daemon_crash_child", "--nocapture"])
+        .env("M3_REAL_DAEMON_DIR", t.dir.path())
+        .env("HTTP_PROXY", &proxy_url)
+        .env("http_proxy", &proxy_url)
+        .env("ALL_PROXY", &proxy_url)
+        .env("all_proxy", &proxy_url)
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .stdout(Stdio::from(child_log.try_clone().expect("log clone")))
+        .stderr(Stdio::from(child_log))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("real daemon child");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !t.dir.path().join("real-daemon-ready").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("real daemon ready");
+    t.child = Test::start(t.dir.path());
+    t.ready().await;
+    t.idle().await;
+    let sent=t.ctl(json!({"command":"send","to":"@sender","body":"send one message","key":"trigger-real-call"})).await;
+    assert!(sent.get("error").is_none(), "{sent}");
+    tokio::time::timeout(Duration::from_secs(5), acceptance.recv())
+        .await
+        .expect("accepted invocation")
+        .expect("signal");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while t.rows().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("durable acceptance");
+    t.child
+        .kill()
+        .await
+        .expect("kill agentd after durable acceptance");
+    t.child.wait().await.expect("reap");
+    unblock.notify_one();
+    std::fs::write(t.dir.path().join("allow-callback"), "yes").expect("recover callbacks");
+    t.child = Test::start(t.dir.path());
+    t.ready().await;
+    let success = tokio::time::timeout(Duration::from_secs(12), async {
+        while !t.dir.path().join("real-daemon-success").exists() {
+            if let Some(status) = daemon.try_wait().expect("daemon status") {
+                panic!(
+                    "real daemon exited {status}: {}",
+                    std::fs::read_to_string(t.dir.path().join("real-daemon.log")).expect("log")
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        success.is_ok(),
+        "model did not receive success: {}",
+        std::fs::read_to_string(t.dir.path().join("real-daemon.log")).expect("log")
+    );
+    assert_eq!(
+        t.rows().len(),
+        1,
+        "one durable RAP message across agentd crash"
+    );
+    daemon.kill().await.expect("kill test daemon");
+    daemon.wait().await.expect("reap daemon");
+    proxy_task.abort();
 }

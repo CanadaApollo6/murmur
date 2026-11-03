@@ -3941,8 +3941,14 @@ async fn external_transport_failure_after_reused_callback_id_settles() {
         tokio::time::timeout(Duration::from_secs(2), h.ctrl.next_request()).await.expect("first result");
         failing.store(true, std::sync::atomic::Ordering::SeqCst);
         h.ctrl.send_tool_call("reused", "work", serde_json::json!({})); h.ctrl.finish();
-        let request = tokio::time::timeout(Duration::from_secs(2), h.ctrl.next_request()).await.expect("transport failure must settle reused ID");
-        assert!(format!("{:?}", request.chat_history).contains("Error: Tool call failed"));
+        let started = tokio::time::Instant::now();
+        let request = tokio::time::timeout(Duration::from_secs(65), h.ctrl.next_request()).await.expect("exhausted transport retries must settle reused ID");
+        let history = format!("{:?}", request.chat_history);
+        assert!(started.elapsed() >= Duration::from_secs(59), "allow the transport retry window before reporting uncertainty");
+        assert!(history.contains("Outcome unknown: the message may have been sent"), "{history}");
+        assert!(!history.contains("Error: Tool call failed"), "{history}");
+        assert_eq!(history.matches("real external result").count(), 1);
+        assert_eq!(history.matches("Outcome unknown:").count(), 1);
         h.ctrl.send_text("finished"); h.ctrl.finish();
         server.abort();
     }).await;
@@ -4580,4 +4586,81 @@ mod r17o {
             assert_eq!(stall, !all_in_first, "stall fires exactly when a batch-mate missed the first completion");
         }).await;
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rap_resumed_root_can_send_while_open_waits_for_replay() {
+    tokio::task::LocalSet::new().run_until(async {
+        use agentd::{mailroom::Mailroom, model::AgentName, supervisor::{AgentSpec, Broker}, surfaces::{Bindings, ControlApi, rap::{RapConfig, RapServer}}};
+        use futures_util::{SinkExt, StreamExt};
+        let mut h = start_harness().await.expect("harness");
+        let address = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("port").local_addr().expect("address");
+        let socket = h.cwd.path().join("open-race.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("socket");
+        let replay_waiting = Arc::new(tokio::sync::Notify::new());
+        let release_replay = Arc::new(tokio::sync::Notify::new());
+        let manager = h.manager.clone();
+        let waiting = replay_waiting.clone(); let release = release_replay.clone();
+        let accept = tokio::task::spawn_local(async move {
+            loop {
+                let (client, _) = listener.accept().await.expect("client");
+                let (proxy, server) = tokio::net::UnixStream::pair().expect("pair");
+                tokio::task::spawn_local(infinity_daemon::client_handler::handle_client(server, manager.clone()));
+                let waiting=waiting.clone(); let release=release.clone();
+                tokio::task::spawn_local(async move {
+                    let mut client = tokio_util::codec::Framed::new(client, infinity_protocol::length_delimited_codec());
+                    let mut daemon = tokio_util::codec::Framed::new(proxy, infinity_protocol::length_delimited_codec());
+                    loop {
+                        tokio::select! {
+                            frame = client.next() => {
+                                let Some(Ok(frame)) = frame else { break };
+                                if let Err(error)=daemon.send(frame.freeze()).await { eprintln!("proxy client closed: {error}"); break; }
+                            }
+                            frame = daemon.next() => {
+                                let Some(Ok(frame)) = frame else { break };
+                                if matches!(serde_json::from_slice::<DaemonMessage>(&frame), Ok(DaemonMessage::Replay { .. })) {
+                                    waiting.notify_one(); release.notified().await;
+                                }
+                                if let Err(error)=client.send(frame.freeze()).await { eprintln!("proxy daemon closed: {error}"); break; }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        rap_test_servers::write_rap_config(h.cwd.path(), address.port()).expect("RAP config");
+        h.client_tx.send(ClientMessage::CreateSession {cwd:h.cwd.path().into(), location:None, model:None, keeps_session_alive:true, input_admitted:false}).expect("create root");
+        let DaemonMessage::Connected {root_thread_id:root, ..} = wait_for_message(&mut h.daemon_rx, |message| matches!(message, DaemonMessage::Connected {..})).await else {panic!("root")};
+
+        let db = h.cwd.path().join("open-race.db");
+        let room = Mailroom::open(&db, Default::default()).await.expect("mailroom");
+        let name = AgentName::parse("model").expect("name");
+        let agent = room.register(name.clone()).await.expect("sender");
+        let receiver = room.register(AgentName::parse("receiver").expect("name")).await.expect("receiver");
+        room.close().await.expect("close fixture");
+        let token = serde_json::json!({"kind":"infinity", "socket":socket, "root":root, "boot_id":h.manager.lock().await.boot_id}).to_string();
+        rusqlite::Connection::open(&db).expect("fixture DB").execute(
+            "INSERT INTO actor_state(agent,incarnation,kind,resume) VALUES (?,1,'infinity',?)",
+            rusqlite::params![serde_json::to_string(&agent).expect("agent"),serde_json::to_string(&token).expect("token")],
+        ).expect("resume token");
+        let room = Arc::new(Mailroom::open(&db, Default::default()).await.expect("mailroom"));
+        let (bound, _) = mpsc::unbounded_channel();
+        let bindings = Arc::new(Bindings::new(h.cwd.path().join("mcp"), "agentd".into(), bound));
+        let broker = Arc::new(Broker::new(room.clone(), vec![agentd::KindConfig::infinity(socket.clone())], Default::default()).expect("broker").with_mcp(bindings.clone(), h.cwd.path().join("agent-state"), Default::default()));
+        let api = Arc::new(ControlApi { broker:broker.clone(), mailroom:room.clone(), bindings });
+        let rap = RapServer::bind(&RapConfig {listen:address}, vec![socket]).await.expect("RAP bind");
+        let serve = tokio::spawn(rap.serve(api));
+        let handle = broker.spawn(AgentSpec {name, kind:"infinity".into(), cwd:h.cwd.path().into(), workspace:None, model:None, permissions:Default::default(), idle_after:None}).await.expect("spawn");
+        tokio::time::timeout(Duration::from_secs(3), replay_waiting.notified()).await.expect("adapter waiting during open");
+        h.client_tx.send(ClientMessage::UserInput {thread_id:root, text:"send while adapter opens".into()}).expect("input");
+        h.ctrl.next_request().await;
+        h.ctrl.send_tool_call("during-open", "send_message", serde_json::json!({"to":"@receiver","body":"sent during replay"})); h.ctrl.finish();
+        let result = tokio::time::timeout(Duration::from_secs(3), h.ctrl.next_request()).await.expect("result while open is waiting");
+        let history = format!("{:?}", result.chat_history);
+        release_replay.notify_one();
+        assert!(history.contains("Queued"), "binding must exist before replay completes: {history}");
+        assert_eq!(room.pending_for(receiver).await.expect("mail").len(), 1);
+        h.ctrl.send_text("done"); h.ctrl.finish();
+        handle.stop().await.expect("stop"); serve.abort(); accept.abort();
+    }).await;
 }

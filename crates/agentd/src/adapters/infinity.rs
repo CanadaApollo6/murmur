@@ -60,6 +60,24 @@ impl Adapter for InfinityAdapter {
         let Wire::Infinity { socket } = &self.0.wire else {
             return Err(protocol("Infinity adapter requires Infinity wire"));
         };
+        let saved = req
+            .resume
+            .map(ResumeToken::decode::<InfinityResume>)
+            .transpose()
+            .map_err(protocol)?;
+        if let Some(saved) = &saved {
+            let Wire::Infinity { socket } = &self.0.wire else {
+                unreachable!()
+            };
+            if saved.kind != self.0.name || &saved.socket != socket || saved.root.remote.is_some() {
+                return Err(protocol("Infinity resume token kind or daemon mismatch"));
+            }
+            if let Some(bindings) = req.bindings {
+                bindings
+                    .bind_infinity(socket, saved.root.clone(), req.agent, req.incarnation)
+                    .await;
+            }
+        }
         let stream = tokio::time::timeout(self.0.request_timeout, UnixStream::connect(socket))
             .await
             .map_err(|e| AdapterError::Unavailable(e.to_string()))?
@@ -119,7 +137,7 @@ impl Adapter for InfinityAdapter {
             boot_id: String::new(),
             needs_interrupt: false,
         });
-        tokio::time::timeout(timeout, session.initialize(&req))
+        tokio::time::timeout(timeout, session.initialize(&req, saved))
             .await
             .map_err(protocol)??;
         Ok(session)
@@ -131,12 +149,11 @@ impl InfinitySession {
         self.tx.send(message).map_err(|_| AdapterError::Ended)
     }
 
-    async fn initialize(&mut self, req: &OpenRequest<'_>) -> Result<(), AdapterError> {
-        let saved = req
-            .resume
-            .map(ResumeToken::decode::<InfinityResume>)
-            .transpose()
-            .map_err(protocol)?;
+    async fn initialize(
+        &mut self,
+        req: &OpenRequest<'_>,
+        saved: Option<InfinityResume>,
+    ) -> Result<(), AdapterError> {
         let sessions = loop {
             match self
                 .rx
@@ -164,15 +181,6 @@ impl InfinitySession {
             }
         };
         if let Some(saved) = &saved {
-            let Wire::Infinity { socket } = &self.kind.wire else {
-                unreachable!()
-            };
-            if saved.kind != self.kind.name
-                || &saved.socket != socket
-                || saved.root.remote.is_some()
-            {
-                return Err(protocol("Infinity resume token kind or daemon mismatch"));
-            }
             let Some(session) = sessions.get(&saved.root) else {
                 return Err(AdapterError::ResumeFailed(
                     "Infinity root thread does not exist".into(),
@@ -237,6 +245,18 @@ impl InfinitySession {
                     }
                     self.root = root_thread_id;
                     if saved.is_none() {
+                        if let (Some(bindings), Wire::Infinity { socket }) =
+                            (req.bindings, &self.kind.wire)
+                        {
+                            bindings
+                                .bind_infinity(
+                                    socket,
+                                    self.root.clone(),
+                                    req.agent,
+                                    req.incarnation,
+                                )
+                                .await;
+                        }
                         return Ok(());
                     }
                     break;
@@ -543,9 +563,6 @@ impl InfinitySession {
 
 #[async_trait]
 impl Session for InfinitySession {
-    fn infinity_root(&self) -> Option<ThreadRef> {
-        Some(self.root.clone())
-    }
     fn resume_token(&self) -> ResumeToken {
         let Wire::Infinity { socket } = &self.kind.wire else {
             unreachable!()

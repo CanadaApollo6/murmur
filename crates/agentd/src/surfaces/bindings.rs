@@ -88,6 +88,10 @@ impl Bindings {
             executable,
         }
     }
+    #[cfg(test)]
+    pub(crate) async fn hold_for_test(&self) -> impl Send + use<> {
+        self.tokens.clone().read_owned().await
+    }
     pub(crate) async fn mint(&self, agent: AgentId, incarnation: Incarnation) -> Result<Value> {
         let token = random_namespace()?;
         let mut tokens = self.tokens.write().await;

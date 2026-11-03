@@ -197,6 +197,7 @@ pub struct Broker {
     mailroom: Arc<Mailroom>,
     kinds: HashMap<String, KindConfig>,
     agents: Arc<Mutex<HashMap<AgentId, AgentHandle>>>,
+    replacements: Mutex<()>,
     events: broadcast::Sender<Event>,
     config: Config,
     mcp: Option<Arc<crate::surfaces::Bindings>>,
@@ -236,6 +237,7 @@ impl Broker {
             mailroom,
             kinds: by_kind,
             agents: Arc::new(Mutex::new(HashMap::new())),
+            replacements: Mutex::new(()),
             events,
             config,
             mcp: None,
@@ -252,6 +254,10 @@ impl Broker {
         self.isolation = Some((state, sandbox));
         self.mcp = Some(bindings);
         self
+    }
+    #[cfg(test)]
+    pub(crate) async fn pause_sends(&self) -> impl Send + use<> {
+        self.agents.clone().lock_owned().await
     }
     pub async fn handle(&self, id: AgentId) -> Option<AgentHandle> {
         self.agents.lock().await.get(&id).cloned()
@@ -277,7 +283,7 @@ impl Broker {
             .get(&spec.kind)
             .ok_or_else(|| Error::Rejected("unknown kind".into()))?
             .clone();
-        let mut agents = self.agents.lock().await;
+        let _replacement = self.replacements.lock().await;
         let saved_specs = self.mailroom.specs().await?;
         if !restore && let Some((_, cfg)) = &self.isolation {
             let workspaces = saved_specs
@@ -315,7 +321,8 @@ impl Broker {
             spec.model = kind.model.clone();
         }
         let id = self.mailroom.register(spec.name.clone()).await?;
-        if let Some(handle) = agents.get(&id).filter(|h| !h.commands.is_closed()) {
+        let previous = self.agents.lock().await.get(&id).cloned();
+        if let Some(handle) = previous.filter(|h| !h.commands.is_closed()) {
             if !restore && matches!(handle.phase(), Phase::Failed { .. }) {
                 if let Some(pin) = saved_specs
                     .iter()
@@ -385,7 +392,7 @@ impl Broker {
             idle_since: Instant::now(),
         };
         tokio::spawn(actor.run());
-        agents.insert(id, handle.clone());
+        self.agents.lock().await.insert(id, handle.clone());
         Ok(handle)
     }
     /// Trusted in-process API. External callers are authenticated by surfaces.
@@ -656,6 +663,7 @@ impl AgentActor {
                 resume: self.resume.as_ref(),
                 incarnation: self.incarnation,
                 launch,
+                bindings: self.mcp.as_deref(),
             })
             .await
         {
@@ -677,13 +685,6 @@ impl AgentActor {
                     } else {
                         self.cancelling = false;
                     }
-                }
-                if let (Some(bindings), Wire::Infinity { socket }, Some(root)) =
-                    (&self.mcp, &self.kind.wire, session.infinity_root())
-                {
-                    bindings
-                        .bind_infinity(socket, root, self.id, self.incarnation)
-                        .await;
                 }
                 let token = session.resume_token();
                 self.session = Some(session);
@@ -1196,4 +1197,112 @@ fn render_peer(env: &Envelope, name: &str, kind: &str) -> String {
         reply,
         escape(env.body().as_str())
     )
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn replacement_does_not_block_sends_or_agent_lookup() {
+        let dir = tempfile::tempdir().expect("directory");
+        let room = Arc::new(
+            Mailroom::open(dir.path().join("mail.db"), Default::default())
+                .await
+                .expect("mailroom"),
+        );
+        let (bound, _) = mpsc::unbounded_channel();
+        let bindings = Arc::new(crate::surfaces::Bindings::new(
+            dir.path().join("mcp"),
+            "agentd".into(),
+            bound,
+        ));
+        let broker = Arc::new(
+            Broker::new(
+                room.clone(),
+                vec![KindConfig::infinity(dir.path().join("missing.sock"))],
+                Default::default(),
+            )
+            .expect("broker"),
+        );
+        let name = AgentName::parse("replacing").expect("name");
+        let id = room.register(name.clone()).await.expect("register");
+        let spec = AgentSpec {
+            name,
+            kind: "infinity".into(),
+            cwd: dir.path().into(),
+            workspace: None,
+            model: None,
+            permissions: Default::default(),
+            idle_after: None,
+        };
+        for round in 0..8 {
+            let (tx, mut commands) = mpsc::channel(64);
+            let (_, phase) = watch::channel(Phase::Failed {
+                last: "injected failed actor".into(),
+            });
+            let (_, isolation) = watch::channel("none");
+            broker.agents.lock().await.insert(
+                id,
+                AgentHandle {
+                    id,
+                    cwd: dir.path().into(),
+                    commands: tx,
+                    phase,
+                    isolation,
+                },
+            );
+            let (stopping, stopped) = oneshot::channel();
+            let old_bindings = bindings.clone();
+            let old = tokio::spawn(async move {
+                if let Some(Command::Stop(reply)) = commands.recv().await {
+                    stopping.send(()).expect("observe replacement stop");
+                    old_bindings.revoke(id).await;
+                    reply.send(Ok(())).expect("stop reply");
+                }
+            });
+            let read_guard = bindings.hold_for_test().await;
+            let replacing = {
+                let broker = broker.clone();
+                let spec = spec.clone();
+                tokio::spawn(async move { broker.spawn(spec).await })
+            };
+            stopped.await.expect("replacement reached stop");
+            let mut sends = tokio::task::JoinSet::new();
+            for number in 0..8 {
+                let broker = broker.clone();
+                sends.spawn(async move {
+                    broker
+                        .send(NewMessage {
+                            from: Sender::Human,
+                            to: id,
+                            body: Body::new("mail during replacement").expect("body"),
+                            reply_to: None,
+                            client_key: ClientKey(format!("{round}:{number}")),
+                            act: crate::swarm::Act::Inform,
+                            task: None,
+                        })
+                        .await
+                });
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while let Some(result) = sends.join_next().await {
+                    result.expect("send task").expect("accepted send");
+                }
+            })
+            .await
+            .expect("sends must not deadlock with replacement revocation");
+            drop(read_guard);
+            let current = tokio::time::timeout(Duration::from_secs(1), replacing)
+                .await
+                .expect("replacement completes")
+                .expect("task")
+                .expect("replacement");
+            tokio::time::timeout(Duration::from_secs(1), broker.handle(id))
+                .await
+                .expect("ls lookup remains responsive");
+            current.stop().await.expect("stop replacement");
+            old.await.expect("old actor task");
+        }
+    }
 }
