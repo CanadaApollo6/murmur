@@ -500,7 +500,20 @@ impl PinnedPath {
                 fd.as_raw_fd()
             ))?)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let _ = path;
+            let mut bytes = vec![0u8; nix::libc::PATH_MAX as usize];
+            // nix's F_GETPATH wrapper requires UTF-8, but Unix paths need not be UTF-8.
+            let result = unsafe {
+                nix::libc::fcntl(fd.as_raw_fd(), nix::libc::F_GETPATH, bytes.as_mut_ptr())
+            };
+            nix::errno::Errno::result(result)?;
+            let path = std::ffi::CStr::from_bytes_until_nul(&bytes)?;
+            Ok(PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes())))
+        }
+        #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
         {
             let _ = fd;
             Ok(std::fs::canonicalize(path)?)
@@ -1105,9 +1118,10 @@ mod tests {
     fn spawn_rejects_links_in_rw_binds_and_follows_operator_aliases() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().expect("tempdir");
-        let tree = tmp.path().join("writable");
-        let target = tmp.path().join("target");
-        let state = tmp.path().join("state");
+        let root = tmp.path().canonicalize().expect("canonical tempdir");
+        let tree = root.join("writable");
+        let target = root.join("target");
+        let state = root.join("state");
         for path in [&tree, &target, &state] {
             std::fs::create_dir(path).expect("directory");
         }
@@ -1116,7 +1130,7 @@ mod tests {
         cfg.binds.push((pin, tree.clone(), false));
         let link = tree.join("planted");
         symlink(&target, &link).expect("planted link");
-        let alias = tmp.path().join("operator-alias");
+        let alias = root.join("operator-alias");
         symlink(&tree, &alias).expect("operator alias");
         for path in [link.clone(), alias.join("planted")] {
             let error = cfg
@@ -1137,6 +1151,22 @@ mod tests {
         );
         cfg.binds[0].2 = true;
         assert_eq!(cfg.spawn_cwd(&link, &[]).expect("read-only link"), target);
+    }
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn descriptor_resolution_tracks_renames() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical tempdir");
+        let original = root.join("original");
+        let moved = root.join("moved");
+        std::fs::create_dir(&original).expect("original directory");
+        let fd = PinnedPath::descriptor(&original, true).expect("directory descriptor");
+        std::fs::rename(&original, &moved).expect("move original");
+        std::fs::create_dir(&original).expect("replacement directory");
+        assert_eq!(
+            PinnedPath::resolved_fd(&fd, &original).expect("descriptor path"),
+            moved
+        );
     }
     #[test]
     fn future_path_resolution_limits_symlink_hops() {
@@ -1240,7 +1270,11 @@ mod tests {
     #[test]
     fn seeds_do_not_overwrite_private_state() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let home = tmp.path().join("home");
+        let home = tmp
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("home");
         let sb = KindSandbox::defaults("claude");
         seed(&sb, &home).expect("seed");
         assert_eq!(
@@ -1308,19 +1342,27 @@ mod tests {
     #[test]
     fn mount_destinations_reject_symlinks_in_home_and_prior_binds() {
         use std::os::unix::fs::symlink;
-        let root = tempfile::tempdir().expect("root");
+        let tmp = tempfile::tempdir().expect("root");
+        let root = tmp.path().canonicalize().expect("canonical root");
         let paths = AgentPaths {
-            home: root.path().join("private"),
-            io: root.path().join("io"),
+            home: root.join("private"),
+            io: root.join("io"),
         };
         std::fs::create_dir(&paths.home).expect("private home");
-        let source = root.path().join("source");
+        let source = root.join("source");
         std::fs::create_dir(&source).expect("source");
-        let file = root.path().join("file");
+        let file = root.join("file");
         std::fs::write(&file, "bind data").expect("file source");
-        let mut facts = Facts::collect().expect("facts");
-        facts.home = "/home/person".into();
-        facts.mounts.clear();
+        let mut facts = Facts {
+            mounts: vec![],
+            links: vec![],
+            home: "/home/person".into(),
+            exe: "/host/agentd".into(),
+            resolved_dns: false,
+            env: BTreeMap::new(),
+            pinned: vec![],
+            seccomp_fd: Arc::new(std::fs::File::open("/dev/null").expect("test fd").into()),
+        };
         symlink("/run", paths.home.join("code")).expect("planted home parent");
         for (source, target) in [
             (&source, "/home/person/code/agentd"),
@@ -1427,20 +1469,21 @@ mod tests {
     }
     #[test]
     fn seed_rejects_symlink_components_and_never_writes_through_leaf_links() {
-        let root = tempfile::tempdir().expect("root");
-        let home = root.path().join("home");
+        let tmp = tempfile::tempdir().expect("root");
+        let root = tmp.path().canonicalize().expect("canonical root");
+        let home = root.join("home");
         let sb = KindSandbox::defaults("codex");
         seed(&sb, &home).expect("seed");
-        let victim = root.path().join("victim");
+        let victim = root.join("victim");
         let config = home.join(".codex/config.toml");
         std::fs::remove_file(&config).expect("unlink");
         std::os::unix::fs::symlink(&victim, &config).expect("symlink");
         seed(&sb, &home).expect("exclusive seed treats existing entry as done");
         assert!(!victim.exists());
         std::fs::remove_dir_all(home.join(".codex")).expect("remove CLI dir");
-        std::os::unix::fs::symlink(root.path(), home.join(".codex")).expect("parent symlink");
+        std::os::unix::fs::symlink(&root, home.join(".codex")).expect("parent symlink");
         assert!(seed(&sb, &home).is_err());
-        assert!(!root.path().join("config.toml").exists());
+        assert!(!root.join("config.toml").exists());
     }
     #[test]
     fn custom_socket_ancestors_and_runtime_paths_are_rejected() {

@@ -7,7 +7,7 @@ use nix::{
 use std::{
     fs::File,
     io::{self, Read, Write},
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::OwnedFd,
     path::{Component, Path},
 };
 
@@ -165,11 +165,23 @@ impl Dir {
         }
         result
     }
-    // Linux AF_UNIX has no bindat. Keep the directory descriptor alive with the listener.
-    pub fn socket_path(&self, name: &str) -> std::path::PathBuf {
-        Path::new("/proc/self/fd")
-            .join(self.0.as_raw_fd().to_string())
-            .join(name)
+    pub fn socket_path(&self, name: &str) -> io::Result<std::path::PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // AF_UNIX has no bindat. Keep the descriptor alive with the listener.
+            Ok(Path::new("/proc/self/fd")
+                .join(self.0.as_raw_fd().to_string())
+                .join(name))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = name;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "descriptor-relative sandbox sockets require Linux",
+            ))
+        }
     }
     pub fn clear(&self, name: &std::ffi::OsStr) -> io::Result<()> {
         use std::os::unix::ffi::OsStrExt;
@@ -234,12 +246,13 @@ mod tests {
     #[test]
     fn socket_cleanup_rejects_excessive_depth() {
         let root = tempfile::tempdir().expect("root");
-        let mut nested = root.path().join("mcp.sock");
+        let path = root.path().canonicalize().expect("canonical root");
+        let mut nested = path.join("mcp.sock");
         for _ in 0..40 {
             nested.push("d");
         }
         std::fs::create_dir_all(&nested).expect("deep socket tree");
-        let dir = Dir::open(root.path(), false).expect("io directory");
+        let dir = Dir::open(&path, false).expect("io directory");
         assert!(dir.clear("mcp.sock".as_ref()).is_err());
         assert!(nested.exists(), "over-limit tree is retained");
     }
@@ -247,12 +260,13 @@ mod tests {
     #[test]
     fn socket_cleanup_rejects_excessive_entries() {
         let root = tempfile::tempdir().expect("root");
-        let socket = root.path().join("mcp.sock");
+        let path = root.path().canonicalize().expect("canonical root");
+        let socket = path.join("mcp.sock");
         std::fs::create_dir(&socket).expect("socket tree");
         for i in 0..5000 {
             std::fs::write(socket.join(i.to_string()), []).expect("entry");
         }
-        let dir = Dir::open(root.path(), false).expect("io directory");
+        let dir = Dir::open(&path, false).expect("io directory");
         assert!(dir.clear("mcp.sock".as_ref()).is_err());
         assert!(socket.exists(), "over-limit tree is retained");
     }
@@ -260,19 +274,67 @@ mod tests {
     #[test]
     fn socket_cleanup_removes_small_trees_without_following_links() {
         let root = tempfile::tempdir().expect("root");
-        let outside = root.path().join("outside");
+        let path = root.path().canonicalize().expect("canonical root");
+        let outside = path.join("outside");
         std::fs::create_dir(&outside).expect("outside");
         std::fs::write(outside.join("keep"), "safe").expect("outside file");
-        let socket = root.path().join("mcp.sock");
+        let socket = path.join("mcp.sock");
         std::fs::create_dir_all(socket.join("nested")).expect("socket tree");
         std::os::unix::fs::symlink(&outside, socket.join("nested/link")).expect("link");
-        let dir = Dir::open(root.path(), false).expect("io directory");
+        let dir = Dir::open(&path, false).expect("io directory");
         dir.clear("mcp.sock".as_ref()).expect("bounded cleanup");
         dir.clear("mcp.sock".as_ref()).expect("already absent");
         assert!(!socket.exists());
         assert_eq!(
             std::fs::read_to_string(outside.join("keep")).expect("outside file"),
             "safe"
+        );
+    }
+
+    #[test]
+    fn private_directories_reject_symlink_components() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().canonicalize().expect("canonical root");
+        let outside = path.join("outside");
+        std::fs::create_dir(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, path.join("link")).expect("link");
+        let dir = Dir::open(&path, false).expect("private directory");
+        for create in [false, true] {
+            assert!(Dir::open(&path.join("link/child"), create).is_err());
+            assert!(dir.descend(Path::new("link/child"), create).is_err());
+        }
+        assert!(!outside.join("child").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_socket_path_stays_with_the_open_directory() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().canonicalize().expect("canonical root");
+        let original = path.join("original");
+        let moved = path.join("moved");
+        let dir = Dir::open(&original, true).expect("io directory");
+        std::fs::rename(&original, &moved).expect("move io directory");
+        std::fs::create_dir(&original).expect("replacement directory");
+        let _listener = std::os::unix::net::UnixListener::bind(
+            dir.socket_path("mcp.sock").expect("socket path"),
+        )
+        .expect("private listener");
+        assert!(moved.join("mcp.sock").exists());
+        assert!(!original.join("mcp.sock").exists());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn sandbox_socket_path_requires_linux() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().canonicalize().expect("canonical root");
+        let dir = Dir::open(&path, false).expect("io directory");
+        assert_eq!(
+            dir.socket_path("mcp.sock")
+                .expect_err("Linux-only sockets")
+                .kind(),
+            io::ErrorKind::Unsupported
         );
     }
 }

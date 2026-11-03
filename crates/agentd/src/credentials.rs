@@ -223,11 +223,12 @@ mod tests {
     }
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let root = tempfile::tempdir().expect("root");
-        let human = root.path().join("human");
+        let path = root.path().canonicalize().expect("canonical root");
+        let human = path.join("human");
         std::fs::create_dir_all(human.join(".codex")).expect("CLI dir");
         let host = human.join(".codex/auth.json");
         std::fs::write(&host, b"{\"token\":0}").expect("credential");
-        let home = root.path().join("private");
+        let home = path.join("private");
         std::fs::create_dir(&home).expect("home");
         (root, human, host, home)
     }
@@ -264,7 +265,11 @@ mod tests {
     #[test]
     fn refresh_cas_propagates_and_refuses_stale_or_external_updates() {
         let (root, human, host, home) = fixture();
-        let other = root.path().join("sibling");
+        let other = root
+            .path()
+            .canonicalize()
+            .expect("canonical root")
+            .join("sibling");
         std::fs::create_dir(&other).expect("sibling");
         let mut credentials = Credentials::default();
         let a = AgentId(ulid::Ulid::new());

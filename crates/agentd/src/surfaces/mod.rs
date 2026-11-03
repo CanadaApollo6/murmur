@@ -603,7 +603,7 @@ pub struct Socket {
 }
 impl Socket {
     pub(crate) fn bind_private(dir: Arc<crate::private_fs::Dir>, name: &str) -> Result<Self> {
-        Self::bind_at(&dir.socket_path(name), Some(dir))
+        Self::bind_at(&dir.socket_path(name)?, Some(dir))
     }
     pub fn bind(path: &Path) -> Result<Self> {
         Self::bind_at(path, None)
