@@ -1,4 +1,6 @@
 //! Linux namespace launch plans. The adapter only sees a program and its environment.
+use crate::seccomp;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -678,6 +680,7 @@ pub struct Facts {
     resolved_dns: bool,
     env: BTreeMap<String, String>,
     pub pinned: Vec<PinnedMount>,
+    seccomp_fd: Arc<OwnedFd>,
 }
 impl Facts {
     pub fn collect() -> Result<Self> {
@@ -690,6 +693,7 @@ impl Facts {
             resolved_dns: Path::new("/run/systemd/resolve").exists(),
             env: std::env::vars().collect(),
             pinned: vec![],
+            seccomp_fd: seccomp::filter_fd()?,
         };
         for path in ["/bin", "/sbin", "/lib", "/lib64"] {
             if let Ok(target) = std::fs::read_link(path) {
@@ -804,6 +808,10 @@ pub fn plan(
             mount.target.as_os_str(),
         ]);
     }
+    push(&[
+        "--add-seccomp-fd".as_ref(),
+        facts.seccomp_fd.as_raw_fd().to_string().as_ref(),
+    ]);
     push(&["--chdir".as_ref(), spec.cwd.as_os_str()]);
     if cfg.network == Network::Host && facts.resolved_dns {
         push(&[
@@ -858,7 +866,12 @@ pub fn plan(
         args: a,
         env: Env::Clear(env.into_iter().map(|(k, v)| (k.into(), v.into())).collect()),
         mcp_server: None,
-        mount_fds: facts.pinned.iter().map(|m| m.fd.clone()).collect(),
+        mount_fds: facts
+            .pinned
+            .iter()
+            .map(|m| m.fd.clone())
+            .chain(std::iter::once(facts.seccomp_fd.clone()))
+            .collect(),
     }
 }
 
@@ -867,6 +880,7 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
         .iter()
         .any(|k| matches!(k.isolation, Isolation::Bwrap(_)))
     {
+        seccomp::check_arch()?;
         let out = tokio::process::Command::new(&cfg.path)
             .arg("--help")
             .output()
@@ -880,6 +894,9 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
         if !out.status.success() || !help.contains("--bind-fd ") || !help.contains("--ro-bind-fd ")
         {
             return Err("bwrap preflight requires --bind-fd and --ro-bind-fd (bubblewrap >= 0.10.0); configure [bwrap] path = \"<bwrap >= 0.10.0>\" or sandbox = \"none\"".into());
+        }
+        if !help.contains("--add-seccomp-fd ") {
+            return Err("bwrap preflight requires --add-seccomp-fd; sandbox launches require a seccomp filter".into());
         }
     }
     for kind in kinds {
@@ -1116,6 +1133,7 @@ mod tests {
                     exe: "/host/agentd".into(),
                     resolved_dns: false,
                     pinned: vec![],
+                    seccomp_fd: Arc::new(std::fs::File::open("/dev/null").expect("test fd").into()),
                     env: BTreeMap::from([
                         ("PATH".into(), "/usr/bin".into()),
                         ("AGENTD_MCP_TOKEN".into(), "do-not-forward".into()),
@@ -1143,7 +1161,8 @@ mod tests {
                     ""
                 };
                 let expected = format!(
-                    "--unshare-user\n--unshare-pid\n--unshare-ipc\n--unshare-uts\n--unshare-cgroup\n--die-with-parent\n--new-session\n{net}--ro-bind\n/usr\n/usr\n--ro-bind\n/etc\n/etc\n--symlink\nusr/bin\n/bin\n--proc\n/proc\n--dev\n/dev\n--tmpfs\n/tmp\n--tmpfs\n/run\n--bind\n/state/agents/id/home\n/home/person\n--ro-bind\n/host/agentd\n/run/agentd/bin/agentd\n--bind\n/state/agents/id/io\n/run/agentd/io\n--bind\n/state/agents/id/home/private\n/home/person/private\n--chdir\n/workspace\n--\n/run/agentd/bin/agentd\nsandbox-init\n{host}--\n{}",
+                    "--unshare-user\n--unshare-pid\n--unshare-ipc\n--unshare-uts\n--unshare-cgroup\n--die-with-parent\n--new-session\n{net}--ro-bind\n/usr\n/usr\n--ro-bind\n/etc\n/etc\n--symlink\nusr/bin\n/bin\n--proc\n/proc\n--dev\n/dev\n--tmpfs\n/tmp\n--tmpfs\n/run\n--bind\n/state/agents/id/home\n/home/person\n--ro-bind\n/host/agentd\n/run/agentd/bin/agentd\n--bind\n/state/agents/id/io\n/run/agentd/io\n--bind\n/state/agents/id/home/private\n/home/person/private\n--add-seccomp-fd\n{}\n--chdir\n/workspace\n--\n/run/agentd/bin/agentd\nsandbox-init\n{host}--\n{}",
+                    facts.seccomp_fd.as_raw_fd(),
                     kind.command
                 );
                 assert_eq!(
@@ -1386,6 +1405,7 @@ mod tests {
             resolved_dns: false,
             env: BTreeMap::new(),
             pinned: vec![],
+            seccomp_fd: Arc::new(std::fs::File::open("/dev/null").expect("test fd").into()),
         };
         let spec = AgentSpec {
             workspace: None,

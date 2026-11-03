@@ -184,3 +184,40 @@ fn real_daemon_availability_and_explicit_pin_recovery() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+fn seccomp_gate(mode: &str) {
+    assert!(supported(), "seccomp regression requires real bubblewrap");
+    let output = Command::new("python3")
+        .arg(format!(
+            "{}/tests/support/isolation_seccomp_driver.py",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .args([
+            env!("CARGO_BIN_EXE_agentd"),
+            env!("CARGO_BIN_EXE_agentd-fake-acp"),
+            mode,
+        ])
+        .output()
+        .expect("seccomp driver");
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn real_sandbox_denies_vsock() {
+    seccomp_gate("vsock");
+}
+
+#[test]
+fn real_sandbox_denies_inherited_session_keyring() {
+    seccomp_gate("keyring");
+}
+
+#[test]
+fn real_sandbox_denies_io_uring() {
+    seccomp_gate("io_uring");
+}

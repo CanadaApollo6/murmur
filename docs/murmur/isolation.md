@@ -28,6 +28,21 @@ namespace. A private network namespace also removes host loopback services and
 abstract UNIX sockets. These matter because a local control service can launch
 an unsandboxed process on the agent's behalf.
 
+Every sandboxed launch also installs one seccomp-BPF filter through bubblewrap's
+`--add-seccomp-fd`. It returns `EAFNOSUPPORT` for `socket` and `socketpair` with
+`AF_VSOCK`. Vsock can cross network namespaces when `net.vsock.ns_mode` is
+`global`, bypassing the CONNECT proxy. The filter returns `ENOSYS` for `keyctl`,
+`add_key` and `request_key`. Session keyrings survive fork and exec, including
+bubblewrap's `--new-session`. It also returns `ENOSYS` for `io_uring_setup`,
+`io_uring_enter` and `io_uring_register`. io_uring can create sockets without
+calling `socket`.
+
+Other native syscalls remain allowed. Foreign audit architectures are killed.
+On x86_64, syscalls with the x32 bit set return `ENOSYS`. The filter supports
+little-endian Linux x86_64 and aarch64. Other architectures fail preflight.
+Filter construction or installation failures prevent launch. This also applies
+to host-network mode.
+
 Infinity is currently unsandboxed. Its adapter attaches to a shared host daemon
 rather than launching a child. Confining that daemon and its existing sessions is
 outside this change. Infinity counts as `none` in mixed-mode warnings and listings.
@@ -241,7 +256,9 @@ source with `O_PATH|O_CLOEXEC`, plus `O_DIRECTORY` for workspaces, compares iden
 and rechecks the fd's resolved
 path. Bubblewrap receives `--bind-fd` or `--ro-bind-fd`, verifies the mounted
 identity, and closes each fd before executing the child. Broker fds retain
-CLOEXEC; only the fork child clears it for these explicit mount fds.
+CLOEXEC; only the fork child clears it for these explicit bwrap fds.
+The seccomp filter uses the same FD inheritance path. Bubblewrap closes its FD
+before executing the child.
 A mismatch fails the launch with a reason in the log and `agentctl ls`'s `error`
 field. An invalid restored workspace or bind does not abort the entire daemon.
 First-use and previously pinned bind failures disable sandboxed launches while
@@ -268,8 +285,10 @@ control/state/SQLite and sibling proc paths, sibling MCP isolation, socket sende
 attribution, token rejection, host-wide readable proc token scans, credential
 rename, a real TLS handshake to example.com with matching SNI, refusal of mismatched
 SNI, denied private/unknown CONNECT, and descendant
-cleanup after SIGTERM and SIGKILL. The public CONNECT check uses `example.com:443`
-and needs outbound network access. A real bwrap capability probe skips the test
+cleanup after SIGTERM and SIGKILL. Separate real-launch tests cover a host vsock
+listener, inherited session keyring reads and io_uring denial. Only the vsock test
+skips when the host cannot create a vsock listener. The public CONNECT check uses
+`example.com:443` and needs outbound network access. A real bwrap capability probe skips the test
 when bubblewrap or namespaces are unavailable locally. With
 `AGENTD_REQUIRE_SANDBOX=1`, unavailable confinement fails the test. Ubuntu CI sets
 that variable; macOS remains excluded. A skip is not qualification.
@@ -315,7 +334,8 @@ evidence. The implementation handoff report records local run results separately
   Per-agent clones and reviewed artifacts are future work.
 - R4. Host-network mode restores loopback, abstract UNIX sockets and unrestricted
   network access. It is a debugging escape hatch, not equivalent confinement.
-- R5. Nested user namespaces expose kernel code. A tested seccomp policy is later work.
+- R5. Nested user namespaces expose kernel code. The seccomp filter blocks vsock,
+  keyring operations and io_uring. Broader seccomp hardening is still later work.
 - R6. Infinity and `none` agents can use host control and per-agent sockets. Isolation
   holds only when no untrusted host process or unsandboxed agent can do that.
 - R7. Toolchain binds expose their full contents. Defaults bind `~/.cargo/bin`, not
