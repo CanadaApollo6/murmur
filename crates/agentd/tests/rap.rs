@@ -58,25 +58,6 @@ impl Test {
             .expect("register receiver");
         room.close().await.expect("close seed mailroom");
         let daemon = fake::FakeDaemon::bind(&dir.path().join("infinity.sock"));
-        let address = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("port reservation")
-            .local_addr()
-            .expect("addr");
-        let base = format!("http://{address}");
-        let config = format!(
-            r#"sandbox = "none"
-{mail}
-[rap]
-listen = "{address}"
-[kind.infinity]
-wire = "infinity"
-socket = {}
-"#,
-            json!(dir.path().join("infinity.sock"))
-        );
-        std::fs::write(dir.path().join("kinds.toml"), config).expect("config");
-        let child = Self::start(dir.path());
         let (tx, callbacks) = mpsc::unbounded_channel();
         let status = Arc::new(AtomicU16::new(200));
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -113,6 +94,39 @@ socket = {}
                 }
             }
         });
+        // The RAP listener needs a fixed port, so reserve one and release it.
+        // A parallel test can take it before agentd binds; retry on a new port.
+        let (child, base) = 'launch: {
+            for attempt in 1..=5 {
+                let address = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("port reservation")
+                    .local_addr()
+                    .expect("addr");
+                let config = format!(
+                    r#"sandbox = "none"
+{mail}
+[rap]
+listen = "{address}"
+[kind.infinity]
+wire = "infinity"
+socket = {}
+"#,
+                    json!(dir.path().join("infinity.sock"))
+                );
+                std::fs::write(dir.path().join("kinds.toml"), config).expect("config");
+                let mut child = Self::start(dir.path());
+                match Self::bound(&mut child, dir.path()).await {
+                    Ok(()) => break 'launch (child, format!("http://{address}")),
+                    Err(log) if attempt < 5 && log.contains("Address already in use") => {
+                        eprintln!("RAP port {address} was taken; retrying");
+                        std::fs::remove_file(dir.path().join("agentd.log")).expect("reset log");
+                    }
+                    Err(log) => panic!("agentd failed to start: {log}"),
+                }
+            }
+            unreachable!("bug: the last attempt panics instead of retrying")
+        };
         let mut t = Self {
             dir,
             daemon,
@@ -150,6 +164,28 @@ socket = {}
             .kill_on_drop(true)
             .spawn()
             .expect("agentd")
+    }
+    /// Waits until agentd has bound its listeners. agentd binds the RAP
+    /// listener before the control socket, so a live process with a
+    /// connectable control socket owns the RAP port. Returns the log if
+    /// agentd exits first.
+    async fn bound(child: &mut Child, dir: &Path) -> Result<(), String> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if child.try_wait().expect("status").is_some() {
+                    return Err(std::fs::read_to_string(dir.join("agentd.log")).expect("log"));
+                }
+                if UnixStream::connect(dir.join("state/agentd.sock"))
+                    .await
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("agentd bound")
     }
     async fn ready(&mut self) {
         tokio::time::timeout(Duration::from_secs(10), async {
