@@ -57,6 +57,7 @@ type PendingCalls = Arc<Mutex<HashMap<(ThreadId, rap_protocol::ToolCallId), Pend
 struct PendingCall {
     server_id: uuid::Uuid,
     invocation: uuid::Uuid,
+    settling: bool,
     context: ToolContext<ChannelSender>,
     call_id: Option<rap_protocol::ProviderCallId>,
     operation: String,
@@ -69,6 +70,11 @@ pub(crate) struct RapInputSender {
     sender: ChannelSender,
     pending: PendingCalls,
     invocation: Option<uuid::Uuid>,
+    #[cfg(test)]
+    enqueue_probe: Option<(
+        tokio::sync::mpsc::UnboundedSender<()>,
+        Arc<tokio::sync::Semaphore>,
+    )>,
 }
 
 #[async_trait]
@@ -98,7 +104,7 @@ impl InputSender for RapInputSender {
                 .split(':')
                 .next()
                 .and_then(|s| uuid::Uuid::parse_str(s).ok());
-            let pending = self.pending.lock().expect("bug: pending calls poisoned");
+            let mut pending = self.pending.lock().expect("bug: pending calls poisoned");
             let key = pending
                 .iter()
                 .find(|(_, call)| Some(call.invocation) == scope)
@@ -111,20 +117,97 @@ impl InputSender for RapInputSender {
                 message.content,
                 InputMessageContent::User(UserContent::ToolResult(_))
             ) {
-                settled = Some((key, scope));
+                let call = pending.get_mut(&key).expect("bug: pending key just found");
+                if call.settling {
+                    return Ok(());
+                }
+                call.settling = true;
+                settled = Some((key, call.invocation));
             }
         }
-        self.sender.send_to_input_queue(message, &dedup_id).await?;
-        if let Some((key, scope)) = settled {
+        #[cfg(test)]
+        if let Some((entered, gate)) = &self.enqueue_probe {
+            entered.send(()).expect("observe enqueue");
+            gate.acquire().await.expect("enqueue gate").forget();
+        }
+        if let Err(error) = self.sender.send_to_input_queue(message, &dedup_id).await {
+            if let Some((key, invocation)) = settled {
+                let mut pending = self.pending.lock().expect("bug: pending calls poisoned");
+                if let Some(call) = pending
+                    .get_mut(&key)
+                    .filter(|call| call.invocation == invocation)
+                {
+                    call.settling = false;
+                }
+            }
+            return Err(error);
+        }
+        if let Some((key, invocation)) = settled {
             let mut pending = self.pending.lock().expect("bug: pending calls poisoned");
             if pending
                 .get(&key)
-                .is_some_and(|call| Some(call.invocation) == scope)
+                .is_some_and(|call| call.invocation == invocation)
             {
                 pending.remove(&key);
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct InvocationHttp {
+    http: SimpleHttpClient,
+    retry: Option<(PendingCalls, uuid::Uuid)>,
+}
+
+#[async_trait]
+impl HttpClient for InvocationHttp {
+    type Error = std::io::Error;
+
+    async fn post(&self, url: &str, body: &str) -> Result<u16, Self::Error> {
+        let Some((pending, invocation)) = &self.retry else {
+            return self
+                .http
+                .post(url, body)
+                .await
+                .map_err(std::io::Error::other);
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut backoff = std::time::Duration::from_millis(100);
+        loop {
+            if !pending
+                .lock()
+                .expect("bug: pending calls poisoned")
+                .values()
+                .any(|call| call.invocation == *invocation)
+            {
+                return Ok(200);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let attempt = tokio::time::timeout(
+                remaining.min(std::time::Duration::from_secs(10)),
+                self.http.post(url, body),
+            )
+            .await;
+            let error = match attempt {
+                Ok(Ok(status)) => return Ok(status),
+                Ok(Err(error)) => std::io::Error::other(error),
+                Err(error) => std::io::Error::new(std::io::ErrorKind::TimedOut, error),
+            };
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::error!(%invocation, %error, "external RAP transport retries exhausted");
+                return Err(error);
+            }
+            tracing::warn!(%invocation, %error, "retrying external RAP invocation after transport loss");
+            tokio::time::sleep(backoff.min(remaining)).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(3));
+        }
+    }
+
+    async fn get(&self, url: &str) -> Result<(u16, Vec<u8>), Self::Error> {
+        self.http.get(url).await.map_err(std::io::Error::other)
     }
 }
 
@@ -579,6 +662,7 @@ impl Tool<ChannelSender> for ManagedRapTool {
                     PendingCall {
                         server_id: self.server.id,
                         invocation,
+                        settling: false,
                         context: context.clone(),
                         call_id: call_id.clone(),
                         operation: self.descriptor.name.clone(),
@@ -594,6 +678,8 @@ impl Tool<ChannelSender> for ManagedRapTool {
                 sender: context.message_sender.clone(),
                 pending: self.server.pending.clone(),
                 invocation,
+                #[cfg(test)]
+                enqueue_probe: None,
             },
             group_id: context.group_id.clone(),
             callback_url: invocation.map_or_else(
@@ -609,8 +695,15 @@ impl Tool<ChannelSender> for ManagedRapTool {
             thread_stack: context.thread_stack.clone(),
             safe_spawn_point: context.safe_spawn_point,
         };
+        let external = matches!(self.server.spec, ServerSpec::External { .. });
+        let http = InvocationHttp {
+            http: self.http_client.clone(),
+            retry: invocation
+                .filter(|_| external)
+                .map(|id| (self.server.pending.clone(), id)),
+        };
         let result = invoke_rap_tool(
-            &self.http_client,
+            &http,
             RapInvocationParams {
                 endpoint: &endpoint,
                 operation: &self.descriptor.name,
@@ -632,7 +725,11 @@ impl Tool<ChannelSender> for ManagedRapTool {
                         group_id: context.group_id.clone(),
                         id,
                         call_id,
-                        text: Some("Error: Tool call failed".into()),
+                        text: Some(if external {
+                            "Outcome unknown: the message may have been sent. Delivery could not be confirmed. Retrying as a new call may send it twice."
+                        } else {
+                            "Error: Tool call failed"
+                        }.into()),
                         content: None,
                         display_as: None,
                         subscription: None,
@@ -738,6 +835,8 @@ impl SessionRapManager {
             sender,
             pending: self.pending.clone(),
             invocation: None,
+            #[cfg(test)]
+            enqueue_probe: None,
         }
     }
 
@@ -1296,6 +1395,143 @@ mod r14a_registry {
             })
             .await;
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_callbacks_enqueue_once() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                use super::*;
+                let mut h = start_harness().await.expect("harness");
+                let root = create_session_and_chat(&mut h).await;
+                let manager = h.manager.lock().await;
+                let mut sender = manager.rap_manager.callback_sender(manager.input_sender());
+                let invocation = uuid::Uuid::new_v4();
+                let key = (
+                    root.id.clone(),
+                    rap_protocol::ToolCallId::from("concurrent"),
+                );
+                sender.pending.lock().expect("registry").insert(
+                    key,
+                    PendingCall {
+                        server_id: uuid::Uuid::new_v4(),
+                        invocation,
+                        settling: false,
+                        context: ToolContext {
+                            message_sender: manager.input_sender(),
+                            group_id: root.id.clone(),
+                            callback_url: "http://unused".into(),
+                            user_id: None,
+                            thread_stack: vec![root.id.clone()],
+                            safe_spawn_point: None,
+                        },
+                        call_id: None,
+                        operation: "send_message".into(),
+                        arguments: serde_json::json!({}),
+                        endpoint: "http://unused".into(),
+                    },
+                );
+                drop(manager);
+                let (entered, mut rx) = mpsc::unbounded_channel();
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                sender.enqueue_probe = Some((entered, gate.clone()));
+                let callback = infinity_rap_bridge::prepare_callback(
+                    rap_protocol::RapCallback::ToolResult(rap_protocol::RapToolResult {
+                        group_id: root.id,
+                        id: "concurrent".into(),
+                        call_id: None,
+                        text: Some("done".into()),
+                        content: None,
+                        display_as: None,
+                        subscription: None,
+                    }),
+                );
+                let infinity_rap_bridge::CallbackDelivery::Input { message, dedup_id } = callback
+                else {
+                    panic!("result")
+                };
+                let dedup = format!("managed:{invocation}:{dedup_id}");
+                let first = {
+                    let sender = sender.clone();
+                    let message = message.clone();
+                    let dedup = dedup.clone();
+                    tokio::task::spawn_local(async move {
+                        sender.send_to_input_queue(*message, &dedup).await
+                    })
+                };
+                rx.recv().await.expect("first enqueue paused");
+                let second = tokio::task::spawn_local(async move {
+                    sender.send_to_input_queue(*message, &dedup).await
+                });
+                tokio::task::yield_now().await;
+                gate.add_permits(2);
+                first.await.expect("first task").expect("first enqueue");
+                second
+                    .await
+                    .expect("second task")
+                    .expect("second acknowledged");
+                assert!(
+                    rx.try_recv().is_err(),
+                    "identical concurrent callback must not enqueue a second result"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_transport_loss_retries_the_same_invocation() {
+        tokio::task::LocalSet::new().run_until(async {
+            use http_body_util::BodyExt;
+            let mut h = start_harness().await.expect("harness");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("listener");
+            let port = listener.local_addr().expect("address").port();
+            let (tx, mut requests) = mpsc::unbounded_channel();
+            let server = tokio::task::spawn_local(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let tx = tx.clone();
+                    tokio::task::spawn_local(async move {
+                        let service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                            let tx = tx.clone();
+                            async move {
+                                if request.uri().path() == "/.well-known/rap-toolset" {
+                                    return Ok::<_, std::io::Error>(hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from(
+                                        serde_json::json!({"name":"transport", "endpoint":format!("http://127.0.0.1:{port}/invoke"), "tools":[{"name":"send_message","description":"send","inputSchema":{"type":"object"}}]}).to_string()))));
+                                }
+                                let body = request.into_body().collect().await.expect("body").to_bytes();
+                                tx.send(body).expect("observe accepted invocation");
+                                Err(std::io::Error::other("accepted mail but lost HTTP response"))
+                            }
+                        });
+                        if let Err(error) = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), service).await {
+                            eprintln!("injected transport loss: {error}");
+                        }
+                    });
+                }
+            });
+            rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
+            let root = create_session_and_chat(&mut h).await;
+            h.client_tx.send(ClientMessage::UserInput { thread_id:root, text:"send".into() }).expect("input");
+            h.ctrl.next_request().await;
+            h.ctrl.send_tool_call("transport-call", "send_message", serde_json::json!({"to":"@receiver","body":"once"}));
+            h.ctrl.finish();
+            let first = requests.recv().await.expect("first accepted dispatch");
+            let retry = tokio::time::timeout(Duration::from_secs(4), requests.recv()).await.expect("daemon must retry transport loss").expect("retry");
+            assert_eq!(first, retry, "retry must preserve UUID and complete body");
+            let invocation: rap_protocol::RapInvocation = serde_json::from_slice(&retry).expect("invocation");
+            let uuid = uuid::Uuid::parse_str(invocation.callback_url.rsplit('/').next().expect("uuid")).expect("uuid");
+            assert!(h.manager.lock().await.rap_manager.claim_rap_invocation(&uuid).is_some());
+            let status = reqwest::Client::new().post(&invocation.callback_url).json(&rap_protocol::RapCallback::ToolResult(rap_protocol::RapToolResult {
+                group_id:invocation.group_id, id:invocation.id, call_id:invocation.call_id, text:Some("Already queued receipt-once".into()), content:None, display_as:None, subscription:None,
+            })).send().await.expect("success callback").status();
+            assert!(status.is_success());
+            let request = tokio::time::timeout(Duration::from_secs(3), h.ctrl.next_request()).await.expect("model receives success");
+            let history = format!("{:?}", request.chat_history);
+            assert!(history.contains("Already queued receipt-once"), "{history}");
+            assert!(!history.contains("Tool call failed"), "{history}");
+            h.ctrl.send_text("done"); h.ctrl.finish();
+            server.abort();
+        }).await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn failed_callback_enqueue_keeps_the_managed_claim() {
         let local = tokio::task::LocalSet::new();
