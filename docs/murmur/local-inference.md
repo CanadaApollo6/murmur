@@ -32,6 +32,12 @@ key. The variable must exist in the provider process environment.
 If `model` is omitted, discovery requires exactly one model ID from `/v1/models`.
 Set it explicitly for engines that advertise aliases or loaded adapters. A
 configured model absent from a nonempty model list is logged as an error.
+With a configured model, llama.cpp and generic servers do not need
+`/v1/models`; the provider logs a warning and uses the configured model.
+
+Request conversion drops empty text parts and any message left empty, with one
+exception: a tool result is always sent, even with empty content. Dropping it
+would leave its tool call without an answer, which the chat templates reject.
 
 ## TensorFold
 
