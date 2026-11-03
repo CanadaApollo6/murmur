@@ -1,0 +1,68 @@
+---
+source: crates/infinity-provider-local/src/convert.rs
+expression: "body(&server, &profile, \"weights\", &req, None)"
+---
+{
+  "chat_template_kwargs": {
+    "enable_thinking": true
+  },
+  "messages": [
+    {
+      "content": "system",
+      "role": "system"
+    },
+    {
+      "content": "[Compacted conversation summary]\nSummary of child work",
+      "role": "user"
+    },
+    {
+      "content": null,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{}",
+            "name": "async_tool"
+          },
+          "id": "[id]",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "async tool result",
+      "role": "tool",
+      "tool_call_id": "[id]"
+    },
+    {
+      "content": "processed tool result",
+      "role": "assistant"
+    },
+    {
+      "content": "message after compaction",
+      "role": "user"
+    }
+  ],
+  "min_p": 0.0,
+  "model": "weights",
+  "parallel_tool_calls": false,
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "temperature": 0.6,
+  "tools": [
+    {
+      "function": {
+        "description": "Read",
+        "name": "read",
+        "parameters": {
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ],
+  "top_k": 20,
+  "top_p": 0.95
+}
