@@ -221,3 +221,27 @@ fn real_sandbox_denies_inherited_session_keyring() {
 fn real_sandbox_denies_io_uring() {
     seccomp_gate("io_uring");
 }
+
+#[test]
+fn real_sandbox_relaunch_bounds_planted_socket_cleanup() {
+    if !supported() {
+        return;
+    }
+    let output = Command::new("python3")
+        .arg(format!(
+            "{}/tests/support/isolation_relaunch_driver.py",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .args([
+            env!("CARGO_BIN_EXE_agentd"),
+            env!("CARGO_BIN_EXE_agentd-fake-acp"),
+        ])
+        .output()
+        .expect("relaunch driver");
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

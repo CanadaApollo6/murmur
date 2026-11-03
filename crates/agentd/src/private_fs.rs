@@ -141,31 +141,107 @@ impl Dir {
             .join(name)
     }
     pub fn clear(&self, name: &std::ffi::OsStr) -> io::Result<()> {
-        match openat(
-            &self.0,
-            name,
-            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => {
-                let dir = Self(fd);
-                let mut entries = nix::dir::Dir::from_fd(dir.0.try_clone()?)?;
-                for entry in entries.iter() {
-                    let entry = entry?;
-                    use std::os::unix::ffi::OsStrExt;
-                    let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
-                    if name != "." && name != ".." {
-                        dir.clear(name)?;
-                    }
+        use std::os::unix::ffi::OsStrExt;
+        const MAX_DEPTH: usize = 32;
+        const MAX_ENTRIES: usize = 4096;
+        let mut stack: Vec<(Self, nix::dir::OwningIter, std::ffi::OsString)> = Vec::new();
+        let mut pending = Some(name.to_owned());
+        let mut visited = 0;
+        loop {
+            if let Some(name) = pending.take() {
+                visited += 1;
+                if visited > MAX_ENTRIES {
+                    return Err(io::Error::other("socket cleanup exceeds 4096 entries"));
                 }
-                unlinkat(&self.0, name, UnlinkatFlags::RemoveDir)?;
+                let parent = stack.last().map_or(self, |(dir, _, _)| dir);
+                match openat(
+                    &parent.0,
+                    name.as_os_str(),
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(fd) => {
+                        if stack.len() >= MAX_DEPTH {
+                            return Err(io::Error::other(
+                                "socket cleanup exceeds 32 directories deep",
+                            ));
+                        }
+                        let dir = Self(fd);
+                        let entries = nix::dir::Dir::from_fd(dir.0.try_clone()?)?.into_iter();
+                        stack.push((dir, entries, name));
+                    }
+                    Err(nix::errno::Errno::ENOENT) => {}
+                    Err(nix::errno::Errno::ENOTDIR | nix::errno::Errno::ELOOP) => {
+                        unlinkat(&parent.0, name.as_os_str(), UnlinkatFlags::NoRemoveDir)?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                continue;
             }
-            Err(nix::errno::Errno::ENOENT) => {}
-            Err(nix::errno::Errno::ENOTDIR | nix::errno::Errno::ELOOP) => {
-                unlinkat(&self.0, name, UnlinkatFlags::NoRemoveDir)?
+            let Some((_, entries, _)) = stack.last_mut() else {
+                return Ok(());
+            };
+            if let Some(entry) = entries.next() {
+                let entry = entry?;
+                let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+                if name != "." && name != ".." {
+                    pending = Some(name.to_owned());
+                }
+            } else {
+                let (_, _, name) = stack.pop().expect("bug: cleanup directory absent");
+                let parent = stack.last().map_or(self, |(dir, _, _)| dir);
+                unlinkat(&parent.0, name.as_os_str(), UnlinkatFlags::RemoveDir)?;
             }
-            Err(e) => return Err(e.into()),
         }
-        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_cleanup_rejects_excessive_depth() {
+        let root = tempfile::tempdir().expect("root");
+        let mut nested = root.path().join("mcp.sock");
+        for _ in 0..40 {
+            nested.push("d");
+        }
+        std::fs::create_dir_all(&nested).expect("deep socket tree");
+        let dir = Dir::open(root.path(), false).expect("io directory");
+        assert!(dir.clear("mcp.sock".as_ref()).is_err());
+        assert!(nested.exists(), "over-limit tree is retained");
+    }
+
+    #[test]
+    fn socket_cleanup_rejects_excessive_entries() {
+        let root = tempfile::tempdir().expect("root");
+        let socket = root.path().join("mcp.sock");
+        std::fs::create_dir(&socket).expect("socket tree");
+        for i in 0..5000 {
+            std::fs::write(socket.join(i.to_string()), []).expect("entry");
+        }
+        let dir = Dir::open(root.path(), false).expect("io directory");
+        assert!(dir.clear("mcp.sock".as_ref()).is_err());
+        assert!(socket.exists(), "over-limit tree is retained");
+    }
+
+    #[test]
+    fn socket_cleanup_removes_small_trees_without_following_links() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside");
+        std::fs::write(outside.join("keep"), "safe").expect("outside file");
+        let socket = root.path().join("mcp.sock");
+        std::fs::create_dir_all(socket.join("nested")).expect("socket tree");
+        std::os::unix::fs::symlink(&outside, socket.join("nested/link")).expect("link");
+        let dir = Dir::open(root.path(), false).expect("io directory");
+        dir.clear("mcp.sock".as_ref()).expect("bounded cleanup");
+        dir.clear("mcp.sock".as_ref()).expect("already absent");
+        assert!(!socket.exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("keep")).expect("outside file"),
+            "safe"
+        );
     }
 }

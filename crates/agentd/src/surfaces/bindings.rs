@@ -103,8 +103,12 @@ impl Bindings {
         let SessionIdentity { agent, incarnation } = identity;
         self.revoke(agent).await;
         let io = std::sync::Arc::new(crate::private_fs::Dir::open(&paths.io, true)?);
-        io.clear("mcp.sock".as_ref())?;
-        io.clear("egress.sock".as_ref())?;
+        let cleanup = io.clone();
+        tokio::task::spawn_blocking(move || {
+            cleanup.clear("mcp.sock".as_ref())?;
+            cleanup.clear("egress.sock".as_ref())
+        })
+        .await??;
         let socket = super::Socket::bind_private(io.clone(), "mcp.sock")?;
         let mut socket_paths = vec![socket.identity()];
         let cancel = tokio_util::sync::CancellationToken::new();

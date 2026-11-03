@@ -76,7 +76,9 @@ hooks, configuration or session history. Filesystem facts are collected before
 Each listener is bound before the ACP child starts. Broker-side UID checks run
 on accepted connections. Revocation invalidates identity, cancels listeners and
 connections, stops egress, and removes sockets only when their inodes still match.
-The next incarnation receives fresh listeners. Shared MCP tokens remain available
+The next incarnation receives fresh listeners. Socket-path cleanup runs on a
+blocking worker with no-follow traversal. Each path is limited to 4096 entries
+and 32 directory levels. A larger tree fails only that agent's launch. Shared MCP tokens remain available
 only for `none` agents.
 
 Bubblewrap uses `--die-with-parent` and `--new-session`. agentd's runtime remains
