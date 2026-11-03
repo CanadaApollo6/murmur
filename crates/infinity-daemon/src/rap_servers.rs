@@ -1193,7 +1193,7 @@ mod r14a_registry {
                     serde_json::json!({"canonical":true}),
                 );
                 h.ctrl.finish();
-                let invocation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let invocation = tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
                         if let Some(id) = h
                             .manager
