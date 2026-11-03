@@ -23,6 +23,7 @@ uuid = { workspace = true }
 regex = "1"
 
 [dev-dependencies]
+infinity-agent-core = { path = "../infinity-agent-core" }
 axum = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }

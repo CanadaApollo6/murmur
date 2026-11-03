@@ -2989,6 +2989,7 @@ dependencies = [
  "async-trait",
  "axum",
  "futures-util",
+ "infinity-agent-core",
  "infinity-provider-protocol",
  "insta",
  "regex",
