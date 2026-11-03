@@ -87,6 +87,7 @@ impl InputSender for RapInputSender {
             ),
             None => dedup_id.to_owned(),
         };
+        let mut settled = None;
         if let Some(scoped) = dedup_id.strip_prefix("managed:")
             && message.synthetic.is_none()
         {
@@ -94,7 +95,7 @@ impl InputSender for RapInputSender {
                 .split(':')
                 .next()
                 .and_then(|s| uuid::Uuid::parse_str(s).ok());
-            let mut pending = self.pending.lock().expect("bug: pending calls poisoned");
+            let pending = self.pending.lock().expect("bug: pending calls poisoned");
             let key = pending
                 .iter()
                 .find(|(_, call)| Some(call.invocation) == scope)
@@ -107,10 +108,20 @@ impl InputSender for RapInputSender {
                 message.content,
                 InputMessageContent::User(UserContent::ToolResult(_))
             ) {
+                settled = Some((key, scope));
+            }
+        }
+        self.sender.send_to_input_queue(message, &dedup_id).await?;
+        if let Some((key, scope)) = settled {
+            let mut pending = self.pending.lock().expect("bug: pending calls poisoned");
+            if pending
+                .get(&key)
+                .is_some_and(|call| Some(call.invocation) == scope)
+            {
                 pending.remove(&key);
             }
         }
-        self.sender.send_to_input_queue(message, &dedup_id).await
+        Ok(())
     }
 }
 

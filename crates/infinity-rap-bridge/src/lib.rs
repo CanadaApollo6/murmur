@@ -11,7 +11,9 @@ use infinity_agent_core::system::local::ChannelSender;
 use infinity_agent_core::tools::Tool;
 use infinity_agent_core::tools::rap_tool::RapTool;
 use infinity_agent_core::traits::InputSender;
-use rap_client::callback_server::{bind_callback_listener, start_callback_server_on_with_path};
+use rap_client::callback_server::{
+    bind_callback_listener, start_fallible_callback_server_on_with_path,
+};
 use rap_client::http::{InMemoryToolsetCache, SimpleHttpClient};
 use rap_client::notifier::RapNotifier;
 use rap_client::toolset_loader::ToolsetLoader;
@@ -113,28 +115,31 @@ impl RapCallbackBridge {
         S: InputSender + 'static,
     {
         let (view_tx, view_rx) = mpsc::unbounded_channel();
-        let task = start_callback_server_on_with_path(self.listener, move |callback, path| {
-            let sender = sender.clone();
-            let view_tx = view_tx.clone();
-            async move {
-                match prepare_callback(callback) {
-                    CallbackDelivery::Input { message, dedup_id } => {
-                        let dedup_id = path.strip_prefix("/managed/").map_or_else(
-                            || dedup_id.clone(),
-                            |scope| format!("managed:{scope}:{dedup_id}"),
-                        );
-                        if let Err(error) = sender.send_to_input_queue(*message, &dedup_id).await {
-                            tracing::warn!(%error, "failed to route RAP callback");
+        let task =
+            start_fallible_callback_server_on_with_path(self.listener, move |callback, path| {
+                let sender = sender.clone();
+                let view_tx = view_tx.clone();
+                async move {
+                    match prepare_callback(callback) {
+                        CallbackDelivery::Input { message, dedup_id } => {
+                            let dedup_id = path.strip_prefix("/managed/").map_or_else(
+                                || dedup_id.clone(),
+                                |scope| format!("managed:{scope}:{dedup_id}"),
+                            );
+                            sender
+                                .send_to_input_queue(*message, &dedup_id)
+                                .await
+                                .map_err(|error| Box::new(error) as BoxError)?;
+                        }
+                        CallbackDelivery::ViewUpdate(update) => {
+                            if view_tx.send(update).is_err() {
+                                return Err("RAP view-update destination has stopped".into());
+                            }
                         }
                     }
-                    CallbackDelivery::ViewUpdate(update) => {
-                        if view_tx.send(update).is_err() {
-                            tracing::warn!("RAP view-update destination has stopped");
-                        }
-                    }
+                    Ok(())
                 }
-            }
-        });
+            });
         (view_rx, task)
     }
 }
@@ -402,6 +407,35 @@ mod tests {
             "reused model ID has a fresh invocation identity"
         );
         assert_eq!(sent[0].1, "managed:first:rap-tool-result-reused");
+        task.abort();
+    }
+    #[derive(Clone)]
+    struct RecoveringSender(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait]
+    impl InputSender for RecoveringSender {
+        type Error = RecordingSendError;
+        async fn send_to_input_queue(&self, _: InputMessage, _: &str) -> Result<(), Self::Error> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(RecordingSendError)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_routing_failure_is_retryable() {
+        use rap_client::http::HttpClient;
+        let bridge = RapCallbackBridge::bind().await.expect("listener");
+        let url = bridge.callback_url().to_owned();
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_views, task) = bridge.serve_into(RecoveringSender(ready.clone()));
+        let payload = serde_json::json!({"type":"tool_result", "group_id":"thread", "id":"call", "text":"done"}).to_string();
+        let http = SimpleHttpClient::new();
+        assert_eq!(http.post(&url, &payload).await.expect("callback"), 503);
+        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(http.post(&url, &payload).await.expect("retry"), 200);
         task.abort();
     }
 }

@@ -42,6 +42,24 @@ where
     F: Fn(RapCallback, String) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    start_fallible_callback_server_on_with_path(listener, move |callback, path| {
+        let future = handler(callback, path);
+        async move {
+            future.await;
+            Ok(())
+        }
+    })
+}
+
+/// Like [`start_callback_server_on_with_path`], but failed delivery returns HTTP 503.
+pub fn start_fallible_callback_server_on_with_path<F, Fut>(
+    listener: TcpListener,
+    handler: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn(RapCallback, String) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'static,
+{
     let handler = Arc::new(handler);
     tracing::info!(
         "RAP callback server listening on {:?}",
@@ -116,7 +134,7 @@ fn ok_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
 async fn handle<F, Fut>(req: Request<Incoming>, handler: Arc<F>) -> Response<Full<Bytes>>
 where
     F: Fn(RapCallback, String) -> Fut + Send + Sync,
-    Fut: Future<Output = ()> + Send,
+    Fut: Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
 {
     if req.method() != hyper::Method::POST {
         return ok_response(StatusCode::METHOD_NOT_ALLOWED, "POST only");
@@ -140,6 +158,9 @@ where
         }
     };
 
-    handler(cb, path).await;
+    if let Err(error) = handler(cb, path).await {
+        tracing::warn!(%error, "failed to route RAP callback");
+        return ok_response(StatusCode::SERVICE_UNAVAILABLE, "Callback routing failed");
+    }
     ok_response(StatusCode::OK, "OK")
 }
