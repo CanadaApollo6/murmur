@@ -52,6 +52,9 @@ use crate::{config, mcp_proxy, set_title_tool};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+#[cfg(unix)]
+const COMMAND_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 type PendingCalls = Arc<Mutex<HashMap<(ThreadId, rap_protocol::ToolCallId), PendingCall>>>;
 
 struct CallLifetime(tokio_util::sync::CancellationToken);
@@ -509,6 +512,8 @@ impl ManagedRapServer {
     /// a restart is transparent. MCP servers have no such contract (one may
     /// hold state that lives only as long as its process), so MCP proxies
     /// are left running; external servers are not ours to stop.
+    /// On Unix, commands get one second to exit after SIGINT before the
+    /// remaining process group is killed with SIGKILL.
     pub async fn shutdown(&self) {
         let mut state = self.state.lock().await;
         match &self.spec {
@@ -518,18 +523,42 @@ impl ManagedRapServer {
                 {
                     #[cfg(unix)]
                     {
-                        use nix::sys::signal::{self, Signal};
+                        use nix::sys::signal::{Signal, killpg};
                         use nix::unistd::Pid;
                         if let Some(id) = child.id() {
-                            // Negative ID signals the entire process group.
-                            let _ = signal::kill(Pid::from_raw(-(id as i32)), Signal::SIGINT);
+                            let group = Pid::from_raw(id as i32);
+                            if let Err(error) = killpg(group, Signal::SIGINT)
+                                && error != nix::errno::Errno::ESRCH
+                            {
+                                tracing::warn!(%error, id, "Failed to interrupt RAP process group");
+                            }
+                            let stopped =
+                                tokio::time::timeout(COMMAND_SHUTDOWN_GRACE, child.wait()).await;
+                            if stopped.is_err() {
+                                tracing::warn!(id, "RAP command exceeded shutdown grace period");
+                            }
+                            // A command can hang in its signal handler, or exit
+                            // while descendants still own the listening socket.
+                            if let Err(error) = killpg(group, Signal::SIGKILL)
+                                && error != nix::errno::Errno::ESRCH
+                            {
+                                tracing::error!(%error, id, "Failed to kill RAP process group");
+                            }
+                            let status = match stopped {
+                                Ok(status) => status,
+                                Err(_) => child.wait().await,
+                            };
+                            if let Err(error) = status {
+                                tracing::error!(%error, id, "Failed to reap RAP command");
+                            }
                         }
                     }
                     #[cfg(not(unix))]
                     {
-                        let _ = child.start_kill();
+                        if let Err(error) = child.kill().await {
+                            tracing::error!(%error, "Failed to kill and reap RAP command");
+                        }
                     }
-                    let _ = child.wait().await;
                     tracing::info!("Stopped RAP server for session {}", self.session_id);
                 }
                 *state = ServerState::Down;
@@ -1208,7 +1237,16 @@ mod command_shutdown {
     use std::path::Path;
     use std::time::Duration;
 
-    async fn ignores_interrupt(descendant: bool) {
+    fn clean_up_failed_test(pid: u32) {
+        if let Err(error) = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        ) {
+            assert_eq!(error, nix::errno::Errno::ESRCH, "clean up failed test");
+        }
+    }
+
+    async fn shutdown_command(command_template: &str) {
         let cwd = tempfile::tempdir().expect("create RAP working directory");
         let script =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../agentd/tests/support/delayed_rap.py");
@@ -1217,11 +1255,7 @@ mod command_shutdown {
             script.display(),
             cwd.path().join("invoked").display()
         );
-        let command = if descendant {
-            format!("trap '' INT; {python} & wait")
-        } else {
-            format!("trap '' INT; exec {python}")
-        };
+        let command = command_template.replace("{python}", &python);
         let server = ManagedRapServer::new(
             infinity_agent_core::ThreadId::from("shutdown-test"),
             None,
@@ -1248,16 +1282,11 @@ mod command_shutdown {
                 .is_ok()
         );
         let stopped = tokio::time::timeout(Duration::from_secs(3), server.shutdown()).await;
-        if stopped.is_err()
-            && let Err(error) = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            )
-        {
-            assert_eq!(error, nix::errno::Errno::ESRCH, "clean up failed test");
+        if stopped.is_err() {
+            clean_up_failed_test(pid);
         }
         stopped.expect("shutdown must terminate a command that ignores SIGINT");
-        tokio::time::timeout(Duration::from_secs(3), async {
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
             while tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
                 .is_ok()
@@ -1265,8 +1294,11 @@ mod command_shutdown {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("shutdown must close the command group's listener");
+        .await;
+        if closed.is_err() {
+            clean_up_failed_test(pid);
+        }
+        closed.expect("shutdown must close the command group's listener");
         assert_eq!(
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
             Err(nix::errno::Errno::ESRCH),
@@ -1277,12 +1309,17 @@ mod command_shutdown {
 
     #[tokio::test]
     async fn kills_interrupt_ignoring_command() {
-        ignores_interrupt(false).await;
+        shutdown_command("trap '' INT; exec {python}").await;
     }
 
     #[tokio::test]
     async fn kills_interrupt_ignoring_descendant() {
-        ignores_interrupt(true).await;
+        shutdown_command("trap '' INT; {python} & wait").await;
+    }
+
+    #[tokio::test]
+    async fn kills_descendant_after_command_exits() {
+        shutdown_command("trap 'exit 0' INT; (trap '' INT; exec {python}) & wait").await;
     }
 }
 

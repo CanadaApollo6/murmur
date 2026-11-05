@@ -72,6 +72,3 @@ These stay open until a milestone closes them. The design's
 - Migration of agentd-hosted sessions is unsupported until the handoff protocol
   exists.
 - Replay can re-offer an answered choice until dismissal clears persistence.
-- `r12o_repeated_cli_quit_crash_budget` in `tests/infinity_recovery.rs` fails
-  about once in 15 isolated runs. It waits 3 seconds for a killed command RAP
-  server's port to close.
