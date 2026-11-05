@@ -1202,6 +1202,90 @@ fn collect_server_specs(
     Ok((source_info, servers))
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod command_shutdown {
+    use super::{ManagedRapServer, ServerSpec, ServerState};
+    use std::path::Path;
+    use std::time::Duration;
+
+    async fn ignores_interrupt(descendant: bool) {
+        let cwd = tempfile::tempdir().expect("create RAP working directory");
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../agentd/tests/support/delayed_rap.py");
+        let python = format!(
+            "python3 '{}' '{}'",
+            script.display(),
+            cwd.path().join("invoked").display()
+        );
+        let command = if descendant {
+            format!("trap '' INT; {python} & wait")
+        } else {
+            format!("trap '' INT; exec {python}")
+        };
+        let server = ManagedRapServer::new(
+            infinity_agent_core::ThreadId::from("shutdown-test"),
+            None,
+            ServerSpec::Command {
+                command,
+                cwd: cwd.path().to_path_buf(),
+            },
+        );
+        let manifest = server
+            .ensure_up()
+            .await
+            .expect("boot interrupt-ignoring RAP server");
+        let address = reqwest::Url::parse(&manifest.endpoint).expect("RAP URL");
+        let port = address.port().expect("RAP port");
+        let pid = match &*server.state.lock().await {
+            ServerState::Up {
+                child: Some(child), ..
+            } => child.id().expect("running command"),
+            _ => panic!("bug: booted command has no child"),
+        };
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+        );
+        let stopped = tokio::time::timeout(Duration::from_secs(3), server.shutdown()).await;
+        if stopped.is_err()
+            && let Err(error) = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+        {
+            assert_eq!(error, nix::errno::Errno::ESRCH, "clean up failed test");
+        }
+        stopped.expect("shutdown must terminate a command that ignores SIGINT");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shutdown must close the command group's listener");
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
+            Err(nix::errno::Errno::ESRCH),
+            "the command must be reaped, not left as a zombie"
+        );
+        assert!(server.current_base_url().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn kills_interrupt_ignoring_command() {
+        ignores_interrupt(false).await;
+    }
+
+    #[tokio::test]
+    async fn kills_interrupt_ignoring_descendant() {
+        ignores_interrupt(true).await;
+    }
+}
+
 #[cfg(test)]
 mod r14a_registry {
     use std::sync::Arc;
