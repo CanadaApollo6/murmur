@@ -1,6 +1,6 @@
 # agentd per-agent isolation
 
-Status: implemented on `feat/agentd-isolation`, based on `main` at `c437918`.
+Status: merged in #7, based on `main` at `c437918`.
 The original design was prototyped on Linux with bubblewrap 0.13.1. The production
 implementation is verified by the reproducible gates linked below.
 

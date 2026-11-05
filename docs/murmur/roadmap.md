@@ -1,6 +1,6 @@
 # murmur roadmap
 
-Status as of 2026-11-03. The [design](design.md) explains each part. This page
+Status as of 2026-11-06. The [design](design.md) explains each part. This page
 orders the remaining work.
 
 ## Where murmur is
@@ -13,12 +13,12 @@ only delivery authority.
 |---|---|
 | Core peer messages, provider cancellation | Merged (#1, #2) |
 | Mailroom, ACP supervisor, `agentctl`, bound MCP tools, Infinity adapter | Merged (#3 to #6) |
-| [ACP per-agent isolation](isolation.md): bubblewrap, egress proxy, credential sync | Done on `feat/agentd-isolation`, not merged |
+| [ACP per-agent isolation](isolation.md): bubblewrap, egress proxy, credential sync | Merged (#7) |
 | v1 swarm schema: `Act` on every envelope, task ledger with budgets, `Report` outcomes, exposure log | Built in the mailroom |
-| Mail limits | Done on `feat/agentd-mail-limits`, not merged |
-| Infinity model agents sending mail | Done on `feat/agentd-rap-send`, not merged |
-| `infinity-provider-local` | Not built |
-| Event bus and graph UI | Not built. `agentctl watch` streams events |
+| Mail limits | Merged (#8) |
+| Infinity model agents sending mail | Merged (#9) |
+| `infinity-provider-local` | Merged (#10). Live engine probes and agent qualification are pending. See [Run local inference](local-inference.md) |
+| Event bus and graph UI | Merged (#13, #14). See the [agentd README](../../crates/agentd/README.md#graph-ui) |
 | Verifier and calibration | Not built. `Partial` and `Infeasible` reports reach `Verifying` and stay there |
 | Pi, Prime and Muse adapters | Not built |
 | Infinity sandbox | Not built. Infinity agents run on the host (isolation risk R6) |
@@ -27,21 +27,22 @@ only delivery authority.
 
 Each milestone ends in a merged PR with its tests in `./check.bash`.
 
-1. **Land isolation.** Merge `feat/agentd-isolation`.
-2. **Mail limits.** A per-sender cap and a per-pair cap on undelivered mail,
+1. **Land isolation.** Done (#7).
+2. **Mail limits.** Done (#8). A per-sender cap and a per-pair cap on undelivered mail,
    checked at `Mailroom::accept`, and a per-turn batch limit at the pump. This
    bounds what one agent can queue before more agents can send.
-3. **Infinity agents send mail.** Done on `feat/agentd-rap-send`. A RAP toolset
+3. **Infinity agents send mail.** Done (#9). A RAP toolset
    provides `send_message` through daemon-owned invocation claims and live root
    bindings. Child threads share their root agent's sender and mail limits.
-4. **Local inference.** Implemented on `feat/local-inference` for TensorFold,
+4. **Local inference.** Implemented (#10) for TensorFold,
    llama.cpp, vLLM, SGLang, and generic loopback servers. Configured profiles,
    per-server gates, streaming tools and reasoning, bounded retries, and overflow
    guards have deterministic and mock-engine coverage. Live engine probes and
    the RTX 3090 agent qualification remain pending. See
    [Run local inference](local-inference.md).
-5. **Event bus and graph UI.** `/events` over WebSocket: a snapshot at a cursor,
-   then agent, message and permission events.
+5. **Event bus and graph UI.** Done (#13, #14). `/events` over WebSocket: a
+   snapshot at a cursor, then agent, message and permission events. The graph UI
+   is read-only and the web listener is off by default.
 6. **Close the v1 swarm loop.** A verifier from another model family checks each
    `Verifying` task in a fresh session. `Calibration` records feed later checks.
    Seeded tasks with known answers measure both.
