@@ -82,13 +82,18 @@ impl UiServer {
         if mode != 0o600 {
             return Err("ui.token must have mode 0600".into());
         }
+        let manifest = if config.assets.is_some() {
+            HashMap::new()
+        } else {
+            bundled_manifest()
+        };
         Ok(Some(Self {
             listener: TcpListener::bind(addr).await?,
             host: addr.to_string(),
             config,
             token,
             manifest: Mutex::new(ManifestState {
-                current: Arc::new(HashMap::new()),
+                current: Arc::new(manifest),
                 last_attempt: None,
                 rebuilding: false,
                 failed: false,
@@ -455,7 +460,7 @@ impl UiServer {
             return response(&mut stream, 200, "OK", bytes, mime, host, false).await;
         }
         if path == "/" && self.config.assets.is_none() {
-            return response(&mut stream,200,"OK",b"<!doctype html><title>murmur</title><p>Build the graph UI with npm ci and npm run build in agentd-web, then set [ui] assets to its dist directory. The read-only API is available.</p>","text/html",host,false).await;
+            return response(&mut stream,200,"OK",b"<!doctype html><title>murmur</title><p>Build the graph UI with npm ci and npm run build in agentd-web, then set [ui] assets to its dist directory, or build agentd with --features bundled-web. The read-only API is available.</p>","text/html",host,false).await;
         }
         response(
             &mut stream,
@@ -531,6 +536,47 @@ fn parameters(query: &str) -> Result<HashMap<String, String>> {
         .into_owned()
         .collect())
 }
+fn asset_mime(path: &Path) -> &'static str {
+    match path.extension().and_then(|s| s.to_str()) {
+        Some("html") => "text/html",
+        Some("js") => "text/javascript",
+        Some("css") => "text/css",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("woff2") => "font/woff2",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
+    }
+}
+#[cfg(feature = "bundled-web")]
+static BUNDLED_WEB: include_dir::Dir =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../agentd-web/dist");
+/// The UI embedded by the `bundled-web` feature, used when `[ui] assets` is not set.
+#[cfg(feature = "bundled-web")]
+fn bundled_manifest() -> Manifest {
+    fn walk(dir: &include_dir::Dir<'static>, out: &mut Manifest) {
+        for file in dir.files() {
+            let Some(name) = file.path().to_str() else {
+                tracing::error!(path=%file.path().display(),"skipping non-UTF8 bundled UI asset");
+                continue;
+            };
+            out.insert(
+                format!("/{name}"),
+                (Arc::from(file.contents()), asset_mime(file.path())),
+            );
+        }
+        for child in dir.dirs() {
+            walk(child, out);
+        }
+    }
+    let mut out = HashMap::new();
+    walk(&BUNDLED_WEB, &mut out);
+    out
+}
+#[cfg(not(feature = "bundled-web"))]
+fn bundled_manifest() -> Manifest {
+    HashMap::new()
+}
 fn load_manifest(root: &Path) -> Result<Manifest> {
     use crate::private_fs::{Asset, Dir};
     use std::{io::Read, os::unix::ffi::OsStrExt};
@@ -572,19 +618,9 @@ fn load_manifest(root: &Path) -> Result<Manifest> {
                         return Err("asset tree exceeds byte limit".into());
                     }
                     *bytes += data.len();
-                    let mime = match path.extension().and_then(|s| s.to_str()) {
-                        Some("html") => "text/html",
-                        Some("js") => "text/javascript",
-                        Some("css") => "text/css",
-                        Some("svg") => "image/svg+xml",
-                        Some("png") => "image/png",
-                        Some("woff2") => "font/woff2",
-                        Some("json") => "application/json",
-                        _ => "application/octet-stream",
-                    };
                     out.insert(
                         format!("/{}", path.to_str().ok_or("non-UTF8 asset name")?),
-                        (Arc::from(data), mime),
+                        (Arc::from(data), asset_mime(&path)),
                     );
                 }
                 Err(error) => {

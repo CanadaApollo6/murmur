@@ -471,6 +471,51 @@ The ignored `live_claude_acp` and `live_codex_acp` tests use logged-in shims at
 `cargo test -p agentd --test supervisor live_ -- --ignored --nocapture`.
 They verify a first turn, idle suspension, session load and remembered context.
 
+## Graph UI
+
+The graph UI in `agentd-web/` answers two questions at a glance: what is stuck,
+and what is waiting on you? It shows agents and the mail between them, pending
+permissions and held mail with commands to copy, and each agent's activity and
+queue. It is read-only. It never changes anything itself, and it only displays
+commands that the server built.
+
+A default `cargo build` does not use npm and does not include the UI. To use the
+UI, do one of these procedures.
+
+To embed the UI in the binary, build with the `bundled-web` feature. The build
+needs npm.
+
+```sh
+cargo build -p agentd --features bundled-web
+```
+
+To serve a separate build, run npm and set `assets` to the output directory.
+
+```sh
+cd agentd-web && npm ci && npm run build
+```
+
+```toml
+[ui]
+listen = "127.0.0.1:7434"
+assets = "/absolute/path/to/agentd-web/dist"
+```
+
+Either way, set `listen`, restart agentd, run `agentctl ui`, and open the URL that
+it prints. If the page says that the token was rejected, run `agentctl ui` again.
+
+For development, run `npm run watch` in `agentd-web` with `assets` set as shown.
+The server reloads the files on the next `GET /`. To test the app, run these
+commands.
+
+```sh
+cd agentd-web && npm ci && npm test                # reducer, client and layout
+npx playwright@1.60.0 install chromium
+cargo test -p agentd --features e2e-web --test web_e2e  # real agentd and browser
+```
+
+Set `AGENTD_UI_SHOTS=<directory>` to write screenshots during the browser tests.
+
 ## Read-only event feed and web access
 
 `agentctl watch` sends a cursor snapshot followed by durable mail transitions and
@@ -527,8 +572,8 @@ transports. HTTP allows 64 connections. A blocked feed send closes after ten
 seconds. WebSocket input is limited to 4 KiB; pings run every thirty seconds,
 and sixty seconds without a pong closes the connection.
 
-Without a bundle or an `assets` directory, `/` displays build instructions. With
-`assets`, the server canonicalizes the root at startup and refreshes its manifest
+Without a bundle or an `assets` directory, `/` displays build instructions. An
+`assets` directory replaces the bundle. With `assets`, the server canonicalizes the root at startup and refreshes its manifest
 on `GET /`, at most once per second on a blocking worker. It opens the root and
 every entry through descriptor-relative no-follow operations, skips and logs
 symlinks, and refuses roots inside `state_dir`. A tree may contain at most 4,096

@@ -36,6 +36,19 @@ tokio = { workspace = true, features = ["rt", "process", "io-util", "io-std", "t
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 ulid = { version = "1", features = ["serde"] }
+include_dir = { version = "0.7", optional = true }
+
+# For the `e2e-web` feature only (browser tests in `tests/web_e2e.rs`). This is a
+# regular optional dependency because Cargo has no optional dev-dependencies.
+# Nothing outside `tests/` uses it.
+playwright-rs = { version = "0.14", optional = true, default-features = false, features = ["macros", "screenshot-diff", "rustls-tls-webpki-roots"] }
+
+[features]
+# Embed `agentd-web/dist` in the binary. The build runs npm.
+bundled-web = ["dep:include_dir"]
+# Browser tests of the bundled UI against a real agentd. These need npm and
+# Playwright's browser (`npx playwright@1.60.0 install chromium`).
+e2e-web = ["bundled-web", "dep:playwright-rs"]
 
 [dev-dependencies]
 rusqlite = { version = "0.32.1", features = ["hooks"] }
