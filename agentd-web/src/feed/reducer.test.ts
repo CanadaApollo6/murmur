@@ -593,7 +593,13 @@ describe("pruning on a snapshot", () => {
     const room = new SimMailroom();
     let state = fresh(room);
     for (let i = 0; i < 500; i += 1) {
-      state = apply(withVolatile(state, `agent:${i}`), room.nullSnapshot(0));
+      const agent = `agent:${i}`;
+      state = withVolatile(
+        apply(state, { event: "agent", ...listed(agent) }),
+        agent,
+      );
+      expectKept(state, agent, true);
+      state = apply(state, room.nullSnapshot(0));
     }
     expect(Object.keys(state.activity)).toEqual([]);
     expect(Object.keys(state.turns)).toEqual([]);
