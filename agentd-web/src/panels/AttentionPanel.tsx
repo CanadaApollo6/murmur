@@ -15,6 +15,8 @@ import styles from "./panels.module.css";
 const PAGE = 100;
 /** Enough to see a problem without pushing what waits on the operator off screen. */
 const BROKEN_FIRST = 8;
+/** A permission row carries its commands, so far fewer fit than other rows. */
+const PERMISSIONS_FIRST = 20;
 
 const EFFECT_LABEL: Record<string, string> = {
   UserChoice: "choice",
@@ -66,7 +68,17 @@ const PermissionItem = memo(function PermissionItem({
       {request.options.map((option) => (
         <Command
           key={option.key}
-          label={`${option.label} · ${EFFECT_LABEL[option.effect] ?? option.effect}`}
+          label={
+            <>
+              {/* The effect is the server's. The label is the ACP server's text. */}
+              <span className={styles.optionEffect} data-testid="option-effect">
+                {EFFECT_LABEL[option.effect] ?? option.effect}
+              </span>
+              <bdi className={styles.optionLabel} data-testid="option-label">
+                {option.label}
+              </bdi>
+            </>
+          }
           command={option.command}
           fallback="agentctl approvals"
         />
@@ -225,6 +237,7 @@ export function AttentionPanel({
 }) {
   const { totals } = model;
   const [brokenShown, setBrokenShown] = useState(BROKEN_FIRST);
+  const [permissionsShown, setPermissionsShown] = useState(PERMISSIONS_FIRST);
   const [heldShown, setHeldShown] = useState(PAGE);
   const [uncertainShown, setUncertainShown] = useState(PAGE);
   const broken = useMemo(
@@ -323,7 +336,7 @@ export function AttentionPanel({
             </p>
           ) : null}
           <ul className={styles.list}>
-            {requests.map((request) => (
+            {requests.slice(0, permissionsShown).map((request) => (
               <PermissionItem
                 key={request.id}
                 request={request}
@@ -332,6 +345,14 @@ export function AttentionPanel({
               />
             ))}
           </ul>
+          <ShowMore
+            shown={permissionsShown}
+            total={requests.length}
+            step={PERMISSIONS_FIRST}
+            onMore={() =>
+              setPermissionsShown(permissionsShown + PERMISSIONS_FIRST)
+            }
+          />
         </Group>
       ) : null}
       {totals.held > 0 || held.length > 0 ? (

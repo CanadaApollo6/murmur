@@ -1,6 +1,6 @@
 // Commands are built by the server and only ever shown or copied here. The
 // browser never assembles one.
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import styles from "./panels.module.css";
 
 type CopyState = "idle" | "copied" | "failed";
@@ -11,7 +11,7 @@ export function Command({
   fallback,
   compact = false,
 }: {
-  label: string;
+  label: ReactNode;
   command: string | null;
   /** The `agentctl` subcommand to use when the server sent no command. */
   fallback: string;
