@@ -11,7 +11,11 @@ NPM_ALLOWED="MIT;MIT*;Apache-2.0;Apache*;ISC;BSD-2-Clause;BSD-3-Clause;0BSD;CC0-
 cd "$ROOT_DIR"
 
 echo "Generating Rust third-party notices..."
-cargo about generate about.hbs > "$OUTPUT"
+# The shipped binaries include the bundled UI, which links `include_dir`. The
+# test-only `e2e-web` feature stays off, which keeps `playwright-rs` out.
+cargo about generate \
+    --features agentd/bundled-web,infinity-daemon/bundled-web,infinity-agent-cli/bundled-web \
+    about.hbs > "$OUTPUT"
 
 echo "Generating npm third-party notices..."
 for dir in infinity-ui agent agentd-web; do

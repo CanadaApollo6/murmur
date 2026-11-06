@@ -11493,6 +11493,8 @@ Used by:
   async-stream-impl 0.3.6
   async-stream 0.3.6
   base64-simd 0.8.0
+  include_dir 0.7.4
+  include_dir_macros 0.7.4
   vsimd 0.8.0
 
 --------------------------------------------------------------------------------
