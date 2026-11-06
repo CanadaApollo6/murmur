@@ -96,7 +96,19 @@ async fn run(args: Args) -> Result<()> {
         ..Default::default()
     };
     let rap_config = cfg.rap.clone();
+    let ui_config = cfg.ui.clone();
+    let ui = agentd::surfaces::ui::UiServer::bind(ui_config.clone(), &state).await?;
     let mut kinds = cfg.kinds()?;
+    if ui.is_some() {
+        for kind in &kinds {
+            if matches!(kind.isolation, agentd::sandbox::Isolation::None) {
+                eprintln!(
+                    "agentd: WARNING UI enabled with unsandboxed kind {}: its agents can read ui.token",
+                    kind.name
+                );
+            }
+        }
+    }
     let infinity_sockets: Vec<_> = kinds
         .iter()
         .filter_map(|kind| match &kind.wire {
@@ -155,7 +167,7 @@ async fn run(args: Args) -> Result<()> {
         Arc::clone(&mailroom),
         bindings,
         bound_rx,
-        rap,
+        (rap, ui),
     )
     .await;
     let shutdown = broker.shutdown().await;
@@ -176,7 +188,10 @@ async fn serve(
     mailroom: Arc<Mailroom>,
     bindings: Arc<Bindings>,
     mut bound: tokio::sync::mpsc::UnboundedReceiver<BoundListener>,
-    rap: Option<agentd::surfaces::rap::RapServer>,
+    (rap, ui): (
+        Option<agentd::surfaces::rap::RapServer>,
+        Option<agentd::surfaces::ui::UiServer>,
+    ),
 ) -> Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -189,6 +204,8 @@ async fn serve(
         broker,
         mailroom,
         bindings,
+        control_path: control_path.to_owned(),
+        ui_url: ui.as_ref().map(|ui| ui.url()),
     });
     let control_slots = Arc::new(Semaphore::new(64));
     let mcp_slots = Arc::new(Semaphore::new(64));
@@ -202,9 +219,23 @@ async fn serve(
         }
     };
     tokio::pin!(rap_server);
+    let ui_api = api.clone();
+    let ui_cancel = tokio_util::sync::CancellationToken::new();
+    let cancel = ui_cancel.clone();
+    let mut ui_server = tokio::spawn(async move {
+        match ui {
+            Some(ui) => ui.serve(ui_api, cancel).await,
+            None => {
+                cancel.cancelled().await;
+                Ok(())
+            }
+        }
+    });
+    let mut ui_done = false;
     let result = loop {
         let accepted = tokio::select! {
             result = &mut rap_server => break result,
+            result = &mut ui_server => {ui_done=true;break result?;},
             Some(listener) = bound.recv() => {
                 let api = Arc::clone(&api);
                 listeners.spawn(async move { serve_agent(api,listener).await });
@@ -258,6 +289,10 @@ async fn serve(
             .await
         });
     };
+    ui_cancel.cancel();
+    if !ui_done {
+        ui_server.await??;
+    }
     listeners.shutdown().await;
     connections.shutdown().await;
     result

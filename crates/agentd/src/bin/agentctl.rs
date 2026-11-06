@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use agentd::model::*;
 use agentd::supervisor::AgentSpec;
 use agentd::surfaces::{
-    ControlRequest, Result, Socket, default_state_dir, read_frame, write_frame,
+    ControlRequest, Result, Socket, default_state_dir, read_frame_limit, write_frame,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
@@ -55,7 +55,13 @@ enum Command {
     Drop {
         id: String,
     },
-    Watch,
+    Watch {
+        #[arg(long)]
+        cursor: Option<i64>,
+        #[arg(long)]
+        nonce: Option<String>,
+    },
+    Ui,
 }
 #[derive(Clone, ValueEnum)]
 enum Kind {
@@ -130,9 +136,10 @@ async fn run(args: Args) -> Result<()> {
         Command::Drop { id } => ControlRequest::Drop {
             id: MessageId(id.parse()?),
         },
-        Command::Watch => ControlRequest::Watch,
+        Command::Watch { cursor, nonce } => ControlRequest::Watch { cursor, nonce },
+        Command::Ui => ControlRequest::Ui,
     };
-    let watch = matches!(request, ControlRequest::Watch);
+    let watch = matches!(request, ControlRequest::Watch { .. });
     let held = matches!(request, ControlRequest::Held { .. });
     let mut held_mail = Vec::new();
     let socket = args
@@ -145,7 +152,7 @@ async fn run(args: Args) -> Result<()> {
     write_frame(&mut write, &request).await?;
     let mut read = BufReader::new(read);
     loop {
-        let line = read_frame(&mut read)
+        let line = read_frame_limit(&mut read, 64 * 1024 * 1024)
             .await?
             .ok_or("broker closed connection")?;
         let value: Value = serde_json::from_slice(&line)?;

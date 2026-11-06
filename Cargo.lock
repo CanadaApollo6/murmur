@@ -73,6 +73,7 @@ name = "agentd"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "clap",
  "futures-util",
@@ -94,15 +95,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "tokio-util",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "url",
  "uuid",
 ]
 

@@ -21,13 +21,20 @@ fn update(session: &str, text: &str) {
     );
 }
 fn permission(session: &str, id: &str, reject: bool) {
-    let mut options = vec![json!({"optionId":"yes","name":"Allow once","kind":"allow_once"})];
+    let key = std::env::var("FAKE_OPTION_KEY").unwrap_or_else(|_| "yes".into());
+    let title = "T".repeat(
+        std::env::var("FAKE_TITLE_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10),
+    );
+    let mut options = vec![json!({"optionId":key,"name":"Allow once","kind":"allow_once"})];
     if reject {
         options.push(json!({"optionId":"no","name":"Reject once","kind":"reject_once"}));
     }
     emit(
         json!({"jsonrpc":"2.0","id":id,"method":"session/request_permission",
-        "params":{"sessionId":session,"toolCall":{"toolCallId":id,"title":"Write file","kind":"edit"},
+        "params":{"sessionId":session,"toolCall":{"toolCallId":id,"title":title,"kind":"edit"},
         "options":options}}),
     );
 }

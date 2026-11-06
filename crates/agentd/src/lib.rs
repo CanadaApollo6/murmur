@@ -19,3 +19,5 @@ mod seccomp;
 
 mod credentials;
 mod private_fs;
+
+pub mod event_hub;

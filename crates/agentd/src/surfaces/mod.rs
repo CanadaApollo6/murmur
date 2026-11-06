@@ -20,7 +20,9 @@ use crate::swarm::Act;
 type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub mod events;
 pub mod rap;
+pub mod ui;
 
 pub fn default_state_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -42,6 +44,8 @@ pub struct FileConfig {
     pub listen: ListenConfig,
     #[serde(default)]
     pub rap: rap::RapConfig,
+    #[serde(default)]
+    pub ui: ui::UiConfig,
     #[serde(default)]
     kind: BTreeMap<String, KindFile>,
 }
@@ -242,38 +246,39 @@ pub enum ControlRequest {
     Drop {
         id: MessageId,
     },
-    Watch,
+    Watch {
+        cursor: Option<i64>,
+        nonce: Option<String>,
+    },
+    Ui,
 }
 
 pub struct ControlApi {
     pub broker: Arc<Broker>,
     pub mailroom: Arc<Mailroom>,
     pub bindings: Arc<Bindings>,
+    pub control_path: PathBuf,
+    pub ui_url: Option<String>,
 }
 impl ControlApi {
     async fn agents(&self) -> Result<Value> {
         let mut rows = Vec::new();
-        for (id, spec) in self.mailroom.specs().await? {
+        for (id, spec, queued) in self.mailroom.observed_agents().await? {
             let handle = self.broker.handle(id).await;
             let phase = handle.as_ref().map_or(Phase::Ended, |h| h.phase());
             let isolation = handle.as_ref().map_or("none", |h| h.isolation());
             rows.push(
                 json!({"id":format!("agent:{id}"),"name":format!("@{}",spec.name.as_str()),
                 "kind":spec.kind,"isolation":isolation,"phase":phase_name(&phase),"error":match &phase { Phase::Failed { last } => Some(last.as_str()), Phase::NeedsRecovery { reason } => Some(reason.as_str()), _ => None },
-                "queued":self.mailroom.pending_for(id).await?.len()}),
+                "queued":queued}),
             );
         }
         Ok(json!(rows))
     }
-    async fn approvals(&self) -> Result<Vec<PermissionRequest>> {
-        let mut requests = Vec::new();
-        for (id, _) in self.mailroom.specs().await? {
-            if let Some(handle) = self.broker.handle(id).await {
-                requests.extend(handle.pending_permissions().await?);
-            }
-        }
-        Ok(requests)
+    fn approvals(&self) -> Result<Vec<PermissionRequest>> {
+        Ok(self.broker.event_hub().permissions())
     }
+
     async fn send(
         &self,
         from: AuthenticatedSender,
@@ -333,11 +338,31 @@ impl ControlApi {
             ControlRequest::Send { to, body, key } => {
                 self.send(Bindings::human(), &to, body, None, key).await
             }
-            ControlRequest::Approvals => Ok(json!(self.approvals().await?)),
+            ControlRequest::Approvals => Ok(json!(
+                self.approvals()?
+                    .into_iter()
+                    .map(|r| {
+                        let mut value =
+                            serde_json::to_value(&r).expect("bug: permission serializes");
+                        for (option, raw) in value["options"]
+                            .as_array_mut()
+                            .expect("bug: permission options")
+                            .iter_mut()
+                            .zip(&r.options)
+                        {
+                            option["command"] = json!(events::command(
+                                &self.control_path,
+                                "approve",
+                                &[&r.id.to_string(), &raw.key]
+                            ));
+                        }
+                        value
+                    })
+                    .collect::<Vec<_>>()
+            )),
             ControlRequest::Approve { id, option } => {
                 let request = self
-                    .approvals()
-                    .await?
+                    .approvals()?
                     .into_iter()
                     .find(|r| r.id == id)
                     .ok_or("stale permission")?;
@@ -375,7 +400,10 @@ impl ControlApi {
                 self.mailroom.drop_held(id, "dropped by human").await?;
                 Ok(json!({"dropped":id}))
             }
-            ControlRequest::Watch => Err("watch requires streaming".into()),
+            ControlRequest::Watch { .. } => Err("watch requires streaming".into()),
+            ControlRequest::Ui => Ok(
+                json!({"url":self.ui_url,"status":self.ui_url.clone().unwrap_or_else(|| "Add to kinds.toml:\n[ui]\nlisten = \"127.0.0.1:7434\"".into())}),
+            ),
         }
     }
     async fn mcp(
@@ -470,23 +498,23 @@ impl ControlApi {
                     continue;
                 }
             };
-            if matches!(request, ControlRequest::Watch) {
-                let mut events = self.broker.events();
-                write_frame(&mut write,&json!({"event":"snapshot","agents":self.agents().await?,"approvals":self.approvals().await?})).await?;
-                loop {
-                    tokio::select! {
-                        event = events.recv() => {
-                            let value = match event {
-                                Ok(event) => event_json(event),
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => json!({"event":"lagged","skipped":n}),
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            };
-                            write_frame(&mut write,&value).await?;
-                        }
-                        frame = read_frame(&mut read) => { frame?; break; }
+            if let ControlRequest::Watch { cursor, nonce } = request {
+                let _permit = match events::subscribe() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        write_frame(&mut write, &json!({"error":e.to_string(),"status":503}))
+                            .await?;
+                        return Ok(());
                     }
-                }
-                return Ok(());
+                };
+                let resume = cursor
+                    .zip(nonce)
+                    .map(|(seq, nonce)| crate::mailroom::Anchor { seq, nonce });
+                let mut sink = events::UnixSink(write);
+                return tokio::select! {
+                    result=events::feed(self,&mut sink,resume)=>result,
+                    frame=read_frame(&mut read)=>{frame?;Ok(())}
+                };
             }
             let held = matches!(request, ControlRequest::Held { .. });
             let response = match self.control(request).await {
@@ -534,38 +562,15 @@ fn phase_name(phase: &Phase) -> &'static str {
         Phase::NeedsRecovery { .. } => "needs-recovery",
     }
 }
-fn event_json(event: crate::supervisor::Event) -> Value {
-    use crate::supervisor::Event;
-    match event {
-        Event::EgressDenied { agent, host, port } => {
-            json!({"event":"egress_denied","agent":agent,"host":host,"port":port})
-        }
-        Event::PhaseChanged {
-            agent,
-            incarnation,
-            phase,
-        } => {
-            json!({"event":"phase_changed","agent":agent,"incarnation":incarnation,"phase":phase_name(&phase)})
-        }
-        Event::Offered { agent, ids } => json!({"event":"offered","agent":agent,"ids":ids}),
-        Event::Started { agent, ids } => json!({"event":"started","agent":agent,"ids":ids}),
-        Event::Consumed { agent, ids } => json!({"event":"consumed","agent":agent,"ids":ids}),
-        Event::Activity { agent, text } => json!({"event":"activity","agent":agent,"text":text}),
-        Event::PermissionPending(request) => {
-            json!({"event":"permission_pending","request":request})
-        }
-        Event::PermissionAnswered { agent, id } => {
-            json!({"event":"permission_answered","agent":agent,"id":id})
-        }
-        Event::TurnEnded { agent, outcome } => {
-            json!({"event":"turn_ended","agent":agent,"outcome":format!("{outcome:?}")})
-        }
-    }
-}
-
 pub async fn read_frame(read: &mut (impl AsyncBufRead + Unpin)) -> Result<Option<Vec<u8>>> {
+    read_frame_limit(read, 1024 * 1024).await
+}
+pub async fn read_frame_limit(
+    read: &mut (impl AsyncBufRead + Unpin),
+    limit: u64,
+) -> Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
-    let n = read.take(1024 * 1024).read_until(b'\n', &mut line).await?;
+    let n = read.take(limit).read_until(b'\n', &mut line).await?;
     if n == 0 {
         return Ok(None);
     }

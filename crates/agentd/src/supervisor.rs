@@ -198,7 +198,7 @@ pub struct Broker {
     kinds: HashMap<String, KindConfig>,
     agents: Arc<Mutex<HashMap<AgentId, AgentHandle>>>,
     replacements: Mutex<()>,
-    events: broadcast::Sender<Event>,
+    events: crate::event_hub::EventHub,
     config: Config,
     mcp: Option<Arc<crate::surfaces::Bindings>>,
     isolation: Option<(PathBuf, crate::sandbox::SandboxConfig)>,
@@ -212,7 +212,7 @@ impl Broker {
         {
             return Err(Error::Rejected("invalid crash policy".into()));
         }
-        let (events, _) = broadcast::channel(1024);
+        let events = crate::event_hub::EventHub::default();
         let mut by_kind = HashMap::new();
         for kind in kinds {
             if (matches!(kind.wire, Wire::Acp) && kind.command.is_empty())
@@ -269,7 +269,10 @@ impl Broker {
     }
     /// The receiver is display-only and may lag. SQLite remains delivery authority.
     pub fn events(&self) -> broadcast::Receiver<Event> {
-        self.events.subscribe()
+        self.events.events()
+    }
+    pub fn event_hub(&self) -> &crate::event_hub::EventHub {
+        &self.events
     }
     pub async fn spawn(&self, spec: AgentSpec) -> Result<AgentHandle> {
         self.spawn_inner(spec, false).await
@@ -354,6 +357,7 @@ impl Broker {
             isolation,
         };
         let actor = AgentActor {
+            permissions_guard: self.events.owner(),
             _lease: lease,
             mcp: self.mcp.clone(),
             isolation: self.isolation.clone(),
@@ -391,8 +395,8 @@ impl Broker {
             interrupt_since: None,
             idle_since: Instant::now(),
         };
-        tokio::spawn(actor.run());
         self.agents.lock().await.insert(id, handle.clone());
+        tokio::spawn(actor.run());
         Ok(handle)
     }
     /// Trusted in-process API. External callers are authenticated by surfaces.
@@ -439,6 +443,7 @@ struct AgentActor {
     kind: KindConfig,
     mcp: Option<Arc<crate::surfaces::Bindings>>,
     _lease: crate::mailroom::ActorLease,
+    permissions_guard: crate::event_hub::PermissionGuard,
     id: AgentId,
     spec: AgentSpec,
     adapter: Arc<dyn Adapter>,
@@ -452,7 +457,7 @@ struct AgentActor {
     waiting_offers: Vec<MessageId>,
     // Wire choice deadlines survive socket and incarnation changes.
     choice_deadlines: HashMap<String, Option<Instant>>,
-    events: broadcast::Sender<Event>,
+    events: crate::event_hub::EventHub,
     commands: mpsc::Receiver<Command>,
     phase_tx: watch::Sender<Phase>,
     isolation_tx: watch::Sender<&'static str>,
@@ -471,9 +476,7 @@ struct AgentActor {
 
 impl AgentActor {
     fn emit(&self, event: Event) {
-        if self.events.send(event).is_err() {
-            tracing::trace!("no agentd event subscribers");
-        }
+        self.permissions_guard.emit(event);
     }
     fn phase(&mut self, phase: Phase) {
         self.phase = phase.clone();
@@ -489,6 +492,7 @@ impl AgentActor {
     }
     async fn run(mut self) {
         let result = self.drive().await;
+        self.clear_pending();
         if let Err(error) = &result {
             tracing::error!(agent=%self.id,%error,"agent actor failed");
         }

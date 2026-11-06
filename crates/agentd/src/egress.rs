@@ -88,7 +88,7 @@ pub async fn serve(
     policy: Policy,
     agent: AgentId,
     name: String,
-    events: tokio::sync::broadcast::Sender<Event>,
+    events: crate::event_hub::EventHub,
 ) -> Result<()> {
     let slots = Arc::new(tokio::sync::Semaphore::new(64));
     let mut connections = tokio::task::JoinSet::new();
@@ -111,7 +111,7 @@ async fn connection(
     policy: &Policy,
     agent: AgentId,
     name: &str,
-    events: &tokio::sync::broadcast::Sender<Event>,
+    events: &crate::event_hub::EventHub,
 ) -> Result<()> {
     let mut read = BufReader::new(stream);
     let header = tokio::time::timeout(Duration::from_secs(15), async {
@@ -170,12 +170,7 @@ async fn connection(
         let body = format!("blocked by agentd egress policy for @{name}\n");
         read.get_mut().write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await?;
         // Events have no delivery guarantee, just like activity and phase events.
-        if events
-            .send(Event::EgressDenied { agent, host, port })
-            .is_err()
-        {
-            tracing::debug!("no egress event subscribers");
-        }
+        events.emit(Event::EgressDenied { agent, host, port });
         return Ok(());
     };
     let mut upstream = connect(addrs).await?;
@@ -187,12 +182,7 @@ async fn connection(
             Ok(Ok(hello)) => hello,
             result => {
                 tracing::warn!(%agent, %host, ?result, "TLS ClientHello rejected");
-                if events
-                    .send(Event::EgressDenied { agent, host, port })
-                    .is_err()
-                {
-                    tracing::debug!("no egress event subscribers");
-                }
+                events.emit(Event::EgressDenied { agent, host, port });
                 return Ok(());
             }
         };

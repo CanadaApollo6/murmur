@@ -58,7 +58,6 @@ CREATE TABLE IF NOT EXISTS exposures (
     source_id TEXT NOT NULL REFERENCES messages(id),
     PRIMARY KEY(agent,epoch,seq)
 );
-PRAGMA user_version=1;
 COMMIT;
 
 CREATE TABLE IF NOT EXISTS actor_state (

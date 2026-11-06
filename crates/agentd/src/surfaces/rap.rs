@@ -501,6 +501,8 @@ mod tests {
         let broker =
             Arc::new(Broker::new(room.clone(), vec![], Default::default()).expect("broker"));
         let api = Arc::new(ControlApi {
+            control_path: "/tmp/agentd.sock".into(),
+            ui_url: None,
             mailroom: room.clone(),
             broker: broker.clone(),
             bindings: bindings.clone(),

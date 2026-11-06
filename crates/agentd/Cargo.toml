@@ -20,6 +20,10 @@ tokio-util = { version = "0.7", features = ["codec"] }
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.3"
 sha2 = "0.10"
+tokio-tungstenite = "0.26"
+subtle = "2"
+base64 = "0.22"
+url = "2"
 toml = "0.9"
 async-trait = { workspace = true }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
@@ -33,6 +37,7 @@ tracing-subscriber = { workspace = true }
 ulid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
+rusqlite = { version = "0.32.1", features = ["hooks"] }
 rap-client = { path = "../rap-client" }
 infinity-daemon = { path = "../infinity-daemon" }
 infinity-agent-core = { path = "../infinity-agent-core" }

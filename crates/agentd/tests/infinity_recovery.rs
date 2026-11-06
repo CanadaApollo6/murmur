@@ -4653,7 +4653,7 @@ async fn rap_resumed_root_can_send_while_open_waits_for_replay() {
         let (bound, _) = mpsc::unbounded_channel();
         let bindings = Arc::new(Bindings::new(h.cwd.path().join("mcp"), "agentd".into(), bound));
         let broker = Arc::new(Broker::new(room.clone(), vec![agentd::KindConfig::infinity(socket.clone())], Default::default()).expect("broker").with_mcp(bindings.clone(), h.cwd.path().join("agent-state"), Default::default()));
-        let api = Arc::new(ControlApi { broker:broker.clone(), mailroom:room.clone(), bindings });
+        let api = Arc::new(ControlApi { broker:broker.clone(), mailroom:room.clone(), bindings, control_path:"/tmp/agentd.sock".into(), ui_url:None });
         let rap = RapServer::bind(&RapConfig {listen:address}, vec![socket]).await.expect("RAP bind");
         let serve = tokio::spawn(rap.serve(api));
         let handle = broker.spawn(AgentSpec {name, kind:"infinity".into(), cwd:h.cwd.path().into(), workspace:None, model:None, permissions:Default::default(), idle_after:None}).await.expect("spawn");

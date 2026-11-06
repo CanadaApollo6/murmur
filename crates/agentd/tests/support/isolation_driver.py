@@ -17,6 +17,8 @@ hard_exit = '--sigkill' in sys.argv
 root = Path(tempfile.mkdtemp(prefix='agentd-isolation-'))
 state = root / 'state'
 state.mkdir(mode=0o700)
+(state / "ui.token").write_text("a" * 64)
+(state / "ui.token").chmod(0o600)
 human = root / 'home'
 for directory in ['.claude', '.codex']:
     (human / directory).mkdir(parents=True)
@@ -39,6 +41,10 @@ for kind, name, model in [('claude', 'a', 'default'), ('codex', 'b', 'read-only'
         config += f'egress = ["localhost", "example.com"]\n'
     config += f'[kind.{kind}.env]\nFAKE_ROOT = {json.dumps(str(root / name))}\nFAKE_MODE = {json.dumps(model)}\nFAKE_ROOT_FROM_CWD = "1"\n'
 if not baseline:
+    with socket.socket() as reserve:
+        reserve.bind(('127.0.0.1', 0))
+        ui_port = reserve.getsockname()[1]
+    config += f'[ui]\nlisten = \"127.0.0.1:{ui_port}\"\n'
     config += '[kind.infinity]\nwire = "infinity"\nsocket = "/nonexistent/infinity.sock"\n'
 (root / 'config.toml').write_text(config)
 # Old main does not understand isolation configuration.
@@ -132,7 +138,7 @@ try:
     late_socket.listen(1)
     marker = str(root / 'detached-marker')
     config = {'baseline': baseline, 'shared': str(state / 'mcp.sock'), 'credential': str(credential), 'marker': marker, 'late': str(late),
-              'paths': {'control': str(state / 'agentd.sock'), 'state': str(state), 'sqlite': str(state / 'mail.db'),
+              'paths': {'control': str(state / 'agentd.sock'), 'state': str(state), 'sqlite': str(state / 'mail.db'), 'ui_token': str(state / 'ui.token'),
                         'sibling_environ': f'/proc/{sibling}/environ', 'sibling_cmdline': f'/proc/{sibling}/cmdline', 'sibling_mcp': str(state / 'agents' / b['id'].split(':', 1)[1] / 'io/mcp.sock')}}
     if not baseline:
         assert 'mixed isolation: kind infinity is unsandboxed' in (root / 'daemon.log').read_text()
@@ -149,23 +155,50 @@ try:
         watch.sendall(b'{"command":"watch"}\n')
         watched = watch.makefile('rb')
         assert json.loads(watched.readline())['event'] == 'snapshot'
+        web = socket.create_connection(('127.0.0.1', ui_port), timeout=5)
+        web.sendall((f'GET /events HTTP/1.1\r\nHost: 127.0.0.1:{ui_port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: murmur.events.v1, murmur.token.' + 'a' * 64 + '\r\n\r\n').encode())
+        web_read = web.makefile('rb')
+        assert b'101' in web_read.readline()
+        while web_read.readline() != b'\r\n':
+            pass
+        def web_event():
+            import struct
+            while True:
+                header = web_read.read(2)
+                assert len(header) == 2, 'WebSocket closed'
+                size = header[1] & 127
+                if size == 126:
+                    size = struct.unpack('!H', web_read.read(2))[0]
+                elif size == 127:
+                    size = struct.unpack('!Q', web_read.read(8))[0]
+                data = web_read.read(size)
+                if header[0] & 15 == 1:
+                    return json.loads(data)
+        assert web_event()['event'] == 'snapshot'
+
     ctl({'command': 'send', 'to': '@a', 'body': 'isolation-probe mcp-send hold', 'key': 'probe'})
     wait(lambda: (root / 'a/probe-result.json').exists(), 'probe')
     wait(lambda: (root / 'a/mcp-result.json').exists(), 'own shim')
     result = json.loads((root / 'a/probe-result.json').read_text())
     print(json.dumps({'root': str(root), 'baseline': baseline, 'probe': result}), flush=True)
     if baseline:
-        assert all(result[k] for k in ['control', 'state', 'sqlite', 'sibling_environ', 'sibling_cmdline', 'forged_agent']), result
+        assert all(result[k] for k in ['control', 'state', 'sqlite', 'ui_token', 'sibling_environ', 'sibling_cmdline', 'forged_agent']), result
     else:
-        assert not any(result[k] for k in ['control', 'state', 'sqlite', 'sibling_environ', 'sibling_cmdline', 'forged_agent', 'own_token', 'direct_network', 'sibling_mcp']), result
+        assert not any(result[k] for k in ['control', 'state', 'sqlite', 'ui_token', 'sibling_environ', 'sibling_cmdline', 'forged_agent', 'own_token', 'direct_network', 'sibling_mcp']), result
         assert all(result[k] for k in ['host_dirfd_hidden', 'token_rejected', 'rename', 'proxy_deny', 'proxy_private_deny', 'proxy_allow', 'proxy_sni_deny']), result
         while True:
             event = json.loads(watched.readline())
-            if event.get('event') == 'egress_denied' and event.get('host') == 'example.com':
+            if event.get('event') == 'egress_denied' and event.get('host') == 'attacker.invalid':
                 break
         watched.close()
         watch.close()
-        print('PASS mismatched ClientHello emits egress_denied', flush=True)
+        while True:
+            event = web_event()
+            if event.get('event') == 'egress_denied' and event.get('host') == 'attacker.invalid':
+                break
+        web_read.close()
+        web.close()
+        print('PASS real proxy denial reaches Unix and WebSocket feeds', flush=True)
         wait(lambda: credential.read_text() == '{"token":1}', 'credential copy-back')
         for relative, before in original_cli.items():
             if relative not in ['.claude/.credentials.json', '.codex/auth.json']:

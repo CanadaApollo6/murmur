@@ -113,7 +113,7 @@ impl Bindings {
         cfg: &crate::sandbox::SandboxConfig,
         sb: &crate::sandbox::KindSandbox,
         spec: &crate::supervisor::AgentSpec,
-        events: tokio::sync::broadcast::Sender<crate::supervisor::Event>,
+        events: crate::event_hub::EventHub,
     ) -> Result<Value> {
         let SessionIdentity { agent, incarnation } = identity;
         self.revoke(agent).await;

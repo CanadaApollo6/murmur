@@ -470,3 +470,75 @@ The ignored `live_claude_acp` and `live_codex_acp` tests use logged-in shims at
 `AGENTD_CLAUDE_ACP` and `AGENTD_CODEX_ACP`. Run them with
 `cargo test -p agentd --test supervisor live_ -- --ignored --nocapture`.
 They verify a first turn, idle suspension, session load and remembered context.
+
+## Read-only event feed and web access
+
+`agentctl watch` sends a cursor snapshot followed by durable mail transitions and
+volatile agent, permission, activity, turn-end, and egress events. It accepts
+`--cursor <seq> --nonce <nonce>` to resume. Echo the last applied mail frame's
+sequence and nonce, or the anchor from a full snapshot. A valid resume sends
+`mail: null` and replays every later mail event. A missing, mismatched, or pruned
+anchor sends a full mail snapshot. Mail event history keeps the newest 65,536
+rows, checked every 1,024 new events and pruned in batches of at most 4,096.
+
+Mail snapshots contain exact edge counts, the newest 1,000 stuck deliveries
+(held or uncertain), and the newest 1,000 moving deliveries (queued or offered).
+Each list has a truncation flag. Mail frames carry `prev_state` and `state` so
+clients can update edge counts without holding message history. Frames contain
+metadata, never message bodies. Agents use `agent:<ULID>` throughout the feed.
+Activity is display-only, coalesced every 100 ms, and limited to the newest 2 KiB
+of JSON-encoded text. State and activity have separate channels. Egress denials
+are limited to one per agent per second. The existing in-process
+`Broker::events()` channel keeps its original events.
+
+The web listener is disabled by default. To enable it, add this configuration.
+
+```toml
+[ui]
+listen = "127.0.0.1:7434"
+# Optional directory containing index.html and its assets.
+# assets = "/absolute/path/to/agentd-web/dist"
+```
+
+Run `agentctl ui` to print the authenticated URL. The token is in the URL
+fragment, which is not sent to the server. `state_dir/ui.token` contains 256 random
+bits, has mode 0600, and survives restarts. Delete it and restart agentd to rotate
+it. Unsandboxed agents running as your user can read it and already have full
+control through the Unix socket. Startup prints a warning for those kinds.
+
+The listener accepts only loopback addresses with a fixed, nonzero port. Every
+request checks `Host`. WebSocket requests also check `Origin` when present.
+The listener applies a restrictive CSP and sends no CORS headers.
+
+- `GET /events?cursor=<seq>&nonce=<nonce>` upgrades to the same feed as
+  `agentctl watch`. Supply both WebSocket subprotocols, `murmur.events.v1` and
+  `murmur.token.<hex>`. The server echoes only the first.
+- `GET /mail?from=&to=&states=&before_msg_seq=&limit=` returns metadata newest
+  first, with a maximum limit of 1,000. `states` is comma-separated. Each job
+  examines at most 10,000 message candidates. A short or empty page may still
+  have `next_before_msg_seq`; continue until it is null.
+- `GET /messages/<ULID>` returns one envelope, its body, `sent_at`, and `bytes`.
+  Both HTTP data routes require `Authorization: Bearer <hex>`.
+
+All browser data reads, feed reads, `ls`, and agent-callable `list_agents` share
+one observer permit on the existing exclusive mailroom worker. Delivery jobs do
+not acquire that permit. Eight feed subscribers are allowed across both
+transports. HTTP allows 64 connections. A blocked feed send closes after ten
+seconds. WebSocket input is limited to 4 KiB; pings run every thirty seconds,
+and sixty seconds without a pong closes the connection.
+
+Without a bundle or an `assets` directory, `/` displays build instructions. With
+`assets`, the server reads a path manifest and refreshes it on every `GET /`.
+Request paths never become filesystem paths. The web API has no write routes.
+Permission and held-mail frames include server-built POSIX shell commands for
+`agentctl`. Commands quote every argument and use the bound control socket;
+values containing control characters have no copyable command.
+
+The full-scale worker cost gate is an explicit test. It creates a 1M-message
+fixture with 64 KiB bodies in the newest 20,000 messages, a 200,000-message dormant
+backlog, and concurrent observers. Run it on a quiet machine with an optimized
+build and enough disk space for the database and WAL.
+
+```bash
+cargo test --release -p agentd --lib m5_cost_gate -- --ignored --nocapture
+```

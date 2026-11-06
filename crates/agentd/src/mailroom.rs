@@ -1,7 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
+
+#[path = "mail_feed.rs"]
+mod feed;
+pub use feed::{Anchor, MailQuery};
 use std::thread;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -166,6 +170,8 @@ type Job = Box<dyn FnOnce(&mut Store) + Send>;
 pub struct Mailroom {
     jobs: mpsc::Sender<Job>,
     worker: thread::JoinHandle<Result<()>>,
+    observers: Arc<tokio::sync::Semaphore>,
+    changes: tokio::sync::watch::Receiver<i64>,
 }
 
 pub(crate) struct ActorLease {
@@ -197,15 +203,37 @@ impl Mailroom {
         let path = path.as_ref().to_owned();
         let mut store = tokio::task::spawn_blocking(move || Store::open(&path, config)).await??;
         let (jobs, rx) = mpsc::channel::<Job>();
+        let (changes_tx, changes) = tokio::sync::watch::channel(feed::head(&store.db)?);
         let worker = thread::Builder::new()
             .name("agentd-mailroom".into())
             .spawn(move || {
                 for job in rx {
+                    let before = store.db.total_changes();
                     job(&mut store);
+                    if store.db.total_changes() != before {
+                        let head = feed::head(&store.db)?;
+                        changes_tx.send_if_modified(|seq| {
+                            if head > *seq {
+                                *seq = head;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if head - store.last_prune >= 1024 {
+                            store.last_prune = head;
+                            feed::prune(&mut store.db)?;
+                        }
+                    }
                 }
                 store.db.close().map_err(|(_, e)| Error::Store(e))
             })?;
-        Ok(Self { jobs, worker })
+        Ok(Self {
+            jobs,
+            worker,
+            observers: Arc::new(tokio::sync::Semaphore::new(1)),
+            changes,
+        })
     }
 
     async fn call<T: Send + 'static>(
@@ -220,6 +248,35 @@ impl Mailroom {
                         Ok(_) => tracing::debug!("mailroom caller cancelled after submission"),
                         Err(error) => tracing::error!(%error, "mailroom operation failed after caller cancellation"),
                     }
+                }
+            }))
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
+    }
+
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<i64> {
+        self.changes.clone()
+    }
+
+    pub(crate) async fn observe<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Store) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let permit = self
+            .observers
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Closed)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.jobs
+            .send(Box::new(move |store| {
+                let _permit = permit;
+                if tx.is_closed() {
+                    return;
+                }
+                if let Err(Err(error)) = tx.send(f(store)) {
+                    tracing::error!(%error, "observer failed after cancellation");
                 }
             }))
             .map_err(|_| Error::Closed)?;
@@ -584,7 +641,7 @@ impl Mailroom {
         self.call(move |s| {
             let tx = s.db.transaction()?;
             if tx.execute("UPDATE agents SET retired=1 WHERE id=?", [json(&agent)?])? == 0 { return Err(Error::NotFound(agent.to_string())); }
-            tx.execute("UPDATE deliveries SET state='dead',incarnation=NULL,reason='recipient retired' WHERE state IN ('queued','offered','held','uncertain') AND message_id IN (SELECT id FROM messages WHERE recipient=?)", [json(&agent)?])?;
+            tx.execute("UPDATE deliveries SET state='dead',turn_started=0,incarnation=NULL,reason='recipient retired' WHERE state IN ('queued','offered','held','uncertain') AND message_id IN (SELECT id FROM messages WHERE recipient=?)", [json(&agent)?])?;
             tx.commit()?;
             Ok(())
         }).await
@@ -648,10 +705,11 @@ impl Mailroom {
     }
 }
 
-struct Store {
-    db: Connection,
+pub(crate) struct Store {
+    pub(crate) db: Connection,
     config: Config,
     actors: HashMap<AgentId, ulid::Ulid>,
+    last_prune: i64,
 }
 
 impl Store {
@@ -669,16 +727,21 @@ impl Store {
             ));
         }
         let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 1 {
+        if version > 2 {
             return Err(Error::Rejected(format!(
                 "unsupported schema version {version}"
             )));
         }
         db.execute_batch(include_str!("schema.sql"))?;
+        if version < 2 {
+            db.execute_batch(include_str!("schema-v2.sql"))?;
+        }
+        let last_prune = feed::head(&db)?;
         Ok(Self {
             db,
             config,
             actors: HashMap::new(),
+            last_prune,
         })
     }
 
@@ -858,8 +921,9 @@ impl Store {
             }
         }
         tx.execute("INSERT INTO messages(id,sender,client_key,recipient,conversation,in_reply_to,hop,act,task,exposure,body,sent_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", params![json(&env.id)?, sender, msg.client_key.0, json(&env.to)?, json(&env.conversation)?, env.in_reply_to.map(|v| json(&v)).transpose()?, env.hop, json(&env.act)?, env.task.map(|v| json(&v)).transpose()?, env.exposure.map(|v| json(&v)).transpose()?, env.body.as_str(), json(&env.sent_at)?])?;
+        let msg_seq = tx.last_insert_rowid();
         tx.execute(
-            "INSERT INTO deliveries(message_id,state,reason) VALUES (?,?,?)",
+            "INSERT INTO deliveries(message_id,state,reason,msg_seq) VALUES (?,?,?,?)",
             params![
                 json(&env.id)?,
                 if held_reason.is_some() {
@@ -867,7 +931,8 @@ impl Store {
                 } else {
                     "queued"
                 },
-                held_reason
+                held_reason,
+                msg_seq
             ],
         )?;
         if let Some(t) = updated_task {
