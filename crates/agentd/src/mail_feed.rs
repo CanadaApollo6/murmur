@@ -1338,6 +1338,91 @@ mod gate {
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "full-scale disk and latency measurement; run explicitly with --ignored --nocapture"]
     async fn m5_cost_gate() {
+        run_measurement(Measurement::CostGate).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "ten-minute full-load RSS soak; run separately with --ignored --nocapture"]
+    async fn m5_memory_soak() {
+        run_measurement(Measurement::MemorySoak).await;
+    }
+    #[derive(PartialEq)]
+    enum Measurement {
+        CostGate,
+        MemorySoak,
+    }
+    async fn memory_soak(
+        room: &Mailroom,
+        to: AgentId,
+        load: &Arc<Load>,
+        tasks: &mut tokio::task::JoinSet<crate::surfaces::Result<()>>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(600);
+        let sampler = tokio::spawn({
+            let load = load.clone();
+            let accepted = accepted.clone();
+            async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(10));
+                let mut previous = load.counts();
+                for sample in 0..=60 {
+                    interval.tick().await;
+                    memory_sample("soak");
+                    let counts = load.counts();
+                    println!(
+                        "SOAK sample={sample} elapsed_seconds={:.3} accepts={} workload_counts={counts:?}",
+                        start.elapsed().as_secs_f64(),
+                        accepted.load(Relaxed)
+                    );
+                    if sample > 0 {
+                        assert!(
+                            counts[..17]
+                                .iter()
+                                .zip(&previous)
+                                .all(|(now, before)| now > before),
+                            "soak workload stopped completing during an RSS interval"
+                        );
+                    }
+                    previous = counts;
+                }
+            }
+        });
+        // Keep no per-accept samples or worker trace during the soak.
+        while tokio::time::Instant::now() < deadline {
+            if let Some(result) = tasks.try_join_next() {
+                result
+                    .expect("soak workload panicked")
+                    .expect("soak workload failed");
+                panic!("soak workload ended unexpectedly");
+            }
+            let n = accepted.load(Relaxed);
+            let message = NewMessage {
+                from: Sender::Human,
+                to,
+                body: Body::new("gate delivery").expect("body"),
+                reply_to: None,
+                client_key: ClientKey(format!("soak-{n}")),
+                act: Act::Inform,
+                task: None,
+            };
+            tokio::time::timeout(Duration::from_secs(10), room.accept(message))
+                .await
+                .expect("soak accept hung")
+                .expect("real soak accept");
+            accepted.fetch_add(1, Relaxed);
+        }
+        sampler
+            .await
+            .expect("all 61 soak RSS samples and workload checks");
+        assert!(accepted.load(Relaxed) >= 2048, "soak accepts missing");
+        println!(
+            "SOAK complete accepts={} elapsed_seconds={:.3}",
+            accepted.load(Relaxed),
+            start.elapsed().as_secs_f64()
+        );
+    }
+    async fn run_measurement(measurement: Measurement) {
         let mode = GateMode::from_marker(std::env::var_os("M5_GATE_RAM_DISK").as_deref())
             .expect("gate mode");
         println!(
@@ -1571,6 +1656,45 @@ mod gate {
             s.db.execute("UPDATE deliveries SET attempts=attempts+1 WHERE msg_seq BETWEEN 200001 AND 206000",[])?;
             let head=head(&s.db)?;s.last_prune=head-1023;s.prunes.clear();Ok(head)
         }).await.expect("stage real delivery events for sampled pruning");
+        if measurement == Measurement::MemorySoak {
+            memory_soak(&room, to, &load, &mut tasks).await;
+            let (last_head, prunes) = room
+                .observe(|s| Ok((head(&s.db)?, s.prunes.clone())))
+                .await
+                .expect("soak pruning evidence");
+            assert!(
+                prunes.iter().any(|(seq, deleted)| *seq > first_head
+                    && *seq <= last_head
+                    && *deleted >= 4000),
+                "soak multi-thousand-row prune missing"
+            );
+            println!("SOAK pruning head={first_head}..{last_head} prunes={prunes:?}");
+            assert!(
+                load.replayed.load(Relaxed) >= 65535,
+                "soak full replay missing"
+            );
+            cancel.cancel();
+            let completed = drain_workloads(&mut tasks)
+                .await
+                .expect("every soak workload succeeds");
+            assert_eq!(completed, 18, "every soak workload must finish cleanly");
+            assert!(load.ready(), "soak workload minimums missing");
+            tokio::time::timeout(Duration::from_secs(10), events::encoders_idle())
+                .await
+                .expect("soak encoders finish");
+            room.call(|_| Ok(())).await.expect("drain soak worker");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            memory_sample("post_load");
+            drop(api);
+            Arc::try_unwrap(room)
+                .unwrap_or_else(|_| panic!("soak room owners"))
+                .close()
+                .await
+                .expect("close soak");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            memory_sample("post_close");
+            return;
+        }
         let progress = room
             .call(|_| Ok(trace::start()))
             .await

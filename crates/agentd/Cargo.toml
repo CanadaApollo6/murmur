@@ -19,7 +19,7 @@ futures-util = { workspace = true, features = ["sink"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.3"
-mimalloc = { version = "0.1.52", default-features = false }
+mimalloc = { git = "https://github.com/microsoft/mimalloc.git", rev = "56dc5eb80145f9a3ba7ca23d47c6a248b9d8586c", default-features = false }
 sha2 = "0.10"
 tokio-tungstenite = "0.26"
 subtle = "2"

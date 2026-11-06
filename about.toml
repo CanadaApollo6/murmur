@@ -13,3 +13,19 @@ accepted = [
 
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
+
+# The pinned Microsoft crates share the repository-root MIT notice.
+
+[mimalloc.clarify]
+license = "MIT"
+
+[[mimalloc.clarify.files]]
+path = "../../LICENSE"
+checksum = "82ade5d7d9b029044b5fbbc326207fc47c2d44ee4dd71e8a559c36d728217de9"
+
+[mimalloc-sys.clarify]
+license = "MIT"
+
+[[mimalloc-sys.clarify.files]]
+path = "../../../LICENSE"
+checksum = "82ade5d7d9b029044b5fbbc326207fc47c2d44ee4dd71e8a559c36d728217de9"

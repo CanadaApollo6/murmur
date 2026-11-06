@@ -568,10 +568,16 @@ the mailroom still open. A second sample follows mailroom close and another idle
 second. No allocator trim or collection is forced; the peak includes fixture
 initialization as well as the sampled load.
 
-The daemon and its library test binary share the Rust `mimalloc` global
-allocator. SQLite keeps its system allocator: C malloc interposition is disabled.
+The daemon and its library test binary share Microsoft's Rust `mimalloc` 3.6.1
+global allocator, built from the same repository's C sources. The git dependency
+is pinned to commit `56dc5eb80145f9a3ba7ca23d47c6a248b9d8586c`, the commit behind
+the annotated `v3.6.1` tag. Default features and C malloc interposition are disabled,
+so SQLite keeps its system allocator.
 `agentctl`, the fake ACP helper and other production binaries keep their existing
 allocator. The daemon and gate allocator declarations come from the same module.
+The license generator verifies the shared repository-root MIT notice by checksum.
+The existing build profiles are unchanged; upstream's LTO recommendation is a
+performance option rather than a build requirement.
 
 The baseline has 2,048 accepts. The loaded window keeps the same closed-loop
 accepts and observer workload for at least 2,048 accepts, extending until all six
@@ -588,6 +594,19 @@ host load; the gate does not retry a miss.
 
 ```bash
 cargo test --release -p agentd --lib m5_cost_gate -- --ignored --nocapture
+```
+
+For a separate ten-minute memory diagnostic, run `m5_memory_soak` instead. It
+shares the complete fixture and all 18 workload tasks with the gate, including
+closed-loop accepts, reconnects, full replay, mail views and pruning. It prints
+RSS and workload counters every ten seconds, checks continued work and a real
+multi-thousand-row prune, then reports RSS after draining clients and closing the
+mailroom. Worker tracing and per-accept timing retention are off during the soak
+so the diagnostic does not accumulate its own timing records. The normal gate's
+window, load and pass rules are unchanged.
+
+```bash
+cargo test --release -p agentd --lib m5_memory_soak -- --ignored --nocapture
 ```
 
 For RAM-disk diagnostics, build once with `--no-run`, then execute the printed
