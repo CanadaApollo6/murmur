@@ -290,6 +290,35 @@ describe("FeedClient", () => {
       expect(sockets[1]!.url).toBe("ws://127.0.0.1:7434/events");
     });
 
+    it("backs off and says so when the socket closes before the gap's flush", async () => {
+      const { client, sockets, room } = connected();
+      const attempts: number[] = [];
+      for (let cycle = 0; cycle < 5; cycle += 1) {
+        const socket = sockets.at(-1)!;
+        const count = sockets.length;
+        room.accept("human", "agent:A"); // Never delivered.
+        socket.send(room.accept("human", "agent:A"));
+        socket.drop(); // The frame after the gap is still waiting to be flushed.
+        expect(client.getState().link).toBe("disconnected");
+        expect(client.getRetry().problem).toContain("missed");
+        const { attempt } = client.getRetry();
+        attempts.push(attempt);
+        // Exactly one retry, and not before its backoff.
+        const ceiling = Math.min(30_000, 500 * 2 ** (attempt - 1));
+        await vi.advanceTimersByTimeAsync(ceiling * 0.8 - 1);
+        expect(sockets).toHaveLength(count);
+        await vi.advanceTimersByTimeAsync(ceiling * 0.4 + 2);
+        expect(sockets).toHaveLength(count + 1);
+        const next = sockets.at(-1)!;
+        expect(next.url).toBe("ws://127.0.0.1:7434/events");
+        next.open();
+        next.send(room.snapshot());
+      }
+      expect(attempts).toEqual([1, 2, 3, 4, 5]);
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(sockets).toHaveLength(6);
+    });
+
     it("costs one full snapshot, then no reconnect loop", async () => {
       const { client, sockets, room } = connected();
       room.accept("human", "agent:A"); // Never delivered.

@@ -148,15 +148,17 @@ export class FeedClient {
     }
   }
 
-  private dispatch(action: Action) {
+  /** False when the action could not be applied, which `resync` has handled. */
+  private dispatch(action: Action): boolean {
     try {
       this.state = reduce(this.state, action);
       this.pump();
     } catch (error) {
       this.resync("agentd sent data this page could not apply.", error);
-      return;
+      return false;
     }
     this.notify();
+    return true;
   }
 
   /**
@@ -333,8 +335,14 @@ export class FeedClient {
     }
     const frames = this.queue;
     this.queue = [];
-    this.dispatch({ type: "frames", frames, now: this.deps.now() });
-    if (this.state.resyncNeeded && this.socket !== null) {
+    const applied = this.dispatch({
+      type: "frames",
+      frames,
+      now: this.deps.now(),
+    });
+    // Also when `onclose` is flushing: a gap costs the same however quickly the
+    // socket closes after it, or a repeating fault would never back off.
+    if (applied && this.state.resyncNeeded) {
       this.resync("This page missed part of agentd's mail feed.");
     }
   }
