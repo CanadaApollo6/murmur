@@ -742,12 +742,16 @@ mod gate {
     #[derive(Default)]
     struct Load {
         reconnects: [std::sync::atomic::AtomicUsize; 7],
+        timeout_attempts: [std::sync::atomic::AtomicUsize; 7],
         views: [std::sync::atomic::AtomicUsize; 8],
         rare: std::sync::atomic::AtomicUsize,
         lists: std::sync::atomic::AtomicUsize,
         replayed: std::sync::atomic::AtomicUsize,
     }
     impl Load {
+        fn timed_out(&self, client: usize) {
+            self.timeout_attempts[client].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         fn counts(&self) -> Vec<usize> {
             use std::sync::atomic::Ordering::Relaxed;
             self.reconnects
@@ -766,9 +770,25 @@ mod gate {
                 && self.replayed.load(Relaxed) >= 8192
         }
     }
+    fn check_iterations(counts: &[usize]) -> std::result::Result<(), String> {
+        let minimums = [vec![2; 7], vec![1; 8], vec![20, 20, 256]].concat();
+        if counts.len() != minimums.len() {
+            return Err("missing workload counts".into());
+        }
+        for (class, (actual, minimum)) in counts.iter().zip(minimums).enumerate() {
+            if *actual < minimum {
+                return Err(format!(
+                    "workload class {class} absent from sampled accepts: {actual} < {minimum}"
+                ));
+            }
+        }
+        Ok(())
+    }
     struct Serialized {
         load: Arc<Load>,
         replay: bool,
+        client: Option<usize>,
+        completed_full: bool,
     }
     #[async_trait::async_trait]
     impl events::Sink for Serialized {
@@ -796,6 +816,13 @@ mod gate {
             }
             std::hint::black_box(json);
             tokio::task::yield_now().await;
+            if full_mail
+                && !self.completed_full
+                && let Some(client) = self.client
+            {
+                self.load.reconnects[client].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.completed_full = true;
+            }
             Ok(())
         }
     }
@@ -844,6 +871,166 @@ mod gate {
             "gate ignored generator panic"
         );
     }
+    #[tokio::test]
+    async fn gate_rejects_reconnector_without_completed_full_snapshots() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let load = Arc::new(Load::default());
+        for value in &load.views {
+            value.store(2, Relaxed);
+        }
+        load.rare.store(20, Relaxed);
+        load.lists.store(20, Relaxed);
+        load.replayed.store(8192, Relaxed);
+        for client in 0..7 {
+            for _ in 0..2 {
+                let mut sink = Serialized {
+                    load: load.clone(),
+                    replay: false,
+                    client: Some(client),
+                    completed_full: false,
+                };
+                // Client 3 receives only volatile snapshots. Time still expires.
+                events::Sink::send_snapshot(
+                    &mut sink,
+                    "{\"event\":\"snapshot\"}".into(),
+                    client != 3,
+                )
+                .await
+                .expect("snapshot sink");
+                load.timed_out(client);
+            }
+        }
+        assert!(
+            check_iterations(&load.counts()).is_err(),
+            "gate accepted reconnect timeouts without client 3 full snapshots"
+        );
+        assert_eq!(load.reconnects[3].load(Relaxed), 0);
+        for _ in 0..2 {
+            let mut sink = Serialized {
+                load: load.clone(),
+                replay: false,
+                client: Some(3),
+                completed_full: false,
+            };
+            events::Sink::send_snapshot(&mut sink, "{\"event\":\"snapshot\"}".into(), true)
+                .await
+                .expect("recovered snapshot");
+        }
+        check_iterations(&load.counts()).expect("all actual snapshots completed");
+        assert!(load.ready());
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GateMode {
+        Production,
+        RamDisk,
+    }
+    impl GateMode {
+        fn from_marker(marker: Option<&std::ffi::OsStr>) -> std::result::Result<Self, String> {
+            match marker {
+                None => Ok(Self::Production),
+                Some(value) if value == "1" => Ok(Self::RamDisk),
+                Some(_) => Err("M5_GATE_RAM_DISK must be 1 or unset".into()),
+            }
+        }
+        fn label(self) -> &'static str {
+            match self {
+                Self::Production => "production",
+                Self::RamDisk => "ram-disk-diagnostic",
+            }
+        }
+    }
+    fn gate_failures(
+        mode: GateMode,
+        queue: f64,
+        _delta: f64,
+        services: &std::collections::BTreeMap<String, trace::Service>,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        if !queue.is_finite() || queue > 20.0 {
+            failures.push(format!(
+                "loaded worker queue p99 {queue:.6} ms exceeds 20 ms"
+            ));
+        }
+        for class in trace::OBSERVER_CLASSES {
+            if !services.contains_key(class) {
+                failures.push(format!("observer class {class} has no samples"));
+            }
+        }
+        for (class, service) in services {
+            if service.count < 100 {
+                failures.push(format!(
+                    "observer class {class} has {} samples; requires 100",
+                    service.count
+                ));
+            }
+            if mode == GateMode::Production
+                && (!service.p99_ms.is_finite() || service.p99_ms > 20.0)
+            {
+                failures.push(format!(
+                    "observer class {class} whole-job p99 {:.6} ms exceeds 20 ms",
+                    service.p99_ms
+                ));
+            }
+        }
+        failures
+    }
+    #[test]
+    fn v8_gate_requires_absolute_queue_and_whole_observer_jobs() {
+        assert_eq!(
+            GateMode::from_marker(None).expect("default"),
+            GateMode::Production
+        );
+        assert_eq!(
+            GateMode::from_marker(Some(std::ffi::OsStr::new("1"))).expect("explicit RAM"),
+            GateMode::RamDisk
+        );
+        assert!(GateMode::from_marker(Some(std::ffi::OsStr::new("0"))).is_err());
+        let services = trace::OBSERVER_CLASSES
+            .into_iter()
+            .map(|class| {
+                (
+                    class.to_owned(),
+                    trace::Service {
+                        count: 100,
+                        p99_ms: 20.0,
+                        max_ms: 999.0,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(
+            !gate_failures(GateMode::Production, 20.001, -100.0, &services).is_empty(),
+            "inflated baseline hid queue p99 above 20 ms"
+        );
+        assert!(
+            gate_failures(GateMode::Production, 20.0, 999.0, &services).is_empty(),
+            "reported delta or maximum decided the pass rule"
+        );
+        for class in trace::OBSERVER_CLASSES {
+            let mut short = services.clone();
+            short.get_mut(class).expect("class").count = 99;
+            assert!(
+                !gate_failures(GateMode::Production, 1.0, 0.0, &short).is_empty(),
+                "production accepted fewer than 100 {class} jobs"
+            );
+            assert!(
+                !gate_failures(GateMode::RamDisk, 1.0, 0.0, &short).is_empty(),
+                "RAM diagnostics lack samples for {class}"
+            );
+            let mut slow = services.clone();
+            slow.get_mut(class).expect("class").p99_ms = 20.001;
+            assert!(
+                !gate_failures(GateMode::Production, 1.0, 0.0, &slow).is_empty(),
+                "production accepted slow {class}"
+            );
+            assert!(
+                gate_failures(GateMode::RamDisk, 1.0, 0.0, &slow).is_empty(),
+                "RAM service tail was treated as blocker"
+            );
+        }
+        assert!(!gate_failures(GateMode::RamDisk, 20.001, 0.0, &services).is_empty());
+    }
     fn percentile(mut times: Vec<f64>) -> f64 {
         times.sort_by(f64::total_cmp);
         times[(times.len() * 99 / 100).min(times.len() - 1)]
@@ -874,7 +1061,8 @@ mod gate {
     impl AcceptStats {
         fn print(&self, lane: &str) {
             println!(
-                "GATE accept_attribution lane={lane} samples=2048 total_p99_ms={:.6} queue_p99_ms={:.6} job_p99_ms={:.6} resume_p99_ms={:.6} at_total_p99_queue_ms={:.6} at_total_p99_job_ms={:.6} at_total_p99_resume_ms={:.6}",
+                "GATE accept_attribution lane={lane} samples={} total_p99_ms={:.6} queue_p99_ms={:.6} job_p99_ms={:.6} resume_p99_ms={:.6} at_total_p99_queue_ms={:.6} at_total_p99_job_ms={:.6} at_total_p99_resume_ms={:.6}",
+                self.samples.len(),
                 self.p99,
                 self.queue_p99,
                 self.job_p99,
@@ -885,10 +1073,19 @@ mod gate {
             );
         }
     }
-    async fn sample(room: &Mailroom, to: AgentId, tag: &str) -> AcceptStats {
+    async fn sample(
+        room: &Mailroom,
+        to: AgentId,
+        tag: &str,
+        progress: Option<&trace::Progress>,
+    ) -> AcceptStats {
+        if let Some(progress) = progress {
+            progress.begin_window();
+        }
         let mut times = Vec::new();
         let mut previous_resume = None;
-        for n in 0..2048 {
+        let began_window = Instant::now();
+        for n in 0.. {
             let message = NewMessage {
                 from: Sender::Human,
                 to,
@@ -923,7 +1120,20 @@ mod gate {
                 job_ms: finished.duration_since(began).as_secs_f64() * 1000.0,
                 resume_ms: resumed.duration_since(finished).as_secs_f64() * 1000.0,
             });
+            if n + 1 >= 2048 && progress.is_none_or(|p| p.enough()) {
+                break;
+            }
+            if progress.is_some() && began_window.elapsed() >= Duration::from_secs(120) {
+                break;
+            }
         }
+        println!(
+            "GATE sample_window lane={tag} samples={} elapsed_ms={:.6} extended={} sufficient_observer_samples={}",
+            times.len(),
+            began_window.elapsed().as_secs_f64() * 1000.0,
+            times.len() > 2048,
+            progress.is_none_or(|p| p.enough())
+        );
         times.sort_by(|a, b| a.total_ms().total_cmp(&b.total_ms()));
         let at_p99 = times[times.len() * 99 / 100];
         let stats = AcceptStats {
@@ -937,9 +1147,31 @@ mod gate {
         stats.print(tag);
         stats
     }
+    fn trace_samples(stats: &AcceptStats) -> Vec<(usize, Instant, Instant, Instant, f64, f64)> {
+        stats
+            .samples
+            .iter()
+            .map(|s| {
+                (
+                    s.id,
+                    s.submitted,
+                    s.began,
+                    s.resumed,
+                    s.total_ms(),
+                    s.queue_ms,
+                )
+            })
+            .collect()
+    }
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "full-scale disk and latency measurement; run explicitly with --ignored --nocapture"]
     async fn m5_cost_gate() {
+        let mode = GateMode::from_marker(std::env::var_os("M5_GATE_RAM_DISK").as_deref())
+            .expect("gate mode");
+        println!(
+            "GATE pass_rule=v8 mode={} queue_target_ms=20 service_target_ms=20 service_min_samples=100 minimum_accept_samples=2048 max_loaded_window_seconds=120",
+            mode.label()
+        );
         let dir =
             tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("gate directory");
         let room = Arc::new(
@@ -1025,7 +1257,22 @@ mod gate {
             // The fixture changes immutable metadata only before measurement, then rebuilds its aggregate.
             tx.execute("DELETE FROM mail_edges",[])?;tx.execute("INSERT INTO mail_edges SELECT m.sender,m.recipient,d.state,COUNT(*) FROM messages m JOIN deliveries d ON d.message_id=m.id GROUP BY m.sender,m.recipient,d.state",[])?;tx.commit()?;while s.db.query_row("SELECT COUNT(*) FROM mail_events",[],|r|r.get::<_,i64>(0))?>65536 {prune(&mut s.db)?;}Ok(())}).await.expect("dormant backlog");
         let backlog = snapshot_ms(&api).await;
-        let baseline = sample(&room, to, "baseline").await;
+        room.call(|_| Ok(trace::start()))
+            .await
+            .expect("start baseline trace");
+        let baseline = sample(&room, to, "baseline", None).await;
+        let records = room
+            .call(|_| Ok(trace::take()))
+            .await
+            .expect("baseline trace");
+        trace::report(
+            "baseline",
+            &records,
+            trace_samples(&baseline),
+            baseline.p99,
+            baseline.queue_p99,
+        );
+
         room.call(|s| prune(&mut s.db))
             .await
             .expect("prune baseline before replay anchor");
@@ -1048,7 +1295,7 @@ mod gate {
         let mut tasks = tokio::task::JoinSet::<crate::surfaces::Result<()>>::new();
         let cancel = tokio_util::sync::CancellationToken::new();
         let load = Arc::new(Load::default());
-        for n in 0..8 {
+        for n in 0_usize..8 {
             let api = api.clone();
             let anchor = anchor.clone();
             let load = load.clone();
@@ -1056,13 +1303,13 @@ mod gate {
             tasks.spawn(async move {
                 let _permit=events::subscribe()?;
                 loop {
-                    let mut sink=Serialized{load:load.clone(),replay:n==0};
+                    let mut sink=Serialized{load:load.clone(),replay:n==0,client:(n>0).then_some(n.saturating_sub(1)),completed_full:false};
                     if n==0 {return tokio::select!{_=cancel.cancelled()=>Ok(()),r=events::feed(&api,&mut sink,Some(anchor.clone()))=>{r?;Err("backlog feed ended unexpectedly".into())}};}
                     tokio::select! {
                         _=cancel.cancelled()=>return Ok(()),
                         r=tokio::time::timeout(Duration::from_millis(250),events::feed(&api,&mut sink,None))=>{
                             if let Ok(result)=r {result?;return Err("reconnecting feed ended unexpectedly".into());}
-                            load.reconnects[n-1].fetch_add(1,Relaxed);
+                            load.timed_out(n-1);
                         }
                     }
                 }
@@ -1148,14 +1395,12 @@ mod gate {
             s.db.execute("UPDATE deliveries SET attempts=attempts+1 WHERE msg_seq BETWEEN 200001 AND 206000",[])?;
             let head=head(&s.db)?;s.last_prune=head-1023;s.prunes.clear();Ok(head)
         }).await.expect("stage real delivery events for sampled pruning");
-        room.call(|_| {
-            trace::start();
-            Ok(())
-        })
-        .await
-        .expect("start worker trace");
+        let progress = room
+            .call(|_| Ok(trace::start()))
+            .await
+            .expect("start loaded trace");
         let before_counts = load.counts();
-        let loaded = sample(&room, to, "loaded").await;
+        let loaded = sample(&room, to, "loaded", Some(&progress)).await;
         let during_counts = load
             .counts()
             .into_iter()
@@ -1166,26 +1411,18 @@ mod gate {
             .call(|_| Ok(trace::take()))
             .await
             .expect("worker trace");
-        trace::report(
+        let services = trace::report(
+            "loaded",
             &records,
-            loaded
-                .samples
-                .iter()
-                .map(|s| {
-                    (
-                        s.id,
-                        s.submitted,
-                        s.began,
-                        s.resumed,
-                        s.total_ms(),
-                        s.queue_ms,
-                    )
-                })
-                .collect(),
+            trace_samples(&loaded),
             loaded.p99,
             loaded.queue_p99,
         );
         println!("GATE iterations_inside_accept_window={during_counts:?}");
+        println!(
+            "GATE completed_full_snapshots_inside_window={:?}",
+            &during_counts[..7]
+        );
         let (last_head, prunes) = room
             .observe(|s| Ok((head(&s.db)?, s.prunes.clone())))
             .await
@@ -1218,15 +1455,12 @@ mod gate {
             .expect("every workload task must succeed");
         assert_eq!(completed, 18, "every workload must finish cleanly");
         assert!(load.ready(), "minimum workload iterations missing");
-        let minimums = [vec![2; 7], vec![1; 8], vec![20, 20, 256]].concat();
-        for (class, (actual, minimum)) in during_counts.iter().zip(minimums).enumerate() {
-            assert!(
-                *actual >= minimum,
-                "workload class {class} absent from sampled accepts: {actual} < {minimum}"
-            );
-        }
+        check_iterations(&during_counts)
+            .expect("all workloads must complete inside sampled accepts");
         println!(
-            "GATE current_thread=true snapshot_includes_serialization=true accept_samples_per_lane=2048 retained_backlog_frames_replayed={} reconnect_iterations={:?} view_iterations={:?} rare_queries={} list_queries={} checked_workload_results={completed}",
+            "GATE current_thread=true snapshot_includes_serialization=true baseline_accept_samples={} loaded_accept_samples={} retained_backlog_frames_replayed={} reconnect_full_snapshots={:?} view_iterations={:?} rare_queries={} list_queries={} checked_workload_results={completed}",
+            baseline.samples.len(),
+            loaded.samples.len(),
             load.replayed.load(Relaxed),
             load.reconnects
                 .iter()
@@ -1239,15 +1473,23 @@ mod gate {
             load.rare.load(Relaxed),
             load.lists.load(Relaxed)
         );
+        println!(
+            "GATE reconnect_timeout_attempts={:?}",
+            load.timeout_attempts
+                .iter()
+                .map(|n| n.load(Relaxed))
+                .collect::<Vec<_>>()
+        );
         drop(api);
         println!(
             "GATE snapshot_median_ms={normal:.3} target_ms=100 backlog_200000_snapshot_median_ms={backlog:.3} target_ms=100"
         );
         println!(
-            "GATE accept_baseline_p99_ms={:.3} accept_observers_p99_ms={:.3} delta_ms={:.3} target_delta_ms=20",
+            "GATE accept_baseline_p99_ms={:.3} accept_observers_p99_ms={:.3} delta_ms={:.3} loaded_queue_p99_ms={:.6} queue_target_ms=20",
             baseline.p99,
             loaded.p99,
-            loaded.p99 - baseline.p99
+            loaded.p99 - baseline.p99,
+            loaded.queue_p99
         );
         Arc::try_unwrap(room)
             .unwrap_or_else(|_| panic!("gate room owners"))
@@ -1255,7 +1497,12 @@ mod gate {
             .await
             .expect("close");
         assert!(normal < 100.0 && backlog < 100.0, "snapshot gate missed");
-        assert!(loaded.p99 - baseline.p99 <= 20.0, "accept p99 gate missed");
+        let failures = gate_failures(mode, loaded.queue_p99, loaded.p99 - baseline.p99, &services);
+        assert!(
+            failures.is_empty(),
+            "v8 gate missed: {}",
+            failures.join("; ")
+        );
     }
 }
 

@@ -339,6 +339,8 @@ impl Mailroom {
                     trace::label("cancelled_observer_before_read");
                     return;
                 }
+                #[cfg(test)]
+                trace::mark_observer();
                 if let Err(result) = tx.send(f(store)) {
                     match result {
                         Ok(value) => {

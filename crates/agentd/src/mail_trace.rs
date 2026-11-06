@@ -234,6 +234,8 @@ struct Trace {
     detailed: bool,
     plans: std::collections::BTreeSet<String>,
     cache: Cache,
+    observer: bool,
+    progress: Option<std::sync::Arc<Progress>>,
 }
 thread_local! { static TRACE: RefCell<Trace> = RefCell::default(); }
 pub(super) struct Record {
@@ -241,6 +243,7 @@ pub(super) struct Record {
     start: Instant,
     end: Instant,
     query: bool,
+    observer: bool,
     resource: Resource,
     cache: Cache,
     sql: Option<SqlStats>,
@@ -262,11 +265,20 @@ impl Drop for Span {
         let end = Instant::now();
         TRACE.with_borrow_mut(|trace| {
             if self.active && trace.active {
+                let class = self.class.clone().unwrap_or_else(|| trace.label.clone());
+                let observer = self.class.is_none() && trace.observer;
+                if observer
+                    && let Some(progress) = &trace.progress
+                    && let Some(index) = OBSERVER_CLASSES.iter().position(|name| *name == class)
+                {
+                    progress.counts[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 trace.records.push(Record {
-                    class: self.class.clone().unwrap_or_else(|| trace.label.clone()),
+                    class,
                     start: self.start,
                     end,
                     query: self.query,
+                    observer,
                     resource,
                     cache: if self.query {
                         Cache::default()
@@ -279,14 +291,20 @@ impl Drop for Span {
         });
     }
 }
-pub(super) fn start() {
+pub(super) fn start() -> std::sync::Arc<Progress> {
+    let progress = std::sync::Arc::new(Progress::default());
     TRACE.with_borrow_mut(|trace| {
         *trace = Trace {
             active: true,
             detailed: std::env::var_os("M5_GATE_PROFILE").is_some(),
+            progress: Some(progress.clone()),
             ..Default::default()
         }
     });
+    progress
+}
+pub(super) fn mark_observer() {
+    TRACE.with_borrow_mut(|trace| trace.observer = true);
 }
 pub(super) fn take() -> Vec<Record> {
     TRACE.with_borrow_mut(|trace| {
@@ -336,7 +354,10 @@ fn span(class: Option<&'static str>, query: bool) -> Span {
     }
 }
 pub(super) fn job() -> Span {
-    TRACE.with_borrow_mut(|trace| trace.cache = Cache::default());
+    TRACE.with_borrow_mut(|trace| {
+        trace.cache = Cache::default();
+        trace.observer = false;
+    });
     label("other_unlabelled_job");
     span(None, false)
 }
@@ -361,8 +382,84 @@ fn stats(mut values: Vec<f64>) -> (usize, f64, f64, f64, f64) {
         values.iter().sum(),
     )
 }
+
+pub(super) const OBSERVER_CLASSES: [&str; 6] = [
+    "full_snapshot",
+    "feed_page",
+    "list_agents",
+    "mail_rare_filter",
+    "mail_states_held_uncertain",
+    "mail_states_queued_offered",
+];
+#[derive(Default)]
+pub(super) struct Progress {
+    counts: [std::sync::atomic::AtomicUsize; 6],
+}
+impl Progress {
+    pub(super) fn begin_window(&self) {
+        for count in &self.counts {
+            count.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    pub(super) fn enough(&self) -> bool {
+        self.counts
+            .iter()
+            .all(|n| n.load(std::sync::atomic::Ordering::Relaxed) >= 101)
+    }
+}
+#[derive(Clone, Copy, Default, serde::Serialize)]
+pub(super) struct Service {
+    pub count: usize,
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+    pub total_ms: f64,
+}
+fn observer_services(
+    records: &[Record],
+    start: Instant,
+    end: Instant,
+) -> BTreeMap<String, Service> {
+    let mut classes = OBSERVER_CLASSES
+        .into_iter()
+        .map(|name| (name.to_owned(), Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    for record in records
+        .iter()
+        .filter(|r| r.observer && !r.query && r.end > start && r.start < end)
+    {
+        classes
+            .entry(record.class.clone())
+            .or_default()
+            .push(ms(record.start, record.end));
+    }
+    classes
+        .into_iter()
+        .map(|(name, times)| {
+            let service = if times.is_empty() {
+                Service::default()
+            } else {
+                let (count, p50_ms, p99_ms, max_ms, total_ms) = stats(times);
+                Service {
+                    count,
+                    p50_ms,
+                    p99_ms,
+                    max_ms,
+                    total_ms,
+                }
+            };
+            (name, service)
+        })
+        .collect()
+}
 type Sample = (usize, Instant, Instant, Instant, f64, f64);
-pub(super) fn report(records: &[Record], samples: Vec<Sample>, total_p99: f64, queue_p99: f64) {
+pub(super) fn report(
+    lane: &str,
+    records: &[Record],
+    samples: Vec<Sample>,
+    total_p99: f64,
+    queue_p99: f64,
+) -> BTreeMap<String, Service> {
     let start = samples
         .iter()
         .map(|s| s.1)
@@ -373,6 +470,7 @@ pub(super) fn report(records: &[Record], samples: Vec<Sample>, total_p99: f64, q
         .map(|s| s.3)
         .max()
         .expect("bug: accept samples");
+    let services = observer_services(records, start, end);
     let elapsed = ms(start, end);
     let mut classes: BTreeMap<(&str, bool), Vec<f64>> = BTreeMap::new();
     let mut busy = Vec::new();
@@ -395,10 +493,11 @@ pub(super) fn report(records: &[Record], samples: Vec<Sample>, total_p99: f64, q
             .min()
             .expect("bug: trace origin");
         let raw = serde_json::json!({
-            "window_start_ms": ms(origin, start), "window_end_ms": ms(origin, end),
-            "records": records.iter().map(|r| serde_json::json!({"class":r.class,"query":r.query,"start_ms":ms(origin,r.start),"end_ms":ms(origin,r.end),"resource":r.resource,"cache":r.cache,"sql":r.sql})).collect::<Vec<_>>(),
+            "lane":lane,"observer_services":services,"window_start_ms": ms(origin, start), "window_end_ms": ms(origin, end),
+            "records": records.iter().map(|r| serde_json::json!({"class":r.class,"query":r.query,"observer":r.observer,"start_ms":ms(origin,r.start),"end_ms":ms(origin,r.end),"resource":r.resource,"cache":r.cache,"sql":r.sql})).collect::<Vec<_>>(),
             "accepts": samples.iter().map(|s| serde_json::json!({"id":s.0,"submitted_ms":ms(origin,s.1),"began_ms":ms(origin,s.2),"resumed_ms":ms(origin,s.3),"total_ms":s.4,"queue_ms":s.5})).collect::<Vec<_>>()
         });
+        let path = std::path::PathBuf::from(path).with_extension(format!("{lane}.json"));
         std::fs::write(path, serde_json::to_vec(&raw).expect("encode gate trace"))
             .expect("write gate trace");
     }
@@ -419,14 +518,14 @@ pub(super) fn report(records: &[Record], samples: Vec<Sample>, total_p99: f64, q
     ] {
         if !classes.contains_key(&(class, false)) {
             println!(
-                "GATE worker_class={class} detail=false count=0 p50_ms=NA p99_ms=NA max_ms=NA total_ms=0 busy_share_pct=0"
+                "GATE worker_class={class} lane={lane} detail=false count=0 p50_ms=NA p99_ms=NA max_ms=NA total_ms=0 busy_share_pct=0"
             );
         }
     }
     for ((class, query), values) in classes {
         let (n, p50, p99, max, total) = stats(values);
         println!(
-            "GATE worker_class={class} detail={query} count={n} p50_ms={p50:.6} p99_ms={p99:.6} max_ms={max:.6} total_ms={total:.6} busy_share_pct={:.3}",
+            "GATE worker_class={class} lane={lane} detail={query} count={n} p50_ms={p50:.6} p99_ms={p99:.6} max_ms={max:.6} total_ms={total:.6} busy_share_pct={:.3}",
             total / elapsed * 100.0
         );
     }
@@ -468,11 +567,11 @@ pub(super) fn report(records: &[Record], samples: Vec<Sample>, total_p99: f64, q
     if !gaps.is_empty() {
         let (n, p50, p99, max, total) = stats(gaps);
         println!(
-            "GATE worker_between_jobs count={n} p50_ms={p50:.6} p99_ms={p99:.6} max_ms={max:.6} total_ms={total:.6}"
+            "GATE worker_between_jobs lane={lane} count={n} p50_ms={p50:.6} p99_ms={p99:.6} max_ms={max:.6} total_ms={total:.6}"
         );
     }
     println!(
-        "GATE worker_window_ms={elapsed:.6} busy_ms={busy_ms:.6} busy_share_pct={:.3} closed_loop_accepts=true max_sampled_accepts_in_flight=1",
+        "GATE lane={lane} worker_window_ms={elapsed:.6} busy_ms={busy_ms:.6} busy_share_pct={:.3} closed_loop_accepts=true max_sampled_accepts_in_flight=1",
         busy_ms / elapsed * 100.0
     );
     for (id, submitted, began, _, total, queue) in samples
@@ -503,4 +602,40 @@ pub(super) fn report(records: &[Record], samples: Vec<Sample>, total_p99: f64, q
         );
     }
     println!("GATE implicit_wal_checkpoint=inside_SQLite_commit_not_separately_observable");
+    for (class, service) in &services {
+        println!(
+            "GATE observer_service lane={lane} class={class} count={} p50_ms={:.6} p99_ms={:.6} max_ms={:.6} total_ms={:.6}",
+            service.count, service.p50_ms, service.p99_ms, service.max_ms, service.total_ms
+        );
+    }
+    services
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn service_time_keeps_whole_observer_job_at_window_boundary() {
+        let start = Instant::now();
+        let record = Record {
+            class: "full_snapshot".into(),
+            start,
+            end: start + std::time::Duration::from_millis(30),
+            query: false,
+            observer: true,
+            resource: Resource::default(),
+            cache: Cache::default(),
+            sql: None,
+        };
+        let services = observer_services(
+            &[record],
+            start + std::time::Duration::from_millis(10),
+            start + std::time::Duration::from_millis(20),
+        );
+        assert_eq!(services["full_snapshot"].count, 1);
+        assert!(
+            (services["full_snapshot"].p99_ms - 30.0).abs() < 0.000001,
+            "observer service was clipped to sample window"
+        );
+    }
 }

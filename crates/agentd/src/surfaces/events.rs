@@ -150,7 +150,7 @@ async fn send(sink: &mut impl Sink, value: Value) -> Result<()> {
 }
 
 pub(crate) async fn mail_response(
-    room: &crate::mailroom::Mailroom,
+    room: &Mailroom,
     query: crate::mailroom::MailQuery,
     control_path: PathBuf,
 ) -> Result<Vec<u8>> {
@@ -758,7 +758,10 @@ mod tests {
                 });
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 task.abort();
-                assert!(task.await.err().expect("cancelled task").is_cancelled());
+                match task.await {
+                    Err(error) => assert!(error.is_cancelled()),
+                    Ok(_) => panic!("cancelled encoder unexpectedly completed"),
+                }
             }
             let snapshot_jobs = api.mailroom.jobs_run.load(Ordering::SeqCst) - before;
             let before = api.mailroom.jobs_run.load(Ordering::SeqCst);
@@ -774,7 +777,10 @@ mod tests {
                 });
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 task.abort();
-                assert!(task.await.err().expect("cancelled task").is_cancelled());
+                match task.await {
+                    Err(error) => assert!(error.is_cancelled()),
+                    Ok(_) => panic!("cancelled encoder unexpectedly completed"),
+                }
             }
             let mail_jobs = api.mailroom.jobs_run.load(Ordering::SeqCst) - before;
             release_tx.send(()).expect("release blocker");

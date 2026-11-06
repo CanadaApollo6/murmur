@@ -542,12 +542,44 @@ values containing control characters have no copyable command.
 
 The full-scale worker cost gate is an explicit test. It creates a 1M-message
 fixture with 64 KiB bodies in the newest 20,000 messages, a 200,000-message dormant
-backlog, and concurrent observers. It uses the production current-thread runtime,
-serializes snapshots, checks every generator result and per-class iteration
-count inside the sampled window, and requires a multi-thousand-row prune during
-its 2,048 loaded accepts. Run it on a quiet machine with an optimized
-build and enough disk space for the database and WAL.
+backlog, and concurrent observers on the production current-thread runtime.
+It checks every generator result, completed full snapshots from each reconnecting
+client inside the sampled window, retained replay, and a multi-thousand-row prune.
+Baseline and loaded accepts use the same worker tracing.
+
+The default v8 production rule requires loaded accept worker-queue p99 at or below
+20 ms and whole-job service p99 at or below 20 ms for every observer class,
+including full snapshots. Each class needs at least 100 service samples. Both
+snapshot medians, including serialization, must remain below 100 ms. Total accept
+p99, paired delta, and class maxima are printed but do not decide the result.
+
+The baseline has 2,048 accepts. The loaded window keeps the same closed-loop
+accepts and observer workload for at least 2,048 accepts, extending until all six
+recurring observer classes have enough samples. It waits for 101 completions per
+class to allow for window boundaries; the final check still requires at least
+100 whole jobs per class. A 120-second ceiling reports a shortfall as a failure.
+The classes are full snapshot, feed page, list_agents, rare-filter mail, and the
+held/uncertain and queued/offered mail views. Admissions that skip cancelled reads
+are not observer work; the one-time resume validation occurs during warmup.
+
+Run five fresh sequential attempts on the production filesystem, with an optimized
+build and enough disk space for the database and WAL. Retain every result and record
+host load; the gate does not retry a miss.
 
 ```bash
 cargo test --release -p agentd --lib m5_cost_gate -- --ignored --nocapture
 ```
+
+For RAM-disk diagnostics, build once with `--no-run`, then execute the printed
+test binary by absolute path from a private directory on the RAM disk:
+
+```bash
+# Run from a private directory under /dev/shm, using the binary printed by cargo.
+M5_GATE_RAM_DISK=1 /absolute/path/to/agentd-TEST_HASH m5_cost_gate --ignored --nocapture
+```
+
+`M5_GATE_RAM_DISK=1` reports class service times without asserting their 20 ms
+limit. Queue p99, sample floors, snapshots, replay, pruning and workload checks
+remain strict. The marker does not move the fixture: it uses the current working
+directory. Unset means strict production mode; other marker values are errors.
+Allocator-related service tails on RAM disk remain a named follow-up.
