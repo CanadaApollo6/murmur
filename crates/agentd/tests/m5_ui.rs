@@ -454,11 +454,20 @@ async fn copied_commands_reach_real_actor_and_large_approvals() {
             "key={key}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let wire = std::fs::read_to_string(d.root.path().join("wire.jsonl")).expect("wire");
-        let exact = wire
-            .lines()
-            .map(|l| serde_json::from_str::<Value>(l).expect("wire JSON"))
-            .any(|v| v["result"]["outcome"]["optionId"] == key);
+        // The fake agent appends to the log while this reads it, so only whole lines count.
+        let mut exact = false;
+        for _ in 0..1000 {
+            let wire = std::fs::read_to_string(d.root.path().join("wire.jsonl")).expect("wire");
+            let complete = wire.rfind('\n').map_or("", |end| &wire[..end]);
+            exact = complete
+                .lines()
+                .map(|l| serde_json::from_str::<Value>(l).expect("wire JSON"))
+                .any(|v| v["result"]["outcome"]["optionId"] == key);
+            if exact {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(exact, "actor received exact key {key}");
         assert!(!d.root.path().join("INJECTION").exists());
         assert!(command(&d.socket(), "approve", &["id", "line\nkey"]).is_none());
