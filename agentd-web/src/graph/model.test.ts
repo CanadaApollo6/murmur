@@ -9,7 +9,15 @@ function agent(
   phase: AgentRow["phase"],
   name = `@${id}`,
 ): AgentRow {
-  return { id, name, kind: "claude", isolation: "none", phase, error: null };
+  return {
+    id,
+    name,
+    kind: "claude",
+    isolation: "none",
+    phase,
+    incarnation: 1,
+    error: null,
+  };
 }
 
 function stateWith(room: SimMailroom, agents: AgentRow[]) {

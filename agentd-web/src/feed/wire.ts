@@ -25,8 +25,16 @@ function isString(value: unknown): value is string {
   return typeof value === "string";
 }
 
-function isNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
+function isInteger(value: unknown): value is number {
+  return Number.isInteger(value);
+}
+
+function isCount(value: unknown): boolean {
+  return isInteger(value) && value >= 0;
+}
+
+function isBoolean(value: unknown): value is boolean {
+  return typeof value === "boolean";
 }
 
 function isStringOrNull(value: unknown): boolean {
@@ -53,11 +61,11 @@ function isCommands(value: unknown): boolean {
 export function isMailRow(value: unknown): value is MailRow {
   return (
     isFields(value) &&
-    isNumber(value.msg_seq) &&
+    isInteger(value.msg_seq) &&
     isString(value.id) &&
     isString(value.from) &&
     isString(value.to) &&
-    isNumber(value.hop) &&
+    isCount(value.hop) &&
     isString(value.act) &&
     isState(value.state) &&
     isStringOrNull(value.reason) &&
@@ -73,6 +81,7 @@ function isAgent(value: unknown): boolean {
     isString(value.kind) &&
     isString(value.isolation) &&
     isString(value.phase) &&
+    (value.incarnation === null || isCount(value.incarnation)) &&
     isStringOrNull(value.error)
   );
 }
@@ -95,7 +104,8 @@ function isPermission(value: unknown): boolean {
     isString(value.tool) &&
     isString(value.title) &&
     isString(value.detail) &&
-    isArrayOf(value.options, isOption)
+    isArrayOf(value.options, isOption) &&
+    isBoolean(value.options_truncated)
   );
 }
 
@@ -104,14 +114,14 @@ function isEdge(value: unknown): boolean {
     isFields(value) &&
     isString(value.from) &&
     isString(value.to) &&
-    DELIVERY_STATES.every((state) => isNumber(value[state]))
+    DELIVERY_STATES.every((state) => isCount(value[state]))
   );
 }
 
 function isAnchor(value: unknown): boolean {
   return (
     value === null ||
-    (isFields(value) && isNumber(value.seq) && isString(value.nonce))
+    (isFields(value) && isInteger(value.seq) && isString(value.nonce))
   );
 }
 
@@ -120,20 +130,25 @@ function isFullMail(value: unknown): boolean {
     isFields(value) &&
     isAnchor(value.anchor) &&
     isArrayOf(value.edges, isEdge) &&
+    isBoolean(value.edges_truncated) &&
     isArrayOf(value.stuck, isMailRow) &&
-    isArrayOf(value.moving, isMailRow)
+    isBoolean(value.stuck_truncated) &&
+    isArrayOf(value.moving, isMailRow) &&
+    isBoolean(value.moving_truncated)
   );
 }
 
 const SHAPES: Record<Frame["event"], (frame: Fields) => boolean> = {
   snapshot: (frame) =>
-    isNumber(frame.mail_cursor) &&
+    isInteger(frame.mail_cursor) &&
     isArrayOf(frame.agents, isAgent) &&
+    isBoolean(frame.agents_truncated) &&
     isArrayOf(frame.approvals, isPermission) &&
+    isBoolean(frame.approvals_truncated) &&
     (frame.mail === null || isFullMail(frame.mail)),
   mail: (frame) =>
     isMailRow(frame) &&
-    isNumber(frame.seq) &&
+    isInteger(frame.seq) &&
     isString(frame.nonce) &&
     (frame.prev_state === null || isState(frame.prev_state)),
   agent: isAgent,
@@ -141,7 +156,7 @@ const SHAPES: Record<Frame["event"], (frame: Fields) => boolean> = {
   permission_answered: (frame) => isString(frame.id),
   turn_ended: (frame) => isString(frame.agent) && isString(frame.outcome),
   egress_denied: (frame) =>
-    isString(frame.agent) && isString(frame.host) && isNumber(frame.port),
+    isString(frame.agent) && isString(frame.host) && isCount(frame.port),
   activity: (frame) => isString(frame.agent) && isString(frame.text),
 };
 

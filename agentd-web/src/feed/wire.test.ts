@@ -12,6 +12,7 @@ const agent = {
   kind: "claude",
   isolation: "none",
   phase: "idle",
+  incarnation: 1,
   error: null,
 };
 
@@ -25,6 +26,127 @@ const request = {
   options: [{ key: "yes", label: "Allow", effect: "AllowOnce", command: null }],
   options_truncated: false,
 };
+
+const fullMail = {
+  anchor: null,
+  edges: [
+    {
+      from: "human",
+      to: "agent:A",
+      queued: 0,
+      offered: 0,
+      consumed: 0,
+      uncertain: 0,
+      held: 0,
+      dead: 0,
+    },
+  ],
+  edges_truncated: false,
+  stuck: [],
+  stuck_truncated: false,
+  moving: [],
+  moving_truncated: false,
+};
+const snapshot = {
+  event: "snapshot",
+  mail_cursor: 0,
+  agents: [agent],
+  agents_truncated: false,
+  approvals: [request],
+  approvals_truncated: false,
+  mail: fullMail,
+};
+const row = {
+  msg_seq: 1,
+  id: "m",
+  from: "human",
+  to: "agent:A",
+  hop: 0,
+  act: "request",
+  state: "queued",
+  reason: null,
+};
+const mail = {
+  ...row,
+  event: "mail",
+  seq: 1,
+  nonce: "n",
+  prev_state: null,
+};
+
+describe("the types of numbers and flags", () => {
+  it("accepts the frames these are built from", () => {
+    for (const frame of [snapshot, mail, { event: "agent", ...agent }]) {
+      expect(parse(frame).kind).toBe("frame");
+    }
+    expect(
+      parse({
+        ...snapshot,
+        mail: { ...fullMail, anchor: { seq: 0, nonce: "n" } },
+      }).kind,
+    ).toBe("frame");
+  });
+
+  it.each([
+    ["a seq at the top of i64", { ...mail, seq: 9223372036854775807 }],
+    [
+      "a cursor at the top of i64",
+      { ...snapshot, mail_cursor: 9223372036854775807 },
+    ],
+    [
+      "an incarnation at the top of u64",
+      { event: "agent", ...agent, incarnation: 18446744073709551615 },
+    ],
+    ["an agent with no actor", { event: "agent", ...agent, incarnation: null }],
+    ["a resume's snapshot", { ...snapshot, mail: null }],
+  ])("accepts %s, which the server can send", (_name, frame) => {
+    expect(parse(frame).kind).toBe("frame");
+  });
+
+  const withEdge = (change: Record<string, unknown>) => ({
+    ...snapshot,
+    mail: { ...fullMail, edges: [{ ...fullMail.edges[0], ...change }] },
+  });
+  const withMail = (change: Record<string, unknown>) => ({
+    ...snapshot,
+    mail: { ...fullMail, ...change },
+  });
+  it.each([
+    ["agents_truncated", { ...snapshot, agents_truncated: "false" }],
+    ["agents_truncated missing", { ...snapshot, agents_truncated: undefined }],
+    ["approvals_truncated", { ...snapshot, approvals_truncated: 1 }],
+    ["edges_truncated", withMail({ edges_truncated: "true" })],
+    ["stuck_truncated", withMail({ stuck_truncated: 0 })],
+    ["moving_truncated", withMail({ moving_truncated: null })],
+    [
+      "options_truncated",
+      {
+        event: "permission_pending",
+        request: { ...request, options_truncated: "no" },
+      },
+    ],
+    ["a fractional cursor", { ...snapshot, mail_cursor: 1.5 }],
+    ["a string cursor", { ...snapshot, mail_cursor: "1" }],
+    ["a fractional anchor", withMail({ anchor: { seq: 1.5, nonce: "n" } })],
+    ["a fractional seq", { ...mail, seq: 1.5 }],
+    ["a fractional msg_seq", { ...mail, msg_seq: 1.5 }],
+    ["a fractional count", withEdge({ queued: 0.5 })],
+    ["a negative count", withEdge({ held: -1 })],
+    ["a fractional hop", { ...mail, hop: 0.5 }],
+    [
+      "a fractional port",
+      { event: "egress_denied", agent: "a", host: "h", port: 1.5 },
+    ],
+    [
+      "a fractional incarnation",
+      { event: "agent", ...agent, incarnation: 1.5 },
+    ],
+    ["a string incarnation", { event: "agent", ...agent, incarnation: "1" }],
+    ["no incarnation", { event: "agent", ...agent, incarnation: undefined }],
+  ])("rejects %s", (_name, frame) => {
+    expect(parse(frame).kind).toBe("invalid");
+  });
+});
 
 describe("parseFrame", () => {
   it("accepts every frame the server sends", () => {

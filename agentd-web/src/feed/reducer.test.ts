@@ -12,6 +12,7 @@ import {
   planFetches,
   reduce,
 } from "./reducer";
+import { buildGraph } from "../graph/model";
 import { SimMailroom } from "./simulator";
 import type {
   AgentRow,
@@ -460,6 +461,7 @@ describe("pruning on a snapshot", () => {
     kind: "claude",
     isolation: "none",
     phase: "idle" as const,
+    incarnation: 1,
     error: null,
   });
 
@@ -533,49 +535,202 @@ describe("pruning on a snapshot", () => {
   });
 });
 
-describe("a respawn under the same id", () => {
-  const row = (phase: AgentRow["phase"]): Frame => ({
-    event: "agent",
+describe("a replacement under the same id", () => {
+  const row = (
+    phase: AgentRow["phase"],
+    incarnation: number | null = 1,
+  ): AgentRow => ({
     id: A,
     name: "@a",
     kind: "claude",
     isolation: "none",
     phase,
+    incarnation,
     error: null,
   });
-  const lived = (room: SimMailroom, phase: AgentRow["phase"]) =>
+  const frame = (
+    phase: AgentRow["phase"],
+    incarnation?: number | null,
+  ): Frame => ({
+    event: "agent",
+    ...row(phase, incarnation),
+  });
+  const lived = (room: SimMailroom, phase: AgentRow["phase"] = "idle") =>
     apply(
       fresh(room),
-      row(phase),
+      frame(phase),
       { event: "activity", agent: A, text: "old life" },
       { event: "turn_ended", agent: A, outcome: "failed" },
+      { event: "egress_denied", agent: A, host: "example.com", port: 443 },
     );
-
-  it("does not show the previous life's outcome", () => {
-    const next = apply(lived(new SimMailroom(), "failed"), row("starting"));
-    expect(next.turns[A]).toBeUndefined();
-    expect(next.activity[A]).toBeUndefined();
-  });
-
-  it("is noticed when only a snapshot says so", () => {
-    const room = new SimMailroom();
-    const { event: _event, ...agent } = row("idle") as AgentRow & {
-      event: "agent";
-    };
-    const next = apply(lived(room, "crashed"), {
-      ...room.nullSnapshot(0),
-      agents: [agent],
-    });
-    expect(next.turns[A]).toBeUndefined();
-  });
-
-  it("keeps state through the ordinary phases of one life", () => {
-    let state = lived(new SimMailroom(), "busy");
-    state = apply(state, row("idle"), row("busy"), row("dormant"));
-    expect(state.turns[A]).toBe("failed");
+  const expectForgotten = (state: ClientState) => {
+    expect(state.activity[A]).toBeUndefined();
+    expect(state.turns[A]).toBeUndefined();
+    expect(state.egress[A]).toBeUndefined();
+  };
+  const expectKept = (state: ClientState) => {
     expect(state.activity[A]).toBe("old life");
-    // An ending keeps what the operator needs to see about why.
-    expect(apply(state, row("failed")).turns[A]).toBe("failed");
+    expect(state.turns[A]).toBe("failed");
+    expect(state.egress[A]).toHaveLength(1);
+  };
+
+  it("is noticed from an agent frame", () => {
+    expectForgotten(apply(lived(new SimMailroom()), frame("starting", 2)));
+  });
+
+  it("is noticed across a reconnect with nothing but idle on either side", () => {
+    const room = new SimMailroom();
+    let state = reduce(lived(room), { type: "disconnected" });
+    state = reduce(state, { type: "socket_open" });
+    state = apply(state, {
+      ...room.nullSnapshot(state.cursor!),
+      agents: [row("idle", 2)],
+    });
+    expectForgotten(state);
+    expect(state.agents[A]!.incarnation).toBe(2);
+  });
+
+  it("is noticed from a reconnect's full snapshot", () => {
+    const room = new SimMailroom();
+    let state = reduce(lived(room), { type: "disconnected" });
+    state = reduce(state, { type: "socket_open" });
+    state = apply(state, { ...room.snapshot(), agents: [row("idle", 2)] });
+    expectForgotten(state);
+  });
+
+  it("is noticed from a lag's snapshot, on a socket that stayed up", () => {
+    const room = new SimMailroom();
+    const state = lived(room);
+    expect(state.link).toBe("live");
+    expectForgotten(
+      apply(state, {
+        ...room.nullSnapshot(state.cursor!),
+        agents: [row("idle", 2)],
+      }),
+    );
+  });
+
+  it("keeps state through every phase of one life", () => {
+    const room = new SimMailroom();
+    let state = lived(room);
+    state = apply(state, frame("busy"), frame("failed"), frame("idle"));
+    expectKept(state);
+    state = apply(state, {
+      ...room.nullSnapshot(state.cursor!),
+      agents: [row("idle")],
+    });
+    expectKept(state);
+  });
+
+  it("remembers the last life through a row with no actor", () => {
+    const room = new SimMailroom();
+    let state = lived(room);
+    state = apply(state, {
+      ...room.nullSnapshot(state.cursor!),
+      agents: [row("ended", null)],
+    });
+    expectKept(state);
+    expect(state.agents[A]!.incarnation).toBe(1);
+    expectKept(apply(state, frame("idle", 1)));
+    expectForgotten(apply(state, frame("idle", 2)));
+  });
+
+  it("does not treat the first life it hears of as a replacement", () => {
+    const room = new SimMailroom();
+    const state = apply(
+      fresh(room),
+      { event: "activity", agent: A, text: "old life" },
+      { event: "turn_ended", agent: A, outcome: "failed" },
+      { event: "egress_denied", agent: A, host: "example.com", port: 443 },
+    );
+    const unknown = apply(state, {
+      ...room.nullSnapshot(state.cursor!),
+      agents: [row("ended", null)],
+    });
+    expectKept(unknown);
+    expectKept(apply(unknown, frame("idle", 4)));
+  });
+});
+
+describe("ids that name something on a prototype", () => {
+  const row = (id: string): AgentRow => ({
+    id,
+    name: "@x",
+    kind: "claude",
+    isolation: "none",
+    phase: "idle",
+    incarnation: 1,
+    error: null,
+  });
+  const request = (id: string, agent: string) => ({
+    id,
+    agent,
+    incarnation: 1,
+    tool: "t",
+    title: "t",
+    detail: "",
+    options: [],
+    options_truncated: false,
+  });
+
+  it.each(["__proto__", "constructor", "toString", "hasOwnProperty"])(
+    "%s is an id like any other",
+    (id) => {
+      const room = new SimMailroom();
+      let state = apply(
+        fresh(room),
+        { ...room.nullSnapshot(0), agents: [row(id)] },
+        { event: "agent", ...row(id), phase: "busy" },
+        { event: "activity", agent: id, text: "one" },
+        { event: "activity", agent: id, text: "two" },
+        { event: "turn_ended", agent: id, outcome: "completed" },
+        { event: "egress_denied", agent: id, host: "example.com", port: 443 },
+        { event: "permission_pending", request: request(id, id) },
+      );
+      expect(Object.keys(state.agents)).toEqual([id]);
+      expect(state.agents[id]!.phase).toBe("busy");
+      expect(state.activity[id]).toBe("onetwo");
+      expect(state.turns[id]).toBe("completed");
+      expect(state.egress[id]).toHaveLength(1);
+      expect(Object.keys(state.approvals)).toEqual([id]);
+      expect(buildGraph(state).nodes.map((node) => node.id)).toContain(id);
+      // It survives the next batch's copy and a snapshot's pruning.
+      state = apply(state, {
+        ...room.nullSnapshot(0),
+        agents: [row(id)],
+        approvals: [request(id, id)],
+      });
+      expect(state.activity[id]).toBe("onetwo");
+      expect(Object.keys(state.approvals)).toEqual([id]);
+      state = apply(state, { event: "permission_answered", agent: id, id });
+      expect(Object.keys(state.approvals)).toEqual([]);
+    },
+  );
+
+  it("reads nothing from a prototype for an id it has not seen", () => {
+    const state = fresh(new SimMailroom());
+    for (const id of ["__proto__", "constructor", "toString"]) {
+      expect(state.agents[id]).toBeUndefined();
+      expect(state.activity[id]).toBeUndefined();
+      expect(state.turns[id]).toBeUndefined();
+      expect(state.egress[id]).toBeUndefined();
+      expect(state.approvals[id]).toBeUndefined();
+    }
+  });
+});
+
+describe("the full snapshot count", () => {
+  it("moves on a full snapshot even when no edge's revision can", () => {
+    const room = new SimMailroom();
+    const state = fresh(room);
+    const before = state.fullSnapshots;
+    expect(state.edgeRevision).toEqual({});
+    const next = apply(state, room.snapshot());
+    expect(next.edgeRevision).toEqual({});
+    expect(next.fullSnapshots).toBe(before + 1);
+    expect(apply(next, room.nullSnapshot(next.cursor!)).fullSnapshots).toBe(
+      before + 1,
+    );
   });
 });
 
@@ -944,6 +1099,7 @@ describe("volatile frames", () => {
     kind: "claude",
     isolation: "none",
     phase: "idle" as const,
+    incarnation: 1,
     error: null,
   };
   const request = {

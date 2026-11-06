@@ -19,7 +19,6 @@ import type {
   MailFrame,
   MailRow,
   PermissionRequest,
-  Phase,
   SnapshotFrame,
 } from "./types";
 
@@ -91,6 +90,11 @@ export interface ClientState {
    */
   edgeRevision: Record<string, number>;
   /**
+   * Counts the full mail snapshots applied. It says the mail state was replaced
+   * even when an edge's revision reads the same before and after.
+   */
+  fullSnapshots: number;
+  /**
    * A frame did not follow the cursor, so mail state can no longer be trusted. Only
    * a full snapshot clears this, and no anchor is echoed until then.
    */
@@ -121,25 +125,39 @@ function emptyList(): MailList {
   };
 }
 
+/**
+ * For records keyed by an id from the wire, where `__proto__` and `constructor`
+ * have to be ids like any other. Edge records do not need this: an edge key
+ * contains a newline, so it cannot name anything on a prototype.
+ */
+function idRecord<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
+function copyIds<T>(record: Record<string, T>): Record<string, T> {
+  return Object.assign(idRecord<T>(), record);
+}
+
 export function initialState(): ClientState {
   return {
     link: "connecting",
     hasMail: false,
     cursor: null,
     anchor: null,
-    agents: {},
+    agents: idRecord(),
     agentsTruncated: false,
-    approvals: {},
+    approvals: idRecord(),
     approvalsTruncated: false,
     edges: {},
     edgesTruncated: false,
     stuck: emptyList(),
     moving: emptyList(),
-    activity: {},
-    turns: {},
-    egress: {},
+    activity: idRecord(),
+    turns: idRecord(),
+    egress: idRecord(),
     edgeTouched: {},
     edgeRevision: {},
+    fullSnapshots: 0,
     resyncNeeded: false,
     nextRequestId: 1,
     lastFrameAt: null,
@@ -189,6 +207,7 @@ function applyFullMail(
   draft.edgesTruncated = mail.edges_truncated;
   draft.edgeTouched = {};
   draft.edgeRevision = {};
+  draft.fullSnapshots += 1;
   draft.resyncNeeded = false;
   draft.stuck = listFromSnapshot(draft.stuck, mail.stuck, mail.stuck_truncated);
   draft.moving = listFromSnapshot(
@@ -202,7 +221,7 @@ function pickKeys<T>(
   record: Record<string, T>,
   keep: (key: string) => boolean,
 ): Record<string, T> {
-  const kept: Record<string, T> = {};
+  const kept = idRecord<T>();
   for (const [key, value] of Object.entries(record)) {
     if (keep(key)) {
       kept[key] = value;
@@ -211,19 +230,17 @@ function pickKeys<T>(
   return kept;
 }
 
-/** A respawn keeps the agent's id, so only the phase can say a new life began. */
-const LIFE_OVER: ReadonlySet<Phase> = new Set<Phase>([
-  "ended",
-  "crashed",
-  "failed",
-  "needs-recovery",
-]);
-
+/**
+ * A replacement keeps the agent's id, and the page may have seen none of its phases.
+ * Null says only that no actor is running, so it does not end a life, and the first
+ * value seen has no earlier life to end.
+ */
 function isNewLife(previous: AgentRow | undefined, next: AgentRow): boolean {
   return (
     previous !== undefined &&
-    LIFE_OVER.has(previous.phase) &&
-    !LIFE_OVER.has(next.phase)
+    previous.incarnation !== null &&
+    next.incarnation !== null &&
+    previous.incarnation !== next.incarnation
   );
 }
 
@@ -255,15 +272,20 @@ function pruneVolatile(draft: ClientState) {
 function applySnapshot(draft: ClientState, frame: SnapshotFrame) {
   draft.link = "live";
   const previous = draft.agents;
-  draft.agents = {};
+  draft.agents = idRecord();
   for (const agent of frame.agents) {
-    if (isNewLife(previous[agent.id], agent)) {
+    const before = previous[agent.id];
+    if (isNewLife(before, agent)) {
       forgetLife(draft, agent.id);
     }
-    draft.agents[agent.id] = agent;
+    // The last life stays known through a null, so the next one is still new.
+    draft.agents[agent.id] = {
+      ...agent,
+      incarnation: agent.incarnation ?? before?.incarnation ?? null,
+    };
   }
   draft.agentsTruncated = frame.agents_truncated;
-  draft.approvals = {};
+  draft.approvals = idRecord();
   for (const request of frame.approvals) {
     draft.approvals[request.id] = request;
   }
@@ -396,6 +418,7 @@ function applyAgent(draft: ClientState, frame: AgentRow) {
     kind: frame.kind || previous?.kind || "",
     isolation: frame.isolation,
     phase: frame.phase,
+    incarnation: frame.incarnation ?? previous?.incarnation ?? null,
     error: frame.error,
   };
 }
@@ -419,14 +442,14 @@ function applyFrames(
   // copies are private to this call, so the reducer stays pure.
   const draft: ClientState = {
     ...state,
-    agents: { ...state.agents },
-    approvals: { ...state.approvals },
+    agents: copyIds(state.agents),
+    approvals: copyIds(state.approvals),
     edges: { ...state.edges },
     stuck: { ...state.stuck, rows: [...state.stuck.rows] },
     moving: { ...state.moving, rows: [...state.moving.rows] },
-    activity: { ...state.activity },
-    turns: { ...state.turns },
-    egress: { ...state.egress },
+    activity: copyIds(state.activity),
+    turns: copyIds(state.turns),
+    egress: copyIds(state.egress),
     edgeTouched: { ...state.edgeTouched },
     edgeRevision: { ...state.edgeRevision },
     lastFrameAt: now,

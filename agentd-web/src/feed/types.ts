@@ -72,6 +72,8 @@ export interface AgentRow {
   kind: string;
   isolation: string;
   phase: Phase;
+  /** Which life of this id. Null when a snapshot lists an agent with no actor. */
+  incarnation: number | null;
   error: string | null;
 }
 
