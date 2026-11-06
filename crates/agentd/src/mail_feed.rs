@@ -1750,6 +1750,51 @@ mod query_work_tests {
         query_result(rows, next)
     }
     #[test]
+    fn single_state_repeated_sequence_keeps_legacy_multiplicity() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut s = Store::open(&dir.path().join("mail.db"), Config::default()).expect("store");
+        let to = AgentId::new();
+        s.db.execute(
+            "INSERT INTO agents(id,name) VALUES (?,'ties')",
+            [json(&to).expect("id")],
+        )
+        .expect("agent");
+        for n in 0..3 {
+            s.accept(NewMessage {
+                from: Sender::Human,
+                to,
+                body: Body::new("body").expect("body"),
+                reply_to: None,
+                client_key: ClientKey(format!("tie-{n}")),
+                act: Act::Inform,
+                task: None,
+            })
+            .expect("accept");
+        }
+        s.db.execute("UPDATE deliveries SET state='held',reason='fixture'", [])
+            .expect("held");
+        s.db.execute("UPDATE deliveries SET msg_seq=3 WHERE msg_seq=2", [])
+            .expect("within-state tie");
+        let filter = MailQuery {
+            states: vec!["held".into()],
+            limit: 10,
+            ..Default::default()
+        };
+        let actual = query(&s.db, &filter).expect("page");
+        let sequences = actual["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| r["msg_seq"].as_i64().expect("seq"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sequences,
+            vec![3, 3, 1],
+            "single-state duplicate was discarded"
+        );
+        assert_eq!(actual, legacy_page(&s.db, filter.states, None, 10));
+    }
+    #[test]
     fn unfiltered_pages_preserve_results_with_less_sql_work() {
         let dir = tempfile::tempdir().expect("query dir");
         let mut s =
