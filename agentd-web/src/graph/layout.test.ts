@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   StableLayout,
+  LAYOUT_LINK_LIMIT,
   edgeGeometry,
   fitView,
   keepOrFit,
+  linksForLayout,
   zoomAround,
 } from "./layout";
 
@@ -14,6 +16,71 @@ function ids(n: number): string[] {
 function positions(layout: StableLayout, list: string[]) {
   return new Map(list.map((id) => [id, { ...layout.get(id)! }]));
 }
+
+describe("linksForLayout", () => {
+  const all = new Set(["a", "b", "c", "d"]);
+
+  it("leaves out links between two pinned nodes, and self-links", () => {
+    const links = [
+      { source: "a", target: "b" },
+      { source: "a", target: "c" },
+      { source: "c", target: "c" },
+      { source: "a", target: "gone" },
+    ];
+    expect(linksForLayout(links, all, new Set(["c"]), 100)).toEqual([
+      { source: "a", target: "c" },
+    ]);
+  });
+
+  it("stops at the limit, keeping the earliest", () => {
+    const links = [
+      { source: "a", target: "b" },
+      { source: "c", target: "d" },
+      { source: "a", target: "c" },
+    ];
+    expect(linksForLayout(links, all, all, 2)).toEqual(links.slice(0, 2));
+  });
+});
+
+function dense(list: readonly string[], count: number) {
+  const links = [];
+  for (let i = 0; links.length < count; i += 1) {
+    links.push({
+      source: list[i % list.length]!,
+      target: list[(i + 1 + (i % 7)) % list.length]!,
+    });
+  }
+  return links;
+}
+
+describe("StableLayout at a dense edge count", () => {
+  it("does not move a pinned node when a node arrives", () => {
+    const list = ids(60);
+    const layout = new StableLayout();
+    layout.update(list, dense(list, 20_000));
+    const before = positions(layout, list);
+    const grown = [...list, "agent:new"];
+    layout.update(grown, dense(grown, 20_000));
+    expect(positions(layout, list)).toEqual(before);
+    expect(layout.get("agent:new")).toBeDefined();
+  });
+
+  it("ignores links past the limit", () => {
+    const list = ids(30);
+    const links = dense(list, LAYOUT_LINK_LIMIT);
+    const capped = new StableLayout();
+    capped.update(list, links);
+    const beyond = new StableLayout();
+    beyond.update(list, [
+      ...links,
+      ...Array.from({ length: 500 }, () => ({
+        source: list[0]!,
+        target: list[1]!,
+      })),
+    ]);
+    expect(positions(beyond, list)).toEqual(positions(capped, list));
+  });
+});
 
 describe("StableLayout", () => {
   it("is deterministic for the same input", () => {

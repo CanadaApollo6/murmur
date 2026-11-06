@@ -257,7 +257,12 @@ export function Graph({
   // Runs only when the set of nodes changes. Traffic, phases and new edges
   // between known nodes never reach the layout.
   const points = useMemo(() => {
-    const links = edges.map((edge) => ({ source: edge.from, target: edge.to }));
+    // The edges that matter first, with no selection: where a node lands must not
+    // depend on what the operator has selected.
+    const links = edgesToDraw(edges, EDGE_DRAW_LIMIT, null).map((edge) => ({
+      source: edge.from,
+      target: edge.to,
+    }));
     layout.current.update(
       nodes.map((n) => n.id),
       links,

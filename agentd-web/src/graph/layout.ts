@@ -45,6 +45,39 @@ function seededRandom(seed: number): () => number {
   };
 }
 
+/** Enough to shape the graph. Past this, each link only adds to a spawn's cost. */
+export const LAYOUT_LINK_LIMIT = 2000;
+
+/**
+ * The links a layout simulates. A link between two pinned nodes moves nothing, so
+ * it is left out, and the rest stop at `limit`. Earlier links win, so a caller
+ * orders them by importance. The result is what makes a spawn cheap at a dense
+ * edge count: the simulation's cost is ticks times links.
+ */
+export function linksForLayout(
+  links: readonly LayoutLink[],
+  wanted: ReadonlySet<string>,
+  fresh: ReadonlySet<string>,
+  limit: number,
+): LayoutLink[] {
+  const kept: LayoutLink[] = [];
+  for (const link of links) {
+    if (kept.length >= limit) {
+      break;
+    }
+    const { source, target } = link;
+    if (
+      source !== target &&
+      wanted.has(source) &&
+      wanted.has(target) &&
+      (fresh.has(source) || fresh.has(target))
+    ) {
+      kept.push(link);
+    }
+  }
+  return kept;
+}
+
 export class StableLayout {
   private positions = new Map<string, Point>();
 
@@ -70,12 +103,24 @@ export class StableLayout {
       return;
     }
     const known = new Map(this.positions);
+    const used = linksForLayout(
+      links,
+      wanted,
+      new Set(fresh),
+      LAYOUT_LINK_LIMIT,
+    );
     const neighbours = new Map<string, string[]>();
-    for (const { source, target } of links) {
-      if (wanted.has(source) && wanted.has(target) && source !== target) {
-        neighbours.set(source, [...(neighbours.get(source) ?? []), target]);
-        neighbours.set(target, [...(neighbours.get(target) ?? []), source]);
+    const addNeighbour = (id: string, other: string) => {
+      const list = neighbours.get(id);
+      if (list) {
+        list.push(other);
+      } else {
+        neighbours.set(id, [other]);
       }
+    };
+    for (const { source, target } of used) {
+      addNeighbour(source, target);
+      addNeighbour(target, source);
     }
     const spread = 40 * Math.sqrt(ids.length) + 60;
     const nodes: SimNode[] = ids.map((id) => {
@@ -101,12 +146,9 @@ export class StableLayout {
         y: (anchor?.y ?? 0) + Math.sin(angle) * distance,
       };
     });
-    const simLinks: SimulationLinkDatum<SimNode>[] = links
-      .filter(
-        ({ source, target }) =>
-          source !== target && wanted.has(source) && wanted.has(target),
-      )
-      .map(({ source, target }) => ({ source, target }));
+    const simLinks: SimulationLinkDatum<SimNode>[] = used.map(
+      ({ source, target }) => ({ source, target }),
+    );
     const simulation = forceSimulation<SimNode>(nodes)
       .randomSource(seededRandom(ids.length))
       .force("charge", forceManyBody().strength(-340).distanceMax(900))
