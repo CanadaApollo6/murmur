@@ -1,0 +1,396 @@
+.graph {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg);
+  transition: opacity 0.2s;
+}
+
+.stale {
+  opacity: 0.55;
+}
+
+.canvas {
+  display: block;
+  position: absolute;
+  inset: 0;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.canvas:active {
+  cursor: grabbing;
+}
+
+/* ── Nodes ── */
+
+.node {
+  cursor: pointer;
+  outline: none;
+}
+
+.node:focus-visible .ring,
+.node:focus-visible .shape {
+  stroke: var(--text);
+  stroke-width: 3;
+}
+
+.shape {
+  fill: var(--bg-surface);
+  stroke: var(--text-dim);
+  stroke-width: 2;
+}
+
+.halo {
+  fill: none;
+  stroke: var(--accent-red);
+  stroke-width: 4;
+  opacity: 0.45;
+}
+
+.spinner {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2.5;
+  stroke-dasharray: 6 5;
+  animation: spin 2.4s linear infinite;
+}
+
+.slash {
+  stroke: var(--text-muted);
+  stroke-width: 2;
+}
+
+.glyphMark {
+  fill: var(--text);
+  font-family: var(--font-sans);
+  font-weight: 700;
+  text-anchor: middle;
+  pointer-events: none;
+}
+
+.ring {
+  fill: none;
+  stroke: var(--text);
+  stroke-width: 2;
+  stroke-dasharray: 3 3;
+}
+
+.label {
+  fill: var(--text);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 500;
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: var(--bg);
+  stroke-width: 3.5px;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.brokenTag {
+  fill: var(--accent-red);
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: var(--bg);
+  stroke-width: 3.5px;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.waiting circle {
+  fill: var(--accent-yellow);
+  stroke: var(--bg);
+  stroke-width: 2;
+}
+
+.waiting text {
+  fill: #1a1a1a;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 800;
+  text-anchor: middle;
+}
+
+.failed .shape,
+.recovery .shape {
+  fill: var(--accent-red);
+  stroke: var(--accent-red);
+}
+
+.failed .glyphMark,
+.recovery .glyphMark {
+  fill: #fff;
+}
+
+.crashed .shape {
+  fill: var(--bg-surface);
+  stroke: var(--accent-orange);
+  stroke-width: 2.5;
+}
+
+.busy .shape {
+  fill: var(--accent);
+  stroke: var(--accent);
+}
+
+.idle .shape {
+  stroke: var(--accent-green);
+  stroke-width: 2.5;
+}
+
+.transition .shape {
+  stroke: var(--accent-yellow);
+  stroke-dasharray: 4 3;
+}
+
+.dormant .shape {
+  stroke: var(--text-muted);
+}
+
+.dormant .glyphMark {
+  fill: var(--text-dim);
+  font-weight: 500;
+}
+
+.ended .shape {
+  stroke: var(--text-muted);
+  fill: none;
+}
+
+.unknown .shape {
+  stroke: var(--text-muted);
+  stroke-dasharray: 1 3;
+  stroke-linecap: round;
+  fill: none;
+}
+
+.unknown .glyphMark {
+  fill: var(--text-dim);
+}
+
+.human .shape {
+  fill: var(--bg-user);
+  stroke: var(--text);
+}
+
+.selected .shape {
+  stroke-width: 3;
+}
+
+.dimmed {
+  opacity: 0.22;
+}
+
+.icon {
+  flex: none;
+  overflow: visible;
+}
+
+/* ── Edges ── */
+
+.edgeGroup {
+  cursor: pointer;
+  outline: none;
+}
+
+.edge {
+  fill: none;
+  stroke-linecap: round;
+}
+
+.edgeHit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 14;
+}
+
+.edgeCalm {
+  stroke: var(--text-muted);
+  opacity: 0.55;
+}
+
+.edgeDead {
+  stroke: var(--text-muted);
+  stroke-dasharray: 1 5;
+  opacity: 0.8;
+}
+
+.edgeLive {
+  stroke: var(--accent);
+  stroke-dasharray: 8 6;
+  animation: flow 0.9s linear infinite;
+}
+
+.edgeStuck {
+  stroke: var(--accent-orange);
+  stroke-dasharray: 3 5;
+  stroke-width: 3;
+}
+
+.arrow path {
+  stroke: none;
+}
+
+.arrow.edgeCalm path,
+.arrow.edgeDead path {
+  fill: var(--text-muted);
+}
+
+.arrow.edgeLive path {
+  fill: var(--accent);
+}
+
+.arrow.edgeStuck path {
+  fill: var(--accent-orange);
+}
+
+.arrow {
+  animation: none;
+  stroke-dasharray: none;
+}
+
+.edgeRecent .edgeCalm {
+  stroke: var(--accent);
+  opacity: 1;
+}
+
+.edgeGroup:hover .edge,
+.edgeGroup:focus-visible .edge,
+.edgeSelected .edge {
+  opacity: 1;
+  filter: brightness(1.25);
+}
+
+.edgeSelected .edge {
+  stroke-width: 4;
+}
+
+.stuckBadge rect {
+  fill: var(--accent-orange);
+  stroke: var(--bg);
+  stroke-width: 2;
+}
+
+.stuckBadge text {
+  fill: #1a1a1a;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 800;
+  text-anchor: middle;
+}
+
+.liveBadge text {
+  fill: var(--accent);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 700;
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: var(--bg);
+  stroke-width: 3.5px;
+  stroke-linejoin: round;
+}
+
+/* ── Overlays ── */
+
+.controls {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  gap: 4px;
+}
+
+.controls button,
+.legendToggle {
+  min-width: 30px;
+  height: 30px;
+  padding: 0 10px;
+  color: var(--text);
+  background: var(--glass-bg-opaque);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.controls button:hover,
+.legendToggle:hover {
+  background: var(--bg-hover);
+}
+
+.legend {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  display: flex;
+  flex-direction: column-reverse;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.legendBody {
+  display: grid;
+  grid-template-columns: repeat(2, auto);
+  gap: 4px 16px;
+  padding: 10px 12px;
+  background: var(--glass-bg-opaque);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.legendRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.edgeLimit {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  max-width: 60%;
+  padding: 4px 10px;
+  color: var(--text-dim);
+  background: var(--glass-bg-opaque);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  text-align: center;
+  transform: translateX(-50%);
+}
+
+@keyframes spin {
+  to {
+    stroke-dashoffset: -44;
+  }
+}
+
+@keyframes flow {
+  to {
+    stroke-dashoffset: -14;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner,
+  .edgeLive {
+    animation: none;
+  }
+
+  .stale {
+    transition: none;
+  }
+}
