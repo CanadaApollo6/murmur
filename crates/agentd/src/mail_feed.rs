@@ -735,6 +735,13 @@ mod gate {
                 }
             });
         }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while replayed.load(std::sync::atomic::Ordering::Relaxed) < 256 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replay starts before pruning");
         // Begin with pruning due while the observers contend with the real accept path.
         room.call(|s| {
             s.last_prune = 0;
@@ -858,7 +865,7 @@ mod history_tests {
                 &s.db,
                 Some(Anchor {
                     seq: 999,
-                    nonce: anchor.nonce.clone()
+                    nonce: anchor.nonce
                 })
             )
             .expect("ahead")
@@ -911,6 +918,102 @@ mod history_tests {
             assert!(boundaries.len() <= 2);
         }
         assert_eq!(boundaries, vec![Some(10002), Some(2)]);
+        room.close().await.expect("close");
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    #[test]
+    fn v1_mail_backfills_once_without_events() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("mail.db");
+        let db = Connection::open(&path).expect("db");
+        db.execute_batch(include_str!("schema.sql"))
+            .expect("v1 schema");
+        let agent = json(&AgentId::new()).expect("agent");
+        let id = json(&MessageId::new()).expect("id");
+        db.execute("INSERT INTO agents(id,name) VALUES (?,'a')", [&agent])
+            .expect("agent");
+        db.execute("INSERT INTO messages(seq,id,sender,client_key,recipient,conversation,hop,act,body,sent_at) VALUES (10,?,'\"Human\"','key',?,'\"00000000000000000000000001\"',0,'\"Inform\"','body','unused')",params![id,agent]).expect("message");
+        db.execute(
+            "INSERT INTO deliveries(message_id,state) VALUES (?,'queued')",
+            [&id],
+        )
+        .expect("delivery");
+        db.execute_batch("PRAGMA user_version=1").expect("version");
+        drop(db);
+        for _ in 0..2 {
+            let s = Store::open(&path, Config::default()).expect("migrate");
+            assert_eq!(head(&s.db).expect("head"), 0);
+            let (seq, n): (i64, i64) =
+                s.db.query_row(
+                    "SELECT msg_seq,(SELECT n FROM mail_edges) FROM deliveries",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("backfill");
+            assert_eq!((seq, n), (10, 1));
+            assert!(snapshot(&s.db, None).expect("snapshot").1["anchor"].is_null());
+        }
+    }
+    #[test]
+    fn retention_is_bounded_and_sequence_does_not_rewind() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut s = Store::open(&dir.path().join("mail.db"), Config::default()).expect("store");
+        s.db.execute_batch("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<70000) INSERT INTO mail_events(nonce,message_id,state,turn_started,attempts,at) SELECT lower(hex(randomblob(16))),'id','queued',0,0,'at' FROM n").expect("seed events");
+        prune(&mut s.db).expect("prune");
+        assert_eq!(
+            s.db.query_row("SELECT COUNT(*) FROM mail_events", [], |r| r
+                .get::<_, i64>(0))
+                .expect("count"),
+            70000 - 4096
+        );
+        prune(&mut s.db).expect("second prune");
+        assert_eq!(
+            s.db.query_row("SELECT COUNT(*) FROM mail_events", [], |r| r
+                .get::<_, i64>(0))
+                .expect("count"),
+            65536
+        );
+        assert_eq!(head(&s.db).expect("head"), 70000);
+    }
+    #[tokio::test]
+    async fn rejected_multi_delivery_transaction_leaves_no_event_or_edge_change() {
+        let dir = tempfile::tempdir().expect("dir");
+        let room = Mailroom::open(dir.path().join("mail.db"), Config::default())
+            .await
+            .expect("room");
+        let to = room
+            .register(AgentName::parse("a").expect("name"))
+            .await
+            .expect("agent");
+        let mut ids = Vec::new();
+        for n in 0..2 {
+            ids.push(
+                room.accept(NewMessage {
+                    from: Sender::Human,
+                    to,
+                    body: Body::new("body").expect("body"),
+                    reply_to: None,
+                    client_key: ClientKey(format!("key-{n}")),
+                    act: Act::Inform,
+                    task: None,
+                })
+                .await
+                .expect("accept")
+                .1
+                .id(),
+            );
+        }
+        room.mark_offered(&[ids[1]], Incarnation(1))
+            .await
+            .expect("offer");
+        let before = room.mail_snapshot(None).await.expect("snapshot");
+        assert!(room.mark_offered(&ids, Incarnation(2)).await.is_err());
+        let after = room.mail_snapshot(None).await.expect("snapshot");
+        assert_eq!(before, after, "rolled-back trigger work leaked");
         room.close().await.expect("close");
     }
 }

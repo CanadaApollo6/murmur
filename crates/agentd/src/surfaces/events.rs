@@ -232,9 +232,19 @@ async fn state(
 }
 
 pub async fn feed(api: &ControlApi, sink: &mut impl Sink, resume: Option<Anchor>) -> Result<()> {
-    let mut states = api.broker.event_hub().state();
-    let mut activity = api.broker.event_hub().activity();
-    let mut changes = api.mailroom.changes();
+    let states = api.broker.event_hub().state();
+    let activity = api.broker.event_hub().activity();
+    let changes = api.mailroom.changes();
+    run(api, sink, resume, states, activity, changes).await
+}
+async fn run(
+    api: &ControlApi,
+    sink: &mut impl Sink,
+    resume: Option<Anchor>,
+    mut states: tokio::sync::broadcast::Receiver<Event>,
+    mut activity: tokio::sync::broadcast::Receiver<Event>,
+    mut changes: tokio::sync::watch::Receiver<i64>,
+) -> Result<()> {
     let mut cache = HashMap::new();
     let first = snapshot(api, resume, None, &mut cache).await?;
     let mut cursor = first["mail_cursor"]
@@ -513,6 +523,36 @@ mod tests {
             799
         );
     }
+    #[tokio::test]
+    async fn closed_inputs_end_subscriber_without_spinning() {
+        let (_dir, api, _) = api().await;
+        for closed in 0..3 {
+            let (state_tx, state_rx) = tokio::sync::broadcast::channel(1);
+            let (activity_tx, activity_rx) = tokio::sync::broadcast::channel(1);
+            let (changes_tx, changes_rx) = tokio::sync::watch::channel(0);
+            let mut owners = (Some(state_tx), Some(activity_tx), Some(changes_tx));
+            match closed {
+                0 => drop(owners.0.take()),
+                1 => drop(owners.1.take()),
+                _ => drop(owners.2.take()),
+            };
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                run(
+                    &api,
+                    &mut Record { tx, pause: None },
+                    None,
+                    state_rx,
+                    activity_rx,
+                    changes_rx,
+                ),
+            )
+            .await
+            .expect("closed channel terminates")
+            .expect("feed");
+        }
+    }
     #[tokio::test(start_paused = true)]
     async fn blocked_sink_times_out_without_blocking_delivery() {
         let (_dir, api, id) = api().await;
@@ -613,5 +653,52 @@ mod tests {
         let size = serde_json::to_vec(&snapshot).expect("snapshot").len();
         assert!(size < 64 * 1024 * 1024, "snapshot bytes {size}");
         println!("M5 maximum snapshot bytes={size}");
+    }
+}
+
+#[cfg(test)]
+mod quiet_tests {
+    use super::*;
+    #[tokio::test]
+    async fn idle_subscriber_runs_no_worker_jobs() {
+        let dir = tempfile::tempdir().expect("dir");
+        let room = Arc::new(
+            Mailroom::open(dir.path().join("mail.db"), Default::default())
+                .await
+                .expect("room"),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let api = Arc::new(ControlApi {
+            broker: Arc::new(
+                Broker::new(room.clone(), vec![], Default::default()).expect("broker"),
+            ),
+            mailroom: room.clone(),
+            bindings: Arc::new(Bindings::new(
+                dir.path().join("mcp.sock"),
+                std::env::current_exe().expect("exe"),
+                tx,
+            )),
+            control_path: dir.path().join("control.sock"),
+            ui_url: None,
+        });
+        struct Discard;
+        #[async_trait::async_trait]
+        impl Sink for Discard {
+            async fn send(&mut self, _: Value) -> Result<()> {
+                Ok(())
+            }
+        }
+        let task = tokio::spawn(async move { feed(&api, &mut Discard, None).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = room.jobs_run.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(before, 3, "snapshot, specs, then initial page");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            room.jobs_run.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "idle feed polled worker"
+        );
+        task.abort();
+        assert!(task.await.expect_err("abort").is_cancelled());
     }
 }

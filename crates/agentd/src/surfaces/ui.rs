@@ -149,7 +149,7 @@ impl UiServer {
                 "Forbidden",
                 b"bad Host",
                 "text/plain",
-                host,
+                &self.host,
                 false,
             )
             .await;

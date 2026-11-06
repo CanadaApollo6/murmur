@@ -172,6 +172,8 @@ pub struct Mailroom {
     worker: thread::JoinHandle<Result<()>>,
     observers: Arc<tokio::sync::Semaphore>,
     changes: tokio::sync::watch::Receiver<i64>,
+    #[cfg(test)]
+    pub(crate) jobs_run: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub(crate) struct ActorLease {
@@ -204,10 +206,16 @@ impl Mailroom {
         let mut store = tokio::task::spawn_blocking(move || Store::open(&path, config)).await??;
         let (jobs, rx) = mpsc::channel::<Job>();
         let (changes_tx, changes) = tokio::sync::watch::channel(feed::head(&store.db)?);
+        #[cfg(test)]
+        let jobs_run = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        #[cfg(test)]
+        let counter = jobs_run.clone();
         let worker = thread::Builder::new()
             .name("agentd-mailroom".into())
             .spawn(move || {
                 for job in rx {
+                    #[cfg(test)]
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let before = store.db.total_changes();
                     job(&mut store);
                     if store.db.total_changes() != before {
@@ -233,6 +241,8 @@ impl Mailroom {
             worker,
             observers: Arc::new(tokio::sync::Semaphore::new(1)),
             changes,
+            #[cfg(test)]
+            jobs_run,
         })
     }
 

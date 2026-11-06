@@ -198,6 +198,8 @@ pub struct Broker {
     kinds: HashMap<String, KindConfig>,
     agents: Arc<Mutex<HashMap<AgentId, AgentHandle>>>,
     replacements: Mutex<()>,
+    #[cfg(test)]
+    startup_pause: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
     events: crate::event_hub::EventHub,
     config: Config,
     mcp: Option<Arc<crate::surfaces::Bindings>>,
@@ -238,6 +240,8 @@ impl Broker {
             kinds: by_kind,
             agents: Arc::new(Mutex::new(HashMap::new())),
             replacements: Mutex::new(()),
+            #[cfg(test)]
+            startup_pause: std::sync::Mutex::new(None),
             events,
             config,
             mcp: None,
@@ -397,6 +401,17 @@ impl Broker {
         };
         self.agents.lock().await.insert(id, handle.clone());
         tokio::spawn(actor.run());
+        #[cfg(test)]
+        {
+            let pause = self
+                .startup_pause
+                .lock()
+                .expect("bug: startup pause poisoned")
+                .take();
+            if let Some(pause) = pause {
+                pause.notified().await;
+            }
+        }
         Ok(handle)
     }
     /// Trusted in-process API. External callers are authenticated by surfaces.
@@ -1308,5 +1323,152 @@ mod replacement_tests {
             current.stop().await.expect("stop replacement");
             old.await.expect("old actor task");
         }
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    #[tokio::test]
+    async fn replacement_first_phase_finds_published_handle() {
+        let dir = tempfile::tempdir().expect("dir");
+        let room = Arc::new(
+            Mailroom::open(dir.path().join("mail.db"), Default::default())
+                .await
+                .expect("room"),
+        );
+        let broker = Arc::new(
+            Broker::new(
+                room.clone(),
+                vec![KindConfig::infinity(dir.path().join("absent.sock"))],
+                Default::default(),
+            )
+            .expect("broker"),
+        );
+        let name = AgentName::parse("a").expect("name");
+        let id = room.register(name.clone()).await.expect("register");
+        let (commands, rx) = mpsc::channel(1);
+        drop(rx);
+        let (_, phase) = watch::channel(Phase::Failed {
+            last: "old actor".into(),
+        });
+        let (_, isolation) = watch::channel("none");
+        broker.agents.lock().await.insert(
+            id,
+            AgentHandle {
+                id,
+                cwd: dir.path().into(),
+                commands: commands.clone(),
+                phase,
+                isolation,
+            },
+        );
+        let pause = Arc::new(tokio::sync::Notify::new());
+        *broker.startup_pause.lock().expect("pause") = Some(pause.clone());
+        let spec = AgentSpec {
+            name,
+            kind: "infinity".into(),
+            cwd: dir.path().into(),
+            workspace: None,
+            model: None,
+            permissions: Default::default(),
+            idle_after: None,
+        };
+        let mut events = broker.event_hub().state();
+        let b = broker.clone();
+        let task = tokio::spawn(async move { b.spawn(spec).await });
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("first phase deadline")
+            .expect("phase event");
+        assert!(matches!(event, Event::PhaseChanged { .. }));
+        let current = broker.handle(id).await.expect("new handle published");
+        assert!(
+            !current.commands.same_channel(&commands),
+            "startup event found the old actor handle"
+        );
+        pause.notify_one();
+        task.await.expect("spawn task").expect("spawn");
+        broker.shutdown().await.expect("shutdown");
+    }
+}
+
+#[cfg(test)]
+mod stale_phase_tests {
+    use super::*;
+    use crate::surfaces::{
+        Bindings, ControlApi,
+        events::{self, Sink},
+    };
+    use serde_json::Value;
+    #[tokio::test]
+    async fn stale_busy_event_reads_current_failed_phase() {
+        let dir = tempfile::tempdir().expect("dir");
+        let room = Arc::new(
+            Mailroom::open(dir.path().join("mail.db"), Default::default())
+                .await
+                .expect("room"),
+        );
+        let broker =
+            Arc::new(Broker::new(room.clone(), vec![], Default::default()).expect("broker"));
+        let id = AgentId::new();
+        let (commands, _rx) = mpsc::channel(1);
+        let (_, phase) = watch::channel(Phase::Failed {
+            last: "current failure".into(),
+        });
+        let (_, isolation) = watch::channel("none");
+        broker.agents.lock().await.insert(
+            id,
+            AgentHandle {
+                id,
+                cwd: dir.path().into(),
+                commands,
+                phase,
+                isolation,
+            },
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let api = ControlApi {
+            broker: broker.clone(),
+            mailroom: room,
+            bindings: Arc::new(Bindings::new(
+                dir.path().join("mcp.sock"),
+                std::env::current_exe().expect("exe"),
+                tx,
+            )),
+            control_path: dir.path().join("control.sock"),
+            ui_url: None,
+        };
+        struct Check {
+            broker: Arc<Broker>,
+            id: AgentId,
+            checked: bool,
+        }
+        #[async_trait::async_trait]
+        impl Sink for Check {
+            async fn send(&mut self, v: Value) -> crate::surfaces::Result<()> {
+                if v["event"] == "snapshot" {
+                    self.broker.event_hub().emit(Event::PhaseChanged {
+                        agent: self.id,
+                        incarnation: Incarnation(1),
+                        phase: Phase::Busy,
+                    });
+                }
+                if v["event"] == "agent" {
+                    assert_eq!(v["phase"], "failed");
+                    assert_eq!(v["error"], "current failure");
+                    self.checked = true;
+                    return Err("checked phase".into());
+                }
+                Ok(())
+            }
+        }
+        let mut sink = Check {
+            broker,
+            id,
+            checked: false,
+        };
+        assert!(events::feed(&api, &mut sink, None).await.is_err());
+        assert!(sink.checked);
     }
 }

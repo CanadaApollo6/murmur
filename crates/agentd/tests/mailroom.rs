@@ -863,7 +863,7 @@ async fn schema_version_and_attempt_configuration_are_checked() {
     let dir = tempfile::tempdir().expect("dir");
     let path = dir.path().join("future.db");
     let db = rusqlite::Connection::open(&path).expect("db");
-    db.execute_batch("PRAGMA user_version=2").expect("version");
+    db.execute_batch("PRAGMA user_version=3").expect("version");
     db.close().expect("close");
     assert!(Mailroom::open(&path, Config::default()).await.is_err());
     assert!(

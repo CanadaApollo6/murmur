@@ -273,6 +273,8 @@ async fn real_surface_auth_assets_caps_and_shutdown() {
         };
         assert_ne!(response.status(), 101, "{case}");
     }
+    let missing_key=d.raw("/events",&format!("{}Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: murmur.events.v1,murmur.token.{}\r\n",d.host(),d.token())).await;
+    assert!(missing_key.starts_with("HTTP/1.1 400"));
     let mut watchers = Vec::new();
     for _ in 0..7 {
         let (mut ws, response) = connect_async(d.ws_request()).await.expect("upgrade");
