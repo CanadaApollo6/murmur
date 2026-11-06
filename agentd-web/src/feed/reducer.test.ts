@@ -498,13 +498,42 @@ describe("pruning on a snapshot", () => {
     expect(next.activity[A]).toBe("working");
   });
 
-  it("keeps the state of an agent only an edge still names", () => {
+  it("forgets an agent only an edge still names, which has no life to compare", () => {
     const room = new SimMailroom();
     room.accept(B, A);
     const state = withVolatile(fresh(room), A);
-    const next = apply(state, room.nullSnapshot(room.head()));
-    expectKept(next, A, true);
-    expectKept(apply(next, room.snapshot()), A, true);
+    expectKept(apply(state, room.nullSnapshot(room.head())), A, false);
+    expectKept(apply(state, room.snapshot()), A, false);
+  });
+
+  it("does not hand a dropped row's state to the agent's next life", () => {
+    const room = new SimMailroom();
+    room.accept("human", A);
+    // Known from live frames, then outside the rows of a truncated snapshot.
+    let state = withVolatile(
+      apply(fresh(room), { event: "agent", ...listed(A) }),
+      A,
+    );
+    expect(state.agents[A]!.incarnation).toBe(1);
+    state = apply(state, {
+      ...room.nullSnapshot(room.head()),
+      agents: [listed(B)],
+      agents_truncated: true,
+    });
+    expect(state.agents[A]).toBeUndefined();
+    expect(Object.keys(state.edges)).toEqual([edgeKey("human", A)]);
+    expectKept(state, A, false);
+    state = apply(state, {
+      event: "agent",
+      ...listed(A),
+      incarnation: 2,
+    });
+    expect(state.agents[A]!.incarnation).toBe(2);
+    expectKept(state, A, false);
+    // What the new life does from here is kept.
+    expect(
+      apply(state, { event: "activity", agent: A, text: "new" }).activity[A],
+    ).toBe("new");
   });
 
   it("prunes edgeTouched and revisions to live edges, and keeps live ones", () => {
@@ -1178,7 +1207,7 @@ describe("volatile frames", () => {
     }
     expect(state.activity[A]).toHaveLength(8192);
     expect(state.activity[A]!.endsWith("5")).toBe(true);
-    state = apply(state, room.nullSnapshot(0));
+    state = apply(state, { ...room.nullSnapshot(0), agents: [agent] });
     expect(state.activity[A]).toHaveLength(8192);
   });
 

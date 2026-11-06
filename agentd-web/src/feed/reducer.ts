@@ -252,18 +252,15 @@ function forgetLife(draft: ClientState, agent: string) {
 
 /**
  * Forgets what only a past snapshot's agents and edges could explain, so a page
- * open for days does not grow. An agent stays while it is listed or on an edge.
+ * open for days does not grow. An agent's state goes when its row does, even if an
+ * edge still names it: with no row there is no incarnation to compare, so the state
+ * could not be cleared when a replacement arrives.
  */
 function pruneVolatile(draft: ClientState) {
-  const live = new Set(Object.keys(draft.agents));
-  for (const edge of Object.values(draft.edges)) {
-    live.add(edge.from);
-    live.add(edge.to);
-  }
-  const isLive = (agent: string) => live.has(agent);
-  draft.activity = pickKeys(draft.activity, isLive);
-  draft.turns = pickKeys(draft.turns, isLive);
-  draft.egress = pickKeys(draft.egress, isLive);
+  const isListed = (agent: string) => Object.hasOwn(draft.agents, agent);
+  draft.activity = pickKeys(draft.activity, isListed);
+  draft.turns = pickKeys(draft.turns, isListed);
+  draft.egress = pickKeys(draft.egress, isListed);
   const isEdge = (key: string) => Object.hasOwn(draft.edges, key);
   draft.edgeTouched = pickKeys(draft.edgeTouched, isEdge);
   draft.edgeRevision = pickKeys(draft.edgeRevision, isEdge);

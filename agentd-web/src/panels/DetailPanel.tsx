@@ -442,6 +442,12 @@ function AgentDetail({
         >
           {activity}
         </pre>
+      ) : state.agentsTruncated && state.agents[id] === undefined ? (
+        <p className={styles.note} data-testid="activity-unlisted">
+          agentd's last snapshot did not list this agent, so this page cleared
+          its activity, last turn and blocked requests. Use{" "}
+          <code>agentctl ls</code> to see the agent.
+        </p>
       ) : (
         <p className={styles.note}>Nothing since this page opened.</p>
       )}

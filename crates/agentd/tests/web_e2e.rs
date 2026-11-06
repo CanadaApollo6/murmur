@@ -1421,6 +1421,41 @@ async fn an_edges_first_read_that_fails_is_tried_again() {
 }
 
 #[tokio::test]
+async fn an_agent_a_snapshot_stops_listing_says_why_its_activity_is_gone() {
+    let mut daemon = Daemon::new().await;
+    daemon.spawn("a").await;
+    let harness = Harness::launch().await;
+    let page = harness.open(&daemon.url("127.0.0.1"), DESKTOP).await;
+    app_live(&page).await;
+    daemon.ctl(&["send", "@a", "first life"]).await;
+    let agent: String = eval(
+        &page,
+        r#"document.querySelector('[data-testid="node"]:not([data-node-id="human"])').dataset.nodeId"#,
+    )
+    .await;
+    page.locator(&format!("[data-testid=node][data-node-id='{agent}']"))
+        .await
+        .click(None)
+        .await
+        .expect("select the agent");
+    visible(&page, "activity").await;
+    feed_quiet(&page).await;
+
+    // The same mail, so an edge still names the agent, but no row.
+    let mut snapshot = daemon.snapshot().await;
+    snapshot["agents"] = json!([]);
+    snapshot["agents_truncated"] = json!(true);
+    inject(&page, &snapshot.to_string()).await;
+    visible(&page, "activity-unlisted").await;
+    assert_eq!(id(&page, "activity").await.count().await.expect("count"), 0);
+    expect(id(&page, "activity-unlisted").await)
+        .to_contain_text("agentctl ls")
+        .await
+        .expect("the note");
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn a_refresh_that_load_older_supersedes_runs_again() {
     let mut daemon = Daemon::new().await;
     daemon.spawn("a").await;
