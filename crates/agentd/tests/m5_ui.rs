@@ -224,6 +224,7 @@ async fn real_surface_auth_assets_caps_and_shutdown() {
             .await
             .starts_with("HTTP/1.1 404")
     );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
     d.raw("/", &d.host()).await;
     assert!(d.raw("/new.js", &d.host()).await.ends_with("new"));
     for case in [
@@ -558,5 +559,186 @@ async fn real_agentctl_watch_reads_large_snapshot_and_held_commands_execute() {
     }
     watch.kill().await.expect("kill watch");
     watch.wait().await.expect("reap");
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn assets_never_follow_swapped_roots_or_symlink_entries() {
+    let mut d = Daemon::new("yes", 10).await;
+    let assets = d.root.path().join("assets");
+    let state = d.root.path().join("state");
+    std::os::unix::fs::symlink(state.join("ui.token"), assets.join("file-token"))
+        .expect("file symlink");
+    std::os::unix::fs::symlink(&state, assets.join("linked-state")).expect("directory symlink");
+    d.raw("/", &d.host()).await;
+    for path in ["/file-token", "/linked-state/ui.token"] {
+        let r = d.raw(path, &d.host()).await;
+        assert!(
+            !r.contains(&d.token()),
+            "symlink entry served ui.token at {path}"
+        );
+        assert!(r.starts_with("HTTP/1.1 404"));
+    }
+    std::fs::rename(&assets, d.root.path().join("old-assets")).expect("move root");
+    std::os::unix::fs::symlink(&state, &assets).expect("root symlink");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    d.raw("/", &d.host()).await;
+    let r = d.raw("/ui.token", &d.host()).await;
+    assert!(
+        !r.contains(&d.token()),
+        "swapped assets root served ui.token"
+    );
+    assert!(r.starts_with("HTTP/1.1 404"));
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn assets_reject_state_roots_and_oversized_trees() {
+    let mut d = Daemon::new("yes", 10).await;
+    let huge = std::fs::File::create(d.root.path().join("assets/huge.js")).expect("asset");
+    huge.set_len(64 * 1024 * 1024 + 1).expect("large asset");
+    assert!(
+        d.raw("/", &d.host()).await.starts_with("HTTP/1.1 503"),
+        "oversized asset tree must be refused"
+    );
+    d.ctl(&["ls"]).await;
+    d.stop().await;
+    for suffix in ["state", "state/nested"] {
+        std::fs::create_dir_all(d.root.path().join(suffix)).expect("nested");
+        let path = d.root.path().join("config.toml");
+        let config = std::fs::read_to_string(&path).expect("config").replace(
+            &json!(d.root.path().join("assets")).to_string(),
+            &json!(d.root.path().join(suffix)).to_string(),
+        );
+        std::fs::write(&path, config).expect("config");
+        let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .arg("--state-dir")
+            .arg(d.root.path().join("state"))
+            .arg("--config")
+            .arg(&path)
+            .output()
+            .await
+            .expect("daemon");
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("ui.assets must be outside state_dir")
+        );
+        let config = std::fs::read_to_string(&path).expect("config").replace(
+            &json!(d.root.path().join(suffix)).to_string(),
+            &json!(d.root.path().join("assets")).to_string(),
+        );
+        std::fs::write(&path, config).expect("restore config");
+    }
+}
+
+#[tokio::test]
+async fn ui_accept_errors_and_connection_caps_do_not_stop_daemon() {
+    let mut d = Daemon::new("yes", 10).await;
+    d.stop().await;
+    d.child = Command::new("bash")
+        .args(["-c", "ulimit -n 40; exec \"$@\"", "m5-ui-fd-limit"])
+        .arg(env!("CARGO_BIN_EXE_agentd"))
+        .arg("--state-dir")
+        .arg(d.root.path().join("state"))
+        .arg("--config")
+        .arg(d.root.path().join("config.toml"))
+        .env("RUST_LOG", "agentd=debug")
+        .stderr(Stdio::from(
+            std::fs::File::create(d.root.path().join("daemon.log")).expect("log"),
+        ))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("limited daemon");
+    d.ready().await;
+    let mut peers = Vec::new();
+    for _ in 0..60 {
+        peers.push(
+            TcpStream::connect(("127.0.0.1", d.port))
+                .await
+                .expect("idle UI stream"),
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let log = std::fs::read_to_string(d.root.path().join("daemon.log")).expect("log");
+            if log.contains("UI accept failed") {
+                break;
+            }
+            assert!(
+                d.child.try_wait().expect("status").is_none(),
+                "UI accept failure killed daemon"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("exercise UI accept failure");
+    drop(peers);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(d.get("/mail").await.starts_with("HTTP/1.1 200"));
+    d.ctl(&["ls"]).await;
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn watch_requires_both_resume_arguments() {
+    for args in [["--cursor", "1"], ["--nonce", "abc"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("watch")
+            .args(args)
+            .output()
+            .await
+            .expect("CLI");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "partial resume must fail argument validation"
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("required"));
+    }
+}
+
+#[tokio::test]
+async fn ui_ipv6_loopback_and_invalid_addresses() {
+    for address in ["localhost:7434", "[2001:db8::1]:7434"] {
+        let root = tempfile::tempdir().expect("dir");
+        let config = root.path().join("config");
+        std::fs::write(&config, format!("[ui]\nlisten='{address}'")).expect("config");
+        let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .arg("--state-dir")
+            .arg(root.path().join("state"))
+            .arg("--config")
+            .arg(config)
+            .output()
+            .await
+            .expect("run");
+        assert!(!out.status.success(), "accepted {address}");
+    }
+    let mut d = Daemon::new("yes", 10).await;
+    d.stop().await;
+    let reserve = std::net::TcpListener::bind("[::1]:0").expect("IPv6 loopback available");
+    let port = reserve.local_addr().expect("addr").port();
+    drop(reserve);
+    let path = d.root.path().join("config.toml");
+    let cfg = std::fs::read_to_string(&path)
+        .expect("config")
+        .replace(&format!("127.0.0.1:{}", d.port), &format!("[::1]:{port}"));
+    std::fs::write(&path, cfg).expect("IPv6 config");
+    d.child = Daemon::start(&d.root);
+    d.ready().await;
+    let mut stream = TcpStream::connect(("::1", port)).await.expect("IPv6 UI");
+    stream
+        .write_all(
+            format!(
+                "GET /mail HTTP/1.1\r\nHost: [::1]:{port}\r\nAuthorization: Bearer {}\r\n\r\n",
+                d.token()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("request");
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).await.expect("response");
+    assert!(bytes.starts_with(b"HTTP/1.1 200"));
     d.stop().await;
 }

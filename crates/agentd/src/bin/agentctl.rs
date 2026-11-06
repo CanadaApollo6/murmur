@@ -56,9 +56,9 @@ enum Command {
         id: String,
     },
     Watch {
-        #[arg(long)]
+        #[arg(long, requires = "nonce")]
         cursor: Option<i64>,
-        #[arg(long)]
+        #[arg(long, requires = "cursor")]
         nonce: Option<String>,
     },
     Ui,

@@ -23,21 +23,39 @@ pub struct UiConfig {
     pub assets: Option<PathBuf>,
 }
 
-type Manifest = HashMap<String, (Vec<u8>, &'static str)>;
+const MAX_ASSET_FILES: usize = 4096;
+const MAX_ASSET_BYTES: usize = 64 * 1024 * 1024;
+type Manifest = HashMap<String, (Arc<[u8]>, &'static str)>;
+struct ManifestState {
+    current: Arc<Manifest>,
+    last_attempt: Option<tokio::time::Instant>,
+    rebuilding: bool,
+    failed: bool,
+}
+
 pub struct UiServer {
     listener: TcpListener,
     config: UiConfig,
     host: String,
     token: String,
-    manifest: Mutex<Manifest>,
+    manifest: Mutex<ManifestState>,
 }
 impl UiServer {
-    pub async fn bind(config: UiConfig, state: &Path) -> Result<Option<Self>> {
+    pub async fn bind(mut config: UiConfig, state: &Path) -> Result<Option<Self>> {
         let Some(addr) = config.listen else {
             return Ok(None);
         };
         if !addr.ip().is_loopback() || addr.port() == 0 {
             return Err("ui.listen requires a loopback address and a nonzero port".into());
+        }
+        if let Some(assets) = config.assets.take() {
+            let assets =
+                tokio::task::spawn_blocking(move || std::fs::canonicalize(assets)).await??;
+            if assets.starts_with(std::fs::canonicalize(state)?) {
+                return Err("ui.assets must be outside state_dir".into());
+            }
+            crate::private_fs::Dir::open(&assets, false)?;
+            config.assets = Some(assets);
         }
         let dir = crate::private_fs::Dir::open(state, false)?;
         let name = std::ffi::OsStr::new("ui.token");
@@ -68,7 +86,12 @@ impl UiServer {
             host: addr.to_string(),
             config,
             token,
-            manifest: Mutex::new(HashMap::new()),
+            manifest: Mutex::new(ManifestState {
+                current: Arc::new(HashMap::new()),
+                last_attempt: None,
+                rebuilding: false,
+                failed: false,
+            }),
         }))
     }
     pub fn url(&self) -> String {
@@ -97,8 +120,11 @@ impl UiServer {
             tokio::select! {
                 _=cancel.cancelled()=>break,
                 accepted=server.listener.accept()=>{
-                    let (stream,_)=accepted?;
-                    let Ok(permit)=slots.clone().try_acquire_owned() else {continue;};
+                    let (stream,_)=match accepted {
+                        Ok(stream)=>stream,
+                        Err(error)=>{tracing::warn!(%error,"UI accept failed");tokio::time::sleep(Duration::from_millis(100)).await;continue;}
+                    };
+                    let Ok(permit)=slots.clone().try_acquire_owned() else {tracing::debug!("UI connection limit reached; dropping stream");continue;};
                     let server=server.clone();let api=api.clone();
                     connections.spawn(async move {let _permit=permit;if let Err(error)=server.connection(stream,api).await {tracing::debug!(%error,"UI connection closed");}});
                 },
@@ -107,6 +133,43 @@ impl UiServer {
         }
         connections.shutdown().await;
         Ok(())
+    }
+    async fn refresh_manifest(&self) -> bool {
+        let Some(root) = self.config.assets.clone() else {
+            return true;
+        };
+        {
+            let mut state = self.manifest.lock().await;
+            if state.rebuilding
+                || state
+                    .last_attempt
+                    .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+            {
+                return !state.failed;
+            }
+            state.rebuilding = true;
+            state.last_attempt = Some(tokio::time::Instant::now());
+        }
+        let result = tokio::task::spawn_blocking(move || load_manifest(&root)).await;
+        let mut state = self.manifest.lock().await;
+        state.rebuilding = false;
+        match result {
+            Ok(Ok(manifest)) => {
+                state.current = Arc::new(manifest);
+                state.failed = false;
+            }
+            Ok(Err(error)) => {
+                tracing::error!(%error,"refusing UI asset tree");
+                state.current = Arc::new(HashMap::new());
+                state.failed = true;
+            }
+            Err(error) => {
+                tracing::error!(%error,"UI asset rebuild task failed");
+                state.current = Arc::new(HashMap::new());
+                state.failed = true;
+            }
+        }
+        !state.failed
     }
     async fn connection(&self, mut stream: TcpStream, api: Arc<ControlApi>) -> Result<()> {
         let header = tokio::time::timeout(Duration::from_secs(5), async {
@@ -378,14 +441,19 @@ impl UiServer {
                 }
             };
         }
-        if path == "/" {
-            let mut manifest = self.manifest.lock().await;
-            *manifest = match &self.config.assets {
-                Some(dir) => load_manifest(dir)?,
-                None => HashMap::new(),
-            };
+        if path == "/" && !self.refresh_manifest().await {
+            return response(
+                &mut stream,
+                503,
+                "Service Unavailable",
+                b"assets unavailable",
+                "text/plain",
+                host,
+                false,
+            )
+            .await;
         }
-        let manifest = self.manifest.lock().await;
+        let manifest = self.manifest.lock().await.current.clone();
         let key = if path == "/" { "/index.html" } else { path };
         if let Some((bytes, mime)) = manifest.get(key) {
             return response(&mut stream, 200, "OK", bytes, mime, host, false).await;
@@ -464,34 +532,76 @@ fn parameters(query: &str) -> Result<HashMap<String, String>> {
         .collect())
 }
 fn load_manifest(root: &Path) -> Result<Manifest> {
-    fn walk(root: &Path, dir: &Path, out: &mut Manifest) -> Result<()> {
-        for entry in std::fs::read_dir(dir)? {
+    use crate::private_fs::{Asset, Dir};
+    use std::{io::Read, os::unix::ffi::OsStrExt};
+    fn walk(
+        dir: Dir,
+        relative: &Path,
+        out: &mut Manifest,
+        bytes: &mut usize,
+        entries: &mut usize,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > 32 {
+            return Err("asset tree exceeds 32 directories in depth".into());
+        }
+        for entry in dir.entries()? {
             let entry = entry?;
-            let ty = entry.file_type()?;
-            let path = entry.path();
-            if ty.is_dir() {
-                walk(root, &path, out)?;
-            } else if ty.is_file() {
-                let relative = path
-                    .strip_prefix(root)?
-                    .to_str()
-                    .ok_or("non-UTF8 asset name")?;
-                let mime = match path.extension().and_then(|s| s.to_str()) {
-                    Some("html") => "text/html",
-                    Some("js") => "text/javascript",
-                    Some("css") => "text/css",
-                    Some("svg") => "image/svg+xml",
-                    Some("png") => "image/png",
-                    Some("woff2") => "font/woff2",
-                    Some("json") => "application/json",
-                    _ => "application/octet-stream",
-                };
-                out.insert(format!("/{relative}"), (std::fs::read(&path)?, mime));
+            let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+            if name == "." || name == ".." {
+                continue;
+            }
+            *entries += 1;
+            if *entries > MAX_ASSET_FILES * 2 {
+                return Err("asset tree exceeds entry limit".into());
+            }
+            let path = relative.join(name);
+            match dir.asset(name) {
+                Ok(Asset::Directory(child)) => walk(child, &path, out, bytes, entries, depth + 1)?,
+                Ok(Asset::File(file)) => {
+                    if out.len() >= MAX_ASSET_FILES {
+                        return Err("asset tree exceeds file limit".into());
+                    }
+                    let remaining = MAX_ASSET_BYTES - *bytes;
+                    if file.metadata()?.len() > remaining as u64 {
+                        return Err("asset tree exceeds byte limit".into());
+                    }
+                    let mut data = Vec::new();
+                    file.take(remaining as u64 + 1).read_to_end(&mut data)?;
+                    if data.len() > remaining {
+                        return Err("asset tree exceeds byte limit".into());
+                    }
+                    *bytes += data.len();
+                    let mime = match path.extension().and_then(|s| s.to_str()) {
+                        Some("html") => "text/html",
+                        Some("js") => "text/javascript",
+                        Some("css") => "text/css",
+                        Some("svg") => "image/svg+xml",
+                        Some("png") => "image/png",
+                        Some("woff2") => "font/woff2",
+                        Some("json") => "application/json",
+                        _ => "application/octet-stream",
+                    };
+                    out.insert(
+                        format!("/{}", path.to_str().ok_or("non-UTF8 asset name")?),
+                        (Arc::from(data), mime),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(path=%path.display(),%error,"skipping unsafe or unavailable UI asset")
+                }
             }
         }
         Ok(())
     }
     let mut out = HashMap::new();
-    walk(root, root, &mut out)?;
+    walk(
+        Dir::open(root, false)?,
+        Path::new(""),
+        &mut out,
+        &mut 0,
+        &mut 0,
+        0,
+    )?;
     Ok(out)
 }

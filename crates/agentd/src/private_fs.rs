@@ -13,6 +13,11 @@ use std::{
 
 pub(crate) const LIMIT: u64 = 256 * 1024;
 pub(crate) struct Dir(OwnedFd);
+pub(crate) enum Asset {
+    Directory(Dir),
+    File(File),
+}
+
 impl Dir {
     pub fn open(path: &Path, create: bool) -> io::Result<Self> {
         let root = Self(open(
@@ -42,6 +47,32 @@ impl Dir {
             )?;
         }
         Ok(Self(fd))
+    }
+    pub fn entries(&self) -> io::Result<nix::dir::OwningIter> {
+        Ok(nix::dir::Dir::from_fd(self.0.try_clone()?)?.into_iter())
+    }
+    pub fn asset(&self, name: &std::ffi::OsStr) -> io::Result<Asset> {
+        if !matches!(
+            Path::new(name).components().collect::<Vec<_>>().as_slice(),
+            [Component::Normal(_)]
+        ) {
+            return Err(io::Error::other("asset needs a single path component"));
+        }
+        let fd = openat(
+            &self.0,
+            name,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        let file = File::from(fd);
+        let metadata = file.metadata()?;
+        if metadata.is_dir() {
+            Ok(Asset::Directory(Self(file.into())))
+        } else if metadata.is_file() {
+            Ok(Asset::File(file))
+        } else {
+            Err(io::Error::other("asset is not a regular file or directory"))
+        }
     }
     pub fn from_fd(fd: &OwnedFd) -> io::Result<Self> {
         Ok(Self(openat(
