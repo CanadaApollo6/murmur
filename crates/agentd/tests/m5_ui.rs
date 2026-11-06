@@ -1,3 +1,5 @@
+#[path = "support/max_snapshot.rs"]
+mod maximum_fixture;
 use agentd::surfaces::{events::command, read_frame_limit, write_frame};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -959,4 +961,81 @@ async fn assets_cannot_enclose_state_directory() {
     assert!(rejected, "assets root enclosing state_dir was accepted");
     let log = std::fs::read_to_string(d.root.path().join("daemon.log")).expect("log");
     assert!(log.contains("ui.assets must"), "{log}");
+}
+
+#[tokio::test]
+async fn maximum_all_fields_fixture_crosses_real_agentctl_watch() {
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let socket = dir.path().join("watch.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("fixture socket");
+    let (frame, expected) = tokio::task::spawn_blocking(|| {
+        let frame = maximum_fixture::maximum_snapshot();
+        let expected = serde_json::to_vec(&frame).expect("serialize fixture");
+        (frame, expected)
+    })
+    .await
+    .expect("maximum fixture");
+    assert!(expected.len() > 16 * 1024 * 1024 && expected.len() < 64 * 1024 * 1024);
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("watch connection");
+        let request = agentd::surfaces::read_frame(&mut BufReader::new(&mut stream))
+            .await
+            .expect("request")
+            .expect("watch");
+        assert!(matches!(
+            serde_json::from_slice::<agentd::surfaces::ControlRequest>(&request)
+                .expect("request JSON"),
+            agentd::surfaces::ControlRequest::Watch { .. }
+        ));
+        let sent = write_frame(&mut stream, &frame).await;
+        finish_rx.await.expect("client done");
+        sent
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--socket")
+        .arg(socket)
+        .arg("watch")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("real watch");
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        read_frame_limit(
+            &mut BufReader::new(child.stdout.take().expect("stdout")),
+            64 * 1024 * 1024,
+        ),
+    )
+    .await;
+    if child.try_wait().expect("watch status").is_none() {
+        child.kill().await.expect("stop watch");
+    }
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_end(&mut stderr)
+        .await
+        .expect("stderr");
+    finish_tx.send(()).expect("finish fixture");
+    if let Err(error) = server.await.expect("fixture server") {
+        eprintln!("fixture transport: {error}");
+    }
+    let actual = result
+        .expect("watch deadline")
+        .expect("watch output")
+        .unwrap_or_else(|| {
+            panic!(
+                "real agentctl rejected maximum all-fields frame: {}",
+                String::from_utf8_lossy(&stderr)
+            )
+        });
+    assert!(
+        actual.strip_suffix(b"\n") == Some(expected.as_slice()),
+        "all fields survive the real client"
+    );
+    println!("MAXIMUM all_fields_real_agentctl_bytes={}", actual.len());
 }

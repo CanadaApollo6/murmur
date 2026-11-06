@@ -438,6 +438,13 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    mod maximum_fixture {
+        use crate as agentd;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/max_snapshot.rs"
+        ));
+    }
     use super::*;
     use crate::mailroom::{Config, NewMessage};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -791,30 +798,7 @@ mod tests {
                 assert!(serde_json::to_vec(&text).expect("encoded").len() <= n);
             }
         }
-        let path = Path::new("/tmp/control socket");
-        let agent = AgentId::new();
-        let approval = permission(
-            PermissionRequest {
-                id: PermissionId(ulid::Ulid::new()),
-                agent,
-                incarnation: Incarnation(1),
-                tool: hostile.clone(),
-                title: hostile.clone(),
-                detail: hostile.clone(),
-                options: (0..17)
-                    .map(|_| PermissionOption {
-                        key: "'".repeat(1022),
-                        label: hostile.clone(),
-                        effect: PermissionEffect::AllowOnce,
-                    })
-                    .collect(),
-            },
-            path,
-        );
-        let edge = json!({"from":format!("agent:{agent}"),"to":format!("agent:{agent}"),"queued":i64::MAX,"offered":i64::MAX,"consumed":i64::MAX,"uncertain":i64::MAX,"held":i64::MAX,"dead":i64::MAX});
-        let mut row = json!({"msg_seq":i64::MAX,"id":MessageId::new(),"from":format!("agent:{agent}"),"to":format!("agent:{agent}"),"conversation":ConversationId::new(),"in_reply_to":MessageId::new(),"hop":65535,"act":"request","task":TaskId::new(),"exposure":{"sender":format!("agent:{agent}"),"epoch":u64::MAX,"seq":u64::MAX},"state":"held","turn_started":true,"incarnation":u64::MAX,"attempts":u32::MAX,"reason":hostile});
-        mail(&mut row, path);
-        let snapshot = json!({"event":"snapshot","mail_cursor":i64::MAX,"agents":vec![agent_row(agent,&"'".repeat(1024),&"'".repeat(1024),&Phase::Failed{last:"\0".repeat(1024)},"bwrap+proxy");1024],"agents_truncated":true,"approvals":vec![approval;64],"approvals_truncated":true,"mail":{"anchor":{"seq":i64::MAX,"nonce":"a".repeat(32)},"edges":vec![edge;65536],"edges_truncated":true,"stuck":vec![row.clone();1000],"moving":vec![row;1000],"stuck_truncated":true,"moving_truncated":true}});
+        let snapshot = maximum_fixture::maximum_snapshot();
         let size = serde_json::to_vec(&snapshot).expect("snapshot").len();
         assert!(size < 64 * 1024 * 1024, "snapshot bytes {size}");
         println!("M5 maximum snapshot bytes={size}");
