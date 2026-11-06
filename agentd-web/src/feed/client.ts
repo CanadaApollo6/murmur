@@ -13,11 +13,14 @@ import {
   reduce,
 } from "./reducer";
 import type { Frame, MailPage, MailRow, MessageBody } from "./types";
+import { isMailRow, parseFrame } from "./wire";
 
 const FLUSH_MS = 50;
 const BACKOFF_MIN_MS = 500;
 const BACKOFF_MAX_MS = 30_000;
 const REQUEST_TIMEOUT_MS = 30_000;
+/** Resyncs closer together than this back off, so a repeating fault cannot spin. */
+const RESYNC_WINDOW_MS = 2 * BACKOFF_MAX_MS;
 const SUBPROTOCOL = "murmur.events.v1";
 
 export class TokenRejected extends Error {
@@ -52,11 +55,15 @@ export interface Retry {
   attempt: number;
   /** The server answers HTTP but refused the feed, for example at its limit. */
   refused: boolean;
+  /** What the feed sent that this page could not use, until a snapshot applies. */
+  problem: string | null;
 }
 
 export class FeedClient {
   private state: ClientState = initialState();
-  private retry: Retry = { attempt: 0, refused: false };
+  private retry: Retry = { attempt: 0, refused: false, problem: null };
+  private resyncStreak = 0;
+  private lastResyncAt: number | null = null;
   private readonly listeners = new Set<() => void>();
   private socket: SocketLike | null = null;
   private queue: Frame[] = [];
@@ -131,12 +138,60 @@ export class FeedClient {
     return await response.json();
   }
 
-  private dispatch(action: Action) {
-    this.state = reduce(this.state, action);
-    this.pump();
+  private notify() {
     for (const listener of this.listeners) {
-      listener();
+      try {
+        listener();
+      } catch (error) {
+        this.deps.log("a feed listener failed", error);
+      }
     }
+  }
+
+  private dispatch(action: Action) {
+    try {
+      this.state = reduce(this.state, action);
+      this.pump();
+    } catch (error) {
+      this.resync("agentd sent data this page could not apply.", error);
+      return;
+    }
+    this.notify();
+  }
+
+  /**
+   * Drops the connection and the anchor, so the next connection gets a full
+   * snapshot. A one-off fault costs one snapshot. A repeating one backs off and
+   * stays on screen.
+   */
+  private resync(problem: string, error?: unknown) {
+    this.deps.log(problem, error);
+    const now = this.deps.now();
+    this.resyncStreak =
+      this.lastResyncAt !== null && now - this.lastResyncAt < RESYNC_WINDOW_MS
+        ? this.resyncStreak + 1
+        : 1;
+    this.lastResyncAt = now;
+    this.state = reduce(this.state, { type: "resync" });
+    this.queue = [];
+    if (this.flushTimer !== null) {
+      this.deps.clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.retry = { attempt: this.resyncStreak - 1, refused: false, problem };
+    const socket = this.socket;
+    if (socket === null) {
+      // `onclose` is already handling this connection, and retries when it is done.
+      this.notify();
+      return;
+    }
+    this.socket = null;
+    socket.close();
+    this.state = reduce(this.state, { type: "disconnected" });
+    if (!this.stopped) {
+      this.scheduleRetry();
+    }
+    this.notify();
   }
 
   private connect() {
@@ -163,15 +218,23 @@ export class FeedClient {
       if (this.socket !== socket) {
         return;
       }
-      const frame = this.parse(event.data);
-      if (frame === null) {
+      const parsed = parseFrame(event.data);
+      if (parsed.kind === "unknown") {
         return;
       }
+      if (parsed.kind === "invalid") {
+        this.resync(`agentd sent ${parsed.reason}.`);
+        return;
+      }
+      const { frame } = parsed;
       this.queue.push(frame);
       if (frame.event === "snapshot") {
         sawSnapshot = true;
-        this.retry = { attempt: 0, refused: false };
         this.flush();
+        if (this.socket === socket) {
+          this.retry = { attempt: 0, refused: false, problem: null };
+          this.notify();
+        }
       } else if (this.flushTimer === null) {
         this.flushTimer = this.deps.setTimeout(() => {
           this.flushTimer = null;
@@ -203,24 +266,13 @@ export class FeedClient {
     };
   }
 
-  private parse(data: unknown): Frame | null {
-    if (typeof data !== "string") {
-      this.deps.log("ignoring a binary feed message");
-      return null;
-    }
-    try {
-      return JSON.parse(data) as Frame;
-    } catch (error) {
-      this.deps.log("ignoring a malformed feed message", error);
-      return null;
-    }
-  }
-
   private async diagnose() {
     let refused = false;
     try {
       const response = await this.deps.fetch("/mail?limit=1", {
         headers: { Authorization: `Bearer ${this.deps.token}` },
+        // A probe that never returns must not stop the reconnection behind it.
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
       if (response.status === 401) {
         this.tokenRejected();
@@ -258,10 +310,7 @@ export class FeedClient {
       return;
     }
     const attempt = this.retry.attempt + 1;
-    this.retry = { attempt, refused };
-    for (const listener of this.listeners) {
-      listener();
-    }
+    this.retry = { attempt, refused, problem: this.retry.problem };
     const ceiling = Math.min(
       BACKOFF_MAX_MS,
       BACKOFF_MIN_MS * 2 ** (attempt - 1),
@@ -271,6 +320,7 @@ export class FeedClient {
       this.retryTimer = null;
       this.connect();
     }, delay);
+    this.notify();
   }
 
   private flush() {
@@ -284,6 +334,9 @@ export class FeedClient {
     const frames = this.queue;
     this.queue = [];
     this.dispatch({ type: "frames", frames, now: this.deps.now() });
+    if (this.state.resyncNeeded && this.socket !== null) {
+      this.resync("This page missed part of agentd's mail feed.");
+    }
   }
 
   /** Carries out the reducer's plan. Runs after every state change. */
@@ -303,9 +356,7 @@ export class FeedClient {
         () => {
           this.fetchTimer = null;
           this.pump();
-          for (const listener of this.listeners) {
-            listener();
-          }
+          this.notify();
         },
         Math.max(0, plan.wakeAt - now),
       );
@@ -315,7 +366,11 @@ export class FeedClient {
   private async refetch(list: ListName, id: number) {
     let rows: MailRow[];
     try {
-      rows = ((await this.getJson(listTarget(list))) as MailPage).rows;
+      const page = (await this.getJson(listTarget(list))) as Partial<MailPage>;
+      if (!Array.isArray(page.rows) || !page.rows.every(isMailRow)) {
+        throw new Error(`${listTarget(list)}: a malformed page`);
+      }
+      rows = page.rows;
     } catch (error) {
       if (error instanceof TokenRejected) {
         return;

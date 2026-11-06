@@ -13,7 +13,13 @@ import {
   reduce,
 } from "./reducer";
 import { SimMailroom } from "./simulator";
-import type { DeliveryState, EdgeCounts, Frame, MailFrame } from "./types";
+import type {
+  AgentRow,
+  DeliveryState,
+  EdgeCounts,
+  Frame,
+  MailFrame,
+} from "./types";
 
 const A = "agent:A";
 const B = "agent:B";
@@ -231,6 +237,8 @@ describe("resume", () => {
     const twice = apply(once, frame);
     expect(twice.edges).toEqual(once.edges);
     expect(twice.moving.rows).toEqual(once.moving.rows);
+    // The server never repeats a frame, so a repeat also means a lost place.
+    expect(twice.resyncNeeded).toBe(true);
   });
 
   it("replaces all mail state on a full snapshot, even at a lower cursor", () => {
@@ -360,6 +368,216 @@ function heldRoom(count: number): SimMailroom {
   }
   return room;
 }
+
+describe("a frame that does not follow the cursor", () => {
+  function gapAfterOne() {
+    const room = new SimMailroom();
+    room.accept("human", A);
+    const state = fresh(room);
+    const lost = room.accept("human", A);
+    const after = room.move(lost.id, "offered");
+    return { room, state, after };
+  }
+
+  it("leaves no phantom count behind, and is not skipped over", () => {
+    const { state, after } = gapAfterOne();
+    const next = apply(state, after);
+    expect(next.edges).toEqual(state.edges);
+    expect(next.moving.rows).toEqual(state.moving.rows);
+    expect(next.cursor).toBe(state.cursor);
+    expect(next.resyncNeeded).toBe(true);
+  });
+
+  it("drops the anchor, so a resume cannot keep the damage", () => {
+    const { state, after } = gapAfterOne();
+    expect(eventsTarget(apply(state, after))).toBe("/events");
+  });
+
+  it("applies nothing more until a full snapshot", () => {
+    const { room, state, after } = gapAfterOne();
+    const later = room.accept("human", B);
+    const next = apply(state, after, later);
+    expect(next.edges).toEqual(state.edges);
+    const nullSnapshot = apply(next, room.nullSnapshot(room.head()));
+    expect(nullSnapshot.resyncNeeded).toBe(true);
+    expect(eventsTarget(nullSnapshot)).toBe("/events");
+  });
+
+  it("is repaired by one full snapshot, and then frames apply again", () => {
+    const { room, state, after } = gapAfterOne();
+    const repaired = apply(apply(state, after), room.snapshot());
+    expect(repaired.resyncNeeded).toBe(false);
+    expectEdgesEqualFresh(repaired, room);
+    expectListsEqualFresh(repaired, room);
+    const later = apply(repaired, room.accept("human", B));
+    expect(later.resyncNeeded).toBe(false);
+    expect(later.cursor).toBe(room.head());
+    expectEdgesEqualFresh(later, room);
+  });
+
+  it("cannot be applied before any snapshot", () => {
+    const room = new SimMailroom();
+    const state = apply(initialState(), room.accept("human", A));
+    expect(state.edges).toEqual({});
+    expect(state.resyncNeeded).toBe(true);
+  });
+});
+
+describe("an edge's revision", () => {
+  it("changes on a transition that changes no count a panel watches", () => {
+    const room = new SimMailroom();
+    const accepted = room.accept("human", A);
+    const state = fresh(room);
+    const key = edgeKey("human", A);
+    const offered = apply(state, room.move(accepted.id, "offered"));
+    expect(offered.edgeRevision[key]).not.toBe(state.edgeRevision[key]);
+    expect(offered.edgeRevision[key]).toBe(room.head());
+  });
+
+  it("differs between batches applied in the same millisecond", () => {
+    const room = new SimMailroom();
+    const accepted = room.accept("human", A);
+    const key = edgeKey("human", A);
+    const first = apply(fresh(room), room.move(accepted.id, "offered"));
+    const second = apply(first, room.move(accepted.id, "consumed"));
+    expect(second.edgeTouched[key]).toBe(first.edgeTouched[key]);
+    expect(second.edgeRevision[key]).not.toBe(first.edgeRevision[key]);
+  });
+
+  it("is left alone by another edge's frames", () => {
+    const room = new SimMailroom();
+    const state = apply(fresh(room), room.accept("human", A));
+    const next = apply(state, room.accept("human", B));
+    const key = edgeKey("human", A);
+    expect(next.edgeRevision[key]).toBe(state.edgeRevision[key]);
+  });
+});
+
+describe("pruning on a snapshot", () => {
+  const listed = (id: string) => ({
+    id,
+    name: "@x",
+    kind: "claude",
+    isolation: "none",
+    phase: "idle" as const,
+    error: null,
+  });
+
+  function withVolatile(state: ClientState, agent: string): ClientState {
+    return apply(
+      state,
+      { event: "activity", agent, text: "working" },
+      { event: "turn_ended", agent, outcome: "completed" },
+      { event: "egress_denied", agent, host: "example.com", port: 443 },
+    );
+  }
+
+  function expectKept(state: ClientState, agent: string, kept: boolean) {
+    expect(agent in state.activity).toBe(kept);
+    expect(agent in state.turns).toBe(kept);
+    expect(agent in state.egress).toBe(kept);
+  }
+
+  it("forgets an agent that is neither listed nor on an edge", () => {
+    const room = new SimMailroom();
+    const state = withVolatile(fresh(room), A);
+    expectKept(state, A, true);
+    expectKept(apply(state, room.nullSnapshot(0)), A, false);
+  });
+
+  it("keeps a listed agent's state", () => {
+    const room = new SimMailroom();
+    const state = withVolatile(fresh(room), A);
+    const next = apply(state, {
+      ...room.nullSnapshot(0),
+      agents: [listed(A)],
+    });
+    expectKept(next, A, true);
+    expect(next.activity[A]).toBe("working");
+  });
+
+  it("keeps the state of an agent only an edge still names", () => {
+    const room = new SimMailroom();
+    room.accept(B, A);
+    const state = withVolatile(fresh(room), A);
+    const next = apply(state, room.nullSnapshot(room.head()));
+    expectKept(next, A, true);
+    expectKept(apply(next, room.snapshot()), A, true);
+  });
+
+  it("prunes edgeTouched and revisions to live edges, and keeps live ones", () => {
+    const room = new SimMailroom();
+    room.accept("human", A);
+    let state = apply(fresh(room), room.accept("human", A));
+    const live = edgeKey("human", A);
+    const gone = edgeKey("human", B);
+    state = {
+      ...state,
+      edgeTouched: { ...state.edgeTouched, [gone]: 1 },
+      edgeRevision: { ...state.edgeRevision, [gone]: 1 },
+    };
+    const next = apply(state, room.nullSnapshot(room.head()));
+    expect(Object.keys(next.edgeTouched)).toEqual([live]);
+    expect(Object.keys(next.edgeRevision)).toEqual([live]);
+  });
+
+  it("stays bounded across many agents that come and go", () => {
+    const room = new SimMailroom();
+    let state = fresh(room);
+    for (let i = 0; i < 500; i += 1) {
+      state = apply(withVolatile(state, `agent:${i}`), room.nullSnapshot(0));
+    }
+    expect(Object.keys(state.activity)).toEqual([]);
+    expect(Object.keys(state.turns)).toEqual([]);
+    expect(Object.keys(state.egress)).toEqual([]);
+  });
+});
+
+describe("a respawn under the same id", () => {
+  const row = (phase: AgentRow["phase"]): Frame => ({
+    event: "agent",
+    id: A,
+    name: "@a",
+    kind: "claude",
+    isolation: "none",
+    phase,
+    error: null,
+  });
+  const lived = (room: SimMailroom, phase: AgentRow["phase"]) =>
+    apply(
+      fresh(room),
+      row(phase),
+      { event: "activity", agent: A, text: "old life" },
+      { event: "turn_ended", agent: A, outcome: "failed" },
+    );
+
+  it("does not show the previous life's outcome", () => {
+    const next = apply(lived(new SimMailroom(), "failed"), row("starting"));
+    expect(next.turns[A]).toBeUndefined();
+    expect(next.activity[A]).toBeUndefined();
+  });
+
+  it("is noticed when only a snapshot says so", () => {
+    const room = new SimMailroom();
+    const { event: _event, ...agent } = row("idle") as AgentRow & {
+      event: "agent";
+    };
+    const next = apply(lived(room, "crashed"), {
+      ...room.nullSnapshot(0),
+      agents: [agent],
+    });
+    expect(next.turns[A]).toBeUndefined();
+  });
+
+  it("keeps state through the ordinary phases of one life", () => {
+    let state = lived(new SimMailroom(), "busy");
+    state = apply(state, row("idle"), row("busy"), row("dormant"));
+    expect(state.turns[A]).toBe("failed");
+    expect(state.activity[A]).toBe("old life");
+    // An ending keeps what the operator needs to see about why.
+    expect(apply(state, row("failed")).turns[A]).toBe("failed");
+  });
+});
 
 describe("feed mode", () => {
   it("is not changed by /mail results, and a resume after them is correct", () => {
@@ -793,6 +1011,7 @@ describe("volatile frames", () => {
 
   it("keeps a bounded activity tail, across snapshots", () => {
     const room = new SimMailroom();
+    room.accept("human", A);
     let state = fresh(room);
     for (let i = 0; i < 6; i += 1) {
       state = apply(state, {

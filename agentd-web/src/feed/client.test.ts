@@ -2,6 +2,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ClientDeps, FeedClient } from "./client";
 import { SimMailroom } from "./simulator";
 
+// Lets a test make the reducer throw, which no valid frame should ever do.
+const fault = vi.hoisted(() => ({ throwOnFrames: false }));
+vi.mock("./reducer", async (original) => {
+  const actual = await original<typeof import("./reducer")>();
+  return {
+    ...actual,
+    reduce: (...args: Parameters<typeof actual.reduce>) => {
+      if (fault.throwOnFrames && args[1].type === "frames") {
+        throw new Error("the reducer threw");
+      }
+      return actual.reduce(...args);
+    },
+  };
+});
+
 const TOKEN = "ab".repeat(32);
 
 class FakeSocket {
@@ -211,15 +226,258 @@ describe("FeedClient", () => {
     expect(client.getState().cursor).toBe(0);
   });
 
-  it("survives a malformed message", () => {
-    const { client, sockets } = setup(() =>
-      Promise.reject(new Error("unused")),
+  it("gives the probe a request timeout", async () => {
+    const abort = new AbortController();
+    const timeout = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockReturnValue(abort.signal);
+    const { client, sockets, requests } = setup(() => new Promise(() => {}));
+    client.start();
+    sockets[0]!.drop();
+    await settle();
+    expect(requests[0]!.target).toBe("/mail?limit=1");
+    expect(timeout).toHaveBeenCalledWith(30_000);
+    expect(requests[0]!.init.signal).toBe(abort.signal);
+    timeout.mockRestore();
+  });
+
+  it("schedules the backoff when the probe's request is aborted", async () => {
+    const abort = new AbortController();
+    const timeout = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockReturnValue(abort.signal);
+    const { client, sockets } = setup(
+      () =>
+        new Promise<Response>((_resolve, reject) => {
+          abort.signal.addEventListener("abort", () =>
+            reject(abort.signal.reason),
+          );
+        }),
     );
     client.start();
-    sockets[0]!.open();
-    sockets[0]!.onmessage?.({ data: "{not json" } as MessageEvent);
-    sockets[0]!.send(new SimMailroom().snapshot());
-    expect(client.getState().link).toBe("live");
+    sockets[0]!.drop();
+    await settle();
+    expect(sockets).toHaveLength(1);
+    abort.abort(new DOMException("timed out", "TimeoutError"));
+    await settle();
+    expect(client.getRetry().attempt).toBe(1);
+    expect(client.getRetry().refused).toBe(false);
+    await vi.advanceTimersByTimeAsync(501);
+    expect(sockets).toHaveLength(2);
+    timeout.mockRestore();
+  });
+
+  describe("a lost mail frame", () => {
+    function connected() {
+      const harness = setup(() => Promise.reject(new Error("unused")));
+      const room = new SimMailroom();
+      room.accept("human", "agent:A");
+      harness.client.start();
+      harness.sockets[0]!.open();
+      harness.sockets[0]!.send(room.snapshot());
+      return { ...harness, room };
+    }
+
+    it("closes the socket and reconnects without the anchor", async () => {
+      const { client, sockets, room } = connected();
+      room.accept("human", "agent:A"); // Never delivered.
+      sockets[0]!.send(room.accept("human", "agent:A"));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(sockets[0]!.closed).toBe(true);
+      expect(client.getState().link).toBe("disconnected");
+      expect(client.getRetry().problem).toContain("missed");
+      await vi.advanceTimersByTimeAsync(501);
+      expect(sockets[1]!.url).toBe("ws://127.0.0.1:7434/events");
+    });
+
+    it("costs one full snapshot, then no reconnect loop", async () => {
+      const { client, sockets, room } = connected();
+      room.accept("human", "agent:A"); // Never delivered.
+      sockets[0]!.send(room.accept("human", "agent:A"));
+      await vi.advanceTimersByTimeAsync(601);
+      expect(sockets).toHaveLength(2);
+      sockets[1]!.open();
+      sockets[1]!.send(room.snapshot());
+      expect(client.getState().resyncNeeded).toBe(false);
+      expect(client.getRetry()).toEqual({
+        attempt: 0,
+        refused: false,
+        problem: null,
+      });
+      // The hole is behind the new cursor now, so nothing leads back to it.
+      for (let i = 0; i < 50; i += 1) {
+        sockets[1]!.send(room.accept("human", "agent:A"));
+        await vi.advanceTimersByTimeAsync(1000);
+      }
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(sockets).toHaveLength(2);
+      expect(sockets[1]!.closed).toBe(false);
+      expect(client.getState().cursor).toBe(room.head());
+      expect(
+        Object.values(client.getState().edges).reduce(
+          (n, edge) => n + edge.queued,
+          0,
+        ),
+      ).toBe(room.edges().reduce((n, edge) => n + edge.queued, 0));
+    });
+
+    it("backs off if the server keeps skipping, instead of spinning", async () => {
+      const { client, sockets, room } = connected();
+      const delays: number[] = [];
+      let last = Date.now();
+      for (let round = 0; round < 7; round += 1) {
+        const socket = sockets.at(-1)!;
+        room.accept("human", "agent:A"); // Never delivered.
+        socket.send(room.accept("human", "agent:A"));
+        await vi.advanceTimersByTimeAsync(50);
+        const count = sockets.length;
+        last = Date.now();
+        while (sockets.length === count) {
+          await vi.advanceTimersByTimeAsync(100);
+        }
+        delays.push(Date.now() - last);
+        sockets.at(-1)!.open();
+        sockets.at(-1)!.send(room.snapshot());
+      }
+      expect(delays[0]).toBeLessThanOrEqual(600);
+      expect(delays[6]).toBeGreaterThan(delays[0]! * 16);
+      expect(client.getState().link).toBe("live");
+    });
+
+    it("starts from the shortest backoff again after a quiet minute", async () => {
+      const { sockets, room } = connected();
+      room.accept("human", "agent:A");
+      sockets[0]!.send(room.accept("human", "agent:A"));
+      await vi.advanceTimersByTimeAsync(601);
+      sockets[1]!.open();
+      sockets[1]!.send(room.snapshot());
+      await vi.advanceTimersByTimeAsync(61_000);
+      room.accept("human", "agent:A");
+      sockets[1]!.send(room.accept("human", "agent:A"));
+      await vi.advanceTimersByTimeAsync(601);
+      expect(sockets).toHaveLength(3);
+    });
+  });
+
+  describe("a frame this page cannot use", () => {
+    afterEach(() => {
+      fault.throwOnFrames = false;
+    });
+
+    function resumable() {
+      const harness = setup(() => Promise.reject(new Error("unused")));
+      const room = new SimMailroom();
+      room.accept("human", "agent:A");
+      harness.client.start();
+      harness.sockets[0]!.open();
+      harness.sockets[0]!.send(room.snapshot());
+      return { ...harness, room };
+    }
+
+    function send(socket: FakeSocket, data: string) {
+      socket.onmessage?.({ data } as MessageEvent);
+    }
+
+    it.each([
+      ["a snapshot with no fields", '{"event":"snapshot"}'],
+      ["text that is not JSON", "{not json"],
+      ["JSON with no event", "[1,2]"],
+      ["a mail frame with no seq", '{"event":"mail","id":"m"}'],
+      ["an activity frame with no text", '{"event":"activity","agent":"a"}'],
+    ])(
+      "%s: reconnects without the anchor, and says so",
+      async (_name, data) => {
+        const { client, sockets, room } = resumable();
+        expect(() => send(sockets[0]!, data)).not.toThrow();
+        expect(sockets[0]!.closed).toBe(true);
+        expect(client.getRetry().problem).toContain("agentd sent");
+        expect(client.getState().link).toBe("disconnected");
+        await vi.advanceTimersByTimeAsync(601);
+        expect(sockets[1]!.url).toBe("ws://127.0.0.1:7434/events");
+        sockets[1]!.open();
+        sockets[1]!.send(room.snapshot());
+        expect(client.getState().link).toBe("live");
+        expect(client.getRetry().problem).toBeNull();
+      },
+    );
+
+    it("recovers when a malformed snapshot is the first frame", async () => {
+      const { client, sockets } = setup(() =>
+        Promise.reject(new Error("unused")),
+      );
+      client.start();
+      sockets[0]!.open();
+      send(sockets[0]!, '{"event":"snapshot"}');
+      expect(client.getState().link).toBe("disconnected");
+      await vi.advanceTimersByTimeAsync(601);
+      expect(sockets).toHaveLength(2);
+    });
+
+    it("ignores an event kind from a newer server", async () => {
+      const { client, sockets } = resumable();
+      send(sockets[0]!, '{"event":"from_the_future","anything":[1]}');
+      await vi.advanceTimersByTimeAsync(601);
+      expect(sockets).toHaveLength(1);
+      expect(sockets[0]!.closed).toBe(false);
+      expect(client.getRetry().problem).toBeNull();
+      expect(client.getState().link).toBe("live");
+    });
+
+    it("a reducer throw on a live socket reconnects without the anchor", async () => {
+      const { client, sockets, room } = resumable();
+      fault.throwOnFrames = true;
+      sockets[0]!.send(room.accept("human", "agent:A"));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(sockets[0]!.closed).toBe(true);
+      expect(client.getRetry().problem).toContain("could not apply");
+      fault.throwOnFrames = false;
+      await vi.advanceTimersByTimeAsync(601);
+      expect(sockets[1]!.url).toBe("ws://127.0.0.1:7434/events");
+    });
+
+    it("a reducer throw inside onclose does not kill the reconnect", async () => {
+      const { client, sockets, room } = resumable();
+      sockets[0]!.send(room.accept("human", "agent:A"));
+      fault.throwOnFrames = true;
+      expect(() => sockets[0]!.drop()).not.toThrow();
+      fault.throwOnFrames = false;
+      expect(client.getState().link).toBe("disconnected");
+      expect(client.getRetry().problem).toContain("could not apply");
+      await vi.advanceTimersByTimeAsync(601);
+      expect(sockets[1]!.url).toBe("ws://127.0.0.1:7434/events");
+    });
+
+    it("a reducer that keeps throwing on the snapshot backs off and stays visible", async () => {
+      const { client, sockets, room } = resumable();
+      fault.throwOnFrames = true;
+      for (let i = 0; i < 5; i += 1) {
+        sockets.at(-1)!.send(room.snapshot());
+        expect(client.getRetry().problem).toContain("could not apply");
+        const count = sockets.length;
+        while (sockets.length === count) {
+          await vi.advanceTimersByTimeAsync(100);
+        }
+        sockets.at(-1)!.open();
+      }
+      expect(client.getRetry().attempt).toBe(0 + 5);
+    });
+
+    it("a malformed /mail page fails that read, not the page", async () => {
+      const room = new SimMailroom();
+      for (let i = 0; i < 1001; i += 1) {
+        room.accept("human", "agent:A", "held");
+      }
+      const { client, sockets } = setup(() =>
+        Promise.resolve(json(200, { nope: true })),
+      );
+      client.start();
+      sockets[0]!.open();
+      sockets[0]!.send(room.snapshot());
+      await settle();
+      expect(sockets[0]!.closed).toBe(false);
+      expect(client.getState().stuck.outstanding).toBeNull();
+      expect(client.getState().stuck.dirty).toBe(true);
+    });
   });
 
   it("refetches a view-mode list with the bearer token, and retries a failure", async () => {

@@ -184,6 +184,14 @@ export function App({ client }: { client: FeedClient }) {
           </button>
         </div>
       ) : null}
+      {retry.problem !== null ? (
+        <div className={styles.banner} data-testid="feed-problem" role="alert">
+          <span>
+            {retry.problem} Reloading everything from agentd. What is on screen
+            may be out of date until then.
+          </span>
+        </div>
+      ) : null}
       {state.agentsTruncated || state.edgesTruncated ? (
         <div className={styles.notice} data-testid="graph-truncated">
           {state.agentsTruncated

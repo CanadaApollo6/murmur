@@ -19,6 +19,7 @@ import type {
   MailFrame,
   MailRow,
   PermissionRequest,
+  Phase,
   SnapshotFrame,
 } from "./types";
 
@@ -84,6 +85,16 @@ export interface ClientState {
   egress: Record<string, EgressDenial[]>;
   /** Display only: when each edge last carried a frame. */
   edgeTouched: Record<string, number>;
+  /**
+   * The `seq` of the last frame on each edge. Unlike a count, it changes on every
+   * transition, and unlike a time, two batches can never share a value.
+   */
+  edgeRevision: Record<string, number>;
+  /**
+   * A frame did not follow the cursor, so mail state can no longer be trusted. Only
+   * a full snapshot clears this, and no anchor is echoed until then.
+   */
+  resyncNeeded: boolean;
   nextRequestId: number;
   /** When the feed last delivered anything. */
   lastFrameAt: number | null;
@@ -93,6 +104,8 @@ export type Action =
   | { type: "socket_open" }
   | { type: "frames"; frames: readonly Frame[]; now: number }
   | { type: "disconnected" }
+  /** The driver gave up on what it received. Ask for a full snapshot next. */
+  | { type: "resync" }
   | { type: "rejected" }
   | { type: "fetch_sent"; list: ListName; id: number; now: number }
   | { type: "fetch_ok"; list: ListName; id: number; rows: MailRow[] }
@@ -126,6 +139,8 @@ export function initialState(): ClientState {
     turns: {},
     egress: {},
     edgeTouched: {},
+    edgeRevision: {},
+    resyncNeeded: false,
     nextRequestId: 1,
     lastFrameAt: null,
   };
@@ -173,6 +188,8 @@ function applyFullMail(
   draft.edges = edgesFrom(mail.edges);
   draft.edgesTruncated = mail.edges_truncated;
   draft.edgeTouched = {};
+  draft.edgeRevision = {};
+  draft.resyncNeeded = false;
   draft.stuck = listFromSnapshot(draft.stuck, mail.stuck, mail.stuck_truncated);
   draft.moving = listFromSnapshot(
     draft.moving,
@@ -181,10 +198,68 @@ function applyFullMail(
   );
 }
 
+function pickKeys<T>(
+  record: Record<string, T>,
+  keep: (key: string) => boolean,
+): Record<string, T> {
+  const kept: Record<string, T> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (keep(key)) {
+      kept[key] = value;
+    }
+  }
+  return kept;
+}
+
+/** A respawn keeps the agent's id, so only the phase can say a new life began. */
+const LIFE_OVER: ReadonlySet<Phase> = new Set<Phase>([
+  "ended",
+  "crashed",
+  "failed",
+  "needs-recovery",
+]);
+
+function isNewLife(previous: AgentRow | undefined, next: AgentRow): boolean {
+  return (
+    previous !== undefined &&
+    LIFE_OVER.has(previous.phase) &&
+    !LIFE_OVER.has(next.phase)
+  );
+}
+
+function forgetLife(draft: ClientState, agent: string) {
+  delete draft.activity[agent];
+  delete draft.turns[agent];
+  delete draft.egress[agent];
+}
+
+/**
+ * Forgets what only a past snapshot's agents and edges could explain, so a page
+ * open for days does not grow. An agent stays while it is listed or on an edge.
+ */
+function pruneVolatile(draft: ClientState) {
+  const live = new Set(Object.keys(draft.agents));
+  for (const edge of Object.values(draft.edges)) {
+    live.add(edge.from);
+    live.add(edge.to);
+  }
+  const isLive = (agent: string) => live.has(agent);
+  draft.activity = pickKeys(draft.activity, isLive);
+  draft.turns = pickKeys(draft.turns, isLive);
+  draft.egress = pickKeys(draft.egress, isLive);
+  const isEdge = (key: string) => Object.hasOwn(draft.edges, key);
+  draft.edgeTouched = pickKeys(draft.edgeTouched, isEdge);
+  draft.edgeRevision = pickKeys(draft.edgeRevision, isEdge);
+}
+
 function applySnapshot(draft: ClientState, frame: SnapshotFrame) {
   draft.link = "live";
+  const previous = draft.agents;
   draft.agents = {};
   for (const agent of frame.agents) {
+    if (isNewLife(previous[agent.id], agent)) {
+      forgetLife(draft, agent.id);
+    }
     draft.agents[agent.id] = agent;
   }
   draft.agentsTruncated = frame.agents_truncated;
@@ -199,11 +274,13 @@ function applySnapshot(draft: ClientState, frame: SnapshotFrame) {
   if (frame.mail) {
     applyFullMail(draft, frame, frame.mail);
   }
+  pruneVolatile(draft);
 }
 
 function applyEdge(draft: ClientState, frame: MailFrame, now: number) {
   const key = edgeKey(frame.from, frame.to);
   draft.edgeTouched[key] = now;
+  draft.edgeRevision[key] = frame.seq;
   if (frame.prev_state === frame.state) {
     return;
   }
@@ -279,8 +356,15 @@ function applyToFeedList(
 }
 
 function applyMail(draft: ClientState, frame: MailFrame, now: number) {
-  // A client applies each `seq` once.
-  if (draft.cursor !== null && frame.seq <= draft.cursor) {
+  // The server sends every `seq` in order, so anything else means this client has
+  // lost its place. Applying the frame would leave the counts wrong, and its anchor
+  // would then stop a resume from repairing them.
+  if (draft.resyncNeeded) {
+    return;
+  }
+  if (draft.cursor === null || frame.seq !== draft.cursor + 1) {
+    draft.resyncNeeded = true;
+    draft.anchor = null;
     return;
   }
   draft.cursor = frame.seq;
@@ -302,6 +386,9 @@ function applyMail(draft: ClientState, frame: MailFrame, now: number) {
 
 function applyAgent(draft: ClientState, frame: AgentRow) {
   const previous = draft.agents[frame.id];
+  if (isNewLife(previous, frame)) {
+    forgetLife(draft, frame.id);
+  }
   // A missed name lookup still sends the frame, with what it knows.
   draft.agents[frame.id] = {
     id: frame.id,
@@ -341,6 +428,7 @@ function applyFrames(
     turns: { ...state.turns },
     egress: { ...state.egress },
     edgeTouched: { ...state.edgeTouched },
+    edgeRevision: { ...state.edgeRevision },
     lastFrameAt: now,
   };
   for (const frame of frames) {
@@ -418,6 +506,8 @@ export function reduce(state: ClientState, action: Action): ClientState {
         },
         (list) => ({ ...list, outstanding: null }),
       );
+    case "resync":
+      return { ...state, resyncNeeded: true, anchor: null };
     case "rejected":
       return mapLists({ ...state, link: "rejected" }, (list) => ({
         ...list,
