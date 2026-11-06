@@ -60,6 +60,16 @@ pub(crate) fn query(db: &Connection, filter: &MailQuery) -> Result<Value> {
     }) {
         return Err(Error::Rejected("invalid mail state".into()));
     }
+    #[cfg(test)]
+    trace::label(if filter.from.as_deref() == Some("no such sender") {
+        "mail_rare_filter"
+    } else if states == ["held", "uncertain"] {
+        "mail_states_held_uncertain"
+    } else if states == ["offered", "queued"] {
+        "mail_states_queued_offered"
+    } else {
+        "mail_filtered"
+    });
     let before = filter.before_msg_seq.unwrap_or(i64::MAX);
     let limit = filter.limit.clamp(1, 1000);
     // State names above are a closed vocabulary. Each branch walks its state index.
@@ -92,13 +102,34 @@ pub(crate) fn query(db: &Connection, filter: &MailQuery) -> Result<Value> {
             None => Ok("no matching recipient".into()),
         })
         .transpose()?;
+    if from.is_none() && to.is_none() {
+        let (rows, next) = unfiltered_page(db, &states, before, limit)?;
+        return Ok(query_result(rows, next));
+    }
     let sql = format!(
         "WITH candidates AS MATERIALIZED ({candidates}) SELECT {META},{DELIVERY} FROM candidates c JOIN messages m ON m.seq=c.seq JOIN deliveries d ON d.message_id=m.id WHERE (?2 IS NULL OR m.sender=?2) AND (?3 IS NULL OR m.recipient=?3) ORDER BY m.seq DESC LIMIT {limit}"
     );
+    #[cfg(test)]
+    let prepare = trace::query("prepare");
     let mut stmt = db.prepare(&sql)?;
+    #[cfg(test)]
+    drop(prepare);
+    #[cfg(test)]
+    let result = if trace::detailed() {
+        trace::read_rows(db, &mut stmt, params![before, from, to], metadata, "rows")?
+    } else {
+        stmt.query_map(params![before, from, to], metadata)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    #[cfg(not(test))]
     let result = stmt
         .query_map(params![before, from, to], metadata)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    {
+        #[cfg(test)]
+        let _cleanup = trace::query("cleanup");
+        drop(stmt);
+    }
     let next = if result.len() == limit {
         result.last().and_then(|r| r["msg_seq"].as_i64())
     } else {
@@ -109,11 +140,122 @@ pub(crate) fn query(db: &Connection, filter: &MailQuery) -> Result<Value> {
         )?;
         if count == 10000 { last } else { None }
     };
+    Ok(query_result(result, next))
+}
+
+fn query_result(result: Vec<Value>, next: Option<i64>) -> Value {
     #[cfg(test)]
     let _assembly = trace::query("mail_result_assembly");
     let mut response = json!({"next_before_msg_seq":next});
     response["rows"] = Value::Array(result);
-    Ok(response)
+    response
+}
+
+fn unfiltered_page(
+    db: &Connection,
+    states: &[String],
+    before: i64,
+    limit: usize,
+) -> Result<(Vec<Value>, Option<i64>)> {
+    // Merge the same bounded, ordered streams as the filtered query. This
+    // avoids joining and sorting metadata for candidates the page cannot use.
+    #[cfg(test)]
+    let prepare = trace::query("prepare");
+    let sql = if states.is_empty() {
+        vec!["SELECT seq FROM messages WHERE seq<?1 ORDER BY seq DESC LIMIT 10000".to_owned()]
+    } else {
+        states.iter().map(|state| format!("SELECT msg_seq FROM deliveries WHERE state='{state}' AND msg_seq<?1 ORDER BY msg_seq DESC LIMIT 10000")).collect()
+    };
+    let mut sequences = sql
+        .iter()
+        .map(|sql| db.prepare(sql))
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut lookup = db.prepare(&format!("SELECT {META},{DELIVERY} FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.seq=?"))?;
+    #[cfg(test)]
+    drop(prepare);
+    #[cfg(test)]
+    let mut profile = trace::SqlProbe::new("rows");
+    #[cfg(test)]
+    let stamp = profile.stamp();
+    let mut cursors = sequences
+        .iter_mut()
+        .map(|s| s.query([before]))
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut heads = std::collections::BinaryHeap::new();
+    for (index, cursor) in cursors.iter_mut().enumerate() {
+        if let Some(row) = cursor.next()? {
+            heads.push((row.get::<_, i64>(0)?, index));
+        }
+    }
+    #[cfg(test)]
+    profile.sql_done(stamp);
+    let mut rows = Vec::new();
+    let mut examined = 0;
+    let mut last = None;
+    while let Some((seq, index)) = heads.pop() {
+        // UNION deduplicates multiple branches. A single branch keeps its
+        // multiplicity, including repeated msg_seq in a manually edited DB.
+        if states.len() <= 1 || last != Some(seq) {
+            examined += 1;
+            last = Some(seq);
+            #[cfg(test)]
+            let stamp = profile.stamp();
+            let mut found = lookup.query([seq])?;
+            let row = found.next()?;
+            #[cfg(test)]
+            profile.sql_done(stamp);
+            if let Some(row) = row {
+                #[cfg(test)]
+                let stamp = profile.stamp();
+                rows.push(metadata(row)?);
+                #[cfg(test)]
+                profile.row_done(stamp);
+            }
+            #[cfg(test)]
+            let stamp = profile.stamp();
+            drop(found);
+            #[cfg(test)]
+            profile.cleanup_done(stamp);
+            if rows.len() == limit || examined == 10000 {
+                break;
+            }
+        }
+        #[cfg(test)]
+        let stamp = profile.stamp();
+        if let Some(row) = cursors[index].next()? {
+            heads.push((row.get::<_, i64>(0)?, index));
+        }
+        #[cfg(test)]
+        profile.sql_done(stamp);
+    }
+    #[cfg(test)]
+    let stamp = profile.stamp();
+    drop(cursors);
+    #[cfg(test)]
+    profile.cleanup_done(stamp);
+    #[cfg(test)]
+    profile.inspect(
+        db,
+        &sequences.iter().chain([&lookup]).collect::<Vec<_>>(),
+        rows.len(),
+        examined,
+    )?;
+    #[cfg(test)]
+    let cleanup = trace::query("cleanup");
+    drop(lookup);
+    drop(sequences);
+    #[cfg(test)]
+    drop(cleanup);
+    #[cfg(test)]
+    profile.finish();
+    let next = if rows.len() == limit {
+        rows.last().and_then(|r| r["msg_seq"].as_i64())
+    } else if examined == 10000 {
+        last
+    } else {
+        None
+    };
+    Ok((rows, next))
 }
 
 fn window(db: &Connection, states: &[&str]) -> Result<(Vec<Value>, bool)> {
@@ -122,6 +264,24 @@ fn window(db: &Connection, states: &[&str]) -> Result<(Vec<Value>, bool)> {
         "WITH candidates AS MATERIALIZED (SELECT msg_seq FROM ({branches}) ORDER BY msg_seq DESC LIMIT 1001) SELECT {META},{DELIVERY} FROM candidates c JOIN messages m ON m.seq=c.msg_seq JOIN deliveries d ON d.message_id=m.id ORDER BY m.seq DESC"
     );
     let mut stmt = db.prepare(&sql)?;
+    #[cfg(test)]
+    let mut rows = if trace::detailed() {
+        trace::read_rows(
+            db,
+            &mut stmt,
+            [],
+            metadata,
+            if states == ["held", "uncertain"] {
+                "stuck_rows"
+            } else {
+                "moving_rows"
+            },
+        )?
+    } else {
+        stmt.query_map([], metadata)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    #[cfg(not(test))]
     let mut rows = stmt
         .query_map([], metadata)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1471,5 +1631,170 @@ mod head_failure_tests {
         .expect("later accept survives head failure");
         assert!(!fail.load(Ordering::SeqCst));
         room.close().await.expect("close");
+    }
+}
+
+#[cfg(test)]
+mod query_work_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    fn legacy_page(
+        db: &Connection,
+        mut states: Vec<String>,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Value {
+        states.sort_unstable();
+        states.dedup();
+        let limit = limit.clamp(1, 1000);
+        let before = before.unwrap_or(i64::MAX);
+        let candidates = if states.is_empty() {
+            "SELECT seq FROM messages WHERE seq<?1 ORDER BY seq DESC LIMIT 10000".to_owned()
+        } else {
+            let branches=states.iter().map(|s|format!("SELECT msg_seq AS seq FROM (SELECT msg_seq FROM deliveries WHERE state='{s}' AND msg_seq<?1 ORDER BY msg_seq DESC LIMIT 10000)")).collect::<Vec<_>>().join(" UNION ");
+            format!("SELECT seq FROM ({branches}) ORDER BY seq DESC LIMIT 10000")
+        };
+        let sql = format!(
+            "WITH candidates AS MATERIALIZED ({candidates}) SELECT {META},{DELIVERY} FROM candidates c JOIN messages m ON m.seq=c.seq JOIN deliveries d ON d.message_id=m.id WHERE (?2 IS NULL OR m.sender=?2) AND (?3 IS NULL OR m.recipient=?3) ORDER BY m.seq DESC LIMIT {limit}"
+        );
+        let rows = db
+            .prepare(&sql)
+            .expect("legacy")
+            .query_map(
+                params![before, Option::<String>::None, Option::<String>::None],
+                metadata,
+            )
+            .expect("rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect");
+        let next = if rows.len() == limit {
+            rows.last().and_then(|r| r["msg_seq"].as_i64())
+        } else {
+            let (n, last): (usize, Option<i64>) = db
+                .query_row(
+                    &format!("SELECT COUNT(*),MIN(seq) FROM ({candidates})"),
+                    [before],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("candidate count");
+            if n == 10000 { last } else { None }
+        };
+        query_result(rows, next)
+    }
+    #[test]
+    fn unfiltered_pages_preserve_results_with_less_sql_work() {
+        let dir = tempfile::tempdir().expect("query dir");
+        let mut s =
+            Store::open(&dir.path().join("mail.db"), Config::default()).expect("query store");
+        let to = json(&AgentId::new()).expect("agent");
+        s.db.execute("INSERT INTO agents(id,name) VALUES (?,'query')", [&to])
+            .expect("agent");
+        let tx = s.db.transaction().expect("tx");
+        for n in 1..=40000 {
+            let id = format!("\"{n:026}\"");
+            tx.execute("INSERT INTO messages(id,sender,client_key,recipient,conversation,hop,act,body,sent_at) VALUES (?,'\"Human\"',?,?,'\"00000000000000000000000001\"',0,'\"Inform\"','small','unused')",params![id,format!("key-{n}"),to]).expect("message");
+            let state = if n <= 20000 {
+                "queued"
+            } else {
+                match n % 4 {
+                    0 => "held",
+                    1 => "uncertain",
+                    2 => "queued",
+                    _ => "offered",
+                }
+            };
+            tx.execute("INSERT INTO deliveries(message_id,state,incarnation,reason,msg_seq) VALUES (?,?,?,?,?)",params![id,state,if ["offered","uncertain"].contains(&state){Some(1)}else{None},if state=="held"{Some("hold")}else{None},n]).expect("delivery");
+        }
+        tx.commit().expect("commit");
+        let steps = Arc::new(AtomicUsize::new(0));
+        let count = steps.clone();
+        s.db.progress_handler(
+            1,
+            Some(move || {
+                count.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        );
+        for states in [
+            vec!["held".to_owned(), "uncertain".to_owned()],
+            vec!["offered".to_owned(), "queued".to_owned()],
+        ] {
+            let branches=states.iter().map(|s|format!("SELECT msg_seq AS seq FROM (SELECT msg_seq FROM deliveries WHERE state='{s}' AND msg_seq<?1 ORDER BY msg_seq DESC LIMIT 10000)")).collect::<Vec<_>>().join(" UNION ");
+            let candidates = format!("SELECT seq FROM ({branches}) ORDER BY seq DESC LIMIT 10000");
+            let sql = format!(
+                "WITH candidates AS MATERIALIZED ({candidates}) SELECT {META},{DELIVERY} FROM candidates c JOIN messages m ON m.seq=c.seq JOIN deliveries d ON d.message_id=m.id WHERE (?2 IS NULL OR m.sender=?2) AND (?3 IS NULL OR m.recipient=?3) ORDER BY m.seq DESC LIMIT 1000"
+            );
+            steps.store(0, Ordering::Relaxed);
+            let expected =
+                s.db.prepare(&sql)
+                    .expect("legacy")
+                    .query_map(
+                        params![i64::MAX, Option::<String>::None, Option::<String>::None],
+                        metadata,
+                    )
+                    .expect("rows")
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .expect("collect");
+            let legacy_steps = steps.swap(0, Ordering::Relaxed);
+            let actual = query(
+                &s.db,
+                &MailQuery {
+                    states: states.clone(),
+                    limit: 1000,
+                    ..Default::default()
+                },
+            )
+            .expect("query");
+            let actual_steps = steps.swap(0, Ordering::Relaxed);
+            assert_eq!(actual["rows"], Value::Array(expected));
+            assert_eq!(
+                actual["next_before_msg_seq"],
+                actual["rows"][999]["msg_seq"]
+            );
+            println!(
+                "QUERY_WORK states={states:?} legacy_vm={legacy_steps} actual_vm={actual_steps}"
+            );
+            assert!(
+                actual_steps < legacy_steps * 3 / 4,
+                "unfiltered page fetched unused metadata: legacy_vm={legacy_steps} actual_vm={actual_steps}"
+            );
+        }
+        s.db.progress_handler(0, None::<fn() -> bool>);
+        s.db.execute("DELETE FROM deliveries WHERE msg_seq<=20000", [])
+            .expect("orphan messages");
+        s.db.execute(
+            "UPDATE deliveries SET msg_seq=39000 WHERE msg_seq IN (39001,38996)",
+            [],
+        )
+        .expect("duplicate candidate sequences");
+        for states in [
+            vec![],
+            vec!["held"],
+            vec!["queued", "queued"],
+            vec!["held", "uncertain"],
+            vec!["queued", "offered"],
+            vec!["queued", "offered", "consumed", "held", "uncertain", "dead"],
+        ] {
+            let states = states.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            for before in [None, Some(39500), Some(20003), Some(20001), Some(0)] {
+                for limit in [0, 1, 17, 1000, 2000] {
+                    let actual = query(
+                        &s.db,
+                        &MailQuery {
+                            states: states.clone(),
+                            before_msg_seq: before,
+                            limit,
+                            ..Default::default()
+                        },
+                    )
+                    .expect("page");
+                    assert_eq!(
+                        actual,
+                        legacy_page(&s.db, states.clone(), before, limit),
+                        "states={states:?} before={before:?} limit={limit}"
+                    );
+                }
+            }
+        }
     }
 }

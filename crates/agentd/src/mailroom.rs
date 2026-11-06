@@ -223,8 +223,12 @@ impl Mailroom {
                     let before = store.db.total_changes();
                     {
                         #[cfg(test)]
+                        let cache = trace::cache(&store.db);
+                        #[cfg(test)]
                         let _job = trace::job();
                         job(&mut store);
+                        #[cfg(test)]
+                        trace::cache_delta(cache, &store.db);
                     }
                     if store.db.total_changes() != before {
                         #[cfg(test)]

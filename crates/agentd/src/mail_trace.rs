@@ -1,11 +1,239 @@
 //! Opt-in, worker-thread-local instrumentation for the ignored cost gate.
 use std::{cell::RefCell, collections::BTreeMap, time::Instant};
 
+#[derive(Clone, Copy, Default, serde::Serialize)]
+struct Resource {
+    user_us: i64,
+    system_us: i64,
+    cpu_ns: i64,
+    voluntary: i64,
+    involuntary: i64,
+    minor_faults: i64,
+    major_faults: i64,
+}
+impl Resource {
+    fn cpu_ms(self) -> f64 {
+        self.cpu_ns as f64 / 1_000_000.0
+    }
+    fn delta(self, before: Self) -> Self {
+        Self {
+            cpu_ns: self.cpu_ns - before.cpu_ns,
+            user_us: self.user_us - before.user_us,
+            system_us: self.system_us - before.system_us,
+            voluntary: self.voluntary - before.voluntary,
+            involuntary: self.involuntary - before.involuntary,
+            minor_faults: self.minor_faults - before.minor_faults,
+            major_faults: self.major_faults - before.major_faults,
+        }
+    }
+}
+fn resources() -> Resource {
+    #[cfg(target_os = "linux")]
+    {
+        // getrusage initializes the entire C structure on success.
+        let mut usage = std::mem::MaybeUninit::<nix::libc::rusage>::uninit();
+        let result = unsafe { nix::libc::getrusage(nix::libc::RUSAGE_THREAD, usage.as_mut_ptr()) };
+        assert_eq!(
+            result,
+            0,
+            "getrusage for gate worker: {}",
+            std::io::Error::last_os_error()
+        );
+        let u = unsafe { usage.assume_init() };
+        let mut clock = std::mem::MaybeUninit::<nix::libc::timespec>::uninit();
+        let result = unsafe {
+            nix::libc::clock_gettime(nix::libc::CLOCK_THREAD_CPUTIME_ID, clock.as_mut_ptr())
+        };
+        assert_eq!(
+            result,
+            0,
+            "worker CPU clock: {}",
+            std::io::Error::last_os_error()
+        );
+        let clock = unsafe { clock.assume_init() };
+        Resource {
+            cpu_ns: clock.tv_sec * 1_000_000_000 + clock.tv_nsec,
+            user_us: u.ru_utime.tv_sec * 1_000_000 + u.ru_utime.tv_usec,
+            system_us: u.ru_stime.tv_sec * 1_000_000 + u.ru_stime.tv_usec,
+            voluntary: u.ru_nvcsw,
+            involuntary: u.ru_nivcsw,
+            minor_faults: u.ru_minflt,
+            major_faults: u.ru_majflt,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    Resource::default()
+}
+#[derive(Clone, Copy, Default, serde::Serialize)]
+pub(super) struct Cache {
+    hits: i32,
+    misses: i32,
+    writes: i32,
+}
+pub(super) fn cache(db: &rusqlite::Connection) -> Cache {
+    if !TRACE.with_borrow(|trace| trace.active) {
+        return Cache::default();
+    }
+    let read = |op| {
+        let mut current = 0;
+        let mut high = 0;
+        // The worker owns the live connection; these calls only read counters.
+        let result = unsafe {
+            rusqlite::ffi::sqlite3_db_status(db.handle(), op, &mut current, &mut high, 0)
+        };
+        assert_eq!(
+            result,
+            rusqlite::ffi::SQLITE_OK,
+            "read SQLite gate cache counter"
+        );
+        current
+    };
+    Cache {
+        hits: read(rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT),
+        misses: read(rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS),
+        writes: read(rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE),
+    }
+}
+pub(super) fn cache_delta(before: Cache, db: &rusqlite::Connection) {
+    let after = cache(db);
+    TRACE.with_borrow_mut(|trace| {
+        trace.cache = Cache {
+            hits: after.hits - before.hits,
+            misses: after.misses - before.misses,
+            writes: after.writes - before.writes,
+        }
+    });
+}
+#[derive(Default, serde::Serialize)]
+struct SqlStats {
+    rows: usize,
+    candidate_rows: usize,
+    vm_steps: i32,
+    fullscan_steps: i32,
+    sorts: i32,
+    autoindex: i32,
+    sql_wall_ms: f64,
+    row_wall_ms: f64,
+    cleanup_wall_ms: f64,
+    plan: Option<Vec<String>>,
+    expanded_sql: Option<String>,
+}
+pub(super) fn detailed() -> bool {
+    TRACE.with_borrow(|trace| trace.active && trace.detailed)
+}
+pub(super) struct SqlProbe {
+    timing: Span,
+    stats: SqlStats,
+}
+impl SqlProbe {
+    pub(super) fn new(phase: &'static str) -> Self {
+        let mut timing = query(phase);
+        timing.active &= detailed();
+        Self {
+            timing,
+            stats: SqlStats::default(),
+        }
+    }
+    pub(super) fn stamp(&self) -> Option<Instant> {
+        self.timing.active.then(Instant::now)
+    }
+    pub(super) fn sql_done(&mut self, start: Option<Instant>) {
+        if let Some(start) = start {
+            self.stats.sql_wall_ms += start.elapsed().as_secs_f64() * 1000.0;
+        }
+    }
+    pub(super) fn row_done(&mut self, start: Option<Instant>) {
+        if let Some(start) = start {
+            self.stats.row_wall_ms += start.elapsed().as_secs_f64() * 1000.0;
+        }
+    }
+    pub(super) fn cleanup_done(&mut self, start: Option<Instant>) {
+        if let Some(start) = start {
+            self.stats.cleanup_wall_ms += start.elapsed().as_secs_f64() * 1000.0;
+        }
+    }
+    pub(super) fn inspect(
+        &mut self,
+        db: &rusqlite::Connection,
+        stmts: &[&rusqlite::Statement<'_>],
+        rows: usize,
+        candidate_rows: usize,
+    ) -> rusqlite::Result<()> {
+        use rusqlite::StatementStatus as S;
+        if !self.timing.active {
+            return Ok(());
+        }
+        self.stats.rows = rows;
+        self.stats.candidate_rows = candidate_rows;
+        let key = self.timing.class.clone().expect("bug: query phase label");
+        let plan = TRACE.with_borrow_mut(|trace| trace.plans.insert(key));
+        let mut expanded = Vec::new();
+        let mut plans = Vec::new();
+        for (n, stmt) in stmts.iter().enumerate() {
+            self.stats.vm_steps += stmt.get_status(S::VmStep);
+            self.stats.fullscan_steps += stmt.get_status(S::FullscanStep);
+            self.stats.sorts += stmt.get_status(S::Sort);
+            self.stats.autoindex += stmt.get_status(S::AutoIndex);
+            if plan {
+                let sql = stmt.expanded_sql().expect("expanded gate query");
+                expanded.push(sql.clone());
+                plans.push(format!("statement {n}"));
+                plans.extend(
+                    db.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+                        .query_map([], |r| r.get(3))?
+                        .collect::<rusqlite::Result<Vec<String>>>()?,
+                );
+            }
+        }
+        if plan {
+            self.stats.plan = Some(plans);
+            self.stats.expanded_sql = Some(expanded.join(";\n"));
+        }
+        Ok(())
+    }
+    pub(super) fn finish(mut self) {
+        self.timing.sql = Some(self.stats);
+    }
+}
+pub(super) fn read_rows<T>(
+    db: &rusqlite::Connection,
+    stmt: &mut rusqlite::Statement<'_>,
+    params: impl rusqlite::Params,
+    mut convert: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    phase: &'static str,
+) -> rusqlite::Result<Vec<T>> {
+    let mut profile = SqlProbe::new(phase);
+    let start = profile.stamp();
+    let mut rows = stmt.query(params)?;
+    profile.sql_done(start);
+    let mut result = Vec::new();
+    loop {
+        let start = profile.stamp();
+        let next = rows.next()?;
+        profile.sql_done(start);
+        let Some(row) = next else {
+            break;
+        };
+        let start = profile.stamp();
+        result.push(convert(row)?);
+        profile.row_done(start);
+    }
+    let start = profile.stamp();
+    drop(rows);
+    profile.cleanup_done(start);
+    profile.inspect(db, &[stmt], result.len(), 0)?;
+    profile.finish();
+    Ok(result)
+}
+
 #[derive(Default)]
 struct Trace {
     active: bool,
     label: String,
     records: Vec<Record>,
+    detailed: bool,
+    plans: std::collections::BTreeSet<String>,
+    cache: Cache,
 }
 thread_local! { static TRACE: RefCell<Trace> = RefCell::default(); }
 pub(super) struct Record {
@@ -13,26 +241,39 @@ pub(super) struct Record {
     start: Instant,
     end: Instant,
     query: bool,
+    resource: Resource,
+    cache: Cache,
+    sql: Option<SqlStats>,
 }
 pub(super) struct Span {
     start: Instant,
-    class: Option<&'static str>,
+    class: Option<String>,
     query: bool,
     active: bool,
+    resource: Resource,
+    sql: Option<SqlStats>,
 }
 impl Drop for Span {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let resource = resources().delta(self.resource);
         let end = Instant::now();
         TRACE.with_borrow_mut(|trace| {
             if self.active && trace.active {
                 trace.records.push(Record {
-                    class: self
-                        .class
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| trace.label.clone()),
+                    class: self.class.clone().unwrap_or_else(|| trace.label.clone()),
                     start: self.start,
                     end,
                     query: self.query,
+                    resource,
+                    cache: if self.query {
+                        Cache::default()
+                    } else {
+                        trace.cache
+                    },
+                    sql: self.sql.take(),
                 });
             }
         });
@@ -42,6 +283,7 @@ pub(super) fn start() {
     TRACE.with_borrow_mut(|trace| {
         *trace = Trace {
             active: true,
+            detailed: std::env::var_os("M5_GATE_PROFILE").is_some(),
             ..Default::default()
         }
     });
@@ -76,12 +318,25 @@ fn span(class: Option<&'static str>, query: bool) -> Span {
     let active = TRACE.with_borrow(|trace| trace.active);
     Span {
         start: Instant::now(),
-        class,
+        class: class.map(|class| {
+            if query {
+                TRACE.with_borrow(|trace| format!("{}.{}", trace.label, class))
+            } else {
+                class.to_owned()
+            }
+        }),
         query,
         active,
+        resource: if active {
+            resources()
+        } else {
+            Resource::default()
+        },
+        sql: None,
     }
 }
 pub(super) fn job() -> Span {
+    TRACE.with_borrow_mut(|trace| trace.cache = Cache::default());
     label("other_unlabelled_job");
     span(None, false)
 }
@@ -141,7 +396,7 @@ pub(super) fn report(records: &[Record], samples: Vec<Sample>, total_p99: f64, q
             .expect("bug: trace origin");
         let raw = serde_json::json!({
             "window_start_ms": ms(origin, start), "window_end_ms": ms(origin, end),
-            "records": records.iter().map(|r| serde_json::json!({"class":r.class,"query":r.query,"start_ms":ms(origin,r.start),"end_ms":ms(origin,r.end)})).collect::<Vec<_>>(),
+            "records": records.iter().map(|r| serde_json::json!({"class":r.class,"query":r.query,"start_ms":ms(origin,r.start),"end_ms":ms(origin,r.end),"resource":r.resource,"cache":r.cache,"sql":r.sql})).collect::<Vec<_>>(),
             "accepts": samples.iter().map(|s| serde_json::json!({"id":s.0,"submitted_ms":ms(origin,s.1),"began_ms":ms(origin,s.2),"resumed_ms":ms(origin,s.3),"total_ms":s.4,"queue_ms":s.5})).collect::<Vec<_>>()
         });
         std::fs::write(path, serde_json::to_vec(&raw).expect("encode gate trace"))
@@ -173,6 +428,27 @@ pub(super) fn report(records: &[Record], samples: Vec<Sample>, total_p99: f64, q
         println!(
             "GATE worker_class={class} detail={query} count={n} p50_ms={p50:.6} p99_ms={p99:.6} max_ms={max:.6} total_ms={total:.6} busy_share_pct={:.3}",
             total / elapsed * 100.0
+        );
+    }
+    for r in records.iter().filter(|r| {
+        !r.query
+            && r.end > start
+            && r.start < end
+            && (r.class == "full_snapshot" || r.class.starts_with("mail_"))
+            && ms(r.start, r.end) >= 25.0
+    }) {
+        println!(
+            "GATE observer_outlier class={} wall_ms={:.6} cpu_ms={:.6} voluntary_switches={} involuntary_switches={} minor_faults={} major_faults={} cache_hits={} cache_misses={} cache_writes={}",
+            r.class,
+            ms(r.start, r.end),
+            r.resource.cpu_ms(),
+            r.resource.voluntary,
+            r.resource.involuntary,
+            r.resource.minor_faults,
+            r.resource.major_faults,
+            r.cache.hits,
+            r.cache.misses,
+            r.cache.writes
         );
     }
     busy.sort_unstable();
