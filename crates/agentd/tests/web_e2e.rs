@@ -559,14 +559,28 @@ async fn positions(page: &Page) -> BTreeMap<String, (f64, f64, String)> {
         .collect()
 }
 
-/// What a person sees and what they get: the text as rendered, which CSS can change
-/// and `textContent` cannot show, and the clipboard after a real click.
-async fn assert_shows_and_copies(page: &Page, row: &Locator, command: &str) {
-    let rendered = row
-        .locator("[data-testid=command-text]")
-        .inner_text()
+/// The text as rendered, which CSS can change and `textContent` cannot show. A list
+/// item has `content-visibility: auto`, so its contents have no rendered text until a
+/// frame has been painted near the viewport, and an empty result only means not yet.
+async fn rendered_text(locator: &Locator) -> String {
+    locator
+        .scroll_into_view_if_needed()
         .await
-        .expect("rendered command");
+        .expect("scroll into view");
+    for _ in 0..600 {
+        let rendered = locator.inner_text().await.expect("rendered text");
+        if !rendered.is_empty() {
+            return rendered;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no rendered text after 30s");
+}
+
+/// What a person sees and what they get: the text on screen and the clipboard after a
+/// real click.
+async fn assert_shows_and_copies(page: &Page, row: &Locator, command: &str) {
+    let rendered = rendered_text(&row.locator("[data-testid=command-text]")).await;
     assert_eq!(rendered, command, "the text on screen");
     let copy = row.locator("[data-testid=copy]");
     copy.click(None).await.expect("copy");
@@ -922,17 +936,11 @@ async fn permission_and_held_mail_show_the_servers_commands_and_they_work() {
         let row = rows.nth(i32::try_from(index).expect("bug: a small index"));
         // The authoritative effect and the ACP server's own words are separate.
         assert_eq!(
-            row.locator("[data-testid=option-effect]")
-                .inner_text()
-                .await
-                .expect("effect"),
+            rendered_text(&row.locator("[data-testid=option-effect]")).await,
             effect
         );
         assert_eq!(
-            row.locator("bdi[data-testid=option-label]")
-                .inner_text()
-                .await
-                .expect("label"),
+            rendered_text(&row.locator("bdi[data-testid=option-label]")).await,
             option["label"].as_str().expect("label")
         );
         assert_shows_and_copies(&page, &row, option["command"].as_str().expect("command")).await;
