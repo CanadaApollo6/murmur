@@ -163,6 +163,10 @@ impl Default for Config {
     }
 }
 
+#[cfg(test)]
+#[path = "mail_trace.rs"]
+mod trace;
+
 type Job = Box<dyn FnOnce(&mut Store) + Send>;
 
 /// One thread owns the connection. SQLite's exclusive WAL lock also excludes a
@@ -217,8 +221,14 @@ impl Mailroom {
                     #[cfg(test)]
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let before = store.db.total_changes();
-                    job(&mut store);
+                    {
+                        #[cfg(test)]
+                        let _job = trace::job();
+                        job(&mut store);
+                    }
                     if store.db.total_changes() != before {
+                        #[cfg(test)]
+                        let _head = trace::maintenance("post_accept_head");
                         let head = match feed::head(&store.db) {
                             Ok(head)=>head,
                             Err(error)=>{tracing::error!(%error,"mail event head maintenance failed; worker continues");continue;}
@@ -231,7 +241,11 @@ impl Mailroom {
                                 false
                             }
                         });
+                        #[cfg(test)]
+                        drop(_head);
                         if head - store.last_prune >= 1024 {
+                            #[cfg(test)]
+                            let _prune = trace::maintenance("post_accept_prune_retention");
                             match feed::prune(&mut store.db) {
                                 Ok(deleted)=>{store.last_prune=head;#[cfg(test)] store.prunes.push((head,deleted));#[cfg(not(test))] tracing::trace!(deleted,"mail event retention pass");},
                                 Err(error)=>tracing::error!(%error,"mail event pruning failed; worker will retry"),
@@ -255,9 +269,13 @@ impl Mailroom {
         &self,
         f: impl FnOnce(&mut Store) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        #[cfg(test)]
+        let job_name = std::any::type_name_of_val(&f);
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.jobs
             .send(Box::new(move |store| {
+                #[cfg(test)]
+                trace::label(job_name);
                 if let Err(result) = tx.send(f(store)) {
                     match result {
                         Ok(_) => tracing::debug!("mailroom caller cancelled after submission"),
@@ -283,15 +301,28 @@ impl Mailroom {
             .acquire_owned()
             .await
             .map_err(|_| Error::Closed)?;
+        #[cfg(test)]
+        let job_name = std::any::type_name_of_val(&f);
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.jobs
             .send(Box::new(move |store| {
+                #[cfg(test)]
+                trace::label(job_name);
                 let _permit = permit;
                 if tx.is_closed() {
+                    #[cfg(test)]
+                    trace::label("cancelled_observer_before_read");
                     return;
                 }
-                if let Err(Err(error)) = tx.send(f(store)) {
-                    tracing::error!(%error, "observer failed after cancellation");
+                if let Err(result) = tx.send(f(store)) {
+                    match result {
+                        Ok(value) => {
+                            #[cfg(test)]
+                            let _cleanup = trace::query("cancelled_observer_result_drop");
+                            drop(value);
+                        }
+                        Err(error) => tracing::error!(%error, "observer failed after cancellation"),
+                    }
                 }
             }))
             .map_err(|_| Error::Closed)?;

@@ -109,7 +109,11 @@ pub(crate) fn query(db: &Connection, filter: &MailQuery) -> Result<Value> {
         )?;
         if count == 10000 { last } else { None }
     };
-    Ok(json!({"rows":result,"next_before_msg_seq":next}))
+    #[cfg(test)]
+    let _assembly = trace::query("mail_result_assembly");
+    let mut response = json!({"next_before_msg_seq":next});
+    response["rows"] = Value::Array(result);
+    Ok(response)
 }
 
 fn window(db: &Connection, states: &[&str]) -> Result<(Vec<Value>, bool)> {
@@ -127,7 +131,15 @@ fn window(db: &Connection, states: &[&str]) -> Result<(Vec<Value>, bool)> {
 }
 
 pub(crate) fn snapshot(db: &Connection, resume: Option<Anchor>) -> Result<(i64, Value)> {
+    #[cfg(test)]
+    trace::label(if resume.is_some() {
+        "resume_validation"
+    } else {
+        "full_snapshot"
+    });
     if let Some(a) = resume {
+        #[cfg(test)]
+        let _query = trace::query("resume_anchor");
         let valid: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM mail_events WHERE seq=? AND nonce=?)",
             params![a.seq, a.nonce],
@@ -137,7 +149,15 @@ pub(crate) fn snapshot(db: &Connection, resume: Option<Anchor>) -> Result<(i64, 
             return Ok((a.seq, Value::Null));
         }
     }
+    #[cfg(test)]
+    trace::label("full_snapshot");
+    #[cfg(test)]
+    let timing = trace::query("head");
     let cursor = head(db)?;
+    #[cfg(test)]
+    drop(timing);
+    #[cfg(test)]
+    let timing = trace::query("anchor");
     let anchor = db
         .query_row(
             "SELECT seq,nonce FROM mail_events ORDER BY seq DESC LIMIT 1",
@@ -150,6 +170,10 @@ pub(crate) fn snapshot(db: &Connection, resume: Option<Anchor>) -> Result<(i64, 
             },
         )
         .optional()?;
+    #[cfg(test)]
+    drop(timing);
+    #[cfg(test)]
+    let timing = trace::query("edges");
     let mut edges = Vec::new();
     let mut stmt = db.prepare(
         "SELECT sender,recipient,state,n FROM mail_edges WHERE n>0 ORDER BY sender,recipient,state",
@@ -172,12 +196,27 @@ pub(crate) fn snapshot(db: &Connection, resume: Option<Anchor>) -> Result<(i64, 
         let state: String = r.get(2)?;
         edges.last_mut().expect("bug: edge pair inserted")[state] = json!(r.get::<_, i64>(3)?);
     }
+    #[cfg(test)]
+    drop(timing);
+    #[cfg(test)]
+    let timing = trace::query("stuck");
     let (stuck, stuck_truncated) = window(db, &["held", "uncertain"])?;
+    #[cfg(test)]
+    drop(timing);
+    #[cfg(test)]
+    let timing = trace::query("moving");
     let (moving, moving_truncated) = window(db, &["queued", "offered"])?;
-    Ok((
-        cursor,
-        json!({"anchor":anchor,"edges":edges,"edges_truncated":truncated,"stuck":stuck,"moving":moving,"stuck_truncated":stuck_truncated,"moving_truncated":moving_truncated}),
-    ))
+    #[cfg(test)]
+    drop(timing);
+    #[cfg(test)]
+    let _assembly = trace::query("snapshot_result_assembly");
+    // json! serializes Value expressions by reference, copying every row. Move
+    // these arrays into the result so large metadata lists have one owner.
+    let mut result = json!({"anchor":anchor,"edges_truncated":truncated,"stuck_truncated":stuck_truncated,"moving_truncated":moving_truncated});
+    result["edges"] = Value::Array(edges);
+    result["stuck"] = Value::Array(stuck);
+    result["moving"] = Value::Array(moving);
+    Ok((cursor, result))
 }
 
 pub(crate) fn page(db: &Connection, cursor: i64) -> Result<(Option<i64>, Vec<Value>)> {
@@ -209,7 +248,16 @@ pub(crate) fn agents(db: &Connection) -> Result<Vec<(AgentId, crate::supervisor:
 
 impl Mailroom {
     pub async fn mail_query(&self, filter: MailQuery) -> Result<Value> {
-        self.observe(move |s| query(&s.db, &filter)).await
+        self.observe(move |s| {
+            #[cfg(test)]
+            trace::label(if filter.from.as_deref() == Some("no such sender") {
+                "mail_rare_filter"
+            } else {
+                "mail_other"
+            });
+            query(&s.db, &filter)
+        })
+        .await
     }
     pub async fn mail_snapshot(&self, resume: Option<Anchor>) -> Result<(i64, Value)> {
         self.observe(move |s| snapshot(&s.db, resume)).await
@@ -440,6 +488,21 @@ mod tests {
             }));
             let (cursor, snap) = snapshot(&s.db, None)?;
             assert_eq!(snap["moving_truncated"], true);
+            let view = query(
+                &s.db,
+                &MailQuery {
+                    states: vec!["queued".into()],
+                    limit: 1000,
+                    ..Default::default()
+                },
+            )?;
+            assert_eq!(
+                view["rows"], snap["moving"],
+                "snapshot and mail must preserve identical complete rows"
+            );
+            assert_eq!(view["next_before_msg_seq"], snap["moving"][999]["msg_seq"]);
+            assert_eq!(snap["stuck"], json!([]));
+            assert_eq!(snap["stuck_truncated"], false);
             let a: Anchor = serde_json::from_value(snap["anchor"].clone())?;
             assert_eq!(snapshot(&s.db, Some(a.clone()))?, (cursor, Value::Null));
             assert!(
@@ -627,6 +690,10 @@ mod gate {
     }
     #[derive(Clone, Copy)]
     struct AcceptTiming {
+        id: usize,
+        submitted: Instant,
+        began: Instant,
+        resumed: Instant,
         queue_ms: f64,
         job_ms: f64,
         resume_ms: f64,
@@ -637,6 +704,7 @@ mod gate {
         }
     }
     struct AcceptStats {
+        samples: Vec<AcceptTiming>,
         p99: f64,
         queue_p99: f64,
         job_p99: f64,
@@ -659,6 +727,7 @@ mod gate {
     }
     async fn sample(room: &Mailroom, to: AgentId, tag: &str) -> AcceptStats {
         let mut times = Vec::new();
+        let mut previous_resume = None;
         for n in 0..2048 {
             let message = NewMessage {
                 from: Sender::Human,
@@ -670,6 +739,10 @@ mod gate {
                 task: None,
             };
             let submitted = Instant::now();
+            assert!(
+                previous_resume.is_none_or(|last| last <= submitted),
+                "accepts overlap"
+            );
             let (_accepted, began, finished) = room
                 .call(move |store| {
                     let began = Instant::now();
@@ -680,7 +753,12 @@ mod gate {
                 .await
                 .expect("real accept");
             let resumed = Instant::now();
+            previous_resume = Some(resumed);
             times.push(AcceptTiming {
+                id: n,
+                submitted,
+                began,
+                resumed,
                 queue_ms: began.duration_since(submitted).as_secs_f64() * 1000.0,
                 job_ms: finished.duration_since(began).as_secs_f64() * 1000.0,
                 resume_ms: resumed.duration_since(finished).as_secs_f64() * 1000.0,
@@ -694,6 +772,7 @@ mod gate {
             job_p99: percentile(times.iter().map(|s| s.job_ms).collect()),
             resume_p99: percentile(times.iter().map(|s| s.resume_ms).collect()),
             at_p99,
+            samples: times,
         };
         stats.print(tag);
         stats
@@ -905,6 +984,12 @@ mod gate {
             s.db.execute("UPDATE deliveries SET attempts=attempts+1 WHERE msg_seq BETWEEN 200001 AND 206000",[])?;
             let head=head(&s.db)?;s.last_prune=head-1023;s.prunes.clear();Ok(head)
         }).await.expect("stage real delivery events for sampled pruning");
+        room.call(|_| {
+            trace::start();
+            Ok(())
+        })
+        .await
+        .expect("start worker trace");
         let before_counts = load.counts();
         let loaded = sample(&room, to, "loaded").await;
         let during_counts = load
@@ -913,6 +998,29 @@ mod gate {
             .zip(before_counts)
             .map(|(after, before)| after - before)
             .collect::<Vec<_>>();
+        let records = room
+            .call(|_| Ok(trace::take()))
+            .await
+            .expect("worker trace");
+        trace::report(
+            &records,
+            loaded
+                .samples
+                .iter()
+                .map(|s| {
+                    (
+                        s.id,
+                        s.submitted,
+                        s.began,
+                        s.resumed,
+                        s.total_ms(),
+                        s.queue_ms,
+                    )
+                })
+                .collect(),
+            loaded.p99,
+            loaded.queue_p99,
+        );
         println!("GATE iterations_inside_accept_window={during_counts:?}");
         let (last_head, prunes) = room
             .observe(|s| Ok((head(&s.db)?, s.prunes.clone())))
