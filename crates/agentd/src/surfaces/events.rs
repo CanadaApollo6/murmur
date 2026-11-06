@@ -202,7 +202,7 @@ async fn send_snapshot(sink: &mut impl Sink, frame: Snapshot) -> Result<()> {
 async fn agent(
     api: &ControlApi,
     id: AgentId,
-    fallback: Phase,
+    fallback: (Phase, Incarnation),
     cache: &mut HashMap<AgentId, (String, String)>,
 ) -> Result<Value> {
     if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(id)
@@ -216,23 +216,33 @@ async fn agent(
         entry.insert((format!("@{}", spec.name.as_str()), spec.kind));
     }
     let h = api.broker.handle(id).await;
-    let phase = h.as_ref().map_or(fallback, |h| h.phase());
+    let (phase, incarnation) = h
+        .as_ref()
+        .map_or(fallback, |h| (h.phase(), h.incarnation()));
     let (name, kind) = cache.get(&id).cloned().unwrap_or_default();
     Ok(agent_row(
         id,
         &name,
         &kind,
         &phase,
+        Some(incarnation),
         h.as_ref().map_or("none", |h| h.isolation()),
     ))
 }
-fn agent_row(id: AgentId, name: &str, kind: &str, phase: &Phase, isolation: &str) -> Value {
+fn agent_row(
+    id: AgentId,
+    name: &str,
+    kind: &str,
+    phase: &Phase,
+    incarnation: Option<Incarnation>,
+    isolation: &str,
+) -> Value {
     let error = match phase {
         Phase::Failed { last } => Some(cut(last, 1024)),
         Phase::NeedsRecovery { reason } => Some(cut(reason, 1024)),
         _ => None,
     };
-    json!({"id":format!("agent:{id}"),"name":cut(name,1024),"kind":cut(kind,1024),"isolation":isolation,"phase":phase_name(phase),"error":error})
+    json!({"id":format!("agent:{id}"),"name":cut(name,1024),"kind":cut(kind,1024),"isolation":isolation,"phase":phase_name(phase),"incarnation":incarnation,"error":error})
 }
 type AgentCache = HashMap<AgentId, (String, String)>;
 pub(crate) struct Snapshot {
@@ -276,6 +286,7 @@ fn assemble_snapshot(input: SnapshotInput) -> Result<(Snapshot, AgentCache)> {
             &name,
             &spec.kind,
             &handle.as_ref().map_or(Phase::Ended, |h| h.phase()),
+            handle.as_ref().map(|h| h.incarnation()),
             handle.as_ref().map_or("none", |h| h.isolation()),
         ));
     }
@@ -342,9 +353,11 @@ async fn state(
 ) -> Result<Option<Value>> {
     Ok(Some(match event {
         Event::PhaseChanged {
-            agent: id, phase, ..
+            agent: id,
+            incarnation,
+            phase,
         } => {
-            let mut v = agent(api, id, phase, cache).await?;
+            let mut v = agent(api, id, (phase, incarnation), cache).await?;
             v["event"] = json!("agent");
             v
         }
@@ -595,6 +608,25 @@ mod tests {
         assert!(task.await.expect_err("aborted").is_cancelled());
     }
     #[tokio::test]
+    async fn a_phase_change_with_no_actor_names_the_life_it_came_from() {
+        let (_dir, api, id) = api().await;
+        let frame = state(
+            &api,
+            Event::PhaseChanged {
+                agent: id,
+                incarnation: Incarnation(9),
+                phase: Phase::Ended,
+            },
+            &mut HashMap::new(),
+        )
+        .await
+        .expect("frame")
+        .expect("an agent frame");
+        assert_eq!(frame["event"], "agent");
+        assert_eq!(frame["incarnation"], 9);
+        assert_eq!(frame["phase"], "ended");
+    }
+    #[tokio::test]
     async fn interleaves_state_and_activity_with_full_mail_pages() {
         let (_dir, api, id) = api().await;
         accept(&api, id, 0).await;
@@ -842,6 +874,24 @@ mod tests {
             }
         }
         let snapshot = maximum_fixture::maximum_snapshot();
+        // The fixture's agent row is the real row at its largest, so the bound below
+        // cannot miss a field.
+        let row = agent_row(
+            AgentId::new(),
+            &"'".repeat(1024),
+            &"'".repeat(1024),
+            &Phase::Failed {
+                last: "\0".repeat(1024),
+            },
+            Some(Incarnation(u64::MAX)),
+            "bwrap+proxy",
+        );
+        assert_eq!(
+            serde_json::to_vec(&row).expect("row").len(),
+            serde_json::to_vec(&snapshot["agents"][0])
+                .expect("fixture row")
+                .len(),
+        );
         let size = serde_json::to_vec(&snapshot).expect("snapshot").len();
         assert!(size < 64 * 1024 * 1024, "snapshot bytes {size}");
         println!("M5 maximum snapshot bytes={size}");

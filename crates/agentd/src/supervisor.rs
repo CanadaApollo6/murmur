@@ -128,6 +128,7 @@ pub struct AgentHandle {
     commands: mpsc::Sender<Command>,
     phase: watch::Receiver<Phase>,
     isolation: watch::Receiver<&'static str>,
+    incarnation: watch::Receiver<Incarnation>,
 }
 impl AgentHandle {
     fn nudge(&self) {
@@ -143,6 +144,9 @@ impl AgentHandle {
     }
     pub fn phase(&self) -> Phase {
         self.phase.borrow().clone()
+    }
+    pub fn incarnation(&self) -> Incarnation {
+        *self.incarnation.borrow()
     }
     pub fn phases(&self) -> watch::Receiver<Phase> {
         self.phase.clone()
@@ -361,12 +365,14 @@ impl Broker {
         let (tx, commands) = mpsc::channel(64);
         let (phase_tx, phase) = watch::channel(Phase::Dormant);
         let (isolation_tx, isolation) = watch::channel("none");
+        let (incarnation_tx, incarnation_rx) = watch::channel(incarnation);
         let handle = AgentHandle {
             id,
             cwd: spec.cwd.clone(),
             commands: tx,
             phase,
             isolation,
+            incarnation: incarnation_rx,
         };
         #[cfg(test)]
         let adapter = self
@@ -382,6 +388,7 @@ impl Broker {
             isolation: self.isolation.clone(),
             credentials: self.credentials.clone(),
             isolation_tx,
+            incarnation_tx,
             kind: kind.clone(),
             id,
             idle_after: if model_agent {
@@ -498,6 +505,7 @@ struct AgentActor {
     commands: mpsc::Receiver<Command>,
     phase_tx: watch::Sender<Phase>,
     isolation_tx: watch::Sender<&'static str>,
+    incarnation_tx: watch::Sender<Incarnation>,
     phase: Phase,
     incarnation: Incarnation,
     resume: Option<ResumeToken>,
@@ -759,6 +767,7 @@ impl AgentActor {
             .next_incarnation(self.id, self.spec.kind.clone())
             .await?;
         self.incarnation = incarnation;
+        self.incarnation_tx.send_replace(incarnation);
         self.resume = resume;
         self.start().await
     }
@@ -1283,6 +1292,7 @@ mod replacement_tests {
                 last: "injected failed actor".into(),
             });
             let (_, isolation) = watch::channel("none");
+            let (_, incarnation) = watch::channel(Incarnation(1));
             broker.agents.lock().await.insert(
                 id,
                 AgentHandle {
@@ -1291,6 +1301,7 @@ mod replacement_tests {
                     commands: tx,
                     phase,
                     isolation,
+                    incarnation,
                 },
             );
             let (stopping, stopped) = oneshot::channel();
@@ -1375,6 +1386,7 @@ mod publication_tests {
             last: "old actor".into(),
         });
         let (_, isolation) = watch::channel("none");
+        let (_, incarnation) = watch::channel(Incarnation(1));
         broker.agents.lock().await.insert(
             id,
             AgentHandle {
@@ -1383,6 +1395,7 @@ mod publication_tests {
                 commands: commands.clone(),
                 phase,
                 isolation,
+                incarnation,
             },
         );
         let pause = Arc::new(tokio::sync::Notify::new());
@@ -1439,6 +1452,7 @@ mod stale_phase_tests {
             last: "current failure".into(),
         });
         let (_, isolation) = watch::channel("none");
+        let (_, incarnation) = watch::channel(Incarnation(1));
         broker.agents.lock().await.insert(
             id,
             AgentHandle {
@@ -1447,6 +1461,7 @@ mod stale_phase_tests {
                 commands,
                 phase,
                 isolation,
+                incarnation,
             },
         );
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -1640,6 +1655,8 @@ mod cleanup_panic_tests {
         .await
         .expect("permission after reopen");
         assert_eq!(request.incarnation, Incarnation(2));
+        // A reopen is a new life on the handle the feed reads, not only in events.
+        assert_eq!(handle.incarnation(), Incarnation(2));
         tokio::time::timeout(Duration::from_secs(5), entered.notified())
             .await
             .expect("cleanup window");

@@ -379,6 +379,12 @@ async fn real_watch_resume_restart_and_body_routes() {
     assert!(snap["mail"].is_null());
     assert_eq!(snap["mail_cursor"], cursor);
     assert!(snap.get("anchor").is_none());
+    // A resume keeps the mail it has and still learns the agent is a new life.
+    assert!(
+        snap["agents"][0]["incarnation"].as_u64().expect("life")
+            > initial["agents"][0]["incarnation"].as_u64().expect("life"),
+        "{snap}"
+    );
     let mut seen = 0;
     let mut last = cursor;
     while seen < 300 {
@@ -477,6 +483,65 @@ async fn copied_commands_reach_real_actor_and_large_approvals() {
         }
         d.stop().await;
     }
+}
+
+/// The life of the only agent, from one snapshot on each transport, and the open
+/// browser feed.
+async fn life_on_both_transports(
+    d: &Daemon,
+) -> (
+    u64,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+) {
+    let (mut ws, _) = connect_async(d.ws_request()).await.expect("ws");
+    let over_ws = next(&mut ws).await;
+    assert_eq!(over_ws["event"], "snapshot");
+    let stream = UnixStream::connect(d.socket()).await.expect("control");
+    let (r, mut w) = stream.into_split();
+    let mut r = BufReader::new(r);
+    write_frame(&mut w, &json!({"command":"watch"}))
+        .await
+        .expect("watch");
+    let line = read_frame_limit(&mut r, 64 * 1024 * 1024)
+        .await
+        .expect("snapshot")
+        .expect("snapshot");
+    let over_unix: Value = serde_json::from_slice(&line).expect("JSON");
+    assert_eq!(over_unix["event"], "snapshot");
+    assert_eq!(
+        over_ws["agents"][0]["incarnation"],
+        over_unix["agents"][0]["incarnation"]
+    );
+    let life = over_ws["agents"][0]["incarnation"]
+        .as_u64()
+        .expect("a supervised agent has a life");
+    (life, ws)
+}
+
+#[tokio::test]
+async fn both_transports_name_an_agents_life_and_a_restart_changes_it() {
+    let mut d = Daemon::new("yes", 10).await;
+    d.spawn().await;
+    let (first, mut ws) = life_on_both_transports(&d).await;
+
+    // A frame names the same life as the snapshot before it.
+    d.ctl(&["send", "@a", "mail"]).await;
+    let frame = loop {
+        let v = next(&mut ws).await;
+        if v["event"] == "agent" {
+            break v;
+        }
+    };
+    assert_eq!(frame["incarnation"], first);
+    drop(ws);
+
+    d.stop().await;
+    d.child = Daemon::start(&d.root);
+    d.ready().await;
+    let (second, ws) = life_on_both_transports(&d).await;
+    assert!(second > first, "{second} after {first}");
+    drop(ws);
+    d.stop().await;
 }
 
 #[tokio::test]
