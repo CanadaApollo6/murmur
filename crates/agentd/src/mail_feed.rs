@@ -742,16 +742,13 @@ mod gate {
     #[derive(Default)]
     struct Load {
         reconnects: [std::sync::atomic::AtomicUsize; 7],
-        timeout_attempts: [std::sync::atomic::AtomicUsize; 7],
+        attempts: [std::sync::atomic::AtomicUsize; 7],
         views: [std::sync::atomic::AtomicUsize; 8],
         rare: std::sync::atomic::AtomicUsize,
         lists: std::sync::atomic::AtomicUsize,
         replayed: std::sync::atomic::AtomicUsize,
     }
     impl Load {
-        fn timed_out(&self, client: usize) {
-            self.timeout_attempts[client].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         fn counts(&self) -> Vec<usize> {
             use std::sync::atomic::Ordering::Relaxed;
             self.reconnects
@@ -789,6 +786,7 @@ mod gate {
         replay: bool,
         client: Option<usize>,
         completed_full: bool,
+        received: Option<tokio::sync::oneshot::Sender<()>>,
     }
     #[async_trait::async_trait]
     impl events::Sink for Serialized {
@@ -823,7 +821,112 @@ mod gate {
                 self.load.reconnects[client].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.completed_full = true;
             }
+            if full_mail && let Some(received) = self.received.take() {
+                received.send(()).map_err(|_| "snapshot receiver closed")?;
+            }
             Ok(())
+        }
+    }
+    async fn reconnect_attempt(
+        api: &ControlApi,
+        load: Arc<Load>,
+        client: usize,
+    ) -> crate::surfaces::Result<()> {
+        let _subscriber = events::subscribe()?;
+        load.attempts[client].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (received, complete) = tokio::sync::oneshot::channel();
+        let mut sink = Serialized {
+            load,
+            replay: false,
+            client: Some(client),
+            completed_full: false,
+            received: Some(received),
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result=events::feed(api,&mut sink,None)=>{
+                    result?;
+                    Err("reconnecting feed ended before a full snapshot".into())
+                },
+                result=complete=>{
+                    result.map_err(|_| "reconnecting snapshot receiver closed")?;
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .map_err(|_| format!("reconnecting client {client} hung waiting for a full snapshot"))?
+    }
+    #[tokio::test]
+    async fn reconnect_waits_for_snapshot_instead_of_abandoning_at_250ms() {
+        let dir = tempfile::tempdir().expect("directory");
+        let room = Arc::new(
+            Mailroom::open(dir.path().join("mail.db"), Config::default())
+                .await
+                .expect("room"),
+        );
+        let broker =
+            Arc::new(Broker::new(room.clone(), vec![], Default::default()).expect("broker"));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let api = Arc::new(ControlApi {
+            broker,
+            mailroom: room.clone(),
+            bindings: Arc::new(Bindings::new(
+                dir.path().join("mcp.sock"),
+                std::env::current_exe().expect("executable"),
+                tx,
+            )),
+            control_path: dir.path().join("control.sock"),
+            ui_url: None,
+        });
+        let load = Arc::new(Load::default());
+        for (delay, should_hang) in [
+            (Duration::from_millis(300), false),
+            (Duration::from_secs(11), true),
+        ] {
+            tokio::time::pause();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let worker = room.clone();
+            let held = tokio::spawn(async move {
+                worker
+                    .observe(move |_| {
+                        entered_tx.send(()).map_err(|_| Error::Closed)?;
+                        release_rx.recv().map_err(|_| Error::Closed)?;
+                        Ok(())
+                    })
+                    .await
+            });
+            entered_rx.await.expect("worker held");
+            let client = api.clone();
+            let counts = load.clone();
+            let attempt = tokio::spawn(async move { reconnect_attempt(&client, counts, 0).await });
+            tokio::task::yield_now().await;
+            tokio::time::advance(delay).await;
+            tokio::task::yield_now().await;
+            let abandoned = attempt.is_finished();
+            tokio::time::resume();
+            release_tx.send(()).expect("release worker");
+            held.await.expect("held job").expect("held read");
+            let result = attempt.await.expect("client task");
+            assert!(
+                abandoned == should_hang,
+                "unexpected reconnect termination after {delay:?}; hang_expected={should_hang}"
+            );
+            if should_hang {
+                assert!(
+                    result
+                        .expect_err("hang must fail")
+                        .to_string()
+                        .contains("hung waiting")
+                );
+            } else {
+                result.expect("full snapshot received");
+            }
+            assert_eq!(
+                load.reconnects[0].load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
         }
     }
     async fn drain_workloads(
@@ -888,8 +991,9 @@ mod gate {
                     replay: false,
                     client: Some(client),
                     completed_full: false,
+                    received: None,
                 };
-                // Client 3 receives only volatile snapshots. Time still expires.
+                // Client 3 receives only volatile snapshots, which never finish a reconnect.
                 events::Sink::send_snapshot(
                     &mut sink,
                     "{\"event\":\"snapshot\"}".into(),
@@ -897,12 +1001,11 @@ mod gate {
                 )
                 .await
                 .expect("snapshot sink");
-                load.timed_out(client);
             }
         }
         assert!(
             check_iterations(&load.counts()).is_err(),
-            "gate accepted reconnect timeouts without client 3 full snapshots"
+            "gate accepted reconnects without client 3 full snapshots"
         );
         assert_eq!(load.reconnects[3].load(Relaxed), 0);
         for _ in 0..2 {
@@ -911,6 +1014,7 @@ mod gate {
                 replay: false,
                 client: Some(3),
                 completed_full: false,
+                received: None,
             };
             events::Sink::send_snapshot(&mut sink, "{\"event\":\"snapshot\"}".into(), true)
                 .await
@@ -925,6 +1029,14 @@ mod gate {
         RamDisk,
     }
     impl GateMode {
+        fn snapshot_rate_floor(self) -> f64 {
+            // Fixed before qualification: requested btrfs floor, and the old
+            // RAM maximum (28.349120/s) rounded up. Never adapt to a new run.
+            match self {
+                Self::Production => 27.0,
+                Self::RamDisk => 28.35,
+            }
+        }
         fn from_marker(marker: Option<&std::ffi::OsStr>) -> std::result::Result<Self, String> {
             match marker {
                 None => Ok(Self::Production),
@@ -937,6 +1049,22 @@ mod gate {
                 Self::Production => "production",
                 Self::RamDisk => "ram-disk-diagnostic",
             }
+        }
+    }
+    fn snapshot_rate_failure(mode: GateMode, rate: f64) -> Option<String> {
+        let floor = mode.snapshot_rate_floor();
+        (!rate.is_finite() || rate < floor).then(|| {
+            format!(
+                "full_snapshot jobs per second {rate:.6} below fixed old-generator floor {floor:.2}"
+            )
+        })
+    }
+    #[test]
+    fn snapshot_rate_floors_cannot_be_hidden_by_completions_or_cpu() {
+        for (mode, floor) in [(GateMode::Production, 27.0), (GateMode::RamDisk, 28.35)] {
+            assert!(snapshot_rate_failure(mode, floor - 0.001).is_some());
+            assert!(snapshot_rate_failure(mode, floor).is_none());
+            assert!(snapshot_rate_failure(mode, f64::NAN).is_some());
         }
     }
     fn gate_failures(
@@ -994,6 +1122,7 @@ mod gate {
                         count: 100,
                         p99_ms: 20.0,
                         max_ms: 999.0,
+                        cpu_p99_ms: Some(999.0),
                         ..Default::default()
                     },
                 )
@@ -1005,7 +1134,7 @@ mod gate {
         );
         assert!(
             gate_failures(GateMode::Production, 20.0, 999.0, &services).is_empty(),
-            "reported delta or maximum decided the pass rule"
+            "reported delta, CPU or maximum decided the pass rule"
         );
         for class in trace::OBSERVER_CLASSES {
             let mut short = services.clone();
@@ -1059,6 +1188,21 @@ mod gate {
         at_p99: AcceptTiming,
     }
     impl AcceptStats {
+        fn window_seconds(&self) -> f64 {
+            self.samples
+                .iter()
+                .map(|s| s.resumed)
+                .max()
+                .expect("samples")
+                .duration_since(
+                    self.samples
+                        .iter()
+                        .map(|s| s.submitted)
+                        .min()
+                        .expect("samples"),
+                )
+                .as_secs_f64()
+        }
         fn print(&self, lane: &str) {
             println!(
                 "GATE accept_attribution lane={lane} samples={} total_p99_ms={:.6} queue_p99_ms={:.6} job_p99_ms={:.6} resume_p99_ms={:.6} at_total_p99_queue_ms={:.6} at_total_p99_job_ms={:.6} at_total_p99_resume_ms={:.6}",
@@ -1301,16 +1445,15 @@ mod gate {
             let load = load.clone();
             let cancel = cancel.clone();
             tasks.spawn(async move {
-                let _permit=events::subscribe()?;
+                if n==0 {
+                    let _permit=events::subscribe()?;
+                    let mut sink=Serialized{load:load.clone(),replay:true,client:None,completed_full:false,received:None};
+                    return tokio::select!{_=cancel.cancelled()=>Ok(()),r=events::feed(&api,&mut sink,Some(anchor))=>{r?;Err("backlog feed ended unexpectedly".into())}};
+                }
                 loop {
-                    let mut sink=Serialized{load:load.clone(),replay:n==0,client:(n>0).then_some(n.saturating_sub(1)),completed_full:false};
-                    if n==0 {return tokio::select!{_=cancel.cancelled()=>Ok(()),r=events::feed(&api,&mut sink,Some(anchor.clone()))=>{r?;Err("backlog feed ended unexpectedly".into())}};}
                     tokio::select! {
                         _=cancel.cancelled()=>return Ok(()),
-                        r=tokio::time::timeout(Duration::from_millis(250),events::feed(&api,&mut sink,None))=>{
-                            if let Ok(result)=r {result?;return Err("reconnecting feed ended unexpectedly".into());}
-                            load.timed_out(n-1);
-                        }
+                        r=reconnect_attempt(&api,load.clone(),n-1)=>r?
                     }
                 }
             });
@@ -1400,12 +1543,23 @@ mod gate {
             .await
             .expect("start loaded trace");
         let before_counts = load.counts();
+        let before_attempts = load
+            .attempts
+            .iter()
+            .map(|a| a.load(Relaxed))
+            .collect::<Vec<_>>();
         let loaded = sample(&room, to, "loaded", Some(&progress)).await;
         let during_counts = load
             .counts()
             .into_iter()
             .zip(before_counts)
             .map(|(after, before)| after - before)
+            .collect::<Vec<_>>();
+        let attempts = load
+            .attempts
+            .iter()
+            .zip(before_attempts)
+            .map(|(after, before)| after.load(Relaxed) - before)
             .collect::<Vec<_>>();
         let records = room
             .call(|_| Ok(trace::take()))
@@ -1422,6 +1576,15 @@ mod gate {
         println!(
             "GATE completed_full_snapshots_inside_window={:?}",
             &during_counts[..7]
+        );
+        let seconds = loaded.window_seconds();
+        let snapshot_jobs = services.get("full_snapshot").expect("snapshot class").count;
+        let snapshot_rate = snapshot_jobs as f64 / seconds;
+        let completions = during_counts[..7].iter().sum::<usize>();
+        println!(
+            "GATE snapshot_rates window_seconds={seconds:.6} jobs={snapshot_jobs} jobs_per_second={snapshot_rate:.6} minimum_jobs_per_second={:.2} completed={completions} completed_per_second={:.6} attempts_inside_window={attempts:?} reconnect_mode=complete_full_snapshot hang_limit_seconds=10",
+            mode.snapshot_rate_floor(),
+            completions as f64 / seconds
         );
         let (last_head, prunes) = room
             .observe(|s| Ok((head(&s.db)?, s.prunes.clone())))
@@ -1473,13 +1636,6 @@ mod gate {
             load.rare.load(Relaxed),
             load.lists.load(Relaxed)
         );
-        println!(
-            "GATE reconnect_timeout_attempts={:?}",
-            load.timeout_attempts
-                .iter()
-                .map(|n| n.load(Relaxed))
-                .collect::<Vec<_>>()
-        );
         drop(api);
         println!(
             "GATE snapshot_median_ms={normal:.3} target_ms=100 backlog_200000_snapshot_median_ms={backlog:.3} target_ms=100"
@@ -1497,7 +1653,9 @@ mod gate {
             .await
             .expect("close");
         assert!(normal < 100.0 && backlog < 100.0, "snapshot gate missed");
-        let failures = gate_failures(mode, loaded.queue_p99, loaded.p99 - baseline.p99, &services);
+        let mut failures =
+            gate_failures(mode, loaded.queue_p99, loaded.p99 - baseline.p99, &services);
+        failures.extend(snapshot_rate_failure(mode, snapshot_rate));
         assert!(
             failures.is_empty(),
             "v8 gate missed: {}",

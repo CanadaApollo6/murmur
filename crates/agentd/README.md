@@ -546,12 +546,22 @@ backlog, and concurrent observers on the production current-thread runtime.
 It checks every generator result, completed full snapshots from each reconnecting
 client inside the sampled window, retained replay, and a multi-thousand-row prune.
 Baseline and loaded accepts use the same worker tracing.
+Seven reconnecting feeds disconnect only after their complete serialized full
+snapshot is consumed, then reconnect immediately without sleeping. Each attempt
+has a 10-second hang limit that fails the gate. The eighth feed retains the full
+backlog replay. The sampled full-snapshot job rate must reach at least 27/s on
+the production filesystem and 28.35/s on RAM disk, fixed from the earlier deadline
+generator's retained measurements. Both job and completed-snapshot rates are
+printed. Cancellation remains covered by dedicated abandoned-feed tests.
 
 The default v8 production rule requires loaded accept worker-queue p99 at or below
 20 ms and whole-job service p99 at or below 20 ms for every observer class,
 including full snapshots. Each class needs at least 100 service samples. Both
 snapshot medians, including serialization, must remain below 100 ms. Total accept
 p99, paired delta, and class maxima are printed but do not decide the result.
+Thread CPU p99 is printed for each worker and observer class as a diagnostic;
+whole-job wall time still decides the service limit. Thread CPU is unavailable
+on non-Linux hosts and is printed as `NA` there.
 
 The baseline has 2,048 accepts. The loaded window keeps the same closed-loop
 accepts and observer workload for at least 2,048 accepts, extending until all six

@@ -772,8 +772,9 @@ mod tests {
             let before = api.mailroom.jobs_run.load(Ordering::SeqCst);
             for _ in 0..16 {
                 let _subscriber = subscribe().expect("subscriber slot");
-                let mut cache = HashMap::new();
-                let mut request = Box::pin(snapshot(&api, None, None, &mut cache));
+                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut sink = Record { tx, pause: None };
+                let mut request = Box::pin(feed(&api, &mut sink, None));
                 // Flush each query, then poll its result through to the next await.
                 // The final poll queues encoding behind the occupied blocking thread.
                 assert!(futures_util::poll!(request.as_mut()).is_pending());

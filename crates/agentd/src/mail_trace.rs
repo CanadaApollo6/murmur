@@ -414,6 +414,7 @@ pub(super) struct Service {
     pub p99_ms: f64,
     pub max_ms: f64,
     pub total_ms: f64,
+    pub cpu_p99_ms: Option<f64>,
 }
 fn observer_services(
     records: &[Record],
@@ -431,7 +432,7 @@ fn observer_services(
         classes
             .entry(record.class.clone())
             .or_default()
-            .push(ms(record.start, record.end));
+            .push((ms(record.start, record.end), record.resource.cpu_ms()));
     }
     classes
         .into_iter()
@@ -439,13 +440,17 @@ fn observer_services(
             let service = if times.is_empty() {
                 Service::default()
             } else {
-                let (count, p50_ms, p99_ms, max_ms, total_ms) = stats(times);
+                let cpu_p99_ms = cfg!(target_os = "linux")
+                    .then(|| stats(times.iter().map(|(_, cpu)| *cpu).collect()).2);
+                let (count, p50_ms, p99_ms, max_ms, total_ms) =
+                    stats(times.into_iter().map(|(wall, _)| wall).collect());
                 Service {
                     count,
                     p50_ms,
                     p99_ms,
                     max_ms,
                     total_ms,
+                    cpu_p99_ms,
                 }
             };
             (name, service)
@@ -473,6 +478,7 @@ pub(super) fn report(
     let services = observer_services(records, start, end);
     let elapsed = ms(start, end);
     let mut classes: BTreeMap<(&str, bool), Vec<f64>> = BTreeMap::new();
+    let mut cpu_classes: BTreeMap<(&str, bool), Vec<f64>> = BTreeMap::new();
     let mut busy = Vec::new();
     for r in records.iter().filter(|r| r.end > start && r.start < end) {
         let a = r.start.max(start);
@@ -481,6 +487,10 @@ pub(super) fn report(
             .entry((&r.class, r.query))
             .or_default()
             .push(ms(a, b));
+        cpu_classes
+            .entry((&r.class, r.query))
+            .or_default()
+            .push(r.resource.cpu_ms());
         if !r.query {
             busy.push((a, b));
         }
@@ -518,14 +528,27 @@ pub(super) fn report(
     ] {
         if !classes.contains_key(&(class, false)) {
             println!(
-                "GATE worker_class={class} lane={lane} detail=false count=0 p50_ms=NA p99_ms=NA max_ms=NA total_ms=0 busy_share_pct=0"
+                "GATE worker_class={class} lane={lane} detail=false count=0 p50_ms=NA p99_ms=NA max_ms=NA total_ms=0 cpu_p99_ms=NA busy_share_pct=0"
             );
         }
     }
     for ((class, query), values) in classes {
         let (n, p50, p99, max, total) = stats(values);
+        let cpu = if cfg!(target_os = "linux") {
+            format!(
+                "{:.6}",
+                stats(
+                    cpu_classes
+                        .remove(&(class, query))
+                        .expect("bug: matching CPU samples")
+                )
+                .2
+            )
+        } else {
+            "NA".into()
+        };
         println!(
-            "GATE worker_class={class} lane={lane} detail={query} count={n} p50_ms={p50:.6} p99_ms={p99:.6} max_ms={max:.6} total_ms={total:.6} busy_share_pct={:.3}",
+            "GATE worker_class={class} lane={lane} detail={query} count={n} p50_ms={p50:.6} p99_ms={p99:.6} max_ms={max:.6} total_ms={total:.6} cpu_p99_ms={cpu} busy_share_pct={:.3}",
             total / elapsed * 100.0
         );
     }
@@ -603,8 +626,11 @@ pub(super) fn report(
     }
     println!("GATE implicit_wal_checkpoint=inside_SQLite_commit_not_separately_observable");
     for (class, service) in &services {
+        let cpu = service
+            .cpu_p99_ms
+            .map_or_else(|| "NA".into(), |ms| format!("{ms:.6}"));
         println!(
-            "GATE observer_service lane={lane} class={class} count={} p50_ms={:.6} p99_ms={:.6} max_ms={:.6} total_ms={:.6}",
+            "GATE observer_service lane={lane} class={class} count={} p50_ms={:.6} p99_ms={:.6} max_ms={:.6} total_ms={:.6} cpu_p99_ms={cpu}",
             service.count, service.p50_ms, service.p99_ms, service.max_ms, service.total_ms
         );
     }
@@ -623,7 +649,10 @@ mod tests {
             end: start + std::time::Duration::from_millis(30),
             query: false,
             observer: true,
-            resource: Resource::default(),
+            resource: Resource {
+                cpu_ns: 3_000_000,
+                ..Default::default()
+            },
             cache: Cache::default(),
             sql: None,
         };
@@ -636,6 +665,11 @@ mod tests {
         assert!(
             (services["full_snapshot"].p99_ms - 30.0).abs() < 0.000001,
             "observer service was clipped to sample window"
+        );
+        assert_eq!(
+            services["full_snapshot"].cpu_p99_ms,
+            cfg!(target_os = "linux").then_some(3.0),
+            "thread CPU was replaced by wall time"
         );
     }
 }
