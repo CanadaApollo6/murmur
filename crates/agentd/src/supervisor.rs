@@ -64,6 +64,7 @@ pub enum Event {
     },
     Activity {
         agent: AgentId,
+        incarnation: Incarnation,
         text: String,
     },
     PermissionPending(PermissionRequest),
@@ -907,6 +908,7 @@ impl AgentActor {
             }
             SessionEvent::Activity(text) => self.emit(Event::Activity {
                 agent: self.id,
+                incarnation: self.incarnation,
                 text,
             }),
             SessionEvent::PermissionRequested(request) => {
@@ -1182,6 +1184,7 @@ impl AgentActor {
         if self.stall_deadline().is_some_and(|d| d <= now) {
             self.emit(Event::Activity {
                 agent: self.id,
+                incarnation: self.incarnation,
                 text: "mail-starvation stall timeout; cancelling turn".into(),
             });
             if let Err(error) = self.cancel().await {

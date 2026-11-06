@@ -76,9 +76,14 @@ impl EventHub {
             tracing::trace!("no legacy event subscribers");
         }
         let target = match event {
-            Event::Activity { agent, text } => {
+            Event::Activity {
+                agent,
+                incarnation,
+                text,
+            } => {
                 let event = Event::Activity {
                     agent,
+                    incarnation,
                     text: crate::surfaces::events::tail(&text, 2048),
                 };
                 if self.0.activity.send(event).is_err() {
@@ -189,6 +194,7 @@ mod tests {
         for _ in 0..4096 {
             hub.emit(Event::Activity {
                 agent,
+                incarnation: Incarnation(1),
                 text: "x".repeat(8192),
             });
             hub.emit(Event::EgressDenied {

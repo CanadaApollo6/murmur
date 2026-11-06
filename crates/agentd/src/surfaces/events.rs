@@ -346,6 +346,31 @@ pub(crate) async fn snapshot(
     Ok(frame)
 }
 
+/// Each agent's activity since the last flush, and the life it came from.
+type ActivityBuffers = HashMap<AgentId, (Incarnation, String)>;
+
+/// Keeps the newest text of the newest life heard from. Activity is display-only and
+/// may be lost, so a chunk from an older life is simply dropped.
+fn buffer_activity(
+    buffers: &mut ActivityBuffers,
+    agent: AgentId,
+    incarnation: Incarnation,
+    text: &str,
+) {
+    let (life, buffer) = buffers
+        .entry(agent)
+        .or_insert_with(|| (incarnation, String::new()));
+    if incarnation < *life {
+        return;
+    }
+    if incarnation > *life {
+        *life = incarnation;
+        buffer.clear();
+    }
+    buffer.push_str(text);
+    *buffer = tail(buffer, 2048);
+}
+
 async fn state(
     api: &ControlApi,
     event: Event,
@@ -396,7 +421,7 @@ async fn run(
     let mut cursor = first.cursor;
     send_snapshot(sink, first).await?;
     let mut pending = true;
-    let mut text: HashMap<AgentId, String> = HashMap::new();
+    let mut text: ActivityBuffers = HashMap::new();
     let mut flush = tokio::time::Instant::now() + Duration::from_millis(100);
     loop {
         for _ in 0..32 {
@@ -416,18 +441,26 @@ async fn run(
         }
         for _ in 0..1024 {
             match activity.try_recv() {
-                Ok(Event::Activity { agent, text: t }) => {
-                    let buf = text.entry(agent).or_default();
-                    buf.push_str(&t);
-                    *buf = tail(buf, 2048);
-                }
+                Ok(Event::Activity {
+                    agent,
+                    incarnation,
+                    text: t,
+                }) => buffer_activity(&mut text, agent, incarnation, &t),
                 Ok(_) | Err(TryRecvError::Lagged(_)) => {}
                 Err(TryRecvError::Closed) => return Ok(()),
                 Err(TryRecvError::Empty) => break,
             }
         }
         if tokio::time::Instant::now() >= flush {
-            for (agent, text) in text.drain() {
+            for (agent, (life, text)) in text.drain() {
+                // A reopen publishes its incarnation before any frame names it, so
+                // this check sees every life this subscriber has heard of. The reader
+                // would file an older life's text under the new one.
+                if let Some(handle) = api.broker.handle(agent).await
+                    && handle.incarnation() > life
+                {
+                    continue;
+                }
                 send(
                     sink,
                     json!({"event":"activity","agent":format!("agent:{agent}"),"text":text}),
@@ -463,7 +496,7 @@ async fn run(
                 Err(RecvError::Closed)=>return Ok(())
             },
             event=activity.recv()=>match event {
-                Ok(Event::Activity{agent,text:t})=>{let buf=text.entry(agent).or_default();buf.push_str(&t);*buf=tail(buf,2048);},
+                Ok(Event::Activity{agent,incarnation,text:t})=>buffer_activity(&mut text,agent,incarnation,&t),
                 Ok(_)|Err(RecvError::Lagged(_))=>{},Err(RecvError::Closed)=>return Ok(())
             },
             _=tokio::time::sleep_until(flush),if !text.is_empty()=>{}
@@ -607,6 +640,29 @@ mod tests {
         task.abort();
         assert!(task.await.expect_err("aborted").is_cancelled());
     }
+    #[test]
+    fn activity_buffers_keep_the_newest_text_of_the_newest_life() {
+        let agent = AgentId::new();
+        let mut buffers = ActivityBuffers::new();
+        buffer_activity(&mut buffers, agent, Incarnation(2), "one ");
+        buffer_activity(&mut buffers, agent, Incarnation(2), "two");
+        assert_eq!(buffers[&agent], (Incarnation(2), "one two".to_owned()));
+
+        // An older life's chunk changes nothing, and a newer life's replaces it all.
+        buffer_activity(&mut buffers, agent, Incarnation(1), "old");
+        assert_eq!(buffers[&agent], (Incarnation(2), "one two".to_owned()));
+        buffer_activity(&mut buffers, agent, Incarnation(3), "new");
+        assert_eq!(buffers[&agent], (Incarnation(3), "new".to_owned()));
+
+        // Agents do not share a buffer, and the bound and the newest text still hold.
+        let other = AgentId::new();
+        buffer_activity(&mut buffers, other, Incarnation(1), &"x".repeat(4096));
+        buffer_activity(&mut buffers, other, Incarnation(1), "end");
+        let (_, text) = &buffers[&other];
+        assert!(serde_json::to_string(text).expect("text").len() <= 2048);
+        assert!(text.ends_with("end"));
+        assert_eq!(buffers[&agent].1, "new");
+    }
     #[tokio::test]
     async fn a_phase_change_with_no_actor_names_the_life_it_came_from() {
         let (_dir, api, id) = api().await;
@@ -651,6 +707,7 @@ mod tests {
                         outcome: TurnOutcome::Completed,
                     });
                     self.api.broker.event_hub().emit(Event::Activity {
+                        incarnation: Incarnation(1),
                         agent: self.id,
                         text: "newest".into(),
                     });

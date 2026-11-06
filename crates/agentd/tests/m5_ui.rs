@@ -545,6 +545,82 @@ async fn both_transports_name_an_agents_life_and_a_restart_changes_it() {
 }
 
 #[tokio::test]
+async fn activity_buffered_before_a_reopen_never_follows_the_new_lifes_frames() {
+    let d = Daemon::new("yes", 10).await;
+    d.spawn().await;
+    let (mut ws, _) = connect_async(d.ws_request()).await.expect("ws");
+    let mut life = next(&mut ws).await["agents"][0]["incarnation"]
+        .as_u64()
+        .expect("life");
+    // Over one open connection, so a send takes less than the 100 ms buffer does.
+    let stream = UnixStream::connect(d.socket()).await.expect("control");
+    let (r, mut w) = stream.into_split();
+    let mut r = BufReader::new(r);
+    let mut key = 0;
+    let mut send = async |body: &str| {
+        key += 1;
+        write_frame(
+            &mut w,
+            &json!({"command":"send","to":"@a","body":body,"key":format!("key-{key}")}),
+        )
+        .await
+        .expect("send");
+        read_frame_limit(&mut r, 64 * 1024 * 1024)
+            .await
+            .expect("response")
+            .expect("response");
+    };
+
+    // The flush can beat the reopen on a slow machine, so this runs until the text
+    // was still buffered when the new life began, more than once.
+    let mut exercised = 0;
+    for _ in 0..30 {
+        send("exit-after-turn").await;
+        let mut flushed = false;
+        loop {
+            let v = next(&mut ws).await;
+            flushed |= v["event"] == "activity";
+            if v["event"] == "agent" && v["phase"] == "dormant" {
+                break;
+            }
+        }
+        send("silent").await;
+        life += 1;
+        let until = tokio::time::Instant::now() + Duration::from_millis(400);
+        let mut named = false;
+        while let Ok(v) = tokio::time::timeout_at(until, next(&mut ws)).await {
+            named |= v["event"] == "agent" && v["incarnation"] == life;
+            if v["event"] == "activity" {
+                assert!(!named, "life {life} was sent the last life's text: {v}");
+                flushed = true;
+            }
+        }
+        assert!(named, "life {life} was never named");
+        if !flushed {
+            exercised += 1;
+            if exercised == 3 {
+                break;
+            }
+        }
+    }
+    assert!(
+        exercised > 0,
+        "the text never stayed buffered until a reopen"
+    );
+
+    // The current life's own text still gets through.
+    send("hello").await;
+    loop {
+        if next(&mut ws).await["event"] == "activity" {
+            break;
+        }
+    }
+    drop(ws);
+    let mut d = d;
+    d.stop().await;
+}
+
+#[tokio::test]
 async fn invalid_ui_addresses_fail_startup() {
     for address in ["0.0.0.0:7434", "127.0.0.1:0"] {
         let root = tempfile::tempdir().expect("dir");

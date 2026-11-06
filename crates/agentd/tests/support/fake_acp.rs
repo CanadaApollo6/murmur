@@ -285,6 +285,10 @@ fn main() {
                     permission(session, "permission-2", false);
                 } else if text.contains("die-after") {
                     std::process::exit(18);
+                } else if text.contains("exit-after-turn") {
+                    reply(id, json!({"stopReason":"end_turn"}));
+                    std::thread::sleep(Duration::from_millis(5));
+                    std::process::exit(0);
                 } else if text.contains("permission") {
                     flight = Some(id.clone());
                     permission(session, "permission-1", true);
