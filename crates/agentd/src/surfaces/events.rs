@@ -10,6 +10,11 @@ use tokio::sync::{
     broadcast::error::{RecvError, TryRecvError},
 };
 
+static SNAPSHOT_ENCODERS: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(8)));
+static MAIL_ENCODERS: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(64)));
+
 static SUBSCRIBERS: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(8)));
 pub fn subscribe() -> Result<OwnedSemaphorePermit> {
@@ -116,7 +121,12 @@ pub fn mail(row: &mut Value, path: &Path) {
 pub trait Sink: Send {
     async fn send(&mut self, value: Value) -> Result<()>;
     async fn send_snapshot(&mut self, json: String, _full_mail: bool) -> Result<()> {
-        let value = tokio::task::spawn_blocking(move || serde_json::from_str(&json)).await??;
+        let permit = SNAPSHOT_ENCODERS.clone().acquire_owned().await?;
+        let value = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            serde_json::from_str(&json)
+        })
+        .await??;
         self.send(value).await
     }
 }
@@ -139,8 +149,15 @@ async fn send(sink: &mut impl Sink, value: Value) -> Result<()> {
         .map_err(|_| "feed send timed out")?
 }
 
-pub(crate) async fn mail_response(mut value: Value, control_path: PathBuf) -> Result<Vec<u8>> {
+pub(crate) async fn mail_response(
+    room: &crate::mailroom::Mailroom,
+    query: crate::mailroom::MailQuery,
+    control_path: PathBuf,
+) -> Result<Vec<u8>> {
+    let permit = MAIL_ENCODERS.clone().acquire_owned().await?;
+    let mut value = room.mail_query(query).await?;
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         if let Some(rows) = value["rows"].as_array_mut() {
             for row in rows {
                 mail(row, &control_path);
@@ -252,8 +269,15 @@ fn assemble_snapshot(input: SnapshotInput) -> Result<(Snapshot, AgentCache)> {
         cache,
     ))
 }
-async fn encode_snapshot(input: SnapshotInput) -> Result<(Snapshot, AgentCache)> {
-    tokio::task::spawn_blocking(move || assemble_snapshot(input)).await?
+async fn encode_snapshot(
+    input: SnapshotInput,
+    permit: OwnedSemaphorePermit,
+) -> Result<(Snapshot, AgentCache)> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        assemble_snapshot(input)
+    })
+    .await?
 }
 pub(crate) async fn snapshot(
     api: &ControlApi,
@@ -261,6 +285,7 @@ pub(crate) async fn snapshot(
     cursor_only: Option<i64>,
     cache: &mut AgentCache,
 ) -> Result<Snapshot> {
+    let permit = SNAPSHOT_ENCODERS.clone().acquire_owned().await?;
     let (cursor, mail_state) = if let Some(c) = cursor_only {
         (c, Value::Null)
     } else {
@@ -271,15 +296,18 @@ pub(crate) async fn snapshot(
     for (id, _, _) in specs.iter().take(1024) {
         handles.push(api.broker.handle(*id).await);
     }
-    let (frame, updated) = encode_snapshot(SnapshotInput {
-        cursor,
-        mail_state,
-        specs,
-        handles,
-        hub: api.broker.event_hub().clone(),
-        control_path: api.control_path.clone(),
-        cache: std::mem::take(cache),
-    })
+    let (frame, updated) = encode_snapshot(
+        SnapshotInput {
+            cursor,
+            mail_state,
+            specs,
+            handles,
+            hub: api.broker.event_hub().clone(),
+            control_path: api.control_path.clone(),
+            cache: std::mem::take(cache),
+        },
+        permit,
+    )
     .await?;
     *cache = updated;
     Ok(frame)
@@ -699,6 +727,63 @@ mod tests {
         assert_eq!(entered.load(Ordering::SeqCst), 1);
     }
     #[test]
+    fn cancelled_encoders_keep_their_admission_slots() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (_dir, api, _) = api().await;
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered_tx.send(()).expect("entered");
+                release_rx.recv().expect("release");
+            });
+            entered_rx.await.expect("blocker active");
+            let before = api.mailroom.jobs_run.load(Ordering::SeqCst);
+            for _ in 0..16 {
+                let api = api.clone();
+                let task = tokio::spawn(async move {
+                    let _subscriber = subscribe()?;
+                    snapshot(&api, None, None, &mut HashMap::new()).await
+                });
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                task.abort();
+                assert!(task.await.err().expect("cancelled task").is_cancelled());
+            }
+            let snapshot_jobs = api.mailroom.jobs_run.load(Ordering::SeqCst) - before;
+            let before = api.mailroom.jobs_run.load(Ordering::SeqCst);
+            for _ in 0..80 {
+                let api = api.clone();
+                let task = tokio::spawn(async move {
+                    mail_response(
+                        &api.mailroom,
+                        crate::mailroom::MailQuery::default(),
+                        api.control_path.clone(),
+                    )
+                    .await
+                });
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                task.abort();
+                assert!(task.await.err().expect("cancelled task").is_cancelled());
+            }
+            let mail_jobs = api.mailroom.jobs_run.load(Ordering::SeqCst) - before;
+            release_tx.send(()).expect("release blocker");
+            blocker.await.expect("blocker");
+            println!("ENCODER_ADMISSION snapshot_jobs={snapshot_jobs} mail_jobs={mail_jobs}");
+            assert!(
+                snapshot_jobs <= 16,
+                "cancelled snapshots collected past 8 admission slots: jobs={snapshot_jobs}"
+            );
+            assert!(
+                mail_jobs <= 64,
+                "cancelled mail responses collected past 64 admission slots: jobs={mail_jobs}"
+            );
+        });
+    }
+    #[test]
     fn encoded_bounds_and_maximum_shape() {
         let hostile = "\u{0}\n\"\\'".repeat(8192);
         for n in [1024, 2048, 4096, 8192] {
@@ -863,7 +948,16 @@ mod runtime_tests {
         });
         ready_rx.await.expect("timer ready");
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let (frame, _cache) = encode_snapshot(input).await.expect("maximum snapshot");
+        let (frame, _cache) = encode_snapshot(
+            input,
+            SNAPSHOT_ENCODERS
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("encoder permit"),
+        )
+        .await
+        .expect("maximum snapshot");
         assert!(frame.json.len() > 20 * 1024 * 1024);
         assert!(frame.json.len() < 64 * 1024 * 1024);
         tokio::time::sleep(Duration::from_millis(10)).await;

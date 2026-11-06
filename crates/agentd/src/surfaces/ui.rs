@@ -399,8 +399,7 @@ impl UiServer {
                         before_msg_seq: p.get("before_msg_seq").map(|s| s.parse()).transpose()?,
                         limit,
                     };
-                    let value = api.mailroom.mail_query(q).await?;
-                    events::mail_response(value, api.control_path.clone()).await
+                    events::mail_response(&api.mailroom, q, api.control_path.clone()).await
                 } else {
                     let message = api
                         .mailroom

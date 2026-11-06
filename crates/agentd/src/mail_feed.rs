@@ -1080,15 +1080,17 @@ mod gate {
                             vec!["held".into(), "uncertain".into()],
                             vec!["queued".into(), "offered".into()],
                         ] {
-                            let rows = room
-                                .mail_query(MailQuery {
-                                    states,
-                                    limit: 1000,
-                                    ..Default::default()
-                                })
-                                .await?;
                             std::hint::black_box(
-                                events::mail_response(rows, control_path.clone()).await?,
+                                events::mail_response(
+                                    &room,
+                                    MailQuery {
+                                        states,
+                                        limit: 1000,
+                                        ..Default::default()
+                                    },
+                                    control_path.clone(),
+                                )
+                                .await?,
                             );
                         }
                         load.views[n].fetch_add(1, Relaxed);
@@ -1108,15 +1110,17 @@ mod gate {
                 loop {
                     let query = async {
                         if rare {
-                            let rows = room
-                                .mail_query(MailQuery {
-                                    from: Some("no such sender".into()),
-                                    limit: 1000,
-                                    ..Default::default()
-                                })
-                                .await?;
                             std::hint::black_box(
-                                events::mail_response(rows, control_path.clone()).await?,
+                                events::mail_response(
+                                    &room,
+                                    MailQuery {
+                                        from: Some("no such sender".into()),
+                                        limit: 1000,
+                                        ..Default::default()
+                                    },
+                                    control_path.clone(),
+                                )
+                                .await?,
                             );
                             load.rare.fetch_add(1, Relaxed);
                         } else {
