@@ -217,11 +217,23 @@ impl Mailroom {
         let worker = thread::Builder::new()
             .name("agentd-mailroom".into())
             .spawn(move || {
-                for job in rx {
-                    #[cfg(test)]
-                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let before = store.db.total_changes();
-                    {
+                let mut pending_notification=false;
+                let mut retry_at:Option<std::time::Instant>=None;
+                let mut backoff=std::time::Duration::from_millis(20);
+                loop {
+                    let job=if let Some(deadline)=retry_at {
+                        match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                            Ok(job)=>Some(job),
+                            Err(mpsc::RecvTimeoutError::Timeout)=>None,
+                            Err(mpsc::RecvTimeoutError::Disconnected)=>break,
+                        }
+                    } else {
+                        match rx.recv() {Ok(job)=>Some(job),Err(mpsc::RecvError)=>break}
+                    };
+                    if let Some(job)=job {
+                        #[cfg(test)]
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let before = store.db.total_changes();
                         #[cfg(test)]
                         let cache = trace::cache(&store.db);
                         #[cfg(test)]
@@ -229,14 +241,23 @@ impl Mailroom {
                         job(&mut store);
                         #[cfg(test)]
                         trace::cache_delta(cache, &store.db);
+                        pending_notification |= store.db.total_changes()!=before;
                     }
-                    if store.db.total_changes() != before {
+                    if pending_notification && retry_at.is_none_or(|deadline|std::time::Instant::now()>=deadline) {
                         #[cfg(test)]
                         let _head = trace::maintenance("post_accept_head");
                         let head = match feed::head(&store.db) {
                             Ok(head)=>head,
-                            Err(error)=>{tracing::error!(%error,"mail event head maintenance failed; worker continues");continue;}
+                            Err(error)=>{
+                                tracing::error!(%error, retry_ms=backoff.as_millis(), "mail event head maintenance failed; retrying pending notification");
+                                retry_at=Some(std::time::Instant::now()+backoff);
+                                backoff=(backoff*2).min(std::time::Duration::from_secs(1));
+                                continue;
+                            }
                         };
+                        pending_notification=false;
+                        retry_at=None;
+                        backoff=std::time::Duration::from_millis(20);
                         changes_tx.send_if_modified(|seq| {
                             if head > *seq {
                                 *seq = head;

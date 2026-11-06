@@ -1590,6 +1590,70 @@ mod state_filter_tests {
 mod head_failure_tests {
     use super::*;
     #[tokio::test]
+    async fn failed_head_retries_and_wakes_without_another_write() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().expect("dir");
+        let room = Mailroom::open(dir.path().join("mail.db"), Config::default())
+            .await
+            .expect("room");
+        let to = room
+            .register(AgentName::parse("a").expect("name"))
+            .await
+            .expect("agent");
+        let denied = Arc::new(AtomicBool::new(true));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let flag = denied.clone();
+        let count = attempts.clone();
+        room.call(move |s| {
+            s.db.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(
+                    ctx.action,
+                    rusqlite::hooks::AuthAction::Read {
+                        table_name: "sqlite_sequence",
+                        ..
+                    }
+                ) {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if flag.load(Ordering::SeqCst) {
+                        return rusqlite::hooks::Authorization::Deny;
+                    }
+                }
+                rusqlite::hooks::Authorization::Allow
+            }));
+            Ok(())
+        })
+        .await
+        .expect("install head failures");
+        let mut changes = room.changes();
+        changes.borrow_and_update();
+        room.accept(NewMessage {
+            from: Sender::Human,
+            to,
+            body: Body::new("committed").expect("body"),
+            reply_to: None,
+            client_key: ClientKey("wake".into()),
+            act: Act::Inform,
+            task: None,
+        })
+        .await
+        .expect("accept");
+        for _ in 0..20 {
+            room.observed_agents().await.expect("read-only job");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            (1..=6).contains(&attempts.load(Ordering::SeqCst)),
+            "head retry spun on reads"
+        );
+        denied.store(false, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(2), changes.changed())
+            .await
+            .expect("committed mail never woke idle subscriber after head recovery")
+            .expect("watch open");
+        assert_eq!(*changes.borrow_and_update(), 1);
+        room.close().await.expect("close");
+    }
+    #[tokio::test]
     async fn head_read_failure_does_not_close_worker() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::tempdir().expect("dir");
