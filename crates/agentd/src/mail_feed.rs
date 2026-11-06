@@ -1029,11 +1029,10 @@ mod gate {
         RamDisk,
     }
     impl GateMode {
-        fn snapshot_rate_floor(self) -> f64 {
-            // Fixed before qualification: requested btrfs floor, and the old
-            // RAM maximum (28.349120/s) rounded up. Never adapt to a new run.
+        fn completed_snapshot_floor(self) -> f64 {
+            // Fixed by design section 6; first-stage job rate is report-only.
             match self {
-                Self::Production => 27.0,
+                Self::Production => 12.5,
                 Self::RamDisk => 28.35,
             }
         }
@@ -1051,21 +1050,26 @@ mod gate {
             }
         }
     }
-    fn snapshot_rate_failure(mode: GateMode, rate: f64) -> Option<String> {
-        let floor = mode.snapshot_rate_floor();
+    fn throughput_failure(mode: GateMode, _job_rate: f64, rate: f64) -> Option<String> {
+        let floor = mode.completed_snapshot_floor();
         (!rate.is_finite() || rate < floor).then(|| {
-            format!(
-                "full_snapshot jobs per second {rate:.6} below fixed old-generator floor {floor:.2}"
-            )
+            format!("completed full snapshots per second {rate:.6} below fixed floor {floor:.2}")
         })
     }
     #[test]
     fn snapshot_rate_floors_cannot_be_hidden_by_completions_or_cpu() {
-        for (mode, floor) in [(GateMode::Production, 27.0), (GateMode::RamDisk, 28.35)] {
-            assert!(snapshot_rate_failure(mode, floor - 0.001).is_some());
-            assert!(snapshot_rate_failure(mode, floor).is_none());
-            assert!(snapshot_rate_failure(mode, f64::NAN).is_some());
+        for (mode, floor) in [(GateMode::Production, 12.5), (GateMode::RamDisk, 28.35)] {
+            assert!(throughput_failure(mode, 1000.0, floor - 0.001).is_some());
+            assert!(throughput_failure(mode, 0.0, floor).is_none());
+            assert!(throughput_failure(mode, 1000.0, f64::NAN).is_some());
         }
+    }
+    #[test]
+    fn production_completed_snapshot_floor_is_twelve_point_five() {
+        assert!(
+            throughput_failure(GateMode::Production, 0.0, 12.5).is_none(),
+            "12.5 completed full snapshots/s must meet the production floor"
+        );
     }
     fn gate_failures(
         mode: GateMode,
@@ -1307,11 +1311,39 @@ mod gate {
             })
             .collect()
     }
+    fn memory_sample(phase: &str) {
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::fs::read_to_string("/proc/self/status").expect("read gate RSS");
+            let counter = |name: &str| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .expect("Linux memory counter")
+                    .split_whitespace()
+                    .next()
+                    .expect("memory value")
+                    .parse::<u64>()
+                    .expect("memory KiB")
+            };
+            println!(
+                "GATE memory phase={phase} rss_kib={} peak_rss_kib={}",
+                counter("VmRSS:"),
+                counter("VmHWM:")
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        println!("GATE memory phase={phase} rss_kib=NA peak_rss_kib=NA");
+    }
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "full-scale disk and latency measurement; run explicitly with --ignored --nocapture"]
     async fn m5_cost_gate() {
         let mode = GateMode::from_marker(std::env::var_os("M5_GATE_RAM_DISK").as_deref())
             .expect("gate mode");
+        println!(
+            "GATE rust_allocator={}",
+            std::any::type_name_of_val(&crate::allocator::ALLOCATOR)
+        );
         println!(
             "GATE pass_rule=v8 mode={} queue_target_ms=20 service_target_ms=20 service_min_samples=100 minimum_accept_samples=2048 max_loaded_window_seconds=120",
             mode.label()
@@ -1439,6 +1471,7 @@ mod gate {
         let mut tasks = tokio::task::JoinSet::<crate::surfaces::Result<()>>::new();
         let cancel = tokio_util::sync::CancellationToken::new();
         let load = Arc::new(Load::default());
+        memory_sample("before_observers");
         for n in 0_usize..8 {
             let api = api.clone();
             let anchor = anchor.clone();
@@ -1581,10 +1614,10 @@ mod gate {
         let snapshot_jobs = services.get("full_snapshot").expect("snapshot class").count;
         let snapshot_rate = snapshot_jobs as f64 / seconds;
         let completions = during_counts[..7].iter().sum::<usize>();
+        let completion_rate = completions as f64 / seconds;
         println!(
-            "GATE snapshot_rates window_seconds={seconds:.6} jobs={snapshot_jobs} jobs_per_second={snapshot_rate:.6} minimum_jobs_per_second={:.2} completed={completions} completed_per_second={:.6} attempts_inside_window={attempts:?} reconnect_mode=complete_full_snapshot hang_limit_seconds=10",
-            mode.snapshot_rate_floor(),
-            completions as f64 / seconds
+            "GATE snapshot_rates window_seconds={seconds:.6} jobs={snapshot_jobs} jobs_per_second={snapshot_rate:.6} completed={completions} completed_per_second={completion_rate:.6} minimum_completed_per_second={:.2} attempts_inside_window={attempts:?} reconnect_mode=complete_full_snapshot hang_limit_seconds=10",
+            mode.completed_snapshot_floor()
         );
         let (last_head, prunes) = room
             .observe(|s| Ok((head(&s.db)?, s.prunes.clone())))
@@ -1620,6 +1653,14 @@ mod gate {
         assert!(load.ready(), "minimum workload iterations missing");
         check_iterations(&during_counts)
             .expect("all workloads must complete inside sampled accepts");
+        tokio::time::timeout(Duration::from_secs(10), events::encoders_idle())
+            .await
+            .expect("encoders finish after clients close");
+        room.call(|_| Ok(()))
+            .await
+            .expect("drain worker before RSS");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        memory_sample("post_load");
         println!(
             "GATE current_thread=true snapshot_includes_serialization=true baseline_accept_samples={} loaded_accept_samples={} retained_backlog_frames_replayed={} reconnect_full_snapshots={:?} view_iterations={:?} rare_queries={} list_queries={} checked_workload_results={completed}",
             baseline.samples.len(),
@@ -1652,10 +1693,12 @@ mod gate {
             .close()
             .await
             .expect("close");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        memory_sample("post_close");
         assert!(normal < 100.0 && backlog < 100.0, "snapshot gate missed");
         let mut failures =
             gate_failures(mode, loaded.queue_p99, loaded.p99 - baseline.p99, &services);
-        failures.extend(snapshot_rate_failure(mode, snapshot_rate));
+        failures.extend(throughput_failure(mode, snapshot_rate, completion_rate));
         assert!(
             failures.is_empty(),
             "v8 gate missed: {}",

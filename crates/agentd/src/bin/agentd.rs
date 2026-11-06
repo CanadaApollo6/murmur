@@ -1,4 +1,7 @@
 #![deny(clippy::unwrap_used)]
+#[path = "../allocator.rs"]
+mod allocator;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;

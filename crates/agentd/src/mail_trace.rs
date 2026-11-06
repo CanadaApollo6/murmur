@@ -415,6 +415,7 @@ pub(super) struct Service {
     pub max_ms: f64,
     pub total_ms: f64,
     pub cpu_p99_ms: Option<f64>,
+    pub voluntary_p99: Option<f64>,
 }
 fn observer_services(
     records: &[Record],
@@ -429,10 +430,11 @@ fn observer_services(
         .iter()
         .filter(|r| r.observer && !r.query && r.end > start && r.start < end)
     {
-        classes
-            .entry(record.class.clone())
-            .or_default()
-            .push((ms(record.start, record.end), record.resource.cpu_ms()));
+        classes.entry(record.class.clone()).or_default().push((
+            ms(record.start, record.end),
+            record.resource.cpu_ms(),
+            record.resource.voluntary as f64,
+        ));
     }
     classes
         .into_iter()
@@ -441,9 +443,11 @@ fn observer_services(
                 Service::default()
             } else {
                 let cpu_p99_ms = cfg!(target_os = "linux")
-                    .then(|| stats(times.iter().map(|(_, cpu)| *cpu).collect()).2);
+                    .then(|| stats(times.iter().map(|(_, cpu, _)| *cpu).collect()).2);
+                let voluntary_p99 = cfg!(target_os = "linux")
+                    .then(|| stats(times.iter().map(|(_, _, switches)| *switches).collect()).2);
                 let (count, p50_ms, p99_ms, max_ms, total_ms) =
-                    stats(times.into_iter().map(|(wall, _)| wall).collect());
+                    stats(times.into_iter().map(|(wall, _, _)| wall).collect());
                 Service {
                     count,
                     p50_ms,
@@ -451,6 +455,7 @@ fn observer_services(
                     max_ms,
                     total_ms,
                     cpu_p99_ms,
+                    voluntary_p99,
                 }
             };
             (name, service)
@@ -629,8 +634,11 @@ pub(super) fn report(
         let cpu = service
             .cpu_p99_ms
             .map_or_else(|| "NA".into(), |ms| format!("{ms:.6}"));
+        let switches = service
+            .voluntary_p99
+            .map_or_else(|| "NA".into(), |n| format!("{n:.0}"));
         println!(
-            "GATE observer_service lane={lane} class={class} count={} p50_ms={:.6} p99_ms={:.6} max_ms={:.6} total_ms={:.6} cpu_p99_ms={cpu}",
+            "GATE observer_service lane={lane} class={class} count={} p50_ms={:.6} p99_ms={:.6} max_ms={:.6} total_ms={:.6} cpu_p99_ms={cpu} voluntary_p99={switches}",
             service.count, service.p50_ms, service.p99_ms, service.max_ms, service.total_ms
         );
     }

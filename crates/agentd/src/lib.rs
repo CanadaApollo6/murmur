@@ -1,6 +1,9 @@
 //! Durable mail delivery and supervised ACP and Infinity agent sessions.
 #![deny(clippy::unwrap_used)]
 
+#[cfg(test)]
+mod allocator;
+
 pub mod mailroom;
 pub mod model;
 pub mod swarm;

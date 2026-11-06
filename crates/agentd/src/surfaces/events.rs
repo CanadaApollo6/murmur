@@ -15,6 +15,14 @@ static SNAPSHOT_ENCODERS: std::sync::LazyLock<Arc<Semaphore>> =
 static MAIL_ENCODERS: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(64)));
 
+#[cfg(test)]
+pub(crate) async fn encoders_idle() {
+    // Post-load measurement only: observe admission returning without taking it.
+    while SNAPSHOT_ENCODERS.available_permits() != 8 || MAIL_ENCODERS.available_permits() != 64 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 static SUBSCRIBERS: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(8)));
 pub fn subscribe() -> Result<OwnedSemaphorePermit> {

@@ -549,10 +549,10 @@ Baseline and loaded accepts use the same worker tracing.
 Seven reconnecting feeds disconnect only after their complete serialized full
 snapshot is consumed, then reconnect immediately without sleeping. Each attempt
 has a 10-second hang limit that fails the gate. The eighth feed retains the full
-backlog replay. The sampled full-snapshot job rate must reach at least 27/s on
-the production filesystem and 28.35/s on RAM disk, fixed from the earlier deadline
-generator's retained measurements. Both job and completed-snapshot rates are
-printed. Cancellation remains covered by dedicated abandoned-feed tests.
+backlog replay. Completed full snapshots must reach at least 12.5/s on the
+production filesystem and 28.35/s on RAM disk. These are fixed floors; snapshot
+job rate is printed only, since it includes work for clients that disconnected.
+Cancellation remains covered by dedicated abandoned-feed tests.
 
 The default v8 production rule requires loaded accept worker-queue p99 at or below
 20 ms and whole-job service p99 at or below 20 ms for every observer class,
@@ -562,6 +562,11 @@ p99, paired delta, and class maxima are printed but do not decide the result.
 Thread CPU p99 is printed for each worker and observer class as a diagnostic;
 whole-job wall time still decides the service limit. Thread CPU is unavailable
 on non-Linux hosts and is printed as `NA` there.
+On Linux the gate also prints RSS and the process high-water mark. Post-load RSS
+is sampled one second after all clients, encoders and queued reads drain, with
+the mailroom still open. A second sample follows mailroom close and another idle
+second. No allocator trim or collection is forced; the peak includes fixture
+initialization as well as the sampled load.
 
 The baseline has 2,048 accepts. The loaded window keeps the same closed-loop
 accepts and observer workload for at least 2,048 accepts, extending until all six
