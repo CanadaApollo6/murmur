@@ -1052,3 +1052,31 @@ async fn maximum_all_fields_fixture_crosses_real_agentctl_watch() {
     );
     println!("MAXIMUM all_fields_real_agentctl_bytes={}", actual.len());
 }
+
+#[cfg(not(feature = "bundled-web"))]
+#[tokio::test]
+async fn without_a_bundle_or_assets_the_root_explains_how_to_build() {
+    let mut d = Daemon::new("yes", 10).await;
+    d.stop().await;
+    let config = std::fs::read_to_string(d.root.path().join("config.toml")).expect("config");
+    let config = config
+        .lines()
+        .filter(|line| !line.starts_with("assets="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(d.root.path().join("config.toml"), config).expect("config");
+    d.child = Daemon::start(&d.root);
+    d.ready().await;
+    let root = d.raw("/", &d.host()).await;
+    assert!(root.starts_with("HTTP/1.1 200"), "{root}");
+    assert!(root.contains("npm ci"), "{root}");
+    assert!(root.contains("--features bundled-web"), "{root}");
+    assert!(root.contains("script-src 'self'"), "{root}");
+    assert!(
+        d.raw("/assets/index.js", &d.host())
+            .await
+            .starts_with("HTTP/1.1 404")
+    );
+    assert!(d.get("/mail").await.starts_with("HTTP/1.1 200"));
+    d.stop().await;
+}

@@ -22,12 +22,14 @@ fn update(session: &str, text: &str) {
 }
 fn permission(session: &str, id: &str, reject: bool) {
     let key = std::env::var("FAKE_OPTION_KEY").unwrap_or_else(|_| "yes".into());
-    let title = "T".repeat(
-        std::env::var("FAKE_TITLE_BYTES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10),
-    );
+    let title = std::env::var("FAKE_TITLE_TEXT").unwrap_or_else(|_| {
+        "T".repeat(
+            std::env::var("FAKE_TITLE_BYTES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
+        )
+    });
     let mut options = vec![json!({"optionId":key,"name":"Allow once","kind":"allow_once"})];
     if reject {
         options.push(json!({"optionId":"no","name":"Reject once","kind":"reject_once"}));
@@ -198,7 +200,7 @@ fn main() {
                 update(session, "history replay");
                 if root.join("fail-load").exists() {
                     emit(
-                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":"load refused"}}),
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":std::env::var("FAKE_LOAD_ERROR").unwrap_or_else(|_| "load refused".into())}}),
                     );
                 } else {
                     reply(id, json!({}));
@@ -262,7 +264,10 @@ fn main() {
                     continue;
                 }
                 if !text.contains("silent") {
-                    update(session, "started");
+                    update(
+                        session,
+                        &std::env::var("FAKE_ACTIVITY_TEXT").unwrap_or_else(|_| "started".into()),
+                    );
                 }
                 if text.contains("ignore-cancel") || text.contains("late-permissions") {
                     ignore_cancel = text.contains("ignore-cancel");
