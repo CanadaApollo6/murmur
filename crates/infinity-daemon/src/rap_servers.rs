@@ -55,12 +55,22 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[cfg(unix)]
 const COMMAND_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Installs a `SIGCHLD` handler, which stays installed for the life of the process.
+///
+/// If this process inherited `SIGCHLD=SIG_IGN`, the kernel would reap commands by itself,
+/// so their IDs could be reused while we still hold them.
+#[cfg(unix)]
+fn keep_children_waitable() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    signal(SignalKind::child()).map(drop)
+}
+
 /// Waits up to [`COMMAND_SHUTDOWN_GRACE`] for a command to exit, and returns whether it did.
 ///
 /// The command stays unreaped. A zombie keeps its process ID, so its group ID cannot be
 /// reused by an unrelated process before the caller signals the group.
 #[cfg(unix)]
-async fn command_exited_unreaped(id: u32) -> std::io::Result<bool> {
+async fn command_exited_unreaped(id: u32) -> rustix::io::Result<bool> {
     use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
     let pid = Pid::from_raw(id as i32).expect("bug: a running child has a nonzero process ID");
     let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
@@ -553,6 +563,7 @@ impl ManagedRapServer {
                             {
                                 tracing::warn!(%error, id, "Failed to interrupt RAP process group");
                             }
+                            let mut reaped_elsewhere = false;
                             match command_exited_unreaped(id).await {
                                 Ok(exited) => {
                                     if !exited {
@@ -575,15 +586,19 @@ impl ManagedRapServer {
                                     }
                                 }
                                 Err(error) => {
-                                    // The group ID may no longer be ours, so kill only the child,
-                                    // which tokio tracks.
                                     tracing::error!(%error, id, "Failed to poll RAP command");
-                                    if let Err(error) = child.start_kill() {
+                                    // With `ECHILD`, the command is already gone and its ID may
+                                    // belong to another process. Any other error leaves it ours.
+                                    reaped_elsewhere = error == rustix::io::Errno::CHILD;
+                                    if !reaped_elsewhere && let Err(error) = child.start_kill() {
                                         tracing::error!(%error, id, "Failed to kill RAP command");
                                     }
                                 }
                             }
-                            if let Err(error) = child.wait().await {
+                            if reaped_elsewhere {
+                                // Dropping the handle would send `SIGKILL` to that ID.
+                                std::mem::forget(child);
+                            } else if let Err(error) = child.wait().await {
                                 tracing::error!(%error, id, "Failed to reap RAP command");
                             }
                         }
@@ -745,6 +760,9 @@ async fn spawn_rap_server(
 
     let working_dir = cwd.join(".infinity");
     std::fs::create_dir_all(&working_dir).ok();
+
+    #[cfg(unix)]
+    keep_children_waitable().map_err(|e| format!("failed to handle SIGCHLD: {e}"))?;
 
     let mut child = tokio::process::Command::new("sh")
         .args(["-c", command])
@@ -1273,7 +1291,35 @@ mod command_shutdown {
     use std::time::{Duration, Instant};
 
     #[tokio::test]
+    async fn commands_stay_waitable_when_sigchld_is_inherited_as_ignored() {
+        let test = std::env::current_exe().expect("test binary path");
+        let output = tokio::process::Command::new("sh")
+            .args(["-c", "trap '' CHLD; exec \"$0\" --exact \"$1\""])
+            .arg(test)
+            .arg("rap_servers::command_shutdown::exit_check_leaves_the_command_unreaped")
+            .output()
+            .await
+            .expect("run test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_check_reports_a_command_reaped_elsewhere() {
+        // This process is not its own child, which gives the same error as a lost command.
+        let error = super::command_exited_unreaped(std::process::id())
+            .await
+            .expect_err("polling a non-child must fail");
+        assert_eq!(error, rustix::io::Errno::CHILD);
+    }
+
+    #[tokio::test]
     async fn exit_check_leaves_the_command_unreaped() {
+        super::keep_children_waitable().expect("handle SIGCHLD");
         let mut child = tokio::process::Command::new("true")
             .spawn()
             .expect("spawn command");
