@@ -933,3 +933,30 @@ async fn manifest_refresh_is_throttled_and_slow_writes_release_its_lock() {
     drop(slow);
     d.stop().await;
 }
+
+#[tokio::test]
+async fn assets_cannot_enclose_state_directory() {
+    let mut d = Daemon::new("yes", 10).await;
+    d.stop().await;
+    let path = d.root.path().join("config.toml");
+    let config = std::fs::read_to_string(&path).expect("config").replace(
+        &json!(d.root.path().join("assets")).to_string(),
+        &json!(d.root.path()).to_string(),
+    );
+    std::fs::write(path, config).expect("config");
+    d.child = Daemon::start(&d.root);
+    let status = tokio::time::timeout(Duration::from_secs(3), d.child.wait()).await;
+    let rejected = matches!(status,Ok(Ok(status)) if !status.success());
+    if !rejected {
+        d.raw("/", &d.host()).await;
+        let response = d.raw("/state/ui.token", &d.host()).await;
+        println!(
+            "ENCLOSING_ASSETS unauthenticated_token_exposed={}",
+            response.contains(d.token().trim())
+        );
+        d.child.kill().await.expect("kill unsafe daemon");
+    }
+    assert!(rejected, "assets root enclosing state_dir was accepted");
+    let log = std::fs::read_to_string(d.root.path().join("daemon.log")).expect("log");
+    assert!(log.contains("ui.assets must"), "{log}");
+}

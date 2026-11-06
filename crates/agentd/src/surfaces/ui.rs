@@ -51,8 +51,9 @@ impl UiServer {
         if let Some(assets) = config.assets.take() {
             let assets =
                 tokio::task::spawn_blocking(move || std::fs::canonicalize(assets)).await??;
-            if assets.starts_with(std::fs::canonicalize(state)?) {
-                return Err("ui.assets must be outside state_dir".into());
+            let state = std::fs::canonicalize(state)?;
+            if assets.starts_with(&state) || state.starts_with(&assets) {
+                return Err("ui.assets must be outside state_dir and must not contain it".into());
             }
             crate::private_fs::Dir::open(&assets, false)?;
             config.assets = Some(assets);
