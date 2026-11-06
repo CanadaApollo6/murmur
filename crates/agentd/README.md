@@ -538,7 +538,8 @@ its lock across writes.
 Request paths never become filesystem paths. The web API has no write routes.
 Permission and held-mail frames include server-built POSIX shell commands for
 `agentctl`. Commands quote every argument and use the bound control socket;
-values containing control characters have no copyable command.
+values containing control or invisible formatting characters, including bidi
+controls, have no copyable command.
 
 The full-scale worker cost gate is an explicit test. It creates a 1M-message
 fixture with 64 KiB bodies in the newest 20,000 messages, a 200,000-message dormant

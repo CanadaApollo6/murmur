@@ -74,12 +74,26 @@ fn bounded(s: &str, limit: usize, newest: bool) -> String {
     }
     result
 }
+/// A character that could make a pasted command differ from how it displays.
+fn unsafe_to_paste(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{ad}'
+                | '\u{61c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+        )
+}
 pub fn command(path: &Path, verb: &str, args: &[&str]) -> Option<String> {
     let path = path.to_str()?;
     let values = std::iter::once(path)
         .chain(args.iter().copied())
         .collect::<Vec<_>>();
-    if values.iter().any(|v| v.chars().any(char::is_control)) {
+    if values.iter().any(|v| v.chars().any(unsafe_to_paste)) {
         return None;
     }
     let quote = |v: &str| format!("'{}'", v.replace('\'', "'\\''"));

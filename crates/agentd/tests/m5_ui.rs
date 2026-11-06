@@ -462,6 +462,10 @@ async fn copied_commands_reach_real_actor_and_large_approvals() {
         assert!(exact, "actor received exact key {key}");
         assert!(!d.root.path().join("INJECTION").exists());
         assert!(command(&d.socket(), "approve", &["id", "line\nkey"]).is_none());
+        for hidden in ["\u{202e}", "\u{2066}", "\u{200b}", "\u{2028}", "\u{feff}"] {
+            let key = format!("yes{hidden}key");
+            assert!(command(&d.socket(), "approve", &["id", &key]).is_none());
+        }
         d.stop().await;
     }
 }
