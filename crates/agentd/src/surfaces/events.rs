@@ -735,6 +735,26 @@ mod tests {
     }
     #[test]
     fn cancelled_encoders_keep_their_admission_slots() {
+        // This test fills the process-wide slots; other feed tests must not share them.
+        if std::env::var_os("AGENTD_ENCODER_ADMISSION_CHILD").is_none() {
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "surfaces::events::tests::cancelled_encoders_keep_their_admission_slots",
+                        "--nocapture",
+                    ])
+                    .env("AGENTD_ENCODER_ADMISSION_CHILD", "1")
+                    .output()
+                    .expect("run isolated admission regression");
+            assert!(
+                output.status.success(),
+                "isolated admission regression failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
@@ -751,38 +771,32 @@ mod tests {
             entered_rx.await.expect("blocker active");
             let before = api.mailroom.jobs_run.load(Ordering::SeqCst);
             for _ in 0..16 {
-                let api = api.clone();
-                let task = tokio::spawn(async move {
-                    let _subscriber = subscribe()?;
-                    snapshot(&api, None, None, &mut HashMap::new()).await
-                });
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                task.abort();
-                match task.await {
-                    Err(error) => assert!(error.is_cancelled()),
-                    Ok(_) => panic!("cancelled encoder unexpectedly completed"),
+                let _subscriber = subscribe().expect("subscriber slot");
+                let mut cache = HashMap::new();
+                let mut request = Box::pin(snapshot(&api, None, None, &mut cache));
+                // Flush each query, then poll its result through to the next await.
+                // The final poll queues encoding behind the occupied blocking thread.
+                assert!(futures_util::poll!(request.as_mut()).is_pending());
+                for _ in 0..2 {
+                    api.mailroom.specs().await.expect("snapshot query barrier");
+                    assert!(futures_util::poll!(request.as_mut()).is_pending());
                 }
+                drop(request);
             }
-            let snapshot_jobs = api.mailroom.jobs_run.load(Ordering::SeqCst) - before;
+            let snapshot_jobs = api.mailroom.jobs_run.load(Ordering::SeqCst) - before - 32;
             let before = api.mailroom.jobs_run.load(Ordering::SeqCst);
             for _ in 0..80 {
-                let api = api.clone();
-                let task = tokio::spawn(async move {
-                    mail_response(
-                        &api.mailroom,
-                        crate::mailroom::MailQuery::default(),
-                        api.control_path.clone(),
-                    )
-                    .await
-                });
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                task.abort();
-                match task.await {
-                    Err(error) => assert!(error.is_cancelled()),
-                    Ok(_) => panic!("cancelled encoder unexpectedly completed"),
-                }
+                let mut request = Box::pin(mail_response(
+                    &api.mailroom,
+                    crate::mailroom::MailQuery::default(),
+                    api.control_path.clone(),
+                ));
+                assert!(futures_util::poll!(request.as_mut()).is_pending());
+                api.mailroom.specs().await.expect("mail query barrier");
+                assert!(futures_util::poll!(request.as_mut()).is_pending());
+                drop(request);
             }
-            let mail_jobs = api.mailroom.jobs_run.load(Ordering::SeqCst) - before;
+            let mail_jobs = api.mailroom.jobs_run.load(Ordering::SeqCst) - before - 80;
             release_tx.send(()).expect("release blocker");
             blocker.await.expect("blocker");
             println!("ENCODER_ADMISSION snapshot_jobs={snapshot_jobs} mail_jobs={mail_jobs}");
