@@ -19,6 +19,7 @@ futures-util = { workspace = true, features = ["sink"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.3"
+mimalloc = { version = "0.1.52", default-features = false }
 sha2 = "0.10"
 tokio-tungstenite = "0.26"
 subtle = "2"

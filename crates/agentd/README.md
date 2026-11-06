@@ -568,6 +568,11 @@ the mailroom still open. A second sample follows mailroom close and another idle
 second. No allocator trim or collection is forced; the peak includes fixture
 initialization as well as the sampled load.
 
+The daemon and its library test binary share the Rust `mimalloc` global
+allocator. SQLite keeps its system allocator: C malloc interposition is disabled.
+`agentctl`, the fake ACP helper and other production binaries keep their existing
+allocator. The daemon and gate allocator declarations come from the same module.
+
 The baseline has 2,048 accepts. The loaded window keeps the same closed-loop
 accepts and observer workload for at least 2,048 accepts, extending until all six
 recurring observer classes have enough samples. It waits for 101 completions per
