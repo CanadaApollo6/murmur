@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use playwright_rs::protocol::BrowserContextOptions;
@@ -356,8 +356,24 @@ window.__dropped = [];
 window.__lastSocket = null;
 window.__fetches = [];
 const realFetch = window.fetch.bind(window);
+window.__failEdgeReads = false;
+window.__failedEdgeReads = 0;
+window.__holdRefreshes = false;
+window.__heldRefreshes = [];
 window.fetch = (target, init) => {
-  window.__fetches.push(String(target));
+  const url = String(target);
+  window.__fetches.push(url);
+  if (url.startsWith("/mail?from=")) {
+    if (window.__failEdgeReads) {
+      window.__failedEdgeReads += 1;
+      return Promise.resolve(new Response("", { status: 500 }));
+    }
+    if (window.__holdRefreshes && !url.includes("before_msg_seq")) {
+      return new Promise((resolve) => {
+        window.__heldRefreshes.push(() => resolve(realFetch(target, init)));
+      });
+    }
+  }
   return realFetch(target, init);
 };
 const RealWebSocket = window.WebSocket;
@@ -1227,6 +1243,311 @@ async fn a_malformed_frame_says_so_and_recovers_and_an_unknown_one_is_ignored() 
         "{sockets:?}"
     );
     assert_clean(&page, "a malformed frame").await;
+    daemon.stop().await;
+}
+
+/// Opens an edge's detail, with the one agent as its recipient.
+async fn open_edge(page: &Page) {
+    let agent: String = eval(
+        page,
+        r#"document.querySelector('[data-testid="node"]:not([data-node-id="human"])').dataset.nodeId"#,
+    )
+    .await;
+    page.locator(&format!(
+        "[data-testid=edge][data-from=human][data-to='{agent}']"
+    ))
+    .await
+    .click(None)
+    .await
+    .expect("select the edge");
+    visible(page, "edge-message").await;
+}
+
+/// How many times the page has listed an edge's newest rows.
+async fn newest_reads(page: &Page) -> usize {
+    eval::<Vec<String>>(page, "window.__fetches")
+        .await
+        .iter()
+        .filter(|target| target.contains("/mail?from=") && !target.contains("before_msg_seq"))
+        .count()
+}
+
+/// Waits until no frame has reached the page for longer than the refresh interval.
+async fn feed_quiet(page: &Page) {
+    let count = || async { eval::<Vec<Value>>(page, "window.__frames").await.len() };
+    let mut last = count().await;
+    let mut since = Instant::now();
+    while since.elapsed() < Duration::from_millis(2500) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = count().await;
+        if now != last {
+            last = now;
+            since = Instant::now();
+        }
+    }
+}
+
+/// A frame only this page hears of. Nothing it changes can be seen in a count.
+async fn inject_edge_frame(page: &Page) {
+    let cursor: i64 = eval(
+        page,
+        r#"Number(document.querySelector('[data-testid="app"]').dataset.cursor)"#,
+    )
+    .await;
+    let (id, _) = edge_rows(page).await.remove(0);
+    let to: String = eval(
+        page,
+        r#"document.querySelector('[data-testid="edge"][data-from="human"]').dataset.to"#,
+    )
+    .await;
+    let frame = json!({
+        "event": "mail",
+        "seq": cursor + 1,
+        "nonce": "0".repeat(32),
+        "msg_seq": 1,
+        "id": id,
+        "from": "human",
+        "to": to,
+        "conversation": "c",
+        "hop": 0,
+        "act": "request",
+        "state": "held",
+        "prev_state": "held",
+        "reason": null,
+        "at": "2026-01-01T00:00:00Z",
+    });
+    inject(page, &frame.to_string()).await;
+}
+
+#[tokio::test]
+async fn a_failed_refresh_is_tried_again_when_nothing_else_will_cause_one() {
+    let mut daemon = Daemon::new().await;
+    daemon.spawn("a").await;
+    daemon.stop().await;
+    daemon.seed_held(1..=1, "held for this test");
+    daemon.restart().await;
+    let harness = Harness::launch().await;
+    let page = harness.open(&daemon.url("127.0.0.1"), DESKTOP).await;
+    app_live(&page).await;
+    visible(&page, "stuck-held").await;
+    open_edge(&page).await;
+    assert_eq!(edge_rows(&page).await.len(), 1);
+
+    // Every read fails until this traffic's last frame has come and gone.
+    let _: bool = eval(&page, "window.__failEdgeReads = true").await;
+    daemon.ctl(&["send", "@a", "after the failures"]).await;
+    feed_quiet(&page).await;
+    let failed: usize = eval(&page, "window.__failedEdgeReads").await;
+    assert!(failed >= 1, "no read failed");
+    assert_eq!(edge_rows(&page).await.len(), 1);
+
+    // No frame and no reconnect follows, so only the retry can bring the row in.
+    let frames = eval::<Vec<Value>>(&page, "window.__frames").await.len();
+    let _: bool = eval(&page, "window.__failEdgeReads = false").await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while edge_rows(&page).await.len() != 2 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the rows should recover with nothing else happening");
+    assert_eq!(
+        eval::<Vec<Value>>(&page, "window.__frames").await.len(),
+        frames,
+        "a frame arrived, so this did not test the retry"
+    );
+    // The rows are back, and the retries have stopped.
+    let reads = newest_reads(&page).await;
+    tokio::time::sleep(Duration::from_millis(5000)).await;
+    assert_eq!(newest_reads(&page).await, reads);
+
+    // With agentd down, a read that failed waits for the reconnect instead of polling.
+    let _: bool = eval(&page, "window.__failEdgeReads = true").await;
+    let failed: usize = eval(&page, "window.__failedEdgeReads").await;
+    inject_edge_frame(&page).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while eval::<usize>(&page, "window.__failedEdgeReads").await == failed {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the read should fail");
+    daemon.stop().await;
+    visible(&page, "disconnected").await;
+    let reads = newest_reads(&page).await;
+    tokio::time::sleep(Duration::from_millis(5000)).await;
+    assert_eq!(
+        newest_reads(&page).await,
+        reads,
+        "a stopped daemon was polled"
+    );
+}
+
+#[tokio::test]
+async fn an_edges_first_read_that_fails_is_tried_again() {
+    let mut daemon = Daemon::new().await;
+    daemon.spawn("a").await;
+    daemon.stop().await;
+    daemon.seed_held(1..=1, "held for this test");
+    daemon.restart().await;
+    let harness = Harness::launch().await;
+    let page = harness.open(&daemon.url("127.0.0.1"), DESKTOP).await;
+    app_live(&page).await;
+    visible(&page, "stuck-held").await;
+    feed_quiet(&page).await;
+    let _: bool = eval(&page, "window.__failEdgeReads = true").await;
+    let agent: String = eval(
+        &page,
+        r#"document.querySelector('[data-testid="node"]:not([data-node-id="human"])').dataset.nodeId"#,
+    )
+    .await;
+    page.locator(&format!(
+        "[data-testid=edge][data-from=human][data-to='{agent}']"
+    ))
+    .await
+    .click(None)
+    .await
+    .expect("select the edge");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while eval::<usize>(&page, "window.__failedEdgeReads").await == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the first read should fail");
+    let _: bool = eval(&page, "window.__failEdgeReads = false").await;
+    visible(&page, "edge-message").await;
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn a_refresh_that_load_older_supersedes_runs_again() {
+    let mut daemon = Daemon::new().await;
+    daemon.spawn("a").await;
+    daemon.stop().await;
+    daemon.seed_held(1..=60, "held for this test");
+    daemon.restart().await;
+    let harness = Harness::launch().await;
+    let page = harness.open(&daemon.url("127.0.0.1"), DESKTOP).await;
+    app_live(&page).await;
+    visible(&page, "stuck-held").await;
+    open_edge(&page).await;
+    assert_eq!(edge_rows(&page).await.len(), 50);
+
+    // One change, so one invalidation, and its read does not answer yet.
+    let _: bool = eval(&page, "window.__holdRefreshes = true").await;
+    inject_edge_frame(&page).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while eval::<Vec<Value>>(&page, "window.__heldRefreshes.map(() => 0)")
+            .await
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("a refresh should be in flight");
+
+    page.locator("button:has-text('Load older messages')")
+        .await
+        .click(None)
+        .await
+        .expect("load older");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while edge_rows(&page).await.len() != 60 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the older rows should land");
+
+    let reads = newest_reads(&page).await;
+    let _: bool = eval(
+        &page,
+        "window.__holdRefreshes = false; window.__heldRefreshes.forEach((release) => release()); true",
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while newest_reads(&page).await == reads {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the superseded refresh should run again");
+    // Again with every row on screen, not just the newest page.
+    let last: String = eval(&page, "window.__fetches.at(-1)").await;
+    assert!(last.contains("limit=60"), "{last}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(edge_rows(&page).await.len(), 60);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn a_full_snapshot_reads_an_edge_whose_revision_cannot_change() {
+    let mut daemon = Daemon::new().await;
+    daemon.spawn("a").await;
+    daemon.stop().await;
+    daemon.seed_held(1..=1, "held for this test");
+    daemon.restart().await;
+    let harness = Harness::launch().await;
+    let page = harness.open(&daemon.url("127.0.0.1"), DESKTOP).await;
+    app_live(&page).await;
+    visible(&page, "stuck-held").await;
+    open_edge(&page).await;
+    feed_quiet(&page).await;
+
+    // The edge has carried no frame since the page loaded, so its revision reads 0
+    // before and after, on a socket that stays up.
+    let reads = newest_reads(&page).await;
+    let snapshot = daemon.snapshot().await;
+    assert!(!snapshot["mail"].is_null());
+    inject(&page, &snapshot.to_string()).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while newest_reads(&page).await == reads {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("a full snapshot should read the selected edge again");
+    assert_eq!(socket_count(&page).await, 1);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn a_replacement_with_no_phase_to_show_it_does_not_inherit_activity() {
+    let mut daemon = Daemon::new().await;
+    daemon.spawn("a").await;
+    let harness = Harness::launch().await;
+    let page = harness.open(&daemon.url("127.0.0.1"), DESKTOP).await;
+    app_live(&page).await;
+    daemon.ctl(&["send", "@a", "first life"]).await;
+    let agent: String = eval(
+        &page,
+        r#"document.querySelector('[data-testid="node"]:not([data-node-id="human"])').dataset.nodeId"#,
+    )
+    .await;
+    page.locator(&format!("[data-testid=node][data-node-id='{agent}']"))
+        .await
+        .click(None)
+        .await
+        .expect("select the agent");
+    visible(&page, "activity").await;
+    feed_quiet(&page).await;
+
+    // Killed, so nothing tells the page the old life ended. All it sees is a page
+    // that lost its connection, then the same agent under a new life.
+    daemon.signal("-KILL");
+    visible(&page, "disconnected").await;
+    daemon.child.wait().await.expect("reap agentd");
+    daemon.restart().await;
+    app_live(&page).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while id(&page, "activity").await.count().await.expect("count") != 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the old life's activity should be gone");
     daemon.stop().await;
 }
 

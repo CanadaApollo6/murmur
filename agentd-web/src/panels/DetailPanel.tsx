@@ -154,6 +154,9 @@ function MessageRow({ row, client }: { row: MailRow; client: FeedClient }) {
   );
 }
 
+/** What became of a read of an edge's rows. */
+type EdgeRead = "read" | "superseded" | "failed" | "rejected";
+
 function EdgeDetail({
   state,
   edge,
@@ -173,12 +176,16 @@ function EdgeDetail({
   const [failure, setFailure] = useState<string | null>(null);
   const generation = useRef(0);
   const shown = useRef<MailRow[]>([]);
-  const olderRead = useRef<Promise<void> | null>(null);
+  const olderRead = useRef<Promise<unknown> | null>(null);
 
   // A short or empty page may still have a continuation, so a read goes on until
   // it has `wanted` rows or the listing ends. Never enters mail state.
   const read = useCallback(
-    async (before: number | null, wanted: number, replace: boolean) => {
+    async (
+      before: number | null,
+      wanted: number,
+      replace: boolean,
+    ): Promise<EdgeRead> => {
       const mine = ++generation.current;
       try {
         const found: MailRow[] = [];
@@ -199,7 +206,7 @@ function EdgeDetail({
           }
           const page = await client.mailPage(query);
           if (generation.current !== mine) {
-            return;
+            return "superseded";
           }
           found.push(...page.rows);
           cursor = page.next_before_msg_seq;
@@ -213,22 +220,30 @@ function EdgeDetail({
         setNext(cursor);
         setFailure(null);
         setLoading(false);
+        return "read";
       } catch (error) {
         if (generation.current !== mine) {
-          return;
+          return "superseded";
         }
-        if (!(error instanceof TokenRejected)) {
+        const rejected = error instanceof TokenRejected;
+        if (!rejected) {
           console.error("listing an edge's messages failed", error);
         }
         setFailure(errorText(error));
         setLoading(false);
+        return rejected ? "rejected" : "failed";
       }
     },
     [client, from, to],
   );
 
+  const throttle = useRef<RefreshThrottle | null>(null);
   useEffect(() => {
-    void read(null, 1, true);
+    void read(null, 1, true).then((outcome) => {
+      if (outcome === "failed") {
+        throttle.current?.invalidate();
+      }
+    });
     return () => {
       generation.current += 1;
     };
@@ -237,13 +252,31 @@ function EdgeDetail({
   // A row can change with no count changing (`queued` to `offered`), so the edge's
   // revision is what says to look again. It is read again on reconnect as well,
   // since a resume delivers its missed frames after this edge last looked.
-  const throttle = useRef<RefreshThrottle | null>(null);
+  const live = state.link === "live";
+  const revision = state.edgeRevision[edgeKey(from, to)] ?? 0;
+  const { fullSnapshots } = state;
+  const seen = useRef({ live, revision, fullSnapshots });
   useEffect(() => {
     const refresh = new RefreshThrottle(
       async () => {
         // A refresh would cancel a read of older rows, and then cover them.
         await olderRead.current;
-        await read(null, Math.max(1, shown.current.length), true);
+        if (!seen.current.live) {
+          // The reconnect reads again, so a stopped daemon is not polled.
+          return;
+        }
+        const outcome = await read(
+          null,
+          Math.max(1, shown.current.length),
+          true,
+        );
+        if (outcome === "failed") {
+          throw new Error("an edge's rows could not be refreshed");
+        }
+        if (outcome === "superseded") {
+          // "Load older" took over, and this read's changes are still unseen.
+          refresh.invalidate();
+        }
       },
       EDGE_REFRESH_MS,
       {
@@ -255,17 +288,16 @@ function EdgeDetail({
     throttle.current = refresh;
     return () => refresh.dispose();
   }, [read]);
-  const live = state.link === "live";
-  const revision = state.edgeRevision[edgeKey(from, to)] ?? 0;
-  const seen = useRef({ live, revision });
   useEffect(() => {
     const changed =
-      revision !== seen.current.revision || (live && !seen.current.live);
-    seen.current = { live, revision };
+      revision !== seen.current.revision ||
+      fullSnapshots !== seen.current.fullSnapshots ||
+      (live && !seen.current.live);
+    seen.current = { live, revision, fullSnapshots };
     if (changed && live) {
       throttle.current?.invalidate();
     }
-  }, [live, revision]);
+  }, [live, revision, fullSnapshots]);
 
   return (
     <div data-testid="edge-detail">

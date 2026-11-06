@@ -32,6 +32,42 @@ describe("RefreshThrottle", () => {
     expect(read.mock.calls.length).toBeLessThanOrEqual(10);
   });
 
+  it("tries a failed read again at the same rate, then goes quiet", async () => {
+    let failures = 1;
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { read, throttle } = setup(() =>
+      failures-- > 0
+        ? Promise.reject(new Error("HTTP 500"))
+        : Promise.resolve(),
+    );
+    await vi.advanceTimersByTimeAsync(INTERVAL);
+    throttle.invalidate();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(read).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(INTERVAL - 1);
+    expect(read).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(read).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledTimes(1);
+    log.mockRestore();
+  });
+
+  it("does not try again once its owner is gone", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { read, throttle } = setup(() =>
+      Promise.reject(new Error("HTTP 500")),
+    );
+    await vi.advanceTimersByTimeAsync(INTERVAL);
+    throttle.invalidate();
+    await vi.advanceTimersByTimeAsync(0);
+    throttle.dispose();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(read).toHaveBeenCalledTimes(1);
+    log.mockRestore();
+  });
+
   it("waits out the interval after the owner's first read", async () => {
     const { read, throttle } = setup();
     throttle.invalidate();

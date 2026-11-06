@@ -57,6 +57,9 @@ export class RefreshThrottle {
     void this.read()
       .catch((error: unknown) => {
         console.error("refreshing a view failed", error);
+        // The last change may never be followed by another, so nothing else would
+        // bring this view up to date. `schedule` keeps the retry to the same rate.
+        this.pending = true;
       })
       .finally(() => {
         this.running = false;
