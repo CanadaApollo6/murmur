@@ -55,6 +55,27 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[cfg(unix)]
 const COMMAND_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Waits up to [`COMMAND_SHUTDOWN_GRACE`] for a command to exit, and returns whether it did.
+///
+/// The command stays unreaped. A zombie keeps its process ID, so its group ID cannot be
+/// reused by an unrelated process before the caller signals the group.
+#[cfg(unix)]
+async fn command_exited_unreaped(id: u32) -> std::io::Result<bool> {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    let pid = Pid::from_raw(id as i32).expect("bug: a running child has a nonzero process ID");
+    let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+    let deadline = tokio::time::Instant::now() + COMMAND_SHUTDOWN_GRACE;
+    loop {
+        if waitid(WaitId::Pid(pid), options)?.is_some() {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 type PendingCalls = Arc<Mutex<HashMap<(ThreadId, rap_protocol::ToolCallId), PendingCall>>>;
 
 struct CallLifetime(tokio_util::sync::CancellationToken);
@@ -532,23 +553,37 @@ impl ManagedRapServer {
                             {
                                 tracing::warn!(%error, id, "Failed to interrupt RAP process group");
                             }
-                            let stopped =
-                                tokio::time::timeout(COMMAND_SHUTDOWN_GRACE, child.wait()).await;
-                            if stopped.is_err() {
-                                tracing::warn!(id, "RAP command exceeded shutdown grace period");
+                            match command_exited_unreaped(id).await {
+                                Ok(exited) => {
+                                    if !exited {
+                                        tracing::warn!(
+                                            id,
+                                            "RAP command exceeded shutdown grace period"
+                                        );
+                                    }
+                                    // A command can hang in its signal handler, or exit while
+                                    // descendants still own the listening socket. The leader is
+                                    // not reaped yet, so this group ID is still ours.
+                                    if let Err(error) = killpg(group, Signal::SIGKILL)
+                                        && error != nix::errno::Errno::ESRCH
+                                    {
+                                        tracing::error!(
+                                            %error,
+                                            id,
+                                            "Failed to kill RAP process group"
+                                        );
+                                    }
+                                }
+                                Err(error) => {
+                                    // The group ID may no longer be ours, so kill only the child,
+                                    // which tokio tracks.
+                                    tracing::error!(%error, id, "Failed to poll RAP command");
+                                    if let Err(error) = child.start_kill() {
+                                        tracing::error!(%error, id, "Failed to kill RAP command");
+                                    }
+                                }
                             }
-                            // A command can hang in its signal handler, or exit
-                            // while descendants still own the listening socket.
-                            if let Err(error) = killpg(group, Signal::SIGKILL)
-                                && error != nix::errno::Errno::ESRCH
-                            {
-                                tracing::error!(%error, id, "Failed to kill RAP process group");
-                            }
-                            let status = match stopped {
-                                Ok(status) => status,
-                                Err(_) => child.wait().await,
-                            };
-                            if let Err(error) = status {
+                            if let Err(error) = child.wait().await {
                                 tracing::error!(%error, id, "Failed to reap RAP command");
                             }
                         }
@@ -1233,9 +1268,46 @@ fn collect_server_specs(
 
 #[cfg(all(test, target_os = "linux"))]
 mod command_shutdown {
-    use super::{ManagedRapServer, ServerSpec, ServerState};
+    use super::{COMMAND_SHUTDOWN_GRACE, ManagedRapServer, ServerSpec, ServerState};
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn exit_check_leaves_the_command_unreaped() {
+        let mut child = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn command");
+        let id = child.id().expect("running command");
+        let started = Instant::now();
+        let exited = super::command_exited_unreaped(id)
+            .await
+            .expect("poll command");
+        assert!(exited, "the command must be seen to exit");
+        assert!(
+            started.elapsed() < COMMAND_SHUTDOWN_GRACE,
+            "a prompt exit must not use the whole grace period"
+        );
+        // A zombie still holds its process ID, which is what keeps the group ID reserved.
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(id as i32), None)
+            .expect("the exited command must still hold its process ID");
+        let status = child.wait().await.expect("reap command");
+        assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn exit_check_reports_a_running_command() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn command");
+        let id = child.id().expect("running command");
+        let exited = super::command_exited_unreaped(id)
+            .await
+            .expect("poll command");
+        assert!(!exited, "a running command must not be reported as exited");
+        child.kill().await.expect("kill command");
+    }
 
     fn clean_up_failed_test(pid: u32) {
         if let Err(error) = nix::sys::signal::killpg(

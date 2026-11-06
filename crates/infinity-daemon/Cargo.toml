@@ -53,6 +53,7 @@ playwright-rs = { version = "0.14", optional = true, default-features = false, f
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal"] }
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

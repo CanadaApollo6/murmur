@@ -2909,6 +2909,7 @@ dependencies = [
  "rap-protocol",
  "rap-test-servers",
  "reqwest",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "tempfile",
