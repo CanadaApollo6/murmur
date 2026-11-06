@@ -1377,7 +1377,7 @@ mod gate {
                     );
                     if sample > 0 {
                         assert!(
-                            counts[..17]
+                            counts
                                 .iter()
                                 .zip(&previous)
                                 .all(|(now, before)| now > before),
