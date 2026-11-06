@@ -251,16 +251,23 @@ function forgetLife(draft: ClientState, agent: string) {
 }
 
 /**
+ * With no row there is no incarnation to compare, so state kept for an unlisted
+ * agent could not be cleared when a replacement arrives. Its frames are not stored.
+ */
+function isListed(draft: ClientState, agent: string): boolean {
+  return Object.hasOwn(draft.agents, agent);
+}
+
+/**
  * Forgets what only a past snapshot's agents and edges could explain, so a page
  * open for days does not grow. An agent's state goes when its row does, even if an
- * edge still names it: with no row there is no incarnation to compare, so the state
- * could not be cleared when a replacement arrives.
+ * edge still names it.
  */
 function pruneVolatile(draft: ClientState) {
-  const isListed = (agent: string) => Object.hasOwn(draft.agents, agent);
-  draft.activity = pickKeys(draft.activity, isListed);
-  draft.turns = pickKeys(draft.turns, isListed);
-  draft.egress = pickKeys(draft.egress, isListed);
+  const listed = (agent: string) => isListed(draft, agent);
+  draft.activity = pickKeys(draft.activity, listed);
+  draft.turns = pickKeys(draft.turns, listed);
+  draft.egress = pickKeys(draft.egress, listed);
   const isEdge = (key: string) => Object.hasOwn(draft.edges, key);
   draft.edgeTouched = pickKeys(draft.edgeTouched, isEdge);
   draft.edgeRevision = pickKeys(draft.edgeRevision, isEdge);
@@ -470,18 +477,24 @@ function applyFrames(
         delete draft.approvals[frame.id];
         break;
       case "turn_ended":
-        draft.turns[frame.agent] = frame.outcome;
+        if (isListed(draft, frame.agent)) {
+          draft.turns[frame.agent] = frame.outcome;
+        }
         break;
       case "egress_denied":
-        draft.egress[frame.agent] = [
-          ...(draft.egress[frame.agent] ?? []),
-          { host: frame.host, port: frame.port, at: now },
-        ].slice(-EGRESS_KEPT);
+        if (isListed(draft, frame.agent)) {
+          draft.egress[frame.agent] = [
+            ...(draft.egress[frame.agent] ?? []),
+            { host: frame.host, port: frame.port, at: now },
+          ].slice(-EGRESS_KEPT);
+        }
         break;
       case "activity":
-        draft.activity[frame.agent] = tailOf(
-          (draft.activity[frame.agent] ?? "") + frame.text,
-        );
+        if (isListed(draft, frame.agent)) {
+          draft.activity[frame.agent] = tailOf(
+            (draft.activity[frame.agent] ?? "") + frame.text,
+          );
+        }
         break;
       default:
         // A newer server may send more event kinds. They change nothing here.

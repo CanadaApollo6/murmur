@@ -482,14 +482,20 @@ describe("pruning on a snapshot", () => {
 
   it("forgets an agent that is neither listed nor on an edge", () => {
     const room = new SimMailroom();
-    const state = withVolatile(fresh(room), A);
+    const state = withVolatile(
+      apply(fresh(room), { event: "agent", ...listed(A) }),
+      A,
+    );
     expectKept(state, A, true);
     expectKept(apply(state, room.nullSnapshot(0)), A, false);
   });
 
   it("keeps a listed agent's state", () => {
     const room = new SimMailroom();
-    const state = withVolatile(fresh(room), A);
+    const state = withVolatile(
+      apply(fresh(room), { event: "agent", ...listed(A) }),
+      A,
+    );
     const next = apply(state, {
       ...room.nullSnapshot(0),
       agents: [listed(A)],
@@ -501,7 +507,10 @@ describe("pruning on a snapshot", () => {
   it("forgets an agent only an edge still names, which has no life to compare", () => {
     const room = new SimMailroom();
     room.accept(B, A);
-    const state = withVolatile(fresh(room), A);
+    const state = withVolatile(
+      apply(fresh(room), { event: "agent", ...listed(A) }),
+      A,
+    );
     expectKept(apply(state, room.nullSnapshot(room.head())), A, false);
     expectKept(apply(state, room.snapshot()), A, false);
   });
@@ -534,6 +543,34 @@ describe("pruning on a snapshot", () => {
     expect(
       apply(state, { event: "activity", agent: A, text: "new" }).activity[A],
     ).toBe("new");
+  });
+
+  it("stores nothing for an unlisted agent, so its next life starts clean", () => {
+    const room = new SimMailroom();
+    room.accept("human", A);
+    let state = apply(fresh(room), { event: "agent", ...listed(A) });
+    state = apply(state, {
+      ...room.nullSnapshot(room.head()),
+      agents: [listed(B)],
+      agents_truncated: true,
+    });
+    // The old life's frames arrive after its row has gone.
+    state = apply(state, { event: "activity", agent: A, text: "old life" });
+    state = apply(state, {
+      event: "turn_ended",
+      agent: A,
+      outcome: "failed",
+    });
+    state = apply(state, {
+      event: "egress_denied",
+      agent: A,
+      host: "blocked.example",
+      port: 443,
+    });
+    expectKept(state, A, false);
+    state = apply(state, { event: "agent", ...listed(A), incarnation: 2 });
+    expect(state.agents[A]!.incarnation).toBe(2);
+    expectKept(state, A, false);
   });
 
   it("prunes edgeTouched and revisions to live edges, and keeps live ones", () => {
@@ -668,6 +705,7 @@ describe("a replacement under the same id", () => {
     const room = new SimMailroom();
     const state = apply(
       fresh(room),
+      { event: "agent", ...row("ended", null) },
       { event: "activity", agent: A, text: "old life" },
       { event: "turn_ended", agent: A, outcome: "failed" },
       { event: "egress_denied", agent: A, host: "example.com", port: 443 },
@@ -1197,7 +1235,7 @@ describe("volatile frames", () => {
   it("keeps a bounded activity tail, across snapshots", () => {
     const room = new SimMailroom();
     room.accept("human", A);
-    let state = fresh(room);
+    let state = apply(fresh(room), { event: "agent", ...agent });
     for (let i = 0; i < 6; i += 1) {
       state = apply(state, {
         event: "activity",
@@ -1213,17 +1251,21 @@ describe("volatile frames", () => {
 
   it("never starts a tail on half a surrogate pair", () => {
     const text = "😀".repeat(5000);
-    const state = apply(initialState(), { event: "activity", agent: A, text });
+    const state = apply(
+      initialState(),
+      { event: "agent", ...agent },
+      { event: "activity", agent: A, text },
+    );
     const first = state.activity[A]!.charCodeAt(0);
     expect(first >= 0xdc00 && first <= 0xdfff).toBe(false);
   });
 
   it("records outcomes and a bounded list of egress denials", () => {
-    let state = apply(initialState(), {
-      event: "turn_ended",
-      agent: A,
-      outcome: "failed",
-    });
+    let state = apply(
+      initialState(),
+      { event: "agent", ...agent },
+      { event: "turn_ended", agent: A, outcome: "failed" },
+    );
     expect(state.turns[A]).toBe("failed");
     for (let i = 0; i < 30; i += 1) {
       state = apply(state, {
