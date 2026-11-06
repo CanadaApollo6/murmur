@@ -56,6 +56,10 @@ jobs:
         run: |
           cd infinity-ui && npm ci && npm run format:check
 
+      - name: Check agentd-web formatting, types and tests
+        run: |
+          cd agentd-web && npm ci && npm run format:check && npm run typecheck && npm test
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
@@ -139,6 +143,10 @@ jobs:
       - name: Run web UI e2e tests (Linux)
         if: runner.os == 'Linux'
         run: cargo test -p infinity-daemon --features e2e-web --test web_e2e
+
+      - name: Run graph UI e2e tests (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test -p agentd --features e2e-web --test web_e2e
 
       # On screenshot mismatches the test writes `-actual`/`-diff` PNGs next
       # to the goldens; upload them so mismatches can be reviewed (and, if

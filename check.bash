@@ -41,6 +41,16 @@ else
     echo '  (skipped: run `npm ci --prefix infinity-ui` to initialize `node_modules`)'
 fi
 
+step "agentd-web formatting, types and tests"
+if [ -f agentd-web/node_modules/.bin/prettier ]; then
+    (cd agentd-web && npm run format:check) || fail "agentd-web formatting issues found (run 'cd agentd-web && npm run format' to fix)"
+    (cd agentd-web && npm run typecheck) || fail "agentd-web type errors found"
+    (cd agentd-web && npm test) || fail "agentd-web tests failed"
+    pass "agentd-web is formatted, type-checks and passes its tests"
+else
+    echo '  (skipped: run `npm ci --prefix agentd-web` to initialize `node_modules`)'
+fi
+
 step "Clippy (warnings denied)"
 cargo clippy --all-targets -- -D warnings || fail "clippy warnings found"
 pass "No clippy warnings"
@@ -72,6 +82,8 @@ if command -v npm > /dev/null 2>&1 && ls "${HOME}/.cache/ms-playwright"/chromium
     fi
     cargo clippy -p infinity-daemon --features e2e-web --all-targets -- -D warnings || fail "web e2e clippy warnings found"
     cargo test -p infinity-daemon --features e2e-web --test web_e2e || fail "web e2e tests failed"
+    cargo clippy -p agentd --features e2e-web --all-targets -- -D warnings || fail "agentd web e2e clippy warnings found"
+    cargo test -p agentd --features e2e-web --test web_e2e || fail "agentd web e2e tests failed"
     pass "Web UI e2e tests passed"
 else
     echo '  (skipped: run `npx playwright@1.60.0 install chromium` to install Playwright 1.60 chromium)'

@@ -14,7 +14,7 @@ echo "Generating Rust third-party notices..."
 cargo about generate about.hbs > "$OUTPUT"
 
 echo "Generating npm third-party notices..."
-for dir in infinity-ui agent; do
+for dir in infinity-ui agent agentd-web; do
     (cd "$dir" && npm install --ignore-scripts --no-audit --no-fund &>/dev/null)
 
     # Check for disallowed licenses
