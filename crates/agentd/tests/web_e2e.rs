@@ -71,10 +71,10 @@ impl Daemon {
             .local_addr()
             .expect("reserved address")
             .port();
-        let mut env = format!(
-            "FAKE_ROOT={}\nFAKE_MODE='default'\nFAKE_OPTION_KEY='yes'\n",
-            json!(root.path()),
-        );
+        let mut env = format!("FAKE_ROOT={}\nFAKE_MODE='default'\n", json!(root.path()));
+        if !setup.env.iter().any(|(key, _)| *key == "FAKE_OPTION_KEY") {
+            env.push_str("FAKE_OPTION_KEY='yes'\n");
+        }
         for (key, value) in &setup.env {
             env.push_str(&format!("{key}={}\n", json!(value)));
         }
@@ -140,6 +140,17 @@ impl Daemon {
             .expect("agentd shutdown deadline")
             .expect("wait for agentd");
         assert!(status.success(), "agentd shutdown: {}", self.log());
+    }
+
+    /// Keeps every connection open while agentd answers nothing, so a page can be
+    /// watched between losing its feed and getting it back.
+    fn signal(&self, signal: &str) {
+        let pid = self.child.id().expect("agentd is running").to_string();
+        let status = std::process::Command::new("kill")
+            .args([signal, &pid])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill {signal} {pid}: {status}");
     }
 
     async fn restart(&mut self) {
@@ -340,14 +351,31 @@ document.addEventListener("securitypolicyviolation", (e) => {
 window.__sockets = [];
 window.__frames = [];
 window.__pwned = 0;
+window.__dropMail = 0;
+window.__dropped = [];
+window.__lastSocket = null;
+window.__fetches = [];
+const realFetch = window.fetch.bind(window);
+window.fetch = (target, init) => {
+  window.__fetches.push(String(target));
+  return realFetch(target, init);
+};
 const RealWebSocket = window.WebSocket;
 window.WebSocket = class extends RealWebSocket {
   constructor(url, protocols) {
     super(url, protocols);
     const socket = window.__sockets.length;
     window.__sockets.push(url);
+    window.__lastSocket = this;
+    // Registered before the page's own handler, so it can hide a frame from it.
     this.addEventListener("message", (event) => {
       const frame = JSON.parse(event.data);
+      if (frame.event === "mail" && window.__dropMail > 0) {
+        window.__dropMail -= 1;
+        window.__dropped.push(frame.seq);
+        event.stopImmediatePropagation();
+        return;
+      }
       window.__frames.push({
         socket,
         event: frame.event,
@@ -529,6 +557,50 @@ async fn positions(page: &Page) -> BTreeMap<String, (f64, f64, String)> {
     rows.into_iter()
         .map(|(node, x, y, transform)| (node, (x, y, transform)))
         .collect()
+}
+
+/// What a person sees and what they get: the text as rendered, which CSS can change
+/// and `textContent` cannot show, and the clipboard after a real click.
+async fn assert_shows_and_copies(page: &Page, row: &Locator, command: &str) {
+    let rendered = row
+        .locator("[data-testid=command-text]")
+        .inner_text()
+        .await
+        .expect("rendered command");
+    assert_eq!(rendered, command, "the text on screen");
+    let copy = row.locator("[data-testid=copy]");
+    copy.click(None).await.expect("copy");
+    expect(copy)
+        .to_contain_text("Copied")
+        .await
+        .expect("copy feedback");
+    let copied: String = eval(page, "navigator.clipboard.readText()").await;
+    assert_eq!(copied, command, "the clipboard");
+}
+
+async fn edge_rows(page: &Page) -> Vec<(String, String)> {
+    eval(
+        page,
+        r#"[...document.querySelectorAll('[data-testid="edge-message"]')].map(
+            (row) => [row.dataset.id, row.querySelector("button span").textContent])"#,
+    )
+    .await
+}
+
+async fn socket_count(page: &Page) -> usize {
+    eval::<Vec<String>>(page, "window.__sockets").await.len()
+}
+
+/// Hands the page a frame as if it came from its socket.
+async fn inject(page: &Page, data: &str) {
+    let _: bool = eval(
+        page,
+        &format!(
+            "window.__lastSocket.dispatchEvent(new MessageEvent('message', {{ data: {} }}))",
+            json!(data)
+        ),
+    )
+    .await;
 }
 
 async fn wait_for_approvals(daemon: &Daemon, count: usize) -> Value {
@@ -791,7 +863,14 @@ async fn the_csp_listener_would_catch_a_violation() {
 
 #[tokio::test]
 async fn permission_and_held_mail_show_the_servers_commands_and_they_work() {
-    let mut daemon = Daemon::new().await;
+    // HTML collapses a run of spaces unless told not to, which would make a command
+    // on screen differ from the one copied. One run is in an option key, and the
+    // state directory's path puts one in every command's socket path.
+    let mut daemon = Daemon::with(Setup {
+        path_prefix: Some("m5  web "),
+        env: vec![("FAKE_OPTION_KEY", "allow  once".to_owned())],
+    })
+    .await;
     daemon.spawn("a").await;
     daemon.stop().await;
     daemon.seed_held(1..=2, "hop limit reached");
@@ -807,37 +886,88 @@ async fn permission_and_held_mail_show_the_servers_commands_and_they_work() {
     shot(&page, "attention-desktop").await;
     assert!(text(&page, "stat-held").await.starts_with('2'));
 
-    // The text on screen is exactly what the server sent, for every command.
+    page.context()
+        .expect("page context")
+        .grant_permissions(&["clipboard-read", "clipboard-write"], None)
+        .await
+        .expect("clipboard permission");
+
+    // Each command on screen, under the option it belongs to, is exactly what the
+    // server sent for that option, and copying it gives those bytes.
     let snapshot = daemon.snapshot().await;
-    let mut expected = Vec::new();
-    for option in snapshot["approvals"][0]["options"]
+    let options = snapshot["approvals"][0]["options"]
         .as_array()
-        .expect("options")
+        .expect("options");
+    assert_eq!(
+        options.len(),
+        2,
+        "this test needs more than the first option"
+    );
+    assert_eq!(approvals[0]["options"][0]["command"], options[0]["command"]);
+    assert!(
+        options[0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("  "),
+        "this test needs a run of spaces in a command: {options:?}"
+    );
+    let permission = id(&page, "permission").await;
+    let rows = permission.locator("[data-testid=command]");
+    assert_eq!(rows.count().await.expect("command rows"), options.len());
+    for (index, (option, effect)) in options
+        .iter()
+        .zip(["allow once", "reject once"])
+        .enumerate()
     {
-        expected.push(option["command"].as_str().expect("command").to_owned());
+        let row = rows.nth(i32::try_from(index).expect("bug: a small index"));
+        // The authoritative effect and the ACP server's own words are separate.
+        assert_eq!(
+            row.locator("[data-testid=option-effect]")
+                .inner_text()
+                .await
+                .expect("effect"),
+            effect
+        );
+        assert_eq!(
+            row.locator("bdi[data-testid=option-label]")
+                .inner_text()
+                .await
+                .expect("label"),
+            option["label"].as_str().expect("label")
+        );
+        assert_shows_and_copies(&page, &row, option["command"].as_str().expect("command")).await;
     }
-    for row in snapshot["mail"]["stuck"].as_array().expect("stuck rows") {
-        for verb in ["release", "drop"] {
-            expected.push(
-                row["commands"][verb]
-                    .as_str()
-                    .expect("held command")
-                    .to_owned(),
+
+    // The same for held mail, by message and by verb. These rows scroll instead of
+    // wrapping, which must not change what they show either.
+    let stuck = snapshot["mail"]["stuck"].as_array().expect("stuck rows");
+    assert_eq!(stuck.len(), 2);
+    for held in stuck {
+        let item = page
+            .locator(&format!(
+                "[data-testid=stuck-held][data-id='{}']",
+                held["id"].as_str().expect("message id")
+            ))
+            .await;
+        let rows = item.locator("[data-testid=command]");
+        assert_eq!(rows.count().await.expect("held command rows"), 2);
+        for (index, (verb, label)) in [("release", "Release"), ("drop", "Drop")]
+            .into_iter()
+            .enumerate()
+        {
+            let row = rows.nth(i32::try_from(index).expect("bug: a small index"));
+            expect(row.locator("span").first())
+                .to_have_text(label)
+                .await
+                .expect("the verb on this row");
+            let command = held["commands"][verb].as_str().expect("held command");
+            assert!(
+                command.contains("  "),
+                "this test needs a run of spaces in a socket path: {command}"
             );
+            assert_shows_and_copies(&page, &row, command).await;
         }
     }
-    let mut shown: Vec<String> = eval(
-        &page,
-        r#"[...document.querySelectorAll('[data-testid="command-text"]')].map((c) => c.textContent)"#,
-    )
-    .await;
-    shown.sort();
-    expected.sort();
-    assert_eq!(shown, expected);
-    assert_eq!(
-        id(&page, "copy").await.count().await.expect("copy buttons"),
-        shown.len()
-    );
     assert_eq!(
         id(&page, "no-command")
             .await
@@ -846,30 +976,6 @@ async fn permission_and_held_mail_show_the_servers_commands_and_they_work() {
             .expect("no commands"),
         0
     );
-    assert_eq!(
-        approvals[0]["options"][0]["command"],
-        snapshot["approvals"][0]["options"][0]["command"]
-    );
-
-    // Copying gives the same bytes.
-    page.context()
-        .expect("page context")
-        .grant_permissions(&["clipboard-read", "clipboard-write"], None)
-        .await
-        .expect("clipboard permission");
-    id(&page, "permission")
-        .await
-        .locator("[data-testid=copy]")
-        .first()
-        .click(None)
-        .await
-        .expect("copy");
-    let copied: String = eval(&page, "navigator.clipboard.readText()").await;
-    assert!(expected.contains(&copied), "copied {copied}");
-    expect(id(&page, "permission").await)
-        .to_contain_text("Copied")
-        .await
-        .expect("copy feedback");
 
     // Running them through a shell clears the rows, with no action from the page.
     let release = snapshot["mail"]["stuck"][0]["commands"]["release"]
@@ -1015,6 +1121,260 @@ async fn a_reconnect_echoes_its_anchor_and_loses_nothing() {
         .await
         .expect("all nine rows");
     assert_clean(&page, "the resumed screen").await;
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn a_lost_mail_frame_costs_one_full_snapshot_and_no_reconnect_loop() {
+    let mut daemon = Daemon::new().await;
+    daemon.spawn("a").await;
+    let harness = Harness::launch().await;
+    let page = harness.open(&daemon.url("127.0.0.1"), DESKTOP).await;
+    app_live(&page).await;
+    daemon.ctl(&["send", "@a", "before"]).await;
+    edges_converge(&page, &daemon).await;
+    assert_eq!(socket_count(&page).await, 1);
+
+    // The page never sees one frame of this traffic.
+    let _: i64 = eval(&page, "window.__dropMail = 1").await;
+    daemon
+        .ctl(&["send", "@a", "the page loses part of this"])
+        .await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while socket_count(&page).await < 2 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the page should notice the gap and reconnect");
+    app_live(&page).await;
+    edges_converge(&page, &daemon).await;
+    let dropped: Vec<i64> = eval(&page, "window.__dropped").await;
+    assert_eq!(dropped.len(), 1);
+    let sockets: Vec<String> = eval(&page, "window.__sockets").await;
+    assert_eq!(
+        sockets[1],
+        format!("ws://127.0.0.1:{}/events", daemon.port),
+        "a resync must not echo the anchor: {sockets:?}"
+    );
+    let frames: Vec<Value> = eval(&page, "window.__frames").await;
+    let first = frames
+        .iter()
+        .find(|f| f["socket"].as_i64() == Some(1))
+        .expect("a frame on the new socket");
+    assert_eq!(first["event"], "snapshot");
+    assert_eq!(first["fullMail"], true);
+
+    // Real traffic after that follows on, with no more reconnects.
+    for n in 0..5 {
+        daemon.ctl(&["send", "@a", &format!("after {n}")]).await;
+    }
+    edges_converge(&page, &daemon).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(socket_count(&page).await, 2, "one resync, then none");
+    assert_clean(&page, "a resync").await;
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn a_malformed_frame_says_so_and_recovers_and_an_unknown_one_is_ignored() {
+    let mut daemon = Daemon::new().await;
+    daemon.spawn("a").await;
+    let harness = Harness::launch().await;
+    let page = harness.open(&daemon.url("127.0.0.1"), DESKTOP).await;
+    app_live(&page).await;
+    daemon.ctl(&["send", "@a", "before"]).await;
+    edges_converge(&page, &daemon).await;
+
+    // From a newer server: nothing happens.
+    inject(&page, r#"{"event":"from_the_future","anything":[1]}"#).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(socket_count(&page).await, 1);
+    expect(id(&page, "feed-problem").await)
+        .to_have_count(0)
+        .await
+        .expect("an unknown event is not a problem");
+
+    // A frame this page cannot use. agentd answers nothing for now, so the page stays
+    // between losing its feed and getting it back, and the operator can see why.
+    daemon.signal("-STOP");
+    inject(&page, r#"{"event":"snapshot"}"#).await;
+    visible(&page, "feed-problem").await;
+    shot(&page, "feed-problem").await;
+    assert_clean(&page, "the feed problem screen").await;
+
+    // It reconnects without the anchor, and the snapshot clears the problem.
+    daemon.signal("-CONT");
+    expect(id(&page, "feed-problem").await)
+        .with_timeout(Duration::from_secs(30))
+        .to_have_count(0)
+        .await
+        .expect("the problem clears with the snapshot");
+    app_live(&page).await;
+    edges_converge(&page, &daemon).await;
+    let sockets: Vec<String> = eval(&page, "window.__sockets").await;
+    assert_eq!(
+        sockets.last().expect("sockets"),
+        &format!("ws://127.0.0.1:{}/events", daemon.port),
+        "{sockets:?}"
+    );
+    assert_clean(&page, "a malformed frame").await;
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn an_edges_rows_keep_up_with_traffic_and_with_changes_no_count_shows() {
+    let mut daemon = Daemon::new().await;
+    daemon.spawn("a").await;
+    daemon.stop().await;
+    daemon.seed_held(1..=1, "held for this test");
+    daemon.restart().await;
+    let harness = Harness::launch().await;
+    let page = harness.open(&daemon.url("127.0.0.1"), DESKTOP).await;
+    app_live(&page).await;
+    visible(&page, "stuck-held").await;
+    let agent: String = eval(
+        &page,
+        r#"document.querySelector('[data-testid="node"]:not([data-node-id="human"])').dataset.nodeId"#,
+    )
+    .await;
+    page.locator(&format!(
+        "[data-testid=edge][data-from=human][data-to='{agent}']"
+    ))
+    .await
+    .click(None)
+    .await
+    .expect("select the edge");
+    visible(&page, "edge-message").await;
+    assert_eq!(edge_rows(&page).await.len(), 1);
+
+    // A change while the connection is down that moves neither the edge's total nor
+    // its stuck count. A history that no longer has the page's anchor means a full
+    // snapshot, so no frame arrives for this edge: only the reconnect can say to look.
+    let held = edge_rows(&page)
+        .await
+        .into_iter()
+        .find(|(_, state)| state == "held")
+        .expect("the held row")
+        .0;
+    daemon.stop().await;
+    visible(&page, "disconnected").await;
+    let db =
+        rusqlite::Connection::open(daemon.root.path().join("state/mail.db")).expect("open mail.db");
+    let changed = db
+        .execute(
+            "UPDATE deliveries SET state='uncertain',incarnation=1,reason=NULL WHERE message_id=?",
+            [serde_json::to_string(&held).expect("bug: a string serializes")],
+        )
+        .expect("change the delivery");
+    assert_eq!(changed, 1);
+    db.execute(
+        "UPDATE mail_events SET nonce=lower(hex(randomblob(16)))",
+        [],
+    )
+    .expect("replace the history's nonces");
+    drop(db);
+    daemon.restart().await;
+    app_live(&page).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let rows = edge_rows(&page).await;
+            if rows
+                .iter()
+                .any(|(id, state)| *id == held && state == "uncertain")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the row should follow a change that keeps every count");
+    let frames: Vec<Value> = eval(&page, "window.__frames").await;
+    let last_socket = frames.last().expect("frames")["socket"].clone();
+    let resumed: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f["socket"] == last_socket)
+        .collect();
+    assert_eq!(resumed[0]["fullMail"], true, "{resumed:?}");
+    assert!(
+        resumed.iter().all(|f| f["event"] != "mail"),
+        "this needs a reconnect with no mail frame: {resumed:?}"
+    );
+
+    // Traffic with no quiet moment: the list follows it anyway. A debounce would
+    // still show one row when this loop ends.
+    const SENT: usize = 16;
+    for n in 0..SENT {
+        daemon.ctl(&["send", "@a", &format!("traffic {n}")]).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let during = edge_rows(&page).await.len();
+    assert!(
+        during >= 5,
+        "only {during} rows after {SENT} sends in continuous traffic"
+    );
+
+    // An invalidation during the last interval is not lost: the list ends up exact.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let rows = edge_rows(&page).await;
+            let consumed = rows.iter().filter(|(_, state)| state == "consumed").count();
+            if rows.len() == SENT + 1 && consumed == SENT {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the rows should settle on what the server has");
+
+    // The same on a live connection. Nothing this frame changes can be seen in those
+    // counts, so its arrival is what must cause the next read.
+    let cursor: i64 = eval(
+        &page,
+        r#"Number(document.querySelector('[data-testid="app"]').dataset.cursor)"#,
+    )
+    .await;
+    let reads = |fetches: Vec<String>| {
+        fetches
+            .iter()
+            .filter(|target| target.contains("/mail?from="))
+            .count()
+    };
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let before = reads(eval(&page, "window.__fetches").await);
+    let frame = json!({
+        "event": "mail",
+        "seq": cursor + 1,
+        "nonce": "0".repeat(32),
+        "msg_seq": 1,
+        "id": held,
+        "from": "human",
+        "to": agent,
+        "conversation": "00000000000000000000000001",
+        "in_reply_to": null,
+        "hop": 0,
+        "act": "inform",
+        "task": null,
+        "exposure": null,
+        "state": "held",
+        "turn_started": false,
+        "incarnation": null,
+        "attempts": 0,
+        "reason": "a reason",
+        "prev_state": "uncertain",
+        "at": "2026-01-01T00:00:00.000Z",
+    });
+    inject(&page, &frame.to_string()).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while reads(eval(&page, "window.__fetches").await) == before {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("a frame on this edge should cause a read");
+    assert_clean(&page, "an edge under traffic").await;
     daemon.stop().await;
 }
 
@@ -1281,6 +1641,24 @@ async fn truncated_moving_and_approval_lists_are_labelled() {
         .to_contain_text("agentctl approvals")
         .await
         .expect("where the rest are");
+
+    // 64 permissions, each with its commands, start as a page and grow on request.
+    expect(id(&page, "permission").await)
+        .to_have_count(20)
+        .await
+        .expect("the first page of permissions");
+    let more = id(&page, "permissions")
+        .await
+        .locator("button:text('more of')");
+    expect(more.clone())
+        .to_have_text("Show 20 more of 44")
+        .await
+        .expect("what the button will add");
+    more.click(None).await.expect("show more permissions");
+    expect(id(&page, "permission").await)
+        .to_have_count(40)
+        .await
+        .expect("the next page of permissions");
 
     // The first agent by name has the queue, so its detail shows an exact count.
     let recipient = snapshot["mail"]["moving"]
