@@ -185,6 +185,7 @@ mod tests {
         let mut state = hub.state();
         let mut activity = hub.activity();
         let mut legacy = hub.events();
+        let started = Instant::now();
         for _ in 0..4096 {
             hub.emit(Event::Activity {
                 agent,
@@ -196,11 +197,18 @@ mod tests {
                 port: 443,
             });
         }
+        // A slow runner can legitimately cross the one-second limit during the flood.
+        let allowed = started.elapsed().as_secs() + 1;
         assert!(matches!(state.try_recv(), Ok(Event::EgressDenied { .. })));
-        assert!(matches!(
-            state.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
+        let mut denials = 1;
+        loop {
+            match state.try_recv() {
+                Ok(Event::EgressDenied { .. }) => denials += 1,
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                other => panic!("state channel: {other:?}"),
+            }
+        }
+        assert!(denials <= allowed, "{denials} denials in {allowed} seconds");
         assert!(matches!(
             activity.try_recv(),
             Err(broadcast::error::TryRecvError::Lagged(_))
