@@ -32,9 +32,16 @@ fn permission(session: &str, id: &str, reject: bool) {
     if reject {
         options.push(json!({"optionId":"no","name":"Reject once","kind":"reject_once"}));
     }
+    let bounded = std::env::var_os("FAKE_BOUND_OPTIONS").is_some();
+    let (title, tool, padding) = if bounded {
+        options=(0..16).map(|n|json!({"optionId":format!("{n:02}{}","'".repeat(1020)),"name":"\0'\\\"".repeat(1024),"kind":"allow_once"})).collect();
+        ("\0'\\\"".repeat(4096), "t".repeat(2048), "\0".repeat(8192))
+    } else {
+        (title, "edit".into(), String::new())
+    };
     emit(
         json!({"jsonrpc":"2.0","id":id,"method":"session/request_permission",
-        "params":{"sessionId":session,"toolCall":{"toolCallId":id,"title":title,"kind":"edit"},
+        "params":{"sessionId":session,"toolCall":{"toolCallId":id,"title":title,"kind":tool,"rawInput":padding},
         "options":options}}),
     );
 }
@@ -261,6 +268,11 @@ fn main() {
                     ignore_cancel = text.contains("ignore-cancel");
                     late_permissions = usize::from(text.contains("late-permissions"));
                     flight = Some(id.clone());
+                } else if text.contains("max-permissions") {
+                    flight = Some(id.clone());
+                    for n in 0..64 {
+                        permission(session, &format!("permission-max-{n}"), false);
+                    }
                 } else if text.contains("two-permissions") {
                     flight = Some(id.clone());
                     permission_responses_remaining = Some(2);

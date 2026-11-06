@@ -742,3 +742,194 @@ async fn ui_ipv6_loopback_and_invalid_addresses() {
     assert!(bytes.starts_with(b"HTTP/1.1 200"));
     d.stop().await;
 }
+
+#[tokio::test]
+async fn maximum_bounds_snapshot_crosses_real_daemon_and_both_clients() {
+    use agentd::{model::*, supervisor::AgentSpec};
+    let mut d = Daemon::new("yes", 10).await;
+    d.stop().await;
+    let cfg = d.root.path().join("config.toml");
+    let mut config = std::fs::read_to_string(&cfg).expect("config");
+    config.push_str("FAKE_BOUND_OPTIONS='1'\n[kind.infinity]\nwire='infinity'\nsocket='/tmp/m5-unused-infinity.sock'\n");
+    std::fs::write(cfg, config).expect("config");
+    let mut db = rusqlite::Connection::open(d.root.path().join("state/mail.db")).expect("db");
+    db.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")
+        .expect("pragmas");
+    let tx = db.transaction().expect("transaction");
+    let ids = (0..1024).map(|_| AgentId::new()).collect::<Vec<_>>();
+    for (n, id) in ids.iter().enumerate() {
+        let name = AgentName::parse(&format!("agent-{n:026}")).expect("name");
+        let spec = AgentSpec {
+            name: name.clone(),
+            kind: if n == 0 { "claude" } else { "infinity" }.into(),
+            cwd: d.root.path().into(),
+            workspace: None,
+            model: None,
+            permissions: Default::default(),
+            idle_after: None,
+        };
+        let key = serde_json::to_string(id).expect("id");
+        tx.execute(
+            "INSERT INTO agents(id,name) VALUES (?,?)",
+            rusqlite::params![key, name.as_str()],
+        )
+        .expect("agent");
+        tx.execute(
+            "INSERT INTO agent_specs(agent,spec) VALUES (?,?)",
+            rusqlite::params![key, serde_json::to_string(&spec).expect("spec")],
+        )
+        .expect("spec");
+    }
+    let mut insert=tx.prepare("INSERT INTO messages(id,sender,client_key,recipient,conversation,hop,act,body,sent_at) VALUES (?,?,?,?,?,65535,'\"Inform\"','body','[2026,1,0,0,0,0,0,0,0]')").expect("message statement");
+    let reason = "\0'\\\"".repeat(1024);
+    for n in 0..67536 {
+        let id = format!("\"{:026}\"", n + 1);
+        let from = Sender::Agent(ids[1 + (n / 256) % 256]);
+        let to = ids[1 + n % 256];
+        insert
+            .execute(rusqlite::params![
+                id,
+                serde_json::to_string(&from).expect("sender"),
+                format!("max-{n}"),
+                serde_json::to_string(&to).expect("recipient"),
+                format!("\"{:026}\"", n + 1)
+            ])
+            .expect("message");
+        let seq = tx.last_insert_rowid();
+        let state = if n < 65536 {
+            "consumed"
+        } else if n < 66536 {
+            "held"
+        } else {
+            "queued"
+        };
+        tx.execute(
+            "INSERT INTO deliveries(message_id,state,reason,msg_seq) VALUES (?,?,?,?)",
+            rusqlite::params![
+                id,
+                state,
+                if state == "held" { Some(&reason) } else { None },
+                seq
+            ],
+        )
+        .expect("delivery");
+    }
+    drop(insert);
+    tx.commit().expect("commit");
+    drop(db);
+    d.child = Daemon::start(&d.root);
+    d.ready().await;
+    d.ctl(&[
+        "send",
+        "@agent-00000000000000000000000000",
+        "max-permissions",
+    ])
+    .await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if d.ctl(&["approvals"])
+                .await
+                .as_array()
+                .expect("approvals")
+                .len()
+                == 64
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all approvals pending");
+    fn check(v: &Value, bytes: usize) {
+        assert!(
+            bytes < 64 * 1024 * 1024,
+            "maximum snapshot exceeds reader bound: {bytes}"
+        );
+        assert_eq!(v["agents"].as_array().expect("agents").len(), 1024);
+        assert_eq!(v["approvals"].as_array().expect("approvals").len(), 64);
+        assert_eq!(v["mail"]["edges"].as_array().expect("edges").len(), 65536);
+        for list in ["stuck", "moving"] {
+            assert_eq!(v["mail"][list].as_array().expect("list").len(), 1000);
+        }
+        for r in v["approvals"].as_array().expect("approvals") {
+            assert_eq!(r["options"].as_array().expect("options").len(), 16);
+            assert!(serde_json::to_vec(&r["title"]).expect("title").len() <= 4096);
+            assert!(serde_json::to_vec(&r["detail"]).expect("detail").len() <= 8192);
+        }
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--socket")
+        .arg(d.socket())
+        .arg("watch")
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("watch");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let frame = tokio::time::timeout(
+        Duration::from_secs(60),
+        read_frame_limit(&mut reader, 64 * 1024 * 1024),
+    )
+    .await
+    .expect("snapshot deadline")
+    .expect("frame")
+    .expect("snapshot");
+    let v: Value = serde_json::from_slice(&frame).expect("snapshot JSON");
+    check(&v, frame.len());
+    println!("MAXIMUM real_agentctl_snapshot_bytes={}", frame.len());
+    let mut request = d.ws_request();
+    request.headers_mut().insert(
+        "Origin",
+        HeaderValue::from_str(&format!("http://127.0.0.1:{}", d.port)).expect("origin"),
+    );
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_frame_size(Some(64 * 1024 * 1024))
+        .max_message_size(Some(64 * 1024 * 1024));
+    let (mut ws, _) = tokio_tungstenite::connect_async_with_config(request, Some(config), false)
+        .await
+        .expect("WebSocket");
+    let v = next(&mut ws).await;
+    let size = serde_json::to_vec(&v).expect("snapshot").len();
+    check(&v, size);
+    println!("MAXIMUM real_websocket_snapshot_bytes={size}");
+    child.kill().await.expect("stop watch");
+    child.wait().await.expect("wait");
+    drop(ws);
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn manifest_refresh_is_throttled_and_slow_writes_release_its_lock() {
+    let mut d = Daemon::new("yes", 10).await;
+    let large = std::fs::File::create(d.root.path().join("assets/large.js")).expect("large");
+    large.set_len(8 * 1024 * 1024).expect("size");
+    assert!(d.raw("/", &d.host()).await.starts_with("HTTP/1.1 200"));
+    std::fs::write(d.root.path().join("assets/later.js"), "later").expect("asset");
+    for _ in 0..8 {
+        d.raw("/", &d.host()).await;
+    }
+    assert!(
+        d.raw("/later.js", &d.host())
+            .await
+            .starts_with("HTTP/1.1 404"),
+        "rebuilt more than once per second"
+    );
+    let mut slow = TcpStream::connect(("127.0.0.1", d.port))
+        .await
+        .expect("slow client");
+    slow.write_all(format!("GET /large.js HTTP/1.1\r\n{}\r\n", d.host()).as_bytes())
+        .await
+        .expect("request");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let response = tokio::time::timeout(Duration::from_secs(1), d.raw("/old.js", &d.host()))
+        .await
+        .expect("slow response retained manifest lock");
+    assert!(response.ends_with("old"));
+    d.ctl(&["ls"]).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    d.raw("/", &d.host()).await;
+    assert!(d.raw("/later.js", &d.host()).await.ends_with("later"));
+    drop(slow);
+    d.stop().await;
+}

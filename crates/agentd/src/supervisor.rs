@@ -200,6 +200,10 @@ pub struct Broker {
     replacements: Mutex<()>,
     #[cfg(test)]
     startup_pause: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
+    #[cfg(test)]
+    test_adapter: Option<Arc<dyn Adapter>>,
+    #[cfg(test)]
+    actor_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     events: crate::event_hub::EventHub,
     config: Config,
     mcp: Option<Arc<crate::surfaces::Bindings>>,
@@ -242,6 +246,10 @@ impl Broker {
             replacements: Mutex::new(()),
             #[cfg(test)]
             startup_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_adapter: None,
+            #[cfg(test)]
+            actor_tasks: Default::default(),
             events,
             config,
             mcp: None,
@@ -360,6 +368,13 @@ impl Broker {
             phase,
             isolation,
         };
+        #[cfg(test)]
+        let adapter = self
+            .test_adapter
+            .clone()
+            .unwrap_or_else(|| AdapterSet::build(kind.clone()));
+        #[cfg(not(test))]
+        let adapter = AdapterSet::build(kind.clone());
         let actor = AgentActor {
             permissions_guard: self.events.owner(),
             _lease: lease,
@@ -381,7 +396,7 @@ impl Broker {
             waiting_offers: Vec::new(),
             choice_deadlines: HashMap::new(),
             spec,
-            adapter: AdapterSet::build(kind),
+            adapter,
             mailroom: Arc::clone(&self.mailroom),
             events: self.events.clone(),
             config: self.config.clone(),
@@ -400,7 +415,14 @@ impl Broker {
             idle_since: Instant::now(),
         };
         self.agents.lock().await.insert(id, handle.clone());
-        tokio::spawn(actor.run());
+        let task = tokio::spawn(actor.run());
+        #[cfg(test)]
+        self.actor_tasks
+            .lock()
+            .expect("bug: actor task list poisoned")
+            .push(task);
+        #[cfg(not(test))]
+        drop(task);
         #[cfg(test)]
         {
             let pause = self
@@ -1470,5 +1492,216 @@ mod stale_phase_tests {
         };
         assert!(events::feed(&api, &mut sink, None).await.is_err());
         assert!(sink.checked);
+    }
+}
+
+#[cfg(test)]
+mod cleanup_panic_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct FaultAdapter {
+        opens: AtomicUsize,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    struct FaultSession {
+        events: VecDeque<SessionEvent>,
+        panic_on_suspend: bool,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl Adapter for FaultAdapter {
+        async fn open(
+            &self,
+            r: OpenRequest<'_>,
+        ) -> std::result::Result<Box<dyn Session>, AdapterError> {
+            let second = self.opens.fetch_add(1, Ordering::SeqCst) > 0;
+            let events = if second {
+                vec![
+                    SessionEvent::PermissionRequested(PermissionRequest {
+                        id: PermissionId::new(),
+                        agent: r.agent,
+                        incarnation: r.incarnation,
+                        tool: "shell".into(),
+                        title: "pending after reopen".into(),
+                        detail: "detail".into(),
+                        options: vec![PermissionOption {
+                            key: "allow".into(),
+                            label: "Allow".into(),
+                            effect: PermissionEffect::AllowOnce,
+                        }],
+                    }),
+                    SessionEvent::Admitted {
+                        ids: vec![MessageId::new()],
+                    },
+                ]
+            } else {
+                vec![SessionEvent::Ended {
+                    reason: "injected first incarnation crash".into(),
+                }]
+            };
+            Ok(Box::new(FaultSession {
+                events: events.into(),
+                panic_on_suspend: second,
+                entered: self.entered.clone(),
+                release: self.release.clone(),
+            }))
+        }
+    }
+    #[async_trait::async_trait]
+    impl Session for FaultSession {
+        fn resume_token(&self) -> ResumeToken {
+            ResumeToken::encode(&"fault fixture")
+        }
+        fn resumable(&self) -> bool {
+            true
+        }
+        fn busy(&self) -> bool {
+            true
+        }
+        async fn submit(&mut self, _: Turn) -> std::result::Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn cancel(&mut self) -> std::result::Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn answer_permission(
+            &mut self,
+            _: PermissionId,
+            _: &str,
+        ) -> std::result::Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            match self.events.pop_front() {
+                Some(e) => Some(e),
+                None => std::future::pending().await,
+            }
+        }
+        async fn suspend(self: Box<Self>) -> std::result::Result<ResumeToken, AdapterError> {
+            if self.panic_on_suspend {
+                self.entered.notify_one();
+                self.release.notified().await;
+                panic!("injected cleanup panic after reopen");
+            }
+            Ok(self.resume_token())
+        }
+    }
+    #[tokio::test]
+    async fn running_actor_reopen_permission_is_cleared_before_cleanup_panics() {
+        let dir = tempfile::tempdir().expect("dir");
+        let room = Arc::new(
+            Mailroom::open(dir.path().join("mail.db"), Default::default())
+                .await
+                .expect("room"),
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut kind = KindConfig::claude("unused-fixture");
+        kind.isolation = crate::sandbox::Isolation::None;
+        let mut broker = Broker::new(
+            room.clone(),
+            vec![kind],
+            Config {
+                backoff_initial: Duration::from_millis(1),
+                backoff_max: Duration::from_millis(1),
+                ..Default::default()
+            },
+        )
+        .expect("broker");
+        broker.test_adapter = Some(Arc::new(FaultAdapter {
+            opens: AtomicUsize::new(0),
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+        let broker = Arc::new(broker);
+        let mut state = broker.events();
+        let handle = broker
+            .spawn(AgentSpec {
+                name: AgentName::parse("a").expect("name"),
+                kind: "claude".into(),
+                cwd: dir.path().into(),
+                workspace: None,
+                model: None,
+                permissions: Default::default(),
+                idle_after: None,
+            })
+            .await
+            .expect("spawn");
+        let request = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Event::PermissionPending(r) = state.recv().await.expect("event") {
+                    break r;
+                }
+            }
+        })
+        .await
+        .expect("permission after reopen");
+        assert_eq!(request.incarnation, Incarnation(2));
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("cleanup window");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let api = crate::surfaces::ControlApi {
+            broker: broker.clone(),
+            mailroom: room.clone(),
+            bindings: Arc::new(crate::surfaces::Bindings::new(
+                dir.path().join("mcp.sock"),
+                std::env::current_exe().expect("exe"),
+                tx,
+            )),
+            control_path: dir.path().join("control.sock"),
+            ui_url: None,
+        };
+        struct Snapshot(Option<serde_json::Value>);
+        #[async_trait::async_trait]
+        impl crate::surfaces::events::Sink for Snapshot {
+            async fn send(&mut self, v: serde_json::Value) -> crate::surfaces::Result<()> {
+                self.0 = Some(v);
+                Err("snapshot captured".into())
+            }
+        }
+        let mut sink = Snapshot(None);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::surfaces::events::feed(&api, &mut sink, None),
+        )
+        .await
+        .expect("snapshot must not ask blocked actor");
+        assert!(result.is_err());
+        assert!(
+            sink.0.expect("snapshot")["approvals"]
+                .as_array()
+                .expect("approvals")
+                .is_empty(),
+            "snapshot retained permission during cleanup"
+        );
+        release.notify_one();
+        let task = broker
+            .actor_tasks
+            .lock()
+            .expect("tasks")
+            .pop()
+            .expect("actor task");
+        assert!(task.await.expect_err("injected panic").is_panic());
+        handle.commands.closed().await;
+        assert!(broker.event_hub().permissions().is_empty());
+        let answered = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Event::PermissionAnswered { id, .. } =
+                    state.recv().await.expect("answer event")
+                    && id == request.id
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            answered.is_ok(),
+            "permission_answered missing after cleanup panic"
+        );
     }
 }

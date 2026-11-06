@@ -190,15 +190,25 @@ try:
             event = json.loads(watched.readline())
             if event.get('event') == 'egress_denied' and event.get('host') == 'attacker.invalid':
                 break
-        watched.close()
-        watch.close()
         while True:
             event = web_event()
             if event.get('event') == 'egress_denied' and event.get('host') == 'attacker.invalid':
                 break
+        missing = []
+        for transport, receive in [('Unix', lambda: json.loads(watched.readline())), ('WebSocket', web_event)]:
+            try:
+                while True:
+                    event = receive()
+                    if event.get('event') == 'egress_denied' and event.get('host') == 'example.com':
+                        break
+            except TimeoutError:
+                missing.append(transport)
+        assert not missing, f'missing example.com ClientHello denial on {missing}'
+        watched.close()
+        watch.close()
         web_read.close()
         web.close()
-        print('PASS real proxy denial reaches Unix and WebSocket feeds', flush=True)
+        print('PASS real proxy and mismatched ClientHello denials reach Unix and WebSocket feeds', flush=True)
         wait(lambda: credential.read_text() == '{"token":1}', 'credential copy-back')
         for relative, before in original_cli.items():
             if relative not in ['.claude/.credentials.json', '.codex/auth.json']:

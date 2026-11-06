@@ -118,6 +118,8 @@ if not cfg['baseline']:
             except (ssl.SSLError, ConnectionResetError):
                 return False
     result['proxy_allow'] = tls('example.com')
+    import time
+    time.sleep(1.1)
     result['proxy_sni_deny'] = not tls('www.cloudflare.com')
     result['proxy_private_deny'] = '403' in proxy('localhost')
     try:
