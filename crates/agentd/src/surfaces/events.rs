@@ -115,6 +115,10 @@ pub fn mail(row: &mut Value, path: &Path) {
 #[async_trait::async_trait]
 pub trait Sink: Send {
     async fn send(&mut self, value: Value) -> Result<()>;
+    async fn send_snapshot(&mut self, json: String, _full_mail: bool) -> Result<()> {
+        let value = tokio::task::spawn_blocking(move || serde_json::from_str(&json)).await??;
+        self.send(value).await
+    }
 }
 pub struct UnixSink<W>(pub W);
 #[async_trait::async_trait]
@@ -122,11 +126,38 @@ impl<W: AsyncWrite + Unpin + Send> Sink for UnixSink<W> {
     async fn send(&mut self, value: Value) -> Result<()> {
         write_frame(&mut self.0, &value).await
     }
+    async fn send_snapshot(&mut self, json: String, _full_mail: bool) -> Result<()> {
+        self.0.write_all(json.as_bytes()).await?;
+        self.0.write_all(b"\n").await?;
+        self.0.flush().await?;
+        Ok(())
+    }
 }
 async fn send(sink: &mut impl Sink, value: Value) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(10), sink.send(value))
         .await
         .map_err(|_| "feed send timed out")?
+}
+
+pub(crate) async fn mail_response(mut value: Value, control_path: PathBuf) -> Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        if let Some(rows) = value["rows"].as_array_mut() {
+            for row in rows {
+                mail(row, &control_path);
+            }
+        }
+        Ok(serde_json::to_vec(&value)?)
+    })
+    .await?
+}
+
+async fn send_snapshot(sink: &mut impl Sink, frame: Snapshot) -> Result<()> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        sink.send_snapshot(frame.json, frame.full_mail),
+    )
+    .await
+    .map_err(|_| "feed send timed out")?
 }
 
 async fn agent(
@@ -164,44 +195,96 @@ fn agent_row(id: AgentId, name: &str, kind: &str, phase: &Phase, isolation: &str
     };
     json!({"id":format!("agent:{id}"),"name":cut(name,1024),"kind":cut(kind,1024),"isolation":isolation,"phase":phase_name(phase),"error":error})
 }
-pub(crate) async fn snapshot(
-    api: &ControlApi,
-    resume: Option<Anchor>,
-    cursor_only: Option<i64>,
-    cache: &mut HashMap<AgentId, (String, String)>,
-) -> Result<Value> {
-    let (cursor, mut mail_state) = if let Some(c) = cursor_only {
-        (c, Value::Null)
-    } else {
-        api.mailroom.mail_snapshot(resume).await?
-    };
+type AgentCache = HashMap<AgentId, (String, String)>;
+pub(crate) struct Snapshot {
+    pub cursor: i64,
+    pub json: String,
+    pub full_mail: bool,
+}
+struct SnapshotInput {
+    cursor: i64,
+    mail_state: Value,
+    specs: Vec<(AgentId, AgentSpec, i64)>,
+    handles: Vec<Option<crate::supervisor::AgentHandle>>,
+    hub: crate::event_hub::EventHub,
+    control_path: PathBuf,
+    cache: AgentCache,
+}
+fn assemble_snapshot(input: SnapshotInput) -> Result<(Snapshot, AgentCache)> {
+    let SnapshotInput {
+        cursor,
+        mut mail_state,
+        specs,
+        handles,
+        hub,
+        control_path,
+        mut cache,
+    } = input;
     for list in ["stuck", "moving"] {
         if let Some(rows) = mail_state.get_mut(list).and_then(Value::as_array_mut) {
             for row in rows {
-                mail(row, &api.control_path);
+                mail(row, &control_path);
             }
         }
     }
-    let specs = api.mailroom.observed_agents().await?;
     let truncated = specs.len() > 1024;
     let mut agents = Vec::new();
-    for (id, spec, _) in specs.into_iter().take(1024) {
+    for ((id, spec, _), handle) in specs.into_iter().take(1024).zip(handles) {
         let name = format!("@{}", spec.name.as_str());
         cache.insert(id, (name.clone(), spec.kind.clone()));
-        let h = api.broker.handle(id).await;
         agents.push(agent_row(
             id,
             &name,
             &spec.kind,
-            &h.as_ref().map_or(Phase::Ended, |h| h.phase()),
-            h.as_ref().map_or("none", |h| h.isolation()),
+            &handle.as_ref().map_or(Phase::Ended, |h| h.phase()),
+            handle.as_ref().map_or("none", |h| h.isolation()),
         ));
     }
-    let approvals = api.broker.event_hub().permissions();
-    Ok(
-        json!({"event":"snapshot","mail_cursor":cursor,"mail":mail_state,"agents":agents,"agents_truncated":truncated,"approvals_truncated":approvals.len()>64,"approvals":approvals.into_iter().take(64).map(|r|permission(r,&api.control_path)).collect::<Vec<_>>()}),
-    )
+    let approvals = hub.permissions();
+    let full_mail = !mail_state.is_null();
+    let value = json!({"event":"snapshot","mail_cursor":cursor,"mail":mail_state,"agents":agents,"agents_truncated":truncated,"approvals_truncated":approvals.len()>64,"approvals":approvals.into_iter().take(64).map(|r|permission(r,&control_path)).collect::<Vec<_>>()});
+    Ok((
+        Snapshot {
+            cursor,
+            json: serde_json::to_string(&value)?,
+            full_mail,
+        },
+        cache,
+    ))
 }
+async fn encode_snapshot(input: SnapshotInput) -> Result<(Snapshot, AgentCache)> {
+    tokio::task::spawn_blocking(move || assemble_snapshot(input)).await?
+}
+pub(crate) async fn snapshot(
+    api: &ControlApi,
+    resume: Option<Anchor>,
+    cursor_only: Option<i64>,
+    cache: &mut AgentCache,
+) -> Result<Snapshot> {
+    let (cursor, mail_state) = if let Some(c) = cursor_only {
+        (c, Value::Null)
+    } else {
+        api.mailroom.mail_snapshot(resume).await?
+    };
+    let specs = api.mailroom.observed_agents().await?;
+    let mut handles = Vec::with_capacity(specs.len().min(1024));
+    for (id, _, _) in specs.iter().take(1024) {
+        handles.push(api.broker.handle(*id).await);
+    }
+    let (frame, updated) = encode_snapshot(SnapshotInput {
+        cursor,
+        mail_state,
+        specs,
+        handles,
+        hub: api.broker.event_hub().clone(),
+        control_path: api.control_path.clone(),
+        cache: std::mem::take(cache),
+    })
+    .await?;
+    *cache = updated;
+    Ok(frame)
+}
+
 async fn state(
     api: &ControlApi,
     event: Event,
@@ -247,10 +330,8 @@ async fn run(
 ) -> Result<()> {
     let mut cache = HashMap::new();
     let first = snapshot(api, resume, None, &mut cache).await?;
-    let mut cursor = first["mail_cursor"]
-        .as_i64()
-        .expect("bug: snapshot has cursor");
-    send(sink, first).await?;
+    let mut cursor = first.cursor;
+    send_snapshot(sink, first).await?;
     let mut pending = true;
     let mut text: HashMap<AgentId, String> = HashMap::new();
     let mut flush = tokio::time::Instant::now() + Duration::from_millis(100);
@@ -263,7 +344,8 @@ async fn run(
                     }
                 }
                 Err(TryRecvError::Lagged(_)) => {
-                    send(sink, snapshot(api, None, Some(cursor), &mut cache).await?).await?
+                    send_snapshot(sink, snapshot(api, None, Some(cursor), &mut cache).await?)
+                        .await?
                 }
                 Err(TryRecvError::Closed) => return Ok(()),
                 Err(TryRecvError::Empty) => break,
@@ -296,10 +378,8 @@ async fn run(
             let (floor, rows) = api.mailroom.mail_page(cursor).await?;
             if floor.is_some_and(|n| n > cursor + 1) {
                 let snap = snapshot(api, None, None, &mut cache).await?;
-                cursor = snap["mail_cursor"]
-                    .as_i64()
-                    .expect("bug: snapshot has cursor");
-                send(sink, snap).await?;
+                cursor = snap.cursor;
+                send_snapshot(sink, snap).await?;
                 continue;
             }
             pending = rows.len() == 256;
@@ -316,7 +396,7 @@ async fn run(
             changed=changes.changed()=>{if changed.is_err(){return Ok(());} pending=true;},
             event=states.recv()=>match event {
                 Ok(e)=>if let Some(v)=state(api,e,&mut cache).await? {send(sink,v).await?;},
-                Err(RecvError::Lagged(_))=>send(sink,snapshot(api,None,Some(cursor),&mut cache).await?).await?,
+                Err(RecvError::Lagged(_))=>send_snapshot(sink,snapshot(api,None,Some(cursor),&mut cache).await?).await?,
                 Err(RecvError::Closed)=>return Ok(())
             },
             event=activity.recv()=>match event {
@@ -700,5 +780,120 @@ mod quiet_tests {
         );
         task.abort();
         assert!(task.await.expect_err("abort").is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    fn maximum_input() -> (SnapshotInput, crate::event_hub::PermissionGuard) {
+        let hub = crate::event_hub::EventHub::default();
+        let guard = hub.owner();
+        let agent = AgentId::new();
+        let hostile = "\0\n\"\\'".repeat(8192);
+        for _ in 0..64 {
+            guard.emit(Event::PermissionPending(PermissionRequest {
+                id: PermissionId::new(),
+                agent,
+                incarnation: Incarnation(1),
+                tool: hostile.clone(),
+                title: hostile.clone(),
+                detail: hostile.clone(),
+                options: (0..16)
+                    .map(|_| PermissionOption {
+                        key: "'".repeat(1022),
+                        label: hostile.clone(),
+                        effect: PermissionEffect::AllowOnce,
+                    })
+                    .collect(),
+            }));
+        }
+        let edge = json!({"from":format!("agent:{agent}"),"to":format!("agent:{agent}"),"queued":i64::MAX,"offered":i64::MAX,"consumed":i64::MAX,"uncertain":i64::MAX,"held":i64::MAX,"dead":i64::MAX});
+        let row = json!({"msg_seq":i64::MAX,"id":MessageId::new(),"from":format!("agent:{agent}"),"to":format!("agent:{agent}"),"conversation":ConversationId::new(),"in_reply_to":MessageId::new(),"hop":65535,"act":"request","task":TaskId::new(),"exposure":{"sender":format!("agent:{agent}"),"epoch":u64::MAX,"seq":u64::MAX},"state":"held","turn_started":true,"incarnation":u64::MAX,"attempts":u32::MAX,"reason":hostile});
+        let mail_state = json!({"anchor":{"seq":i64::MAX,"nonce":"a".repeat(32)},"edges":vec![edge;65536],"edges_truncated":true,"stuck":vec![row.clone();1000],"moving":vec![row;1000],"stuck_truncated":true,"moving_truncated":true});
+        let specs = (0..1024)
+            .map(|n| {
+                (
+                    AgentId::new(),
+                    AgentSpec {
+                        name: AgentName::parse(&format!("agent-{n:026}")).expect("name"),
+                        kind: "'".repeat(1024),
+                        cwd: "/tmp".into(),
+                        workspace: None,
+                        model: None,
+                        permissions: Default::default(),
+                        idle_after: None,
+                    },
+                    0,
+                )
+            })
+            .collect();
+        (
+            SnapshotInput {
+                cursor: i64::MAX,
+                mail_state,
+                specs,
+                handles: vec![None; 1024],
+                hub,
+                control_path: "/tmp/control socket".into(),
+                cache: HashMap::new(),
+            },
+            guard,
+        )
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn maximum_snapshot_keeps_current_thread_timer_responsive() {
+        let (input, _guard) = tokio::task::spawn_blocking(maximum_input)
+            .await
+            .expect("fixture");
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let done = stop.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let ticker = tokio::spawn(async move {
+            let mut previous = std::time::Instant::now();
+            let mut maximum = Duration::ZERO;
+            let mut ticks = 0;
+            ready_tx.send(()).expect("ready receiver");
+            loop {
+                tokio::select! {
+                    _=done.notified()=>return (maximum,ticks),
+                    _=tokio::time::sleep(Duration::from_millis(2))=>{let now=std::time::Instant::now();maximum=maximum.max(now.duration_since(previous));previous=now;ticks+=1;}
+                }
+            }
+        });
+        ready_rx.await.expect("timer ready");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let (frame, _cache) = encode_snapshot(input).await.expect("maximum snapshot");
+        assert!(frame.json.len() > 20 * 1024 * 1024);
+        assert!(frame.json.len() < 64 * 1024 * 1024);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        stop.notify_one();
+        let (gap, ticks) = ticker.await.expect("timer task");
+        println!(
+            "RESPONSIVENESS snapshot_bytes={} max_timer_gap_ms={:.3} ticks={ticks}",
+            frame.json.len(),
+            gap.as_secs_f64() * 1000.0
+        );
+        assert!(
+            gap < Duration::from_millis(50),
+            "maximum snapshot stalled current-thread runtime for {:.3} ms",
+            gap.as_secs_f64() * 1000.0
+        );
+        assert!(ticks >= 5, "short timer did not run");
+    }
+    #[tokio::test]
+    async fn encoded_snapshot_transports_send_identical_json() {
+        let json = "{\"event\":\"snapshot\",\"mail_cursor\":0,\"mail\":null}".to_owned();
+        let (write, mut read) = tokio::io::duplex(256);
+        let mut sink = UnixSink(write);
+        sink.send_snapshot(json.clone(), false)
+            .await
+            .expect("Unix bytes");
+        drop(sink);
+        let mut bytes = Vec::new();
+        read.read_to_end(&mut bytes).await.expect("read");
+        assert_eq!(bytes, [json.as_bytes(), b"\n"].concat());
+        let message = tokio_tungstenite::tungstenite::Message::Text(json.clone().into());
+        assert_eq!(message.into_data().as_ref(), json.as_bytes());
     }
 }

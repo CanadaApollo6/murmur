@@ -563,6 +563,18 @@ mod gate {
             tokio::task::yield_now().await;
             Ok(())
         }
+        async fn send_snapshot(
+            &mut self,
+            json: String,
+            full_mail: bool,
+        ) -> crate::surfaces::Result<()> {
+            if self.replay && full_mail {
+                return Err("required retained replay lost its anchor".into());
+            }
+            std::hint::black_box(json);
+            tokio::task::yield_now().await;
+            Ok(())
+        }
     }
     async fn drain_workloads(
         tasks: &mut tokio::task::JoinSet<crate::surfaces::Result<()>>,
@@ -613,11 +625,42 @@ mod gate {
         times.sort_by(f64::total_cmp);
         times[(times.len() * 99 / 100).min(times.len() - 1)]
     }
-    async fn sample(room: &Mailroom, to: AgentId, tag: &str) -> f64 {
+    #[derive(Clone, Copy)]
+    struct AcceptTiming {
+        queue_ms: f64,
+        job_ms: f64,
+        resume_ms: f64,
+    }
+    impl AcceptTiming {
+        fn total_ms(self) -> f64 {
+            self.queue_ms + self.job_ms + self.resume_ms
+        }
+    }
+    struct AcceptStats {
+        p99: f64,
+        queue_p99: f64,
+        job_p99: f64,
+        resume_p99: f64,
+        at_p99: AcceptTiming,
+    }
+    impl AcceptStats {
+        fn print(&self, lane: &str) {
+            println!(
+                "GATE accept_attribution lane={lane} samples=2048 total_p99_ms={:.6} queue_p99_ms={:.6} job_p99_ms={:.6} resume_p99_ms={:.6} at_total_p99_queue_ms={:.6} at_total_p99_job_ms={:.6} at_total_p99_resume_ms={:.6}",
+                self.p99,
+                self.queue_p99,
+                self.job_p99,
+                self.resume_p99,
+                self.at_p99.queue_ms,
+                self.at_p99.job_ms,
+                self.at_p99.resume_ms
+            );
+        }
+    }
+    async fn sample(room: &Mailroom, to: AgentId, tag: &str) -> AcceptStats {
         let mut times = Vec::new();
         for n in 0..2048 {
-            let started = Instant::now();
-            room.accept(NewMessage {
+            let message = NewMessage {
                 from: Sender::Human,
                 to,
                 body: Body::new("gate delivery").expect("body"),
@@ -625,12 +668,35 @@ mod gate {
                 client_key: ClientKey(format!("{tag}-{n}")),
                 act: Act::Inform,
                 task: None,
-            })
-            .await
-            .expect("real accept");
-            times.push(started.elapsed().as_secs_f64() * 1000.0);
+            };
+            let submitted = Instant::now();
+            let (_accepted, began, finished) = room
+                .call(move |store| {
+                    let began = Instant::now();
+                    let accepted = store.accept(message)?;
+                    let finished = Instant::now();
+                    Ok((accepted, began, finished))
+                })
+                .await
+                .expect("real accept");
+            let resumed = Instant::now();
+            times.push(AcceptTiming {
+                queue_ms: began.duration_since(submitted).as_secs_f64() * 1000.0,
+                job_ms: finished.duration_since(began).as_secs_f64() * 1000.0,
+                resume_ms: resumed.duration_since(finished).as_secs_f64() * 1000.0,
+            });
         }
-        percentile(times)
+        times.sort_by(|a, b| a.total_ms().total_cmp(&b.total_ms()));
+        let at_p99 = times[times.len() * 99 / 100];
+        let stats = AcceptStats {
+            p99: at_p99.total_ms(),
+            queue_p99: percentile(times.iter().map(|s| s.queue_ms).collect()),
+            job_p99: percentile(times.iter().map(|s| s.job_ms).collect()),
+            resume_p99: percentile(times.iter().map(|s| s.resume_ms).collect()),
+            at_p99,
+        };
+        stats.print(tag);
+        stats
     }
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "full-scale disk and latency measurement; run explicitly with --ignored --nocapture"]
@@ -693,7 +759,7 @@ mod gate {
                 let frame = events::snapshot(api, None, None, &mut HashMap::new())
                     .await
                     .expect("assembled snapshot");
-                std::hint::black_box(serde_json::to_vec(&frame).expect("serialized snapshot"));
+                std::hint::black_box(frame.json);
                 values.push(start.elapsed().as_secs_f64() * 1000.0);
             }
             values.sort_by(f64::total_cmp);
@@ -765,6 +831,7 @@ mod gate {
         }
         for n in 0..8 {
             let room = room.clone();
+            let control_path = api.control_path.clone();
             let load = load.clone();
             let cancel = cancel.clone();
             tasks.spawn(async move {
@@ -781,7 +848,9 @@ mod gate {
                                     ..Default::default()
                                 })
                                 .await?;
-                            std::hint::black_box(serde_json::to_vec(&rows)?);
+                            std::hint::black_box(
+                                events::mail_response(rows, control_path.clone()).await?,
+                            );
                         }
                         load.views[n].fetch_add(1, Relaxed);
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -793,6 +862,7 @@ mod gate {
         }
         for rare in [false, true] {
             let room = room.clone();
+            let control_path = api.control_path.clone();
             let load = load.clone();
             let cancel = cancel.clone();
             tasks.spawn(async move {
@@ -806,7 +876,9 @@ mod gate {
                                     ..Default::default()
                                 })
                                 .await?;
-                            std::hint::black_box(serde_json::to_vec(&rows)?);
+                            std::hint::black_box(
+                                events::mail_response(rows, control_path.clone()).await?,
+                            );
                             load.rare.fetch_add(1, Relaxed);
                         } else {
                             room.observed_agents().await?;
@@ -900,8 +972,10 @@ mod gate {
             "GATE snapshot_median_ms={normal:.3} target_ms=100 backlog_200000_snapshot_median_ms={backlog:.3} target_ms=100"
         );
         println!(
-            "GATE accept_baseline_p99_ms={baseline:.3} accept_observers_p99_ms={loaded:.3} delta_ms={:.3} target_delta_ms=20",
-            loaded - baseline
+            "GATE accept_baseline_p99_ms={:.3} accept_observers_p99_ms={:.3} delta_ms={:.3} target_delta_ms=20",
+            baseline.p99,
+            loaded.p99,
+            loaded.p99 - baseline.p99
         );
         Arc::try_unwrap(room)
             .unwrap_or_else(|_| panic!("gate room owners"))
@@ -909,7 +983,7 @@ mod gate {
             .await
             .expect("close");
         assert!(normal < 100.0 && backlog < 100.0, "snapshot gate missed");
-        assert!(loaded - baseline <= 20.0, "accept p99 gate missed");
+        assert!(loaded.p99 - baseline.p99 <= 20.0, "accept p99 gate missed");
     }
 }
 

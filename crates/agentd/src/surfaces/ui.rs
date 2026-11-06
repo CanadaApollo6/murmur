@@ -399,28 +399,24 @@ impl UiServer {
                         before_msg_seq: p.get("before_msg_seq").map(|s| s.parse()).transpose()?,
                         limit,
                     };
-                    let mut v = api.mailroom.mail_query(q).await?;
-                    if let Some(rows) = v["rows"].as_array_mut() {
-                        for row in rows {
-                            events::mail(row, &api.control_path);
-                        }
-                    }
-                    Ok::<_, Error>(v)
+                    let value = api.mailroom.mail_query(q).await?;
+                    events::mail_response(value, api.control_path.clone()).await
                 } else {
-                    Ok(api
+                    let message = api
                         .mailroom
                         .observed_message(MessageId(path.trim_start_matches("/messages/").parse()?))
-                        .await?)
+                        .await?;
+                    Ok(serde_json::to_vec(&message)?)
                 }
             }
             .await;
             return match result {
-                Ok(v) => {
+                Ok(bytes) => {
                     response(
                         &mut stream,
                         200,
                         "OK",
-                        &serde_json::to_vec(&v)?,
+                        &bytes,
                         "application/json",
                         host,
                         true,
@@ -483,6 +479,10 @@ impl events::Sink for WsSink {
             .await
             .send(Message::Text(serde_json::to_string(&v)?.into()))
             .await?;
+        Ok(())
+    }
+    async fn send_snapshot(&mut self, json: String, _full_mail: bool) -> Result<()> {
+        self.0.lock().await.send(Message::Text(json.into())).await?;
         Ok(())
     }
 }
