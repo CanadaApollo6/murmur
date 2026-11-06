@@ -164,7 +164,7 @@ fn agent_row(id: AgentId, name: &str, kind: &str, phase: &Phase, isolation: &str
     };
     json!({"id":format!("agent:{id}"),"name":cut(name,1024),"kind":cut(kind,1024),"isolation":isolation,"phase":phase_name(phase),"error":error})
 }
-async fn snapshot(
+pub(crate) async fn snapshot(
     api: &ControlApi,
     resume: Option<Anchor>,
     cursor_only: Option<i64>,

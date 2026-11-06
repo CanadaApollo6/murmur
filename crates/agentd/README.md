@@ -528,7 +528,13 @@ seconds. WebSocket input is limited to 4 KiB; pings run every thirty seconds,
 and sixty seconds without a pong closes the connection.
 
 Without a bundle or an `assets` directory, `/` displays build instructions. With
-`assets`, the server reads a path manifest and refreshes it on every `GET /`.
+`assets`, the server canonicalizes the root at startup and refreshes its manifest
+on `GET /`, at most once per second on a blocking worker. It opens the root and
+every entry through descriptor-relative no-follow operations, skips and logs
+symlinks, and refuses roots inside `state_dir`. A tree may contain at most 4,096
+files, 8,192 entries, 64 MiB of content, and 32 directory levels. Oversized trees
+are logged and refused. Responses share an immutable manifest without holding
+its lock across writes.
 Request paths never become filesystem paths. The web API has no write routes.
 Permission and held-mail frames include server-built POSIX shell commands for
 `agentctl`. Commands quote every argument and use the bound control socket;
@@ -536,7 +542,10 @@ values containing control characters have no copyable command.
 
 The full-scale worker cost gate is an explicit test. It creates a 1M-message
 fixture with 64 KiB bodies in the newest 20,000 messages, a 200,000-message dormant
-backlog, and concurrent observers. Run it on a quiet machine with an optimized
+backlog, and concurrent observers. It uses the production current-thread runtime,
+serializes snapshots, checks every generator result and per-class iteration
+count inside the sampled window, and requires a multi-thousand-row prune during
+its 2,048 loaded accepts. Run it on a quiet machine with an optimized
 build and enough disk space for the database and WAL.
 
 ```bash

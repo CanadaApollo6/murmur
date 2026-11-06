@@ -219,7 +219,10 @@ impl Mailroom {
                     let before = store.db.total_changes();
                     job(&mut store);
                     if store.db.total_changes() != before {
-                        let head = feed::head(&store.db)?;
+                        let head = match feed::head(&store.db) {
+                            Ok(head)=>head,
+                            Err(error)=>{tracing::error!(%error,"mail event head maintenance failed; worker continues");continue;}
+                        };
                         changes_tx.send_if_modified(|seq| {
                             if head > *seq {
                                 *seq = head;
@@ -229,8 +232,10 @@ impl Mailroom {
                             }
                         });
                         if head - store.last_prune >= 1024 {
-                            store.last_prune = head;
-                            feed::prune(&mut store.db)?;
+                            match feed::prune(&mut store.db) {
+                                Ok(deleted)=>{store.last_prune=head;#[cfg(test)] store.prunes.push((head,deleted));#[cfg(not(test))] tracing::trace!(deleted,"mail event retention pass");},
+                                Err(error)=>tracing::error!(%error,"mail event pruning failed; worker will retry"),
+                            }
                         }
                     }
                 }
@@ -720,6 +725,8 @@ pub(crate) struct Store {
     config: Config,
     actors: HashMap<AgentId, ulid::Ulid>,
     last_prune: i64,
+    #[cfg(test)]
+    prunes: Vec<(i64, usize)>,
 }
 
 impl Store {
@@ -752,6 +759,8 @@ impl Store {
             config,
             actors: HashMap::new(),
             last_prune,
+            #[cfg(test)]
+            prunes: Vec::new(),
         })
     }
 

@@ -24,11 +24,11 @@ pub(super) fn head(db: &Connection) -> Result<i64> {
     )?)
 }
 
-pub(super) fn prune(db: &mut Connection) -> Result<()> {
+pub(super) fn prune(db: &mut Connection) -> Result<usize> {
     let tx = db.transaction()?;
-    tx.execute("DELETE FROM mail_events WHERE seq IN (SELECT seq FROM mail_events WHERE seq < (SELECT seq FROM mail_events ORDER BY seq DESC LIMIT 1 OFFSET 65535) ORDER BY seq LIMIT 4096)", [])?;
+    let deleted=tx.execute("DELETE FROM mail_events WHERE seq IN (SELECT seq FROM mail_events WHERE seq < (SELECT seq FROM mail_events ORDER BY seq DESC LIMIT 1 OFFSET 65535) ORDER BY seq LIMIT 4096)", [])?;
     tx.commit()?;
-    Ok(())
+    Ok(deleted)
 }
 
 const META: &str = "m.seq,m.id,m.sender,m.recipient,m.conversation,m.in_reply_to,m.hop,CASE WHEN json_type(m.act)='text' THEN json_extract(m.act,'$') ELSE (SELECT key FROM json_each(m.act) LIMIT 1) END,m.task,m.exposure";
@@ -52,7 +52,9 @@ fn metadata(r: &Row<'_>) -> rusqlite::Result<Value> {
 }
 
 pub(crate) fn query(db: &Connection, filter: &MailQuery) -> Result<Value> {
-    let states = &filter.states;
+    let mut states = filter.states.clone();
+    states.sort_unstable();
+    states.dedup();
     if states.iter().any(|s| {
         !["queued", "offered", "consumed", "uncertain", "held", "dead"].contains(&s.as_str())
     }) {
@@ -515,19 +517,97 @@ mod gate {
     use crate::surfaces::{Bindings, ControlApi, events};
     use std::time::{Duration, Instant};
     #[derive(Default)]
-    struct Discard {
-        replayed: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    struct Load {
+        reconnects: [std::sync::atomic::AtomicUsize; 7],
+        views: [std::sync::atomic::AtomicUsize; 8],
+        rare: std::sync::atomic::AtomicUsize,
+        lists: std::sync::atomic::AtomicUsize,
+        replayed: std::sync::atomic::AtomicUsize,
+    }
+    impl Load {
+        fn counts(&self) -> Vec<usize> {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.reconnects
+                .iter()
+                .chain(&self.views)
+                .chain([&self.rare, &self.lists, &self.replayed])
+                .map(|n| n.load(Relaxed))
+                .collect()
+        }
+        fn ready(&self) -> bool {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.reconnects.iter().all(|n| n.load(Relaxed) >= 2)
+                && self.views.iter().all(|n| n.load(Relaxed) >= 2)
+                && self.rare.load(Relaxed) >= 20
+                && self.lists.load(Relaxed) >= 20
+                && self.replayed.load(Relaxed) >= 8192
+        }
+    }
+    struct Serialized {
+        load: Arc<Load>,
+        replay: bool,
     }
     #[async_trait::async_trait]
-    impl events::Sink for Discard {
+    impl events::Sink for Serialized {
         async fn send(&mut self, value: Value) -> crate::surfaces::Result<()> {
-            if value["event"] == "mail"
-                && let Some(count) = &self.replayed
-            {
-                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.replay && value["event"] == "snapshot" && !value["mail"].is_null() {
+                return Err("required retained replay lost its anchor".into());
             }
+            let bytes = serde_json::to_vec(&value)?;
+            std::hint::black_box(bytes);
+            if self.replay && value["event"] == "mail" {
+                self.load
+                    .replayed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            tokio::task::yield_now().await;
             Ok(())
         }
+    }
+    async fn drain_workloads(
+        tasks: &mut tokio::task::JoinSet<crate::surfaces::Result<()>>,
+    ) -> crate::surfaces::Result<usize> {
+        let mut completed = 0;
+        while let Some(result) = tasks.join_next().await {
+            result??;
+            completed += 1;
+        }
+        Ok(completed)
+    }
+    #[tokio::test]
+    async fn gate_rejects_absent_load_and_failed_generators() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let load = Load::default();
+        assert!(!load.ready());
+        for n in load.reconnects.iter().chain(&load.views) {
+            n.store(2, Relaxed);
+        }
+        load.rare.store(20, Relaxed);
+        load.lists.store(20, Relaxed);
+        load.replayed.store(8192, Relaxed);
+        assert!(load.ready());
+        for counter in load.reconnects.iter().chain(&load.views).chain([
+            &load.rare,
+            &load.lists,
+            &load.replayed,
+        ]) {
+            let previous = counter.swap(0, Relaxed);
+            assert!(!load.ready(), "gate accepted absent workload class");
+            counter.store(previous, Relaxed);
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async { Err("induced workload error".into()) });
+        assert!(
+            drain_workloads(&mut tasks).await.is_err(),
+            "gate ignored workload error"
+        );
+        tasks.spawn(async {
+            panic!("induced generator panic");
+        });
+        assert!(
+            drain_workloads(&mut tasks).await.is_err(),
+            "gate ignored generator panic"
+        );
     }
     fn percentile(mut times: Vec<f64>) -> f64 {
         times.sort_by(f64::total_cmp);
@@ -535,7 +615,7 @@ mod gate {
     }
     async fn sample(room: &Mailroom, to: AgentId, tag: &str) -> f64 {
         let mut times = Vec::new();
-        for n in 0..500 {
+        for n in 0..2048 {
             let started = Instant::now();
             room.accept(NewMessage {
                 from: Sender::Human,
@@ -552,7 +632,7 @@ mod gate {
         }
         percentile(times)
     }
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(flavor = "current_thread")]
     #[ignore = "full-scale disk and latency measurement; run explicitly with --ignored --nocapture"]
     async fn m5_cost_gate() {
         let dir =
@@ -606,33 +686,19 @@ mod gate {
         println!(
             "GATE fixture messages=1000000 agents=40 newest_large=20000 body_bytes=65536 synchronous=FULL"
         );
-        async fn snapshot_ms(room: &Mailroom) -> f64 {
+        async fn snapshot_ms(api: &ControlApi) -> f64 {
             let mut values = Vec::new();
             for _ in 0..7 {
-                values.push(
-                    room.observe(|s| {
-                        let start = Instant::now();
-                        snapshot(&s.db, None)?;
-                        Ok(start.elapsed().as_secs_f64() * 1000.0)
-                    })
+                let start = Instant::now();
+                let frame = events::snapshot(api, None, None, &mut HashMap::new())
                     .await
-                    .expect("snapshot measurement"),
-                );
+                    .expect("assembled snapshot");
+                std::hint::black_box(serde_json::to_vec(&frame).expect("serialized snapshot"));
+                values.push(start.elapsed().as_secs_f64() * 1000.0);
             }
             values.sort_by(f64::total_cmp);
             values[3]
         }
-        let normal = snapshot_ms(&room).await;
-        let to = agents[0];
-        let recipient = json(&to).expect("recipient");
-        room.call(move|s|{let tx=s.db.transaction()?;tx.execute("UPDATE deliveries SET state='queued' WHERE msg_seq<=200000",[])?;tx.execute("UPDATE messages SET recipient=? WHERE seq<=200000",[recipient])?;
-            // The fixture changes immutable metadata only before measurement, then rebuilds its aggregate.
-            tx.execute("DELETE FROM mail_edges",[])?;tx.execute("INSERT INTO mail_edges SELECT m.sender,m.recipient,d.state,COUNT(*) FROM messages m JOIN deliveries d ON d.message_id=m.id GROUP BY m.sender,m.recipient,d.state",[])?;tx.commit()?;while s.db.query_row("SELECT COUNT(*) FROM mail_events",[],|r|r.get::<_,i64>(0))?>65536 {prune(&mut s.db)?;}Ok(())}).await.expect("dormant backlog");
-        let backlog = snapshot_ms(&room).await;
-        let baseline = sample(&room, to, "baseline").await;
-        room.call(|s| prune(&mut s.db))
-            .await
-            .expect("prune baseline before replay anchor");
         let broker =
             Arc::new(Broker::new(room.clone(), vec![], Default::default()).expect("broker"));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -647,6 +713,17 @@ mod gate {
             control_path: dir.path().join("control.sock"),
             ui_url: None,
         });
+        let normal = snapshot_ms(&api).await;
+        let to = agents[0];
+        let recipient = json(&to).expect("recipient");
+        room.call(move|s|{let tx=s.db.transaction()?;tx.execute("UPDATE deliveries SET state='queued' WHERE msg_seq<=200000",[])?;tx.execute("UPDATE messages SET recipient=? WHERE seq<=200000",[recipient])?;
+            // The fixture changes immutable metadata only before measurement, then rebuilds its aggregate.
+            tx.execute("DELETE FROM mail_edges",[])?;tx.execute("INSERT INTO mail_edges SELECT m.sender,m.recipient,d.state,COUNT(*) FROM messages m JOIN deliveries d ON d.message_id=m.id GROUP BY m.sender,m.recipient,d.state",[])?;tx.commit()?;while s.db.query_row("SELECT COUNT(*) FROM mail_events",[],|r|r.get::<_,i64>(0))?>65536 {prune(&mut s.db)?;}Ok(())}).await.expect("dormant backlog");
+        let backlog = snapshot_ms(&api).await;
+        let baseline = sample(&room, to, "baseline").await;
+        room.call(|s| prune(&mut s.db))
+            .await
+            .expect("prune baseline before replay anchor");
         let anchor = room
             .observe(|s| {
                 Ok(s.db.query_row(
@@ -662,104 +739,162 @@ mod gate {
             })
             .await
             .expect("anchor");
-        let mut tasks = tokio::task::JoinSet::new();
-        let replayed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut tasks = tokio::task::JoinSet::<crate::surfaces::Result<()>>::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let load = Arc::new(Load::default());
         for n in 0..8 {
             let api = api.clone();
-            let replayed = replayed.clone();
             let anchor = anchor.clone();
+            let load = load.clone();
+            let cancel = cancel.clone();
             tasks.spawn(async move {
-                let _permit = events::subscribe().expect("subscriber");
+                let _permit=events::subscribe()?;
                 loop {
-                    let mut sink = Discard {
-                        replayed: if n == 0 { Some(replayed.clone()) } else { None },
-                    };
-                    if n == 0 {
-                        events::feed(&api, &mut sink, Some(anchor.clone()))
-                            .await
-                            .expect("backlog feed");
-                        return;
-                    }
-
-                    if let Ok(Err(e)) = tokio::time::timeout(
-                        Duration::from_millis(if n == 0 { 2000 } else { 100 }),
-                        events::feed(
-                            &api,
-                            &mut sink,
-                            if n == 0 { Some(anchor.clone()) } else { None },
-                        ),
-                    )
-                    .await
-                    {
-                        panic!("feed: {e}");
+                    let mut sink=Serialized{load:load.clone(),replay:n==0};
+                    if n==0 {return tokio::select!{_=cancel.cancelled()=>Ok(()),r=events::feed(&api,&mut sink,Some(anchor.clone()))=>{r?;Err("backlog feed ended unexpectedly".into())}};}
+                    tokio::select! {
+                        _=cancel.cancelled()=>return Ok(()),
+                        r=tokio::time::timeout(Duration::from_millis(250),events::feed(&api,&mut sink,None))=>{
+                            if let Ok(result)=r {result?;return Err("reconnecting feed ended unexpectedly".into());}
+                            load.reconnects[n-1].fetch_add(1,Relaxed);
+                        }
                     }
                 }
             });
         }
         for n in 0..8 {
             let room = room.clone();
+            let load = load.clone();
+            let cancel = cancel.clone();
             tasks.spawn(async move {
                 loop {
-                    for states in [
-                        vec!["held".into(), "uncertain".into()],
-                        vec!["queued".into(), "offered".into()],
-                    ] {
-                        room.mail_query(MailQuery {
-                            states,
-                            limit: 1000,
-                            ..Default::default()
-                        })
-                        .await
-                        .expect("view");
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let query = async {
+                        for states in [
+                            vec!["held".into(), "uncertain".into()],
+                            vec!["queued".into(), "offered".into()],
+                        ] {
+                            let rows = room
+                                .mail_query(MailQuery {
+                                    states,
+                                    limit: 1000,
+                                    ..Default::default()
+                                })
+                                .await?;
+                            std::hint::black_box(serde_json::to_vec(&rows)?);
+                        }
+                        load.views[n].fetch_add(1, Relaxed);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+                    };
+                    tokio::select! {_=cancel.cancelled()=>return Ok(()),r=query=>r?}
                 }
             });
-            let _ = n;
         }
         for rare in [false, true] {
             let room = room.clone();
+            let load = load.clone();
+            let cancel = cancel.clone();
             tasks.spawn(async move {
                 loop {
-                    if rare {
-                        room.mail_query(MailQuery {
-                            from: Some("no such sender".into()),
-                            limit: 1000,
-                            ..Default::default()
-                        })
-                        .await
-                        .expect("rare query");
-                    } else {
-                        room.observed_agents().await.expect("list_agents");
-                    }
+                    let query = async {
+                        if rare {
+                            let rows = room
+                                .mail_query(MailQuery {
+                                    from: Some("no such sender".into()),
+                                    limit: 1000,
+                                    ..Default::default()
+                                })
+                                .await?;
+                            std::hint::black_box(serde_json::to_vec(&rows)?);
+                            load.rare.fetch_add(1, Relaxed);
+                        } else {
+                            room.observed_agents().await?;
+                            load.lists.fetch_add(1, Relaxed);
+                        }
+                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+                    };
+                    tokio::select! {_=cancel.cancelled()=>return Ok(()),r=query=>r?}
                 }
             });
         }
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while replayed.load(std::sync::atomic::Ordering::Relaxed) < 256 {
-                tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !load.ready() {
+                if let Some(result) = tasks.try_join_next() {
+                    result.expect("workload panicked").expect("workload failed");
+                    panic!("workload ended before measurement");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("replay starts before pruning");
-        // Begin with pruning due while the observers contend with the real accept path.
-        room.call(|s| {
-            s.last_prune = 0;
-            Ok(())
-        })
-        .await
-        .expect("activate pruning");
+        .expect("all workload classes must be active");
+        let first_head=room.call(|s| {
+            s.db.execute("UPDATE deliveries SET attempts=attempts+1 WHERE msg_seq BETWEEN 200001 AND 206000",[])?;
+            let head=head(&s.db)?;s.last_prune=head-1023;s.prunes.clear();Ok(head)
+        }).await.expect("stage real delivery events for sampled pruning");
+        let before_counts = load.counts();
         let loaded = sample(&room, to, "loaded").await;
+        let during_counts = load
+            .counts()
+            .into_iter()
+            .zip(before_counts)
+            .map(|(after, before)| after - before)
+            .collect::<Vec<_>>();
+        println!("GATE iterations_inside_accept_window={during_counts:?}");
+        let (last_head, prunes) = room
+            .observe(|s| Ok((head(&s.db)?, s.prunes.clone())))
+            .await
+            .expect("sampled pruning evidence");
+        let sampled_prunes = prunes
+            .into_iter()
+            .filter(|(seq, _)| *seq > first_head && *seq <= last_head)
+            .collect::<Vec<_>>();
+        println!(
+            "GATE sampled_accept_seq_window={first_head}..{last_head} prunes={sampled_prunes:?}"
+        );
+        assert!(
+            sampled_prunes.iter().any(|(_, deleted)| *deleted >= 4000),
+            "multi-thousand-row prune did not land in accept samples"
+        );
         tokio::time::timeout(Duration::from_secs(60), async {
-            while replayed.load(std::sync::atomic::Ordering::Relaxed) < 65535 {
+            while load.replayed.load(Relaxed) < 65535 {
+                if let Some(result) = tasks.try_join_next() {
+                    result.expect("workload panicked").expect("workload failed");
+                    panic!("workload ended during replay");
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("full retained replay completes under observer load");
-        let replayed = replayed.load(std::sync::atomic::Ordering::Relaxed);
-        println!("GATE retained_backlog_frames_replayed={replayed}");
-        tasks.shutdown().await;
+        cancel.cancel();
+        let completed = drain_workloads(&mut tasks)
+            .await
+            .expect("every workload task must succeed");
+        assert_eq!(completed, 18, "every workload must finish cleanly");
+        assert!(load.ready(), "minimum workload iterations missing");
+        let minimums = [vec![2; 7], vec![1; 8], vec![20, 20, 256]].concat();
+        for (class, (actual, minimum)) in during_counts.iter().zip(minimums).enumerate() {
+            assert!(
+                *actual >= minimum,
+                "workload class {class} absent from sampled accepts: {actual} < {minimum}"
+            );
+        }
+        println!(
+            "GATE current_thread=true snapshot_includes_serialization=true accept_samples_per_lane=2048 retained_backlog_frames_replayed={} reconnect_iterations={:?} view_iterations={:?} rare_queries={} list_queries={} checked_workload_results={completed}",
+            load.replayed.load(Relaxed),
+            load.reconnects
+                .iter()
+                .map(|n| n.load(Relaxed))
+                .collect::<Vec<_>>(),
+            load.views
+                .iter()
+                .map(|n| n.load(Relaxed))
+                .collect::<Vec<_>>(),
+            load.rare.load(Relaxed),
+            load.lists.load(Relaxed)
+        );
         drop(api);
         println!(
             "GATE snapshot_median_ms={normal:.3} target_ms=100 backlog_200000_snapshot_median_ms={backlog:.3} target_ms=100"
@@ -1014,6 +1149,145 @@ mod durability_tests {
         assert!(room.mark_offered(&ids, Incarnation(2)).await.is_err());
         let after = room.mail_snapshot(None).await.expect("snapshot");
         assert_eq!(before, after, "rolled-back trigger work leaked");
+        room.close().await.expect("close");
+    }
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+    #[tokio::test]
+    async fn failed_prune_keeps_worker_alive_and_retries() {
+        let dir = tempfile::tempdir().expect("dir");
+        let room = Mailroom::open(dir.path().join("mail.db"), Config::default())
+            .await
+            .expect("room");
+        let to = room
+            .register(AgentName::parse("a").expect("name"))
+            .await
+            .expect("agent");
+        room.call(|s|{s.db.execute_batch("CREATE TRIGGER fail_prune BEFORE DELETE ON mail_events BEGIN SELECT RAISE(FAIL,'induced prune failure'); END; WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<70000) INSERT INTO mail_events(nonce,message_id,state,turn_started,attempts,at) SELECT 'nonce','fixture','queued',0,0,'at' FROM n;")?;Ok(())}).await.expect("induce prune failure");
+        room.call(|s| {
+            assert_eq!(s.last_prune, 0, "failed prune advanced checkpoint");
+            s.db.execute_batch("DROP TRIGGER fail_prune")?;
+            Ok(())
+        })
+        .await
+        .expect("worker serves after failed prune");
+        room.accept(NewMessage {
+            from: Sender::Human,
+            to,
+            body: Body::new("after prune error").expect("body"),
+            reply_to: None,
+            client_key: ClientKey("later".into()),
+            act: Act::Inform,
+            task: None,
+        })
+        .await
+        .expect("later accept survives maintenance failure");
+        room.observe(|s| {
+            assert_eq!(s.last_prune, 70001);
+            Ok(())
+        })
+        .await
+        .expect("successful retry checkpoint");
+        room.close().await.expect("close");
+    }
+}
+
+#[cfg(test)]
+mod state_filter_tests {
+    use super::*;
+    #[test]
+    fn repeated_states_have_the_same_query_work_as_one_state() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().expect("dir");
+        let s = Store::open(&dir.path().join("mail.db"), Config::default()).expect("store");
+        let steps = Arc::new(AtomicUsize::new(0));
+        let count = steps.clone();
+        s.db.progress_handler(
+            1,
+            Some(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                false
+            }),
+        );
+        let one = query(
+            &s.db,
+            &MailQuery {
+                states: vec!["queued".into()],
+                limit: 1000,
+                ..Default::default()
+            },
+        )
+        .expect("single state");
+        let single = steps.swap(0, Ordering::SeqCst);
+        let many = query(
+            &s.db,
+            &MailQuery {
+                states: vec!["queued".into(); 499],
+                limit: 1000,
+                ..Default::default()
+            },
+        )
+        .expect("repeated states");
+        let repeated = steps.load(Ordering::SeqCst);
+        assert_eq!(one, many);
+        assert!(
+            repeated <= single * 2,
+            "duplicate states multiplied query work: one={single}, repeated={repeated}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod head_failure_tests {
+    use super::*;
+    #[tokio::test]
+    async fn head_read_failure_does_not_close_worker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().expect("dir");
+        let room = Mailroom::open(dir.path().join("mail.db"), Config::default())
+            .await
+            .expect("room");
+        let to = room
+            .register(AgentName::parse("a").expect("name"))
+            .await
+            .expect("agent");
+        let fail = Arc::new(AtomicBool::new(true));
+        let flag = fail.clone();
+        room.call(move |s| {
+            s.db.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(
+                    ctx.action,
+                    rusqlite::hooks::AuthAction::Read {
+                        table_name: "sqlite_sequence",
+                        ..
+                    }
+                ) && flag.swap(false, Ordering::SeqCst)
+                {
+                    rusqlite::hooks::Authorization::Deny
+                } else {
+                    rusqlite::hooks::Authorization::Allow
+                }
+            }));
+            s.db.execute("UPDATE agents SET epoch=epoch+1", [])?;
+            Ok(())
+        })
+        .await
+        .expect("install one-shot head failure");
+        room.accept(NewMessage {
+            from: Sender::Human,
+            to,
+            body: Body::new("after head error").expect("body"),
+            reply_to: None,
+            client_key: ClientKey("head-recovery".into()),
+            act: Act::Inform,
+            task: None,
+        })
+        .await
+        .expect("later accept survives head failure");
+        assert!(!fail.load(Ordering::SeqCst));
         room.close().await.expect("close");
     }
 }
