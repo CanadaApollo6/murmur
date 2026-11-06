@@ -13,8 +13,11 @@ import {
 } from "../graph/model";
 import { Command } from "./Command";
 import styles from "./panels.module.css";
+import { RefreshThrottle } from "./refresh";
 
 const EDGE_PAGE = 50;
+/** The server's limit on one `/mail` page. */
+const EDGE_READ_MAX = 1000;
 /** A display-only view: it refreshes at most this often while traffic flows. */
 const EDGE_REFRESH_MS = 2000;
 
@@ -168,16 +171,15 @@ function EdgeDetail({
   const [next, setNext] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [failure, setFailure] = useState<string | null>(null);
-  const [pagesLoaded, setPagesLoaded] = useState(1);
   const generation = useRef(0);
+  const shown = useRef<MailRow[]>([]);
+  const olderRead = useRef<Promise<void> | null>(null);
 
-  // A short or empty page may still have a continuation, so a page is read until
-  // it shows something or the listing ends. Never enters mail state.
+  // A short or empty page may still have a continuation, so a read goes on until
+  // it has `wanted` rows or the listing ends. Never enters mail state.
   const read = useCallback(
-    async (before: number | null, replace: boolean) => {
+    async (before: number | null, wanted: number, replace: boolean) => {
       const mine = ++generation.current;
-      setLoading(true);
-      setFailure(null);
       try {
         const found: MailRow[] = [];
         let cursor = before;
@@ -185,7 +187,12 @@ function EdgeDetail({
           const query = new URLSearchParams({
             from,
             to,
-            limit: String(EDGE_PAGE),
+            limit: String(
+              Math.min(
+                EDGE_READ_MAX,
+                Math.max(EDGE_PAGE, wanted - found.length),
+              ),
+            ),
           });
           if (cursor !== null) {
             query.set("before_msg_seq", String(cursor));
@@ -196,12 +203,15 @@ function EdgeDetail({
           }
           found.push(...page.rows);
           cursor = page.next_before_msg_seq;
-          if (found.length > 0 || cursor === null) {
+          if (found.length >= wanted || cursor === null) {
             break;
           }
         }
-        setRows((current) => (replace ? found : [...current, ...found]));
+        const merged = replace ? found : [...shown.current, ...found];
+        shown.current = merged;
+        setRows(merged);
         setNext(cursor);
+        setFailure(null);
         setLoading(false);
       } catch (error) {
         if (generation.current !== mine) {
@@ -218,30 +228,44 @@ function EdgeDetail({
   );
 
   useEffect(() => {
-    setRows([]);
-    setNext(null);
-    setPagesLoaded(1);
-    void read(null, true);
+    void read(null, 1, true);
     return () => {
       generation.current += 1;
     };
   }, [read]);
 
-  // While only the first page is showing, follow the traffic on this edge.
-  const signature = edge
-    ? `${edge.total}:${edge.stuck}:${edge.live}:${edge.counts.consumed}`
-    : "";
-  const firstSignature = useRef(signature);
+  // A row can change with no count changing (`queued` to `offered`), so the edge's
+  // revision is what says to look again. It is read again on reconnect as well,
+  // since a resume delivers its missed frames after this edge last looked.
+  const throttle = useRef<RefreshThrottle | null>(null);
   useEffect(() => {
-    if (signature === firstSignature.current || pagesLoaded > 1) {
-      return;
+    const refresh = new RefreshThrottle(
+      async () => {
+        // A refresh would cancel a read of older rows, and then cover them.
+        await olderRead.current;
+        await read(null, Math.max(1, shown.current.length), true);
+      },
+      EDGE_REFRESH_MS,
+      {
+        now: () => Date.now(),
+        setTimeout: (callback, ms) => window.setTimeout(callback, ms),
+        clearTimeout: (handle) => window.clearTimeout(handle),
+      },
+    );
+    throttle.current = refresh;
+    return () => refresh.dispose();
+  }, [read]);
+  const live = state.link === "live";
+  const revision = state.edgeRevision[edgeKey(from, to)] ?? 0;
+  const seen = useRef({ live, revision });
+  useEffect(() => {
+    const changed =
+      revision !== seen.current.revision || (live && !seen.current.live);
+    seen.current = { live, revision };
+    if (changed && live) {
+      throttle.current?.invalidate();
     }
-    const timer = window.setTimeout(() => {
-      firstSignature.current = signature;
-      void read(null, true);
-    }, EDGE_REFRESH_MS);
-    return () => window.clearTimeout(timer);
-  }, [signature, pagesLoaded, read]);
+  }, [live, revision]);
 
   return (
     <div data-testid="edge-detail">
@@ -268,8 +292,10 @@ function EdgeDetail({
           type="button"
           className={styles.more}
           onClick={() => {
-            setPagesLoaded(pagesLoaded + 1);
-            void read(next, false);
+            setLoading(true);
+            olderRead.current = read(next, EDGE_PAGE, false).finally(() => {
+              olderRead.current = null;
+            });
           }}
         >
           Load older messages
