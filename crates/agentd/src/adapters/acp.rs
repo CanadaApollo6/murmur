@@ -613,3 +613,100 @@ fn string(value: &Value, key: &str) -> Result<String, AdapterError> {
         .map(Into::into)
         .ok_or_else(|| protocol(format!("missing {key}")))
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    type Incoming = mpsc::Sender<Result<Value, String>>;
+
+    const PROMPT: u64 = 1;
+
+    /// A session that asked its agent to cancel `PROMPT`, with the agent's stdout in the test's hands.
+    fn cancelling_session() -> (AcpSession, Incoming) {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn stand-in agent");
+        let stdin = child.stdin.take().expect("stand-in stdin");
+        let (incoming, rx) = mpsc::channel(64);
+        let kind = KindConfig::claude("cat");
+        let session = AcpSession {
+            child,
+            process_group: None,
+            stdin,
+            reader: tokio::spawn(async {}),
+            stderr_reader: tokio::spawn(async {}),
+            stderr: Arc::new(Mutex::new(VecDeque::new())),
+            secret: None,
+            rx,
+            events: VecDeque::new(),
+            session_id: "session".into(),
+            agent: AgentId::new(),
+            incarnation: Incarnation(1),
+            resumable: false,
+            next_id: PROMPT + 1,
+            flight: Some(Flight {
+                request: PROMPT,
+                ids: Vec::new(),
+                started: true,
+                cancel_deadline: Some(Instant::now() + kind.cancel_timeout),
+            }),
+            pending: HashMap::new(),
+            ended: false,
+            kind,
+        };
+        (session, incoming)
+    }
+
+    fn cancelled() -> Result<Value, String> {
+        Ok(json!({"jsonrpc":"2.0","id":PROMPT,"result":{"stopReason":"cancelled"}}))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_that_arrived_before_the_cancel_deadline_counts_when_polled_late() {
+        let (mut session, incoming) = cancelling_session();
+        incoming.send(cancelled()).await.expect("queue response");
+        tokio::time::advance(session.kind.cancel_timeout * 2).await;
+        let event = session.next_event().await;
+        assert!(
+            matches!(event, Some(SessionEvent::Committed { .. })),
+            "the agent answered in time, but the session reported {event:?}"
+        );
+        let event = session.next_event().await;
+        assert!(
+            matches!(
+                event,
+                Some(SessionEvent::TurnEnded {
+                    outcome: TurnOutcome::Cancelled
+                })
+            ),
+            "the agent answered in time, but the session reported {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_that_arrived_after_the_cancel_deadline_does_not_count() {
+        let (mut session, incoming) = cancelling_session();
+        tokio::time::advance(session.kind.cancel_timeout * 2).await;
+        incoming.send(cancelled()).await.expect("queue response");
+        let event = session.next_event().await;
+        assert!(
+            matches!(&event, Some(SessionEvent::Ended { reason }) if reason.contains("cancel completion deadline exceeded")),
+            "the agent answered late, but the session reported {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_agent_times_out_the_cancel() {
+        let (mut session, _incoming) = cancelling_session();
+        let event = session.next_event().await;
+        assert!(
+            matches!(&event, Some(SessionEvent::Ended { reason }) if reason.contains("cancel completion deadline exceeded")),
+            "a silent agent must time out, but the session reported {event:?}"
+        );
+    }
+}

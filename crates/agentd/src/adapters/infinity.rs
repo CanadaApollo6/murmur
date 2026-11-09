@@ -727,3 +727,109 @@ impl Drop for InfinitySession {
         self.connection.abort();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Incoming = mpsc::Sender<Result<DaemonMessage, String>>;
+
+    /// A session whose root thread is busy, with the daemon's side of the socket in the test's hands.
+    fn busy_session() -> (
+        InfinitySession,
+        Incoming,
+        mpsc::UnboundedReceiver<ClientMessage>,
+    ) {
+        let (tx, outgoing) = mpsc::unbounded_channel();
+        let (incoming, rx) = mpsc::channel(64);
+        let session = InfinitySession {
+            kind: KindConfig::infinity("unused.sock"),
+            root: ThreadRef::local("root".into()),
+            agent: AgentId::new(),
+            incarnation: Incarnation(1),
+            connection: tokio::spawn(async {}),
+            tx,
+            rx,
+            events: VecDeque::new(),
+            thread_busy: true,
+            pending: HashMap::new(),
+            receipt_deadline: None,
+            choices: HashMap::new(),
+            cancel_deadline: None,
+            ended: false,
+            boot_id: String::new(),
+            needs_interrupt: false,
+        };
+        (session, incoming, outgoing)
+    }
+
+    fn idle(session: &InfinitySession) -> Result<DaemonMessage, String> {
+        Ok(DaemonMessage::ThreadIdle {
+            thread_id: Some(session.root.clone()),
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_that_arrived_before_the_cancel_deadline_counts_when_polled_late() {
+        let (mut session, incoming, _outgoing) = busy_session();
+        session.cancel().await.expect("cancel");
+        incoming.send(idle(&session)).await.expect("queue idle");
+        tokio::time::advance(session.kind.cancel_timeout * 2).await;
+        let event = session.next_event().await;
+        assert!(
+            matches!(
+                event,
+                Some(SessionEvent::TurnEnded {
+                    outcome: TurnOutcome::Cancelled
+                })
+            ),
+            "the daemon answered in time, but the session reported {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_that_arrived_before_the_receipt_deadline_counts_when_polled_late() {
+        let (mut session, incoming, _outgoing) = busy_session();
+        let id = MessageId::new();
+        session.thread_busy = false;
+        session.pending.insert(id, false);
+        session.receipt_deadline = Some(Instant::now() + session.kind.request_timeout);
+        incoming
+            .send(Ok(DaemonMessage::InputCommitted {
+                thread_id: Some(session.root.clone()),
+                dedup_id: format!("peer-{id}"),
+            }))
+            .await
+            .expect("queue receipt");
+        tokio::time::advance(session.kind.request_timeout * 2).await;
+        let event = session.next_event().await;
+        assert!(
+            matches!(&event, Some(SessionEvent::TurnStarted { ids }) if ids == &[id]),
+            "the daemon committed in time, but the session reported {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_that_arrived_after_the_cancel_deadline_does_not_count() {
+        let (mut session, incoming, _outgoing) = busy_session();
+        session.cancel().await.expect("cancel");
+        tokio::time::advance(session.kind.cancel_timeout * 2).await;
+        incoming.send(idle(&session)).await.expect("queue idle");
+        let event = session.next_event().await;
+        assert!(
+            matches!(event, Some(SessionEvent::CancelTimedOut)),
+            "the daemon answered late, but the session reported {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_daemon_times_out_the_cancel() {
+        let (mut session, _incoming, _outgoing) = busy_session();
+        session.cancel().await.expect("cancel");
+        let event = session.next_event().await;
+        assert!(
+            matches!(event, Some(SessionEvent::CancelTimedOut)),
+            "a silent daemon must time out, but the session reported {event:?}"
+        );
+    }
+}
