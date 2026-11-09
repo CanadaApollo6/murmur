@@ -2406,6 +2406,16 @@ async fn r12a_shutdown_recovery_usage_case(report_usage: bool) {
             tokio::time::timeout(Duration::from_secs(2), h.ctrl.next_request())
                 .await
                 .expect("first recovery");
+            // The stopped driver resumes inference by itself, before agentd reconnects.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while h.manager.lock().await.list_sessions(None).await[&root].status
+                    == SessionStatus::Stopped
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("agentd reconnects the stopped root");
             for round in 0..6 {
                 let status = h.manager.lock().await.list_sessions(None).await[&root]
                     .status
