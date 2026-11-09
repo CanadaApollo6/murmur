@@ -1887,7 +1887,8 @@ async fn r10a_choice_write_failure_has_bounded_recovery() {
             std::fs::rename(&saved, &state_path).expect("repair state");
             let sent = broker.send(human("mail after repaired choice write")).await.expect("later mail");
             let next = tokio::time::timeout(Duration::from_secs(4), h.ctrl.next_request()).await;
-            eprintln!("phase after repair: {:?}; permissions: {:?}; delivery: {:?}", phases.borrow().clone(), agent.pending_permissions().await.expect("permissions"), mailroom.delivery(sent.1.id()).await.expect("delivery").state);
+            let phase = phases.borrow().clone();
+            eprintln!("phase after repair: {phase:?}; permissions: {:?}; delivery: {:?}", agent.pending_permissions().await.expect("permissions"), mailroom.delivery(sent.1.id()).await.expect("delivery").state);
             assert!(next.is_ok(), "single failed choice write must not leave all later broker mail blocked after storage is repaired");
             h.ctrl.send_text("done"); h.ctrl.finish();
             broker.shutdown().await.expect("shutdown"); accept.abort();
