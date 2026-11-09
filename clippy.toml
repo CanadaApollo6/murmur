@@ -1,2 +1,8 @@
 # clippy::unwrap_used is enforced via workspace lints in Cargo.toml.
 # This file provides additional clippy configuration.
+
+# A `watch::Ref` holds the channel's read lock. If it is alive across an `.await`
+# on a current-thread runtime, the next `send` on that thread waits for the lock forever.
+await-holding-invalid-types = [
+    { path = "tokio::sync::watch::Ref", reason = "it holds the watch channel's read lock; copy the value out before awaiting" },
+]
