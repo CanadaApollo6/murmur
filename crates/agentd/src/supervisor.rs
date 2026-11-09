@@ -949,6 +949,7 @@ impl AgentActor {
                 }
             }
             SessionEvent::CancelTimedOut => {
+                tracing::warn!(agent=%self.id, "cancel deadline expired, waiting for session recovery");
                 self.stop_session().await?;
                 self.unavailable_attempts = self.unavailable_attempts.saturating_add(1);
                 let since = self.interrupt_since.get_or_insert_with(Instant::now);
