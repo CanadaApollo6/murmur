@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use super::{Inbound, Inbox, inbox};
 use crate::adapter::*;
 use crate::model::*;
 
@@ -41,7 +41,7 @@ struct AcpSession {
     stderr_reader: JoinHandle<()>,
     stderr: Arc<Mutex<VecDeque<u8>>>,
     secret: Option<String>,
-    rx: mpsc::Receiver<Result<Value, String>>,
+    rx: Inbox<Result<Value, String>>,
     events: VecDeque<SessionEvent>,
     kind: KindConfig,
     session_id: String,
@@ -103,7 +103,7 @@ impl Adapter for AcpAdapter {
         let stdin = child.stdin.take().ok_or(AdapterError::Ended)?;
         let stdout = child.stdout.take().ok_or(AdapterError::Ended)?;
         let mut stderr_pipe = child.stderr.take().ok_or(AdapterError::Ended)?;
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = inbox(64);
         let stdout_secret = secret.clone();
         let reader = tokio::spawn(async move {
             let mut input = BufReader::new(stdout);
@@ -557,13 +557,11 @@ impl Session for AcpSession {
             let cancel_deadline = self.flight.as_ref().and_then(|f| f.cancel_deadline);
             let incoming = tokio::select! {
                 biased;
-                () = async {
-                    match cancel_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                } => Err("ACP cancel completion deadline exceeded".into()),
-                msg = self.rx.recv() => msg.unwrap_or_else(|| Err("ACP stdout closed".into())),
+                inbound = self.rx.recv_by(cancel_deadline) => match inbound {
+                    Inbound::Message(message) => message,
+                    Inbound::Closed => Err("ACP stdout closed".into()),
+                    Inbound::Expired => Err("ACP cancel completion deadline exceeded".into()),
+                },
                 status = self.child.wait() => Err(format!("ACP exited: {status:?}")),
             };
             let result = match incoming {
@@ -617,8 +615,9 @@ fn string(value: &Value, key: &str) -> Result<String, AdapterError> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::adapters::InboxSender;
 
-    type Incoming = mpsc::Sender<Result<Value, String>>;
+    type Incoming = InboxSender<Result<Value, String>>;
 
     const PROMPT: u64 = 1;
 
@@ -632,7 +631,7 @@ mod tests {
             .spawn()
             .expect("spawn stand-in agent");
         let stdin = child.stdin.take().expect("stand-in stdin");
-        let (incoming, rx) = mpsc::channel(64);
+        let (incoming, rx) = inbox(64);
         let kind = KindConfig::claude("cat");
         let session = AcpSession {
             child,
@@ -697,6 +696,18 @@ mod tests {
         assert!(
             matches!(&event, Some(SessionEvent::Ended { reason }) if reason.contains("cancel completion deadline exceeded")),
             "the agent answered late, but the session reported {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn agent_that_exits_during_a_cancel_ends_the_session_before_the_deadline() {
+        let (mut session, _incoming) = cancelling_session();
+        session.child.start_kill().expect("kill stand-in agent");
+        session.child.wait().await.expect("reap stand-in agent");
+        let event = session.next_event().await;
+        assert!(
+            matches!(&event, Some(SessionEvent::Ended { reason }) if reason.contains("ACP exited")),
+            "the agent exited, but the session reported {event:?}"
         );
     }
 
