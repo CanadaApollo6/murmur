@@ -155,10 +155,23 @@ async fn start_harness() -> Result<TestHarness, BoxError> {
     start_harness_at(tempfile::tempdir()?, tempfile::tempdir()?).await
 }
 
+/// Sends warnings to the output that libtest captures, so a failed test shows why the
+/// supervisor retried or crashed its agent.
+fn log_warnings() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::WARN)
+            .init();
+    });
+}
+
 async fn start_harness_at(
     state_dir: tempfile::TempDir,
     cwd: tempfile::TempDir,
 ) -> Result<TestHarness, BoxError> {
+    log_warnings();
     let (model, ctrl) = mock_model();
     let entry = ModelEntry {
         model_id: "mock-model".to_owned(),
