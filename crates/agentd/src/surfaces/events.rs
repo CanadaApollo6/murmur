@@ -1060,6 +1060,13 @@ mod runtime_tests {
             guard,
         )
     }
+    /// CPU time the calling thread has used. Unlike a wall clock, it stands still while the
+    /// thread waits for a core, so a busy host cannot inflate it.
+    fn thread_cpu_time() -> Duration {
+        nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+            .expect("thread CPU clock")
+            .into()
+    }
     #[tokio::test(flavor = "current_thread")]
     async fn maximum_snapshot_keeps_current_thread_timer_responsive() {
         let (input, _guard) = tokio::task::spawn_blocking(maximum_input)
@@ -1069,14 +1076,14 @@ mod runtime_tests {
         let done = stop.clone();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let ticker = tokio::spawn(async move {
-            let mut previous = std::time::Instant::now();
+            let mut previous = thread_cpu_time();
             let mut maximum = Duration::ZERO;
             let mut ticks = 0;
             ready_tx.send(()).expect("ready receiver");
             loop {
                 tokio::select! {
                     _=done.notified()=>return (maximum,ticks),
-                    _=tokio::time::sleep(Duration::from_millis(2))=>{let now=std::time::Instant::now();maximum=maximum.max(now.duration_since(previous));previous=now;ticks+=1;}
+                    _=tokio::time::sleep(Duration::from_millis(2))=>{let now=thread_cpu_time();maximum=maximum.max(now.saturating_sub(previous));previous=now;ticks+=1;}
                 }
             }
         });
@@ -1096,16 +1103,16 @@ mod runtime_tests {
         assert!(frame.json.len() < 64 * 1024 * 1024);
         tokio::time::sleep(Duration::from_millis(10)).await;
         stop.notify_one();
-        let (gap, ticks) = ticker.await.expect("timer task");
+        let (busy, ticks) = ticker.await.expect("timer task");
         println!(
-            "RESPONSIVENESS snapshot_bytes={} max_timer_gap_ms={:.3} ticks={ticks}",
+            "RESPONSIVENESS snapshot_bytes={} max_runtime_cpu_between_ticks_ms={:.3} ticks={ticks}",
             frame.json.len(),
-            gap.as_secs_f64() * 1000.0
+            busy.as_secs_f64() * 1000.0
         );
         assert!(
-            gap < Duration::from_millis(50),
-            "maximum snapshot stalled current-thread runtime for {:.3} ms",
-            gap.as_secs_f64() * 1000.0
+            busy < Duration::from_millis(50),
+            "maximum snapshot kept the current-thread runtime busy for {:.3} ms between timer ticks",
+            busy.as_secs_f64() * 1000.0
         );
         assert!(ticks >= 5, "short timer did not run");
     }

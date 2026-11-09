@@ -67,6 +67,9 @@ workspace = true
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "user", "fs", "dir"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31", features = ["time"] }
+
 [[bin]]
 name = "agentd-fake-acp"
 path = "tests/support/fake_acp.rs"
