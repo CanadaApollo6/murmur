@@ -442,3 +442,84 @@ async fn stop_and_restart_are_idempotent() {
     t.consumed(id).await;
     t.finish().await;
 }
+
+#[tokio::test]
+async fn shutdown_during_a_pending_restart_answers_it_and_starts_nothing() {
+    let mut t = Test::new(None).await;
+    let busy = t.send("ignore-cancel").await;
+    t.event(|e| matches!(e, Event::Started { ids, .. } if ids.contains(&busy)))
+        .await;
+    let (restart, shutdown) = {
+        let restart = t.broker.operate(t.agent.id, Operation::Restart);
+        tokio::pin!(restart);
+        tokio::select! {
+            biased;
+            result = &mut restart => panic!("restart finished before shutdown: {result:?}"),
+            () = t.barrier() => {}
+        }
+        tokio::join!(restart, t.broker.shutdown())
+    };
+    shutdown.expect("shutdown");
+    assert!(
+        restart.is_err(),
+        "a restart that shutdown interrupted must not report success"
+    );
+    let wire = t.wire();
+    assert_eq!(
+        count(&wire, "session/new"),
+        1,
+        "no fresh session after shutdown"
+    );
+    assert_eq!(count(&wire, "session/load"), 0);
+    assert!(
+        pids(&wire).iter().all(|p| !alive(*p)),
+        "no agent process outlives shutdown"
+    );
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn restart_of_a_busy_agent_cancels_the_turn_and_resumes() {
+    let mut t = Test::new(None).await;
+    let busy = t.send("hold").await;
+    t.event(|e| matches!(e, Event::Started { ids, .. } if ids.contains(&busy)))
+        .await;
+    let first = pids(&t.wire())[0];
+
+    t.operate(Operation::Restart).await;
+    assert_eq!(t.agent.phase(), Phase::Idle);
+    assert_eq!(t.state(busy).await, DeliveryState::Consumed);
+    assert!(!alive(first), "restart ends the old process");
+    let wire = t.wire();
+    assert_eq!(pids(&wire).len(), 2);
+    assert_eq!(count(&wire, "session/load"), 1, "restart resumes");
+    assert_eq!(count(&wire, "session/new"), 1);
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn restart_after_a_stop_from_needs_recovery_opens_a_fresh_session() {
+    let mut t = Test::new(Some(Duration::from_millis(25))).await;
+    let first = t.send("first").await;
+    t.consumed(first).await;
+    t.phase(|p| *p == Phase::Dormant).await;
+    std::fs::write(t.root.path().join("fail-load"), "").expect("flag");
+    let waiting = t.send("second").await;
+    t.phase(|p| matches!(p, Phase::NeedsRecovery { .. })).await;
+
+    t.operate(Operation::Stop).await;
+    t.operate(Operation::Restart).await;
+    t.consumed(waiting).await;
+    let wire = t.wire();
+    assert_eq!(
+        count(&wire, "session/new"),
+        2,
+        "stop then restart leaves NeedsRecovery like restart alone"
+    );
+    assert_eq!(
+        count(&wire, "session/load"),
+        1,
+        "only the failed resume loads"
+    );
+    t.finish().await;
+}

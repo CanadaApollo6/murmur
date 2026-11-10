@@ -1886,3 +1886,414 @@ mod cleanup_panic_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod halt_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+    const CANCEL: Duration = Duration::from_millis(100);
+
+    /// A session whose cancel is never acknowledged, so only the halt deadline ends a turn.
+    #[derive(Default)]
+    struct Script {
+        opens: AtomicUsize,
+        resumed: AtomicUsize,
+        submits: AtomicUsize,
+        cancels: AtomicUsize,
+        failing_suspends: AtomicUsize,
+        /// Work the agent runs that agentd did not submit.
+        thread_busy: AtomicBool,
+        accepts_busy_mail: AtomicBool,
+        cancel_times_out: AtomicBool,
+    }
+    struct Scripted(Arc<Script>);
+    struct ScriptedSession {
+        script: Arc<Script>,
+        tx: mpsc::UnboundedSender<SessionEvent>,
+        events: mpsc::UnboundedReceiver<SessionEvent>,
+    }
+    #[async_trait::async_trait]
+    impl Adapter for Scripted {
+        async fn open(
+            &self,
+            r: OpenRequest<'_>,
+        ) -> std::result::Result<Box<dyn Session>, AdapterError> {
+            self.0.opens.fetch_add(1, SeqCst);
+            if r.resume.is_some() {
+                self.0.resumed.fetch_add(1, SeqCst);
+            }
+            let (tx, events) = mpsc::unbounded_channel();
+            Ok(Box::new(ScriptedSession {
+                script: self.0.clone(),
+                tx,
+                events,
+            }))
+        }
+    }
+    #[async_trait::async_trait]
+    impl Session for ScriptedSession {
+        fn resume_token(&self) -> ResumeToken {
+            ResumeToken::encode(&"scripted")
+        }
+        fn resumable(&self) -> bool {
+            true
+        }
+        fn busy(&self) -> bool {
+            self.script.thread_busy.load(SeqCst)
+        }
+        fn accepts_busy_mail(&self) -> bool {
+            self.script.accepts_busy_mail.load(SeqCst)
+        }
+        async fn submit(&mut self, _: Turn) -> std::result::Result<(), AdapterError> {
+            self.script.submits.fetch_add(1, SeqCst);
+            Ok(())
+        }
+        async fn cancel(&mut self) -> std::result::Result<(), AdapterError> {
+            self.script.cancels.fetch_add(1, SeqCst);
+            if self.script.cancel_times_out.load(SeqCst) {
+                self.tx
+                    .send(SessionEvent::CancelTimedOut)
+                    .expect("bug: session owns its receiver");
+            }
+            Ok(())
+        }
+        async fn answer_permission(
+            &mut self,
+            _: PermissionId,
+            _: &str,
+        ) -> std::result::Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            self.events.recv().await
+        }
+        async fn suspend(self: Box<Self>) -> std::result::Result<ResumeToken, AdapterError> {
+            if self
+                .script
+                .failing_suspends
+                .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(AdapterError::Spawn("injected suspend failure".into()));
+            }
+            Ok(self.resume_token())
+        }
+    }
+
+    struct Harness {
+        _dir: tempfile::TempDir,
+        room: Arc<Mailroom>,
+        broker: Arc<Broker>,
+        script: Arc<Script>,
+        agent: AgentHandle,
+    }
+    async fn harness(infinity: bool) -> Harness {
+        let dir = tempfile::tempdir().expect("dir");
+        let room = Arc::new(
+            Mailroom::open(dir.path().join("mail.db"), Default::default())
+                .await
+                .expect("room"),
+        );
+        let mut kind = if infinity {
+            KindConfig::infinity(dir.path().join("unused.sock"))
+        } else {
+            KindConfig::claude("unused-fixture")
+        };
+        kind.isolation = crate::sandbox::Isolation::None;
+        kind.idle_after = None;
+        kind.cancel_timeout = CANCEL;
+        let mut broker = Broker::new(
+            room.clone(),
+            vec![kind.clone()],
+            Config {
+                backoff_initial: Duration::from_millis(1),
+                backoff_max: Duration::from_millis(1),
+                ..Default::default()
+            },
+        )
+        .expect("broker");
+        let script = Arc::new(Script::default());
+        broker.test_adapter = Some(Arc::new(Scripted(script.clone())));
+        let broker = Arc::new(broker);
+        let agent = broker
+            .spawn(AgentSpec {
+                name: AgentName::parse("a").expect("name"),
+                kind: kind.name.clone(),
+                cwd: dir.path().into(),
+                workspace: None,
+                model: None,
+                permissions: Default::default(),
+                idle_after: None,
+            })
+            .await
+            .expect("spawn");
+        let h = Harness {
+            _dir: dir,
+            room,
+            broker,
+            script,
+            agent,
+        };
+        h.wait(|p| *p == Phase::Idle).await;
+        h
+    }
+    impl Harness {
+        async fn wait(&self, matches: impl Fn(&Phase) -> bool) {
+            let mut phases = self.agent.phases();
+            tokio::time::timeout(Duration::from_secs(5), phases.wait_for(|p| matches(p)))
+                .await
+                .expect("phase timeout")
+                .expect("phase channel");
+        }
+        async fn send(&self, body: &str) -> MessageId {
+            self.broker
+                .send(NewMessage {
+                    from: Sender::Human,
+                    to: self.agent.id,
+                    body: Body::new(body).expect("body"),
+                    reply_to: None,
+                    client_key: ClientKey(ulid::Ulid::new().to_string()),
+                    act: crate::swarm::Act::Inform,
+                    task: None,
+                })
+                .await
+                .expect("send")
+                .1
+                .id()
+        }
+        /// Offers one message and leaves the turn running.
+        async fn busy(&self) -> MessageId {
+            let id = self.send("work").await;
+            self.wait(|p| *p == Phase::Busy).await;
+            assert!(matches!(
+                self.state(id).await,
+                DeliveryState::Offered { .. }
+            ));
+            id
+        }
+        async fn operate(&self, op: Operation) -> Result<()> {
+            tokio::time::timeout(CANCEL * 20, self.broker.operate(self.agent.id, op))
+                .await
+                .expect("operator command must finish within the halt deadline")
+        }
+        /// Every command sent before this one has been handled.
+        async fn barrier(&self) {
+            self.broker
+                .handle(self.agent.id)
+                .await
+                .expect("handle")
+                .pending_permissions()
+                .await
+                .expect("actor round trip");
+        }
+        async fn state(&self, id: MessageId) -> DeliveryState {
+            self.room.delivery(id).await.expect("delivery").state
+        }
+        async fn sql(&self, sql: &'static str) {
+            self.room
+                .observe(move |s| Ok(s.db.execute_batch(sql)?))
+                .await
+                .expect("inject SQL");
+        }
+        fn count(&self, counter: fn(&Script) -> &AtomicUsize) -> usize {
+            counter(&self.script).load(SeqCst)
+        }
+    }
+    /// Polls `operation` once so its command is queued, then waits until the actor took it.
+    async fn queue(h: &Harness, operation: std::pin::Pin<&mut impl Future<Output = Result<()>>>) {
+        tokio::select! {
+            biased;
+            result = operation => panic!("operation finished before its deadline: {result:?}"),
+            () = h.barrier() => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn halt_deadline_ends_a_turn_whose_cancel_is_never_acknowledged() {
+        for op in [Operation::Stop, Operation::Restart] {
+            let h = harness(false).await;
+            let mail = h.busy().await;
+            h.operate(op).await.expect("operator command");
+            assert_eq!(h.count(|s| &s.cancels), 1, "{op:?} cancels the turn");
+            match op {
+                Operation::Stop => {
+                    assert_eq!(h.agent.phase(), Phase::Stopped);
+                    assert_eq!(h.state(mail).await, DeliveryState::Queued);
+                    assert_eq!(h.count(|s| &s.opens), 1);
+                }
+                Operation::Restart => {
+                    assert_eq!(h.count(|s| &s.opens), 2);
+                    assert_eq!(
+                        h.count(|s| &s.resumed),
+                        1,
+                        "restart of a busy agent resumes its session"
+                    );
+                }
+            }
+            h.broker.shutdown().await.expect("shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn mail_sent_during_a_halt_is_not_offered_to_the_halting_session() {
+        for op in [Operation::Stop, Operation::Restart] {
+            let h = harness(false).await;
+            h.script.accepts_busy_mail.store(true, SeqCst);
+            h.busy().await;
+            let halt = h.broker.operate(h.agent.id, op);
+            tokio::pin!(halt);
+            queue(&h, halt.as_mut()).await;
+            let late = h.send("late").await;
+            h.barrier().await;
+            assert_eq!(h.state(late).await, DeliveryState::Queued, "{op:?}");
+            assert_eq!(h.count(|s| &s.submits), 1, "{op:?}");
+            tokio::time::timeout(CANCEL * 20, halt)
+                .await
+                .expect("halt deadline")
+                .expect("operator command");
+            h.broker.shutdown().await.expect("shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_halt_that_cannot_settle_says_so_and_a_repeat_repairs_it() {
+        const REFUSE: &str = "CREATE TEMP TRIGGER refuse_settle BEFORE UPDATE OF state ON deliveries WHEN OLD.state='offered' BEGIN SELECT RAISE(ABORT,'injected settlement failure'); END;";
+        for op in [Operation::Stop, Operation::Restart] {
+            for suspend_fails in [true, false] {
+                let case = format!("{op:?}, suspend fails: {suspend_fails}");
+                let h = harness(false).await;
+                let mail = h.busy().await;
+                if suspend_fails {
+                    h.script.failing_suspends.store(1, SeqCst);
+                } else {
+                    h.sql(REFUSE).await;
+                }
+                assert!(h.operate(op).await.is_err(), "{case}");
+                assert_ne!(h.agent.phase(), Phase::Stopped, "{case}");
+                assert_eq!(
+                    h.count(|s| &s.opens),
+                    1,
+                    "{case}: no session before settlement"
+                );
+                assert!(
+                    matches!(h.state(mail).await, DeliveryState::Offered { .. }),
+                    "{case}"
+                );
+                if !suspend_fails {
+                    h.sql("DROP TRIGGER temp.refuse_settle").await;
+                }
+                h.operate(op).await.expect("a repeated command settles");
+                match op {
+                    Operation::Stop => {
+                        assert_eq!(h.agent.phase(), Phase::Stopped, "{case}");
+                        assert_eq!(h.state(mail).await, DeliveryState::Queued, "{case}");
+                    }
+                    Operation::Restart => {
+                        assert_eq!(h.count(|s| &s.opens), 2, "{case}");
+                        assert_eq!(h.count(|s| &s.resumed), 1, "{case}");
+                        assert_ne!(
+                            h.state(mail).await,
+                            DeliveryState::Offered {
+                                incarnation: Incarnation(1)
+                            },
+                            "{case}"
+                        );
+                    }
+                }
+                h.broker.shutdown().await.expect("shutdown");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_reports_infinity_work_that_may_still_be_running() {
+        for timed_out in [false, true] {
+            let h = harness(true).await;
+            h.script.cancel_times_out.store(timed_out, SeqCst);
+            h.script.thread_busy.store(true, SeqCst);
+            let result = h.operate(Operation::Stop).await;
+            assert_eq!(
+                h.count(|s| &s.cancels),
+                1,
+                "stop interrupts daemon work agentd did not submit"
+            );
+            let error = result.expect_err("an unacknowledged interrupt is not a confirmed stop");
+            assert!(
+                error.to_string().contains("may still be running"),
+                "{error}"
+            );
+            h.broker.shutdown().await.expect("shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn operate_respawns_a_failed_actor_and_nothing_else() {
+        let h = harness(false).await;
+        h.sql("CREATE TEMP TRIGGER refuse_offer BEFORE UPDATE OF state ON deliveries WHEN NEW.state='offered' BEGIN SELECT RAISE(ABORT,'injected storage failure'); END;").await;
+        h.send("kills the actor").await;
+        tokio::time::timeout(Duration::from_secs(5), h.agent.commands.closed())
+            .await
+            .expect("actor dies");
+        assert!(matches!(h.agent.phase(), Phase::Failed { .. }));
+        h.sql("DROP TRIGGER temp.refuse_offer").await;
+
+        h.operate(Operation::Stop)
+            .await
+            .expect("stop respawns a failed actor");
+        let current = h.broker.handle(h.agent.id).await.expect("handle");
+        assert!(!current.commands.same_channel(&h.agent.commands));
+        assert_eq!(current.phase(), Phase::Stopped);
+        assert_eq!(h.count(|s| &s.opens), 1, "a stopped respawn opens nothing");
+        h.operate(Operation::Restart).await.expect("restart");
+        assert_eq!(h.count(|s| &s.opens), 2);
+        assert_eq!(
+            h.count(|s| &s.resumed),
+            0,
+            "leaving Failed through stop and restart is a fresh session"
+        );
+
+        h.broker.shutdown().await.expect("shutdown");
+        assert!(
+            h.operate(Operation::Restart).await.is_err(),
+            "an actor ended by shutdown is not respawned"
+        );
+        assert_eq!(h.count(|s| &s.opens), 2);
+    }
+
+    #[tokio::test]
+    async fn a_second_command_replaces_a_pending_halt_and_both_callers_hear() {
+        use Operation::{Restart, Stop};
+        for (first, second) in [
+            (Stop, Stop),
+            (Stop, Restart),
+            (Restart, Stop),
+            (Restart, Restart),
+        ] {
+            let case = format!("{first:?} then {second:?}");
+            let h = harness(false).await;
+            h.busy().await;
+            let a = h.broker.operate(h.agent.id, first);
+            tokio::pin!(a);
+            queue(&h, a.as_mut()).await;
+            let b = h.broker.operate(h.agent.id, second);
+            let (a, b) = tokio::time::timeout(CANCEL * 20, async { tokio::join!(a, b) })
+                .await
+                .expect("the first command's deadline bounds both");
+            a.expect("first caller");
+            b.expect("second caller");
+            assert_eq!(h.count(|s| &s.cancels), 1, "{case}");
+            match second {
+                Stop => {
+                    assert_eq!(h.agent.phase(), Phase::Stopped, "{case}");
+                    assert_eq!(h.count(|s| &s.opens), 1, "{case}");
+                }
+                Restart => {
+                    assert_eq!(h.count(|s| &s.opens), 2, "{case}");
+                    assert!(!h.room.stopped(h.agent.id).await.expect("flag"), "{case}");
+                }
+            }
+            h.broker.shutdown().await.expect("shutdown");
+        }
+    }
+}
