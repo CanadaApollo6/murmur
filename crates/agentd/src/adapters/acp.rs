@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use super::{Inbound, Inbox, inbox};
 use crate::adapter::*;
 use crate::model::*;
 
@@ -41,7 +41,7 @@ struct AcpSession {
     stderr_reader: JoinHandle<()>,
     stderr: Arc<Mutex<VecDeque<u8>>>,
     secret: Option<String>,
-    rx: mpsc::Receiver<Result<Value, String>>,
+    rx: Inbox<Result<Value, String>>,
     events: VecDeque<SessionEvent>,
     kind: KindConfig,
     session_id: String,
@@ -103,7 +103,7 @@ impl Adapter for AcpAdapter {
         let stdin = child.stdin.take().ok_or(AdapterError::Ended)?;
         let stdout = child.stdout.take().ok_or(AdapterError::Ended)?;
         let mut stderr_pipe = child.stderr.take().ok_or(AdapterError::Ended)?;
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = inbox(64);
         let stdout_secret = secret.clone();
         let reader = tokio::spawn(async move {
             let mut input = BufReader::new(stdout);
@@ -557,13 +557,11 @@ impl Session for AcpSession {
             let cancel_deadline = self.flight.as_ref().and_then(|f| f.cancel_deadline);
             let incoming = tokio::select! {
                 biased;
-                () = async {
-                    match cancel_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                } => Err("ACP cancel completion deadline exceeded".into()),
-                msg = self.rx.recv() => msg.unwrap_or_else(|| Err("ACP stdout closed".into())),
+                inbound = self.rx.recv_by(cancel_deadline) => match inbound {
+                    Inbound::Message(message) => message,
+                    Inbound::Closed => Err("ACP stdout closed".into()),
+                    Inbound::Expired => Err("ACP cancel completion deadline exceeded".into()),
+                },
                 status = self.child.wait() => Err(format!("ACP exited: {status:?}")),
             };
             let result = match incoming {
@@ -612,4 +610,114 @@ fn string(value: &Value, key: &str) -> Result<String, AdapterError> {
         .filter(|s| !s.is_empty())
         .map(Into::into)
         .ok_or_else(|| protocol(format!("missing {key}")))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::adapters::InboxSender;
+
+    type Incoming = InboxSender<Result<Value, String>>;
+
+    const PROMPT: u64 = 1;
+
+    /// A session that asked its agent to cancel `PROMPT`, with the agent's stdout in the test's hands.
+    fn cancelling_session() -> (AcpSession, Incoming) {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn stand-in agent");
+        let stdin = child.stdin.take().expect("stand-in stdin");
+        let (incoming, rx) = inbox(64);
+        let kind = KindConfig::claude("cat");
+        let session = AcpSession {
+            child,
+            process_group: None,
+            stdin,
+            reader: tokio::spawn(async {}),
+            stderr_reader: tokio::spawn(async {}),
+            stderr: Arc::new(Mutex::new(VecDeque::new())),
+            secret: None,
+            rx,
+            events: VecDeque::new(),
+            session_id: "session".into(),
+            agent: AgentId::new(),
+            incarnation: Incarnation(1),
+            resumable: false,
+            next_id: PROMPT + 1,
+            flight: Some(Flight {
+                request: PROMPT,
+                ids: Vec::new(),
+                started: true,
+                cancel_deadline: Some(Instant::now() + kind.cancel_timeout),
+            }),
+            pending: HashMap::new(),
+            ended: false,
+            kind,
+        };
+        (session, incoming)
+    }
+
+    fn cancelled() -> Result<Value, String> {
+        Ok(json!({"jsonrpc":"2.0","id":PROMPT,"result":{"stopReason":"cancelled"}}))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_that_arrived_before_the_cancel_deadline_counts_when_polled_late() {
+        let (mut session, incoming) = cancelling_session();
+        incoming.send(cancelled()).await.expect("queue response");
+        tokio::time::advance(session.kind.cancel_timeout * 2).await;
+        let event = session.next_event().await;
+        assert!(
+            matches!(event, Some(SessionEvent::Committed { .. })),
+            "the agent answered in time, but the session reported {event:?}"
+        );
+        let event = session.next_event().await;
+        assert!(
+            matches!(
+                event,
+                Some(SessionEvent::TurnEnded {
+                    outcome: TurnOutcome::Cancelled
+                })
+            ),
+            "the agent answered in time, but the session reported {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_that_arrived_after_the_cancel_deadline_does_not_count() {
+        let (mut session, incoming) = cancelling_session();
+        tokio::time::advance(session.kind.cancel_timeout * 2).await;
+        incoming.send(cancelled()).await.expect("queue response");
+        let event = session.next_event().await;
+        assert!(
+            matches!(&event, Some(SessionEvent::Ended { reason }) if reason.contains("cancel completion deadline exceeded")),
+            "the agent answered late, but the session reported {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn agent_that_exits_during_a_cancel_ends_the_session_before_the_deadline() {
+        let (mut session, _incoming) = cancelling_session();
+        session.child.start_kill().expect("kill stand-in agent");
+        session.child.wait().await.expect("reap stand-in agent");
+        let event = session.next_event().await;
+        assert!(
+            matches!(&event, Some(SessionEvent::Ended { reason }) if reason.contains("ACP exited")),
+            "the agent exited, but the session reported {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_agent_times_out_the_cancel() {
+        let (mut session, _incoming) = cancelling_session();
+        let event = session.next_event().await;
+        assert!(
+            matches!(&event, Some(SessionEvent::Ended { reason }) if reason.contains("cancel completion deadline exceeded")),
+            "a silent agent must time out, but the session reported {event:?}"
+        );
+    }
 }

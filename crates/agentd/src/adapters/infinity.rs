@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::codec::Framed;
 
+use super::{Inbound, Inbox, inbox};
 use crate::adapter::*;
 use crate::model::*;
 
@@ -49,7 +50,7 @@ struct InfinitySession {
     incarnation: Incarnation,
     connection: JoinHandle<()>,
     tx: mpsc::UnboundedSender<ClientMessage>,
-    rx: mpsc::Receiver<Result<DaemonMessage, String>>,
+    rx: Inbox<Result<DaemonMessage, String>>,
     events: VecDeque<SessionEvent>,
     thread_busy: bool,
     pending: HashMap<MessageId, bool>,
@@ -94,7 +95,7 @@ impl Adapter for InfinityAdapter {
             .map_err(|e| AdapterError::Unavailable(e.to_string()))?
             .map_err(|e| AdapterError::Unavailable(format!("Infinity daemon socket: {e}")))?;
         let (tx, mut outgoing) = mpsc::unbounded_channel();
-        let (incoming, rx) = mpsc::channel(64);
+        let (incoming, rx) = inbox(64);
         let timeout = self.0.request_timeout;
         let connection = tokio::spawn(async move {
             let mut framed = Framed::new(stream, infinity_protocol::length_delimited_codec());
@@ -682,12 +683,10 @@ impl Session for InfinitySession {
                 return None;
             }
             let deadline = self.cancel_deadline.or(self.receipt_deadline);
-            let incoming = tokio::select! {
-                biased;
-                () = async { match deadline {
-                    Some(d) => tokio::time::sleep_until(d).await,
-                    None => std::future::pending().await,
-                } } => {
+            let incoming = match self.rx.recv_by(deadline).await {
+                Inbound::Message(message) => message,
+                Inbound::Closed => Err("Infinity daemon connection closed".into()),
+                Inbound::Expired => {
                     self.ended = true;
                     return Some(if self.cancel_deadline.is_some() {
                         SessionEvent::CancelTimedOut
@@ -696,8 +695,7 @@ impl Session for InfinitySession {
                             reason: "Infinity receipt deadline exceeded".into(),
                         }
                     });
-                },
-                msg = self.rx.recv() => msg.unwrap_or_else(|| Err("Infinity daemon connection closed".into())),
+                }
             };
             let needs_interrupt = self.needs_interrupt;
             let result = incoming.map_err(protocol).and_then(|msg| self.receive(msg));
@@ -725,5 +723,146 @@ impl Session for InfinitySession {
 impl Drop for InfinitySession {
     fn drop(&mut self) {
         self.connection.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::FutureExt;
+
+    use super::*;
+    use crate::adapters::InboxSender;
+
+    type Incoming = InboxSender<Result<DaemonMessage, String>>;
+
+    /// A session whose root thread is busy, with the daemon's side of the socket in the test's hands.
+    fn busy_session() -> (
+        InfinitySession,
+        Incoming,
+        mpsc::UnboundedReceiver<ClientMessage>,
+    ) {
+        let (tx, outgoing) = mpsc::unbounded_channel();
+        let (incoming, rx) = inbox(64);
+        let session = InfinitySession {
+            kind: KindConfig::infinity("unused.sock"),
+            root: ThreadRef::local("root".into()),
+            agent: AgentId::new(),
+            incarnation: Incarnation(1),
+            connection: tokio::spawn(async {}),
+            tx,
+            rx,
+            events: VecDeque::new(),
+            thread_busy: true,
+            pending: HashMap::new(),
+            receipt_deadline: None,
+            choices: HashMap::new(),
+            cancel_deadline: None,
+            ended: false,
+            boot_id: String::new(),
+            needs_interrupt: false,
+        };
+        (session, incoming, outgoing)
+    }
+
+    fn idle(session: &InfinitySession) -> Result<DaemonMessage, String> {
+        Ok(DaemonMessage::ThreadIdle {
+            thread_id: Some(session.root.clone()),
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_that_arrived_before_the_cancel_deadline_counts_when_polled_late() {
+        let (mut session, incoming, _outgoing) = busy_session();
+        session.cancel().await.expect("cancel");
+        incoming.send(idle(&session)).await.expect("queue idle");
+        tokio::time::advance(session.kind.cancel_timeout * 2).await;
+        let event = session.next_event().await;
+        assert!(
+            matches!(
+                event,
+                Some(SessionEvent::TurnEnded {
+                    outcome: TurnOutcome::Cancelled
+                })
+            ),
+            "the daemon answered in time, but the session reported {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_that_arrived_before_the_receipt_deadline_counts_when_polled_late() {
+        let (mut session, incoming, _outgoing) = busy_session();
+        let id = MessageId::new();
+        session.thread_busy = false;
+        session.pending.insert(id, false);
+        session.receipt_deadline = Some(Instant::now() + session.kind.request_timeout);
+        incoming
+            .send(Ok(DaemonMessage::InputCommitted {
+                thread_id: Some(session.root.clone()),
+                dedup_id: format!("peer-{id}"),
+            }))
+            .await
+            .expect("queue receipt");
+        tokio::time::advance(session.kind.request_timeout * 2).await;
+        let event = session.next_event().await;
+        assert!(
+            matches!(&event, Some(SessionEvent::TurnStarted { ids }) if ids == &[id]),
+            "the daemon committed in time, but the session reported {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_that_arrived_after_the_cancel_deadline_does_not_count() {
+        let (mut session, incoming, _outgoing) = busy_session();
+        session.cancel().await.expect("cancel");
+        tokio::time::advance(session.kind.cancel_timeout * 2).await;
+        incoming.send(idle(&session)).await.expect("queue idle");
+        let event = session.next_event().await;
+        assert!(
+            matches!(event, Some(SessionEvent::CancelTimedOut)),
+            "the daemon answered late, but the session reported {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_poll_does_not_lose_a_reply_that_arrives_in_time() {
+        let (mut session, incoming, _outgoing) = busy_session();
+        session.cancel().await.expect("cancel");
+        assert!(session.next_event().now_or_never().is_none());
+        incoming.send(idle(&session)).await.expect("queue idle");
+        tokio::time::advance(session.kind.cancel_timeout * 2).await;
+        let event = session.next_event().await;
+        assert!(
+            matches!(
+                event,
+                Some(SessionEvent::TurnEnded {
+                    outcome: TurnOutcome::Cancelled
+                })
+            ),
+            "the daemon answered in time, but the session reported {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_cancel_deadline_wins_over_a_closed_queue() {
+        let (mut session, incoming, _outgoing) = busy_session();
+        session.cancel().await.expect("cancel");
+        drop(incoming);
+        tokio::time::advance(session.kind.cancel_timeout * 2).await;
+        let event = session.next_event().await;
+        assert!(
+            matches!(event, Some(SessionEvent::CancelTimedOut)),
+            "the daemon never answered, but the session reported {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_daemon_times_out_the_cancel() {
+        let (mut session, _incoming, _outgoing) = busy_session();
+        session.cancel().await.expect("cancel");
+        let event = session.next_event().await;
+        assert!(
+            matches!(event, Some(SessionEvent::CancelTimedOut)),
+            "a silent daemon must time out, but the session reported {event:?}"
+        );
     }
 }
