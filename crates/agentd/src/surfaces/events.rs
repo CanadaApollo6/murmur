@@ -373,13 +373,18 @@ fn buffer_activity(
     *buffer = tail(buffer, 2048);
 }
 
-async fn state(
+pub(crate) async fn state(
     api: &ControlApi,
     event: Event,
     cache: &mut HashMap<AgentId, (String, String)>,
 ) -> Result<Option<Value>> {
     Ok(Some(match event {
         Event::PhaseChanged {
+            agent: id,
+            incarnation,
+            phase,
+        }
+        | Event::ErrorChanged {
             agent: id,
             incarnation,
             phase,
@@ -923,27 +928,6 @@ mod tests {
                 "cancelled mail responses collected past 64 admission slots: jobs={mail_jobs}"
             );
         });
-    }
-    #[test]
-    fn a_stop_that_may_have_left_work_running_says_so() {
-        let row = |detached: Option<&str>| {
-            let phase = Phase::Stopped {
-                detached: detached.map(str::to_owned),
-            };
-            agent_row(
-                AgentId::new(),
-                "a",
-                "infinity",
-                &phase,
-                phase_error(&phase),
-                None,
-                "none",
-            )
-        };
-        assert_eq!(row(None)["error"], Value::Null);
-        let detached = row(Some("may still be running"));
-        assert_eq!(detached["phase"], "stopped");
-        assert_eq!(detached["error"], "may still be running");
     }
     #[test]
     fn encoded_bounds_and_maximum_shape() {

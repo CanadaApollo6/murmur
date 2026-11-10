@@ -35,15 +35,19 @@ the shared Infinity daemon, and the daemon protocol has no command that ends a
 thread's work in bounded time: `Interrupt` is the only cancel, and agentd can only
 detach from the thread. If the thread does not acknowledge the interrupt within
 the cancel timeout, `stop` still stops the agent but fails with
-`agent stopped, but the Infinity turn did not acknowledge the cancel ... and may
-still be running in the daemon`. `agentctl ls` and the event feed show the same
-note as the agent's `error` while it stays stopped. The note does not survive an
-agentd restart. Stop also interrupts a thread that is busy with work agentd did
-not submit. The note is reported however the session ends: when the cancel
-cannot be sent, when the daemon connection drops, or when the session ends
-before the deadline. `restart` reports the same case as `agent restarted, but
-...` and reattaches to the thread. `agentctl ls` and the feed show that note as
-the agent's `error` until a turn ends or the next stop or restart.
+`agent stopped, but the Infinity turn has not acknowledged the cancel and may
+still be running in the daemon`. `restart` reports the same case as
+`agent restarted, but ...` and reattaches to the thread. Stop also interrupts a
+thread that is busy with work agentd did not submit.
+
+From the moment a stop or restart interrupts an Infinity turn, `agentctl ls` and
+the event feed show this warning in the agent's `error`, next to any other error,
+in every phase and across an actor respawn. Every reply to `stop` or `restart`
+carries it, including a reply that fails for another reason. Only evidence that
+the turn is over clears it: the thread reports the turn ended, or a session
+attached to the thread reports it idle. A new command does not clear it, and
+neither does an interrupt acknowledgement that leaves the thread running a new
+completion. The warning does not survive an agentd restart.
 
 If agentd cannot settle the ended session's mail (a storage error, or a failed
 session shutdown), the command fails, the agent waits in phase `ended`, and its
@@ -436,7 +440,9 @@ diagnosed, so the twelve tests that use them are ignored there.
   It cancels a running turn and waits at most the kind's `cancel_timeout` before
   it ends the session. The stop flag persists in `agent_specs.stopped` (schema
   version 3). An actor that exited in `Failed` or panicked is respawned from its
-  saved spec. An actor ended by `shutdown()` or a replacement is not, and
+  saved spec. The respawn discards the saved session only when the dead actor's
+  last phase was `failed` or `needs-recovery`, so a busy actor that panicked
+  resumes. An actor ended by `shutdown()` or a replacement is not, and
   `spawn` after `shutdown()` returns `Error::Closed`.
 - `events()` returns a bounded display-only broadcast receiver. Subscribers can
   lag; SQLite remains delivery authority. Activity never becomes agent input.

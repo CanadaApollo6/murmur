@@ -26,8 +26,6 @@ pub struct AgentSpec {
 }
 
 /// `Stopped` is set only by the operator. Mail queues until `restart`.
-/// `detached` says the agent's own work did not acknowledge the cancel and may
-/// still be running outside agentd.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
     Dormant,
@@ -39,7 +37,7 @@ pub enum Phase {
     Crashed { attempt: u32, retry_at: Instant },
     Failed { last: String },
     NeedsRecovery { reason: String },
-    Stopped { detached: Option<String> },
+    Stopped,
 }
 
 /// An operator command that ends the agent's session. A turn in flight is
@@ -58,6 +56,12 @@ pub enum Event {
         port: u16,
     },
     PhaseChanged {
+        agent: AgentId,
+        incarnation: Incarnation,
+        phase: Phase,
+    },
+    /// `AgentHandle::error` changed while the phase did not.
+    ErrorChanged {
         agent: AgentId,
         incarnation: Incarnation,
         phase: Phase,
@@ -146,7 +150,11 @@ pub struct AgentHandle {
     phase: watch::Receiver<Phase>,
     isolation: watch::Receiver<&'static str>,
     incarnation: watch::Receiver<Incarnation>,
-    note: watch::Receiver<Option<String>>,
+    /// Why the last stop or restart did not settle, until one settles.
+    hint: watch::Receiver<Option<String>>,
+    /// Infinity work a halt cancelled that may still run in the daemon. Each
+    /// actor spawned for this id inherits it from the previous handle.
+    warning: watch::Sender<Option<String>>,
 }
 impl AgentHandle {
     fn nudge(&self) {
@@ -170,9 +178,18 @@ impl AgentHandle {
         self.phase.clone()
     }
     /// What `agentctl ls` and the feed show as the agent's error: the phase's
-    /// own reason, else what the last stop or restart left unresolved.
+    /// own reason and whatever the last stop or restart left unresolved.
     pub fn error(&self) -> Option<String> {
-        phase_error(&self.phase()).or_else(|| self.note.borrow().clone())
+        let parts = [
+            phase_error(&self.phase()),
+            self.hint.borrow().clone(),
+            self.warning(),
+        ];
+        let text = parts.into_iter().flatten().collect::<Vec<_>>().join("; ");
+        (!text.is_empty()).then_some(text)
+    }
+    fn warning(&self) -> Option<String> {
+        self.warning.borrow().clone()
     }
     pub async fn cancel(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -341,15 +358,24 @@ impl Broker {
             }
         }
         let replacement = self.replacements.lock().await;
-        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(Error::Rejected("agentd is shutting down".into()));
-        }
         let previous = self.handle(id).await;
         if let Some(handle) = previous.as_ref().filter(|h| !h.commands.is_closed()) {
             drop(replacement);
             return handle.operate(op).await;
         }
-        if previous.as_ref().is_some_and(|h| h.phase() == Phase::Ended) {
+        let result = self.respawn(id, op, previous.as_ref()).await;
+        halt_reply(op, result, previous.and_then(|h| h.warning()).as_deref())
+    }
+    async fn respawn(
+        &self,
+        id: AgentId,
+        op: Operation,
+        previous: Option<&AgentHandle>,
+    ) -> Result<()> {
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Rejected("agentd is shutting down".into()));
+        }
+        if previous.is_some_and(|h| h.phase() == Phase::Ended) {
             return Err(Error::Closed);
         }
         let (_, spec) = self
@@ -365,8 +391,13 @@ impl Broker {
         // These writes are the end state the operator asked for. If the spawn
         // fails, the actor stays dead in Failed and a repeated command converges.
         self.mailroom.set_stopped(id, op == Operation::Stop).await?;
-        if previous.is_some() {
-            // Either command leaves a dead actor with a fresh session, as in the actor.
+        if previous.is_some_and(|h| {
+            matches!(
+                h.phase(),
+                Phase::Failed { .. } | Phase::NeedsRecovery { .. }
+            )
+        }) {
+            // Leaving these phases discards the resume token, as in the actor.
             self.mailroom.forget_resume(id).await?;
         }
         self.spawn_locked(spec, true).await.map(drop)
@@ -422,6 +453,9 @@ impl Broker {
         }
         let id = self.mailroom.register(spec.name.clone()).await?;
         let previous = self.agents.lock().await.get(&id).cloned();
+        let warning = previous
+            .as_ref()
+            .map_or_else(|| watch::channel(None).0, |h| h.warning.clone());
         if let Some(handle) = previous.filter(|h| !h.commands.is_closed()) {
             if !restore && matches!(handle.phase(), Phase::Failed { .. }) {
                 if let Some(pin) = saved_specs
@@ -444,7 +478,7 @@ impl Broker {
         let (lease, incarnation, resume) = self.mailroom.claim_actor(id, spec.kind.clone()).await?;
         self.mailroom.save_spec(id, spec.clone()).await?;
         let initial = if self.mailroom.stopped(id).await? {
-            Phase::Stopped { detached: None }
+            Phase::Stopped
         } else {
             Phase::Dormant
         };
@@ -452,7 +486,7 @@ impl Broker {
         let (phase_tx, phase) = watch::channel(initial.clone());
         let (isolation_tx, isolation) = watch::channel("none");
         let (incarnation_tx, incarnation_rx) = watch::channel(incarnation);
-        let (note_tx, note) = watch::channel(None);
+        let (hint_tx, hint) = watch::channel(None);
         let handle = AgentHandle {
             id,
             cwd: spec.cwd.clone(),
@@ -460,7 +494,8 @@ impl Broker {
             phase,
             isolation,
             incarnation: incarnation_rx,
-            note,
+            hint,
+            warning: warning.clone(),
         };
         #[cfg(test)]
         let adapter = self
@@ -477,7 +512,8 @@ impl Broker {
             credentials: self.credentials.clone(),
             isolation_tx,
             incarnation_tx,
-            note_tx,
+            hint_tx,
+            warning,
             kind: kind.clone(),
             id,
             idle_after: if model_agent {
@@ -505,7 +541,6 @@ impl Broker {
             cancelling: false,
             halting: None,
             fresh: false,
-            unacknowledged: false,
             offered: Vec::new(),
             pending: HashMap::new(),
             crashes: VecDeque::new(),
@@ -602,7 +637,8 @@ struct AgentActor {
     phase_tx: watch::Sender<Phase>,
     isolation_tx: watch::Sender<&'static str>,
     incarnation_tx: watch::Sender<Incarnation>,
-    note_tx: watch::Sender<Option<String>>,
+    hint_tx: watch::Sender<Option<String>>,
+    warning: watch::Sender<Option<String>>,
     phase: Phase,
     incarnation: Incarnation,
     resume: Option<ResumeToken>,
@@ -612,9 +648,6 @@ struct AgentActor {
     /// The next settled stop or restart discards the resume token. Kept here,
     /// not on `Halting`, so a settlement that fails does not forget it.
     fresh: bool,
-    /// An Infinity turn was in flight when a halt began and has not
-    /// acknowledged the cancel. Kept until a settled halt reports it.
-    unacknowledged: bool,
     offered: Vec<MessageId>,
     pending: HashMap<PermissionId, (PermissionRequest, Option<Instant>)>,
     crashes: VecDeque<Instant>,
@@ -642,8 +675,30 @@ impl AgentActor {
             phase,
         });
     }
-    fn note(&mut self, note: Option<String>) {
-        self.note_tx.send_replace(note);
+    fn set_error(&self, cell: &watch::Sender<Option<String>>, value: Option<String>) {
+        if cell.send_if_modified(|v| std::mem::replace(v, value.clone()) != value) {
+            self.emit(Event::ErrorChanged {
+                agent: self.id,
+                incarnation: self.incarnation,
+                phase: self.phase.clone(),
+            });
+        }
+    }
+    /// A halt cancelled an Infinity turn. Suspend only detaches from its
+    /// thread, so the turn may run on until evidence says it ended.
+    fn warn(&self) {
+        if self.model_agent {
+            self.set_error(&self.warning, Some(UNACKNOWLEDGED.into()));
+        }
+    }
+    /// Evidence that the thread's turn is over: it ended, or an attached
+    /// session reports the thread idle.
+    fn turn_over(&self) {
+        self.set_error(&self.warning, None);
+    }
+    /// The reply to a stop or restart always carries the warning.
+    fn reply(&self, op: Operation, result: Result<()>) -> Result<()> {
+        halt_reply(op, result, self.warning.borrow().as_deref())
     }
     fn session(&mut self) -> Result<&mut Box<dyn Session>> {
         self.session.as_mut().ok_or(Error::Closed)
@@ -656,7 +711,10 @@ impl AgentActor {
                 Err(error) => format!("the agent actor failed: {error}"),
             };
             for reply in halting.replies {
-                respond(reply, Err(Error::Rejected(reason.clone())));
+                respond(
+                    reply,
+                    self.reply(halting.op, Err(Error::Rejected(reason.clone()))),
+                );
             }
         }
         self.clear_pending();
@@ -700,7 +758,7 @@ impl AgentActor {
                 self.model_agent,
             )
             .await?;
-        if matches!(self.phase, Phase::Stopped { .. }) {
+        if self.phase == Phase::Stopped {
             self.phase(self.phase.clone());
         } else {
             self.start().await?;
@@ -863,6 +921,9 @@ impl AgentActor {
                         self.cancelling = false;
                     }
                 }
+                if !busy && self.resume.is_some() {
+                    self.turn_over();
+                }
                 let token = session.resume_token();
                 self.session = Some(session);
                 self.mailroom.save_resume(self.id, token.clone()).await?;
@@ -1007,8 +1068,8 @@ impl AgentActor {
                     ids,
                 });
             }
+            // A new completion began after the interrupt, so the thread is still busy.
             SessionEvent::CancelComplete => {
-                self.unacknowledged = false;
                 self.unavailable_attempts = 0;
                 self.interrupt_since = None;
                 self.cancelling = false;
@@ -1021,8 +1082,7 @@ impl AgentActor {
                 self.phase(Phase::Busy);
             }
             SessionEvent::TurnEnded { outcome } => {
-                self.unacknowledged = false;
-                self.note(None);
+                self.turn_over();
                 if !self.offered.is_empty() {
                     self.end("turn ended without receipt".into()).await?;
                 } else {
@@ -1086,7 +1146,6 @@ impl AgentActor {
                 self.stop_session().await?;
                 if self.halting.is_some() {
                     // The pending stop or restart publishes the outcome.
-                    self.unacknowledged = true;
                     return Ok(());
                 }
                 self.unavailable_attempts = self.unavailable_attempts.saturating_add(1);
@@ -1227,12 +1286,8 @@ impl AgentActor {
         }
     }
     async fn operate(&mut self, op: Operation, reply: Reply) -> Result<()> {
-        self.note(None);
-        if op == Operation::Stop
-            && self.halting.is_none()
-            && let Phase::Stopped { detached } = &self.phase
-        {
-            respond(reply, halt_reply(op, detached.as_deref()));
+        if op == Operation::Stop && self.halting.is_none() && self.phase == Phase::Stopped {
+            respond(reply, self.reply(op, Ok(())));
             return Ok(());
         }
         if let Err(error) = self
@@ -1240,7 +1295,7 @@ impl AgentActor {
             .set_stopped(self.id, op == Operation::Stop)
             .await
         {
-            respond(reply, Err(error.into()));
+            respond(reply, self.reply(op, Err(error.into())));
             return Ok(());
         }
         self.fresh |= self.needs_fresh_session();
@@ -1255,8 +1310,7 @@ impl AgentActor {
             deadline: Instant::now() + self.kind.cancel_timeout,
         });
         if self.turn_in_flight() {
-            // Suspend kills an ACP process but only detaches from an Infinity thread.
-            self.unacknowledged |= self.model_agent;
+            self.warn();
             if let Err(error) = self.cancel().await {
                 self.end(error.to_string()).await?;
             }
@@ -1286,60 +1340,53 @@ impl AgentActor {
             return Ok(());
         }
         let Halting { op, replies, .. } = self.halting.take().expect("bug: halting checked above");
-        let detached = (self.unacknowledged || (self.model_agent && in_flight)).then(|| {
-            format!(
-                "the Infinity turn did not acknowledge the cancel within {:?} and may still be running in the daemon",
-                self.kind.cancel_timeout
-            )
-        });
-        if let Err(error) = self.stop_session().await {
-            // The session is gone but its mail may still be offered. A repeated
-            // command settles again, so the agent waits in Ended until then.
-            let command = match op {
-                Operation::Stop => "stop",
-                Operation::Restart => "restart",
-            };
-            let reason = format!(
-                "{command} did not settle the session: {error}; repeat `agentctl {command}` to settle it"
-            );
-            self.note(Some(reason.clone()));
-            self.phase(Phase::Ended);
-            for reply in replies {
-                respond(reply, Err(Error::Rejected(reason.clone())));
-            }
-            return Ok(());
+        if in_flight {
+            self.warn();
+        } else if self.session.is_some() {
+            self.turn_over();
         }
-        let fresh = std::mem::take(&mut self.fresh) || self.needs_fresh_session();
-        self.unacknowledged = false;
-        let result = match op {
-            Operation::Stop => self.stopped(fresh, detached.clone()).await,
-            Operation::Restart => {
-                // Restart reattaches to a thread that may still run the old turn.
-                // The note stays until a turn ends or the next command.
-                self.note(detached.clone());
-                self.restart(fresh).await
+        let result = match self.stop_session().await {
+            Err(error) => {
+                // The session is gone but its mail may still be offered. A repeated
+                // command settles again, so the agent waits in Ended until then.
+                let command = match op {
+                    Operation::Stop => "stop",
+                    Operation::Restart => "restart",
+                };
+                let reason = format!(
+                    "{command} did not settle the session: {error}; repeat `agentctl {command}` to settle it"
+                );
+                self.set_error(&self.hint_tx, Some(reason.clone()));
+                self.phase(Phase::Ended);
+                for reply in replies {
+                    respond(reply, self.reply(op, Err(Error::Rejected(reason.clone()))));
+                }
+                return Ok(());
             }
-        };
-        let failure = match &result {
-            Err(error) => Some(error.to_string()),
-            Ok(()) => halt_reply(op, detached.as_deref())
-                .err()
-                .map(|e| e.to_string()),
+            Ok(()) => {
+                self.set_error(&self.hint_tx, None);
+                let fresh = std::mem::take(&mut self.fresh) || self.needs_fresh_session();
+                match op {
+                    Operation::Stop => self.stopped(fresh).await,
+                    Operation::Restart => self.restart(fresh).await,
+                }
+            }
         };
         for reply in replies {
-            respond(
-                reply,
-                failure.clone().map_or(Ok(()), |e| Err(Error::Rejected(e))),
-            );
+            let shown = match &result {
+                Ok(()) => Ok(()),
+                Err(error) => Err(Error::Rejected(error.to_string())),
+            };
+            respond(reply, self.reply(op, shown));
         }
         result
     }
-    async fn stopped(&mut self, fresh: bool, detached: Option<String>) -> Result<()> {
+    async fn stopped(&mut self, fresh: bool) -> Result<()> {
         if fresh {
             // A later restart leaves NeedsRecovery or Failed fresh, as restart does directly.
             self.mailroom.forget_resume(self.id).await?;
         }
-        self.phase(Phase::Stopped { detached });
+        self.phase(Phase::Stopped);
         Ok(())
     }
     async fn restart(&mut self, fresh: bool) -> Result<()> {
@@ -1502,21 +1549,27 @@ impl AgentActor {
     }
 }
 
-fn halt_reply(op: Operation, detached: Option<&str>) -> Result<()> {
+const UNACKNOWLEDGED: &str =
+    "the Infinity turn has not acknowledged the cancel and may still be running in the daemon";
+
+fn halt_reply(op: Operation, result: Result<()>, warning: Option<&str>) -> Result<()> {
+    let Some(warning) = warning else {
+        return result;
+    };
     let done = match op {
         Operation::Stop => "stopped",
         Operation::Restart => "restarted",
     };
-    detached.map_or(Ok(()), |note| {
-        Err(Error::Rejected(format!("agent {done}, but {note}")))
-    })
+    Err(Error::Rejected(match result {
+        Ok(()) => format!("agent {done}, but {warning}"),
+        Err(error) => format!("{error}; {warning}"),
+    }))
 }
 /// The reason a phase carries, as `agentctl ls` and the feed show it.
 pub fn phase_error(phase: &Phase) -> Option<String> {
     match phase {
         Phase::Failed { last } => Some(last.clone()),
         Phase::NeedsRecovery { reason } => Some(reason.clone()),
-        Phase::Stopped { detached } => detached.clone(),
         _ => None,
     }
 }
@@ -1599,7 +1652,8 @@ mod replacement_tests {
                     phase,
                     isolation,
                     incarnation,
-                    note: watch::channel(None).1,
+                    hint: watch::channel(None).1,
+                    warning: watch::channel(None).0,
                 },
             );
             let (stopping, stopped) = oneshot::channel();
@@ -1694,7 +1748,8 @@ mod publication_tests {
                 phase,
                 isolation,
                 incarnation,
-                note: watch::channel(None).1,
+                hint: watch::channel(None).1,
+                warning: watch::channel(None).0,
             },
         );
         let pause = Arc::new(tokio::sync::Notify::new());
@@ -1761,7 +1816,8 @@ mod stale_phase_tests {
                 phase,
                 isolation,
                 incarnation,
-                note: watch::channel(None).1,
+                hint: watch::channel(None).1,
+                warning: watch::channel(None).0,
             },
         );
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -2298,7 +2354,7 @@ mod halt_tests {
             assert_eq!(h.count(|s| &s.cancels), 1, "{op:?} cancels the turn");
             match op {
                 Operation::Stop => {
-                    assert_eq!(h.agent.phase(), Phase::Stopped { detached: None });
+                    assert_eq!(h.agent.phase(), Phase::Stopped);
                     assert_eq!(h.state(mail).await, DeliveryState::Queued);
                     assert_eq!(h.count(|s| &s.opens), 1);
                 }
@@ -2350,7 +2406,7 @@ mod halt_tests {
                     h.sql(REFUSE).await;
                 }
                 assert!(h.operate(op).await.is_err(), "{case}");
-                assert!(!matches!(h.agent.phase(), Phase::Stopped { .. }), "{case}");
+                assert_ne!(h.agent.phase(), Phase::Stopped, "{case}");
                 assert_eq!(
                     h.count(|s| &s.opens),
                     1,
@@ -2366,7 +2422,7 @@ mod halt_tests {
                 h.operate(op).await.expect("a repeated command settles");
                 match op {
                     Operation::Stop => {
-                        assert_eq!(h.agent.phase(), Phase::Stopped { detached: None }, "{case}");
+                        assert_eq!(h.agent.phase(), Phase::Stopped, "{case}");
                         assert_eq!(h.state(mail).await, DeliveryState::Queued, "{case}");
                     }
                     Operation::Restart => {
@@ -2405,12 +2461,8 @@ mod halt_tests {
                 error.to_string().contains("may still be running"),
                 "{error}"
             );
-            let Phase::Stopped {
-                detached: Some(note),
-            } = h.agent.phase()
-            else {
-                panic!("stopped phase carries the note: {:?}", h.agent.phase());
-            };
+            assert_eq!(h.agent.phase(), Phase::Stopped);
+            let note = h.agent.error().expect("ls shows the warning");
             assert!(note.contains("may still be running"), "{note}");
             assert_eq!(
                 h.operate(Operation::Stop).await.map_err(|e| e.to_string()),
@@ -2437,7 +2489,7 @@ mod halt_tests {
             .expect("stop respawns a failed actor");
         let current = h.broker.handle(h.agent.id).await.expect("handle");
         assert!(!current.commands.same_channel(&h.agent.commands));
-        assert_eq!(current.phase(), Phase::Stopped { detached: None });
+        assert_eq!(current.phase(), Phase::Stopped);
         assert_eq!(h.count(|s| &s.opens), 1, "a stopped respawn opens nothing");
         h.operate(Operation::Restart).await.expect("restart");
         assert_eq!(h.count(|s| &s.opens), 2);
@@ -2479,7 +2531,7 @@ mod halt_tests {
             assert_eq!(h.count(|s| &s.cancels), 1, "{case}");
             match second {
                 Stop => {
-                    assert_eq!(h.agent.phase(), Phase::Stopped { detached: None }, "{case}");
+                    assert_eq!(h.agent.phase(), Phase::Stopped, "{case}");
                     assert_eq!(h.count(|s| &s.opens), 1, "{case}");
                 }
                 Restart => {
@@ -2534,7 +2586,8 @@ mod halt_tests {
                 let crashed = crashes(&mut events);
                 if !reply.as_ref().is_err_and(|e| {
                     e.starts_with("agent stopped, but ") && e.contains("may still be running")
-                }) || !matches!(phase, Phase::Stopped { detached: Some(_) })
+                }) || phase != Phase::Stopped
+                    || h.agent.error().is_none()
                     || !crashed.is_empty()
                 {
                     wrong.push(format!(
@@ -2562,15 +2615,18 @@ mod halt_tests {
         assert_eq!(
             h.agent.error().as_deref(),
             Some(first.as_str()),
-            "ls and the feed show why the agent is Ended"
+            "ls and the feed show why the agent is Ended and that the turn may still run"
         );
         assert!(first.contains("repeat `agentctl stop`"), "{first}");
+        assert!(first.contains("may still be running"), "{first}");
         let result = h.operate(Operation::Stop).await;
         assert_detached(result, "agent stopped, but ", "repeat");
-        assert!(matches!(
-            h.agent.phase(),
-            Phase::Stopped { detached: Some(_) }
-        ));
+        assert_eq!(h.agent.phase(), Phase::Stopped);
+        assert!(
+            h.agent
+                .error()
+                .is_some_and(|e| e.contains("may still be running"))
+        );
         h.broker.shutdown().await.expect("shutdown");
     }
 
