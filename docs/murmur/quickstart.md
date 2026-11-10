@@ -279,8 +279,5 @@ are exempt.
 
 ## Known problems in this run
 
-- A Codex agent crashes when it calls `send_message` in `read-only` mode. The
-  log shows `agent session ended … reason=protocol: missing title`. The
-  message becomes `Uncertain`.
 - `agentctl ls` shows `"error": null` after a crash. The reason is only in the
   daemon log.
