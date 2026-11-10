@@ -1335,15 +1335,12 @@ impl AgentActor {
         let Some(halting) = &self.halting else {
             return Ok(());
         };
-        let in_flight = self.turn_in_flight();
-        if in_flight && halting.deadline > Instant::now() {
+        if self.turn_in_flight() && halting.deadline > Instant::now() {
             return Ok(());
         }
         let Halting { op, replies, .. } = self.halting.take().expect("bug: halting checked above");
-        if in_flight {
+        if self.session.as_ref().is_some_and(|s| s.busy()) {
             self.warn();
-        } else if self.session.is_some() {
-            self.turn_over();
         }
         if let Err(error) = self.stop_session().await {
             // The session is gone but its mail may still be offered. A repeated
@@ -1370,7 +1367,8 @@ impl AgentActor {
         };
         for reply in replies {
             let shown = match &result {
-                Ok(()) => Ok(()),
+                // A restart that could not open its session did not restart.
+                Ok(()) => phase_error(&self.phase).map_or(Ok(()), |e| Err(Error::Rejected(e))),
                 Err(error) => Err(Error::Rejected(error.to_string())),
             };
             respond(reply, self.reply(op, shown));
@@ -1399,6 +1397,10 @@ impl AgentActor {
             mcp.revoke(self.id).await;
         }
         if let Some(session) = self.session.take() {
+            if !session.busy() {
+                // The thread reported idle, whatever mail receipts are still missing.
+                self.turn_over();
+            }
             let token = session
                 .suspend()
                 .await

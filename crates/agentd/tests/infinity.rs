@@ -2462,3 +2462,95 @@ async fn busy_delivery_drains_bounded_batches_without_new_sends_or_idle() {
     t.idle().await;
     t.finish().await;
 }
+
+/// Sends one mail and a stop, and returns the stop's `Interrupt` with the stop still pending.
+macro_rules! stop_a_busy_agent {
+    ($t:ident, $stop:ident) => {{
+        let mail = $t.send(false, "work").await;
+        let offered = $t.daemon.next().await;
+        assert!(matches!(
+            offered.message,
+            ClientMessage::DeliverPeerMessage { .. }
+        ));
+        let interrupt = tokio::select! {
+            result = &mut $stop => panic!("the stop settled before its interrupt: {result:?}"),
+            r = $t.daemon.next() => r,
+        };
+        assert!(matches!(interrupt.message, ClientMessage::Interrupt { .. }));
+        (mail, interrupt)
+    }};
+}
+
+#[tokio::test]
+async fn a_restart_that_cannot_reattach_reports_the_failure_with_the_warning() {
+    use agentd::supervisor::Operation;
+    let mut t = Test::new().await;
+    let stop = t.broker.operate(t.agent.id, Operation::Stop);
+    tokio::pin!(stop);
+    let _ = stop_a_busy_agent!(t, stop);
+    let result = tokio::time::timeout(Duration::from_secs(3), stop)
+        .await
+        .expect("the stop is bounded by the cancel deadline");
+    let stopped = result
+        .expect_err("an unacknowledged interrupt is not a clean stop")
+        .to_string();
+    assert!(stopped.contains("may still be running"), "{stopped}");
+
+    t.daemon.state.lock().expect("state").missing = true;
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        t.broker.operate(t.agent.id, Operation::Restart),
+    )
+    .await
+    .expect("the restart is bounded");
+    assert!(matches!(t.agent.phase(), Phase::NeedsRecovery { .. }));
+    let reply = result
+        .expect_err("a restart that lands in NeedsRecovery did not restart")
+        .to_string();
+    assert!(reply.contains("root thread does not exist"), "{reply}");
+    assert!(reply.contains("may still be running"), "{reply}");
+    t.broker.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn a_thread_that_reports_idle_ends_the_halt_warning_without_the_mail_receipt() {
+    use agentd::supervisor::Operation;
+    for receipt in [true, false] {
+        let mut t = Test::new().await;
+        let stop = t.broker.operate(t.agent.id, Operation::Stop);
+        tokio::pin!(stop);
+        let (mail, interrupt) = stop_a_busy_agent!(t, stop);
+        if receipt {
+            interrupt.emit(fake::receipt(format!("peer-{mail}")));
+        }
+        interrupt.emit(fake::idle());
+        if !receipt {
+            interrupt.emit(DaemonMessage::Info {
+                thread_id: fake::thread(),
+                text: "idle processed".into(),
+            });
+            let barrier = async {
+                loop {
+                    if matches!(
+                        t.events.recv().await.expect("event"),
+                        Event::Activity { text, .. } if text == "idle processed"
+                    ) {
+                        break;
+                    }
+                }
+            };
+            tokio::select! {
+                result = &mut stop => panic!("the stop settled before the idle was read: {result:?}"),
+                result = tokio::time::timeout(Duration::from_secs(2), barrier) => {
+                    result.expect("the agent reads the idle");
+                }
+            }
+        }
+        let result = tokio::time::timeout(Duration::from_secs(3), stop)
+            .await
+            .expect("the stop is bounded by the cancel deadline");
+        assert!(result.is_ok(), "receipt={receipt}: {result:?}");
+        assert_eq!(t.agent.error(), None, "receipt={receipt}");
+        t.broker.shutdown().await.expect("shutdown");
+    }
+}
