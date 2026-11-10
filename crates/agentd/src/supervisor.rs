@@ -2564,11 +2564,12 @@ mod halt_tests {
         error
     }
 
+    /// The phases a crash publishes. A session that goes away during a halt publishes none.
     fn crashes(events: &mut broadcast::Receiver<Event>) -> Vec<Phase> {
         let mut seen = Vec::new();
         while let Ok(event) = events.try_recv() {
             if let Event::PhaseChanged {
-                phase: phase @ Phase::Crashed { .. },
+                phase: phase @ (Phase::Ended | Phase::Crashed { .. } | Phase::Failed { .. }),
                 ..
             } = event
             {
