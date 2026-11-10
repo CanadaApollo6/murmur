@@ -275,7 +275,7 @@ impl ControlApi {
             let isolation = handle.as_ref().map_or("none", |h| h.isolation());
             rows.push(
                 json!({"id":format!("agent:{id}"),"name":format!("@{}",spec.name.as_str()),
-                "kind":spec.kind,"isolation":isolation,"phase":phase_name(&phase),"error":match &phase { Phase::Failed { last } => Some(last.as_str()), Phase::NeedsRecovery { reason } => Some(reason.as_str()), _ => None },
+                "kind":spec.kind,"isolation":isolation,"phase":phase_name(&phase),"error":match &phase { Phase::Failed { last } => Some(last.as_str()), Phase::NeedsRecovery { reason } => Some(reason.as_str()), Phase::Stopped { detached } => detached.as_deref(), _ => None },
                 "queued":queued}),
             );
         }
@@ -313,7 +313,7 @@ impl ControlApi {
         };
         let suffix = match self.broker.handle(id).await.map(|h| h.phase()) {
             Some(Phase::Busy) => " (busy; it sees this when its turn ends)",
-            Some(Phase::Stopped) => " (stopped; it sees this after agentctl restart)",
+            Some(Phase::Stopped { .. }) => " (stopped; it sees this after agentctl restart)",
             _ => "",
         };
         Ok(json!({"id":env.id(),"status":format!("{status} {} for {to}{suffix}.",env.id())}))
@@ -571,7 +571,7 @@ fn phase_name(phase: &Phase) -> &'static str {
         Phase::Crashed { .. } => "crashed",
         Phase::Failed { .. } => "failed",
         Phase::NeedsRecovery { .. } => "needs-recovery",
-        Phase::Stopped => "stopped",
+        Phase::Stopped { .. } => "stopped",
     }
 }
 pub async fn read_frame(read: &mut (impl AsyncBufRead + Unpin)) -> Result<Option<Vec<u8>>> {

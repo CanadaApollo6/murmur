@@ -228,11 +228,11 @@ async fn stopped_idle_agent_keeps_mail_queued_and_starts_no_session() {
     let first_pid = pids(&t.wire())[0];
 
     t.operate(Operation::Stop).await;
-    assert_eq!(t.agent.phase(), Phase::Stopped);
+    assert_eq!(t.agent.phase(), Phase::Stopped { detached: None });
     assert!(!alive(first_pid), "stop ends the agent process");
     let queued = t.send("while stopped").await;
     t.barrier().await;
-    assert_eq!(t.agent.phase(), Phase::Stopped);
+    assert_eq!(t.agent.phase(), Phase::Stopped { detached: None });
     assert_eq!(t.state(queued).await, DeliveryState::Queued);
     let wire = t.wire();
     assert_eq!(pids(&wire).len(), 1, "mail must not start a stopped agent");
@@ -270,7 +270,7 @@ async fn stop_leaves_other_agents_running() {
         |e| matches!(e, Event::Consumed { ids, .. } if ids.contains(&to_b)),
     )
     .await;
-    assert_eq!(a.phase(), Phase::Stopped);
+    assert_eq!(a.phase(), Phase::Stopped { detached: None });
     assert_eq!(b.phase(), Phase::Idle);
     assert!(!mailroom.stopped(b.id).await.expect("b flag"));
     broker.shutdown().await.expect("shutdown");
@@ -303,7 +303,7 @@ async fn stop_during_a_busy_turn_cancels_within_the_cancel_bound() {
         let pid = pids(&t.wire())[0];
 
         t.operate(Operation::Stop).await;
-        assert_eq!(t.agent.phase(), Phase::Stopped, "{body}");
+        assert_eq!(t.agent.phase(), Phase::Stopped { detached: None }, "{body}");
         assert_eq!(t.state(busy).await, expected, "{body}");
         assert!(!alive(pid), "{body}: stop ends the agent process");
         assert_eq!(
@@ -379,9 +379,9 @@ async fn stopped_survives_an_agentd_restart() {
         broker.restore(spec).await.expect("restore");
     }
     let agent = broker.handle(agent.id).await.expect("restored handle");
-    assert_eq!(agent.phase(), Phase::Stopped);
+    assert_eq!(agent.phase(), Phase::Stopped { detached: None });
     barrier(&broker, agent.id).await;
-    assert_eq!(agent.phase(), Phase::Stopped);
+    assert_eq!(agent.phase(), Phase::Stopped { detached: None });
     assert_eq!(
         pids(&wire(root.path())).len(),
         1,
@@ -415,10 +415,10 @@ async fn stopped_survives_an_agentd_restart() {
 async fn stop_and_restart_are_idempotent() {
     let mut t = Test::new(None).await;
     t.operate(Operation::Stop).await;
-    t.phase(|p| *p == Phase::Stopped).await;
+    t.phase(|p| *p == Phase::Stopped { detached: None }).await;
     t.operate(Operation::Stop).await;
     t.barrier().await;
-    assert_eq!(t.agent.phase(), Phase::Stopped);
+    assert_eq!(t.agent.phase(), Phase::Stopped { detached: None });
     while let Ok(event) = t.events.try_recv() {
         assert!(
             !matches!(event, Event::PhaseChanged { .. }),

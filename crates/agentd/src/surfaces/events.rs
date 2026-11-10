@@ -240,6 +240,9 @@ fn agent_row(
     let error = match phase {
         Phase::Failed { last } => Some(cut(last, 1024)),
         Phase::NeedsRecovery { reason } => Some(cut(reason, 1024)),
+        Phase::Stopped {
+            detached: Some(note),
+        } => Some(cut(note, 1024)),
         _ => None,
     };
     json!({"id":format!("agent:{id}"),"name":cut(name,1024),"kind":cut(kind,1024),"isolation":isolation,"phase":phase_name(phase),"incarnation":incarnation,"error":error})
@@ -921,6 +924,25 @@ mod tests {
                 "cancelled mail responses collected past 64 admission slots: jobs={mail_jobs}"
             );
         });
+    }
+    #[test]
+    fn a_stop_that_may_have_left_work_running_says_so() {
+        let row = |detached: Option<&str>| {
+            agent_row(
+                AgentId::new(),
+                "a",
+                "infinity",
+                &Phase::Stopped {
+                    detached: detached.map(str::to_owned),
+                },
+                None,
+                "none",
+            )
+        };
+        assert_eq!(row(None)["error"], Value::Null);
+        let detached = row(Some("may still be running"));
+        assert_eq!(detached["phase"], "stopped");
+        assert_eq!(detached["error"], "may still be running");
     }
     #[test]
     fn encoded_bounds_and_maximum_shape() {

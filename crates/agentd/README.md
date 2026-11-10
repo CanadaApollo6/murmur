@@ -30,11 +30,28 @@ the kind's cancel timeout (two seconds by default), agentd ends the session anyw
 Mail to a stopped agent stays queued under the normal mail limits. `agentctl ls`
 shows the phase `stopped`, and the agent stays stopped across an agentd restart.
 
+Ending the session kills an ACP agent's process. An Infinity agent's work runs in
+the shared Infinity daemon, and the daemon protocol has no command that ends a
+thread's work in bounded time: `Interrupt` is the only cancel, and agentd can only
+detach from the thread. If the thread does not acknowledge the interrupt within
+the cancel timeout, `stop` still stops the agent but fails with
+`agent stopped, but the Infinity turn did not acknowledge the cancel ... and may
+still be running in the daemon`. `agentctl ls` and the event feed show the same
+note as the agent's `error` while it stays stopped. The note does not survive an
+agentd restart. Stop also interrupts a thread that is busy with work agentd did
+not submit.
+
+If agentd cannot settle the ended session's mail (a storage error, or a failed
+session shutdown), the command fails, the agent waits in phase `ended`, and its
+mail keeps its state. Run the same command again to settle it.
+
 `agentctl restart @name` ends any current session the same way and starts a new
 one. From `stopped` or a live phase, the new session resumes the saved
 conversation. From `needs-recovery` or `failed`, restart discards the saved
-conversation and starts a fresh session. This is the only way out of
-`needs-recovery`. Mail held from an uncertain turn stays held; use `agentctl held`,
+conversation and starts a fresh session. A stop from `needs-recovery` or `failed`
+discards it too, so the restart that follows is fresh, as restart alone would be.
+This is the only way out of `needs-recovery`. If agentd shuts down while a stop
+or restart waits for the cancel, the command fails and nothing is started. Mail held from an uncertain turn stays held; use `agentctl held`,
 `release` and `drop` for it. Both commands are idempotent and affect only the
 named agent.
 
@@ -411,7 +428,8 @@ diagnosed, so the twelve tests that use them are ignored there.
 - `operate(id, Operation::Stop | Operation::Restart)` stops or restarts an agent.
   It cancels a running turn and waits at most the kind's `cancel_timeout` before
   it ends the session. The stop flag persists in `agent_specs.stopped` (schema
-  version 3). An actor that died is respawned from its saved spec.
+  version 3). An actor that exited in `Failed` is respawned from its saved spec.
+  An actor ended by `shutdown()` or a replacement is not.
 - `events()` returns a bounded display-only broadcast receiver. Subscribers can
   lag; SQLite remains delivery authority. Activity never becomes agent input.
 - `shutdown()` stops and reaps sessions, settles outstanding delivery, and waits
