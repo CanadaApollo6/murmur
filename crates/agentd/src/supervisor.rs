@@ -25,6 +25,7 @@ pub struct AgentSpec {
     pub idle_after: Option<Duration>,
 }
 
+/// `Stopped` is set only by the operator. Mail queues until `restart`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
     Dormant,
@@ -36,6 +37,15 @@ pub enum Phase {
     Crashed { attempt: u32, retry_at: Instant },
     Failed { last: String },
     NeedsRecovery { reason: String },
+    Stopped,
+}
+
+/// An operator command that ends the agent's session. A turn in flight is
+/// cancelled first and waited for at most the kind's `cancel_timeout`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operation {
+    Stop,
+    Restart,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +56,12 @@ pub enum Event {
         port: u16,
     },
     PhaseChanged {
+        agent: AgentId,
+        incarnation: Incarnation,
+        phase: Phase,
+    },
+    /// `AgentHandle::error` changed while the phase did not.
+    ErrorChanged {
         agent: AgentId,
         incarnation: Incarnation,
         phase: Phase,
@@ -120,6 +136,10 @@ enum Command {
         reply: Reply,
     },
     Stop(Reply),
+    Operate {
+        op: Operation,
+        reply: Reply,
+    },
 }
 
 #[derive(Clone)]
@@ -130,6 +150,11 @@ pub struct AgentHandle {
     phase: watch::Receiver<Phase>,
     isolation: watch::Receiver<&'static str>,
     incarnation: watch::Receiver<Incarnation>,
+    /// Why the last stop or restart did not settle, until one settles.
+    hint: watch::Receiver<Option<String>>,
+    /// Infinity work a halt cancelled that may still run in the daemon. Each
+    /// actor spawned for this id inherits it from the previous handle.
+    warning: watch::Sender<Option<String>>,
 }
 impl AgentHandle {
     fn nudge(&self) {
@@ -151,6 +176,20 @@ impl AgentHandle {
     }
     pub fn phases(&self) -> watch::Receiver<Phase> {
         self.phase.clone()
+    }
+    /// What `agentctl ls` and the feed show as the agent's error: the phase's
+    /// own reason and whatever the last stop or restart left unresolved.
+    pub fn error(&self) -> Option<String> {
+        let parts = [
+            phase_error(&self.phase()),
+            self.hint.borrow().clone(),
+            self.warning(),
+        ];
+        let text = parts.into_iter().flatten().collect::<Vec<_>>().join("; ");
+        (!text.is_empty()).then_some(text)
+    }
+    fn warning(&self) -> Option<String> {
+        self.warning.borrow().clone()
     }
     pub async fn cancel(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -186,6 +225,14 @@ impl AgentHandle {
             .map_err(|_| Error::Closed)?;
         rx.await.map_err(|_| Error::Closed)?
     }
+    async fn operate(&self, op: Operation) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.commands
+            .send(Command::Operate { op, reply: tx })
+            .await
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
+    }
     pub async fn stop(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.commands
@@ -203,6 +250,7 @@ pub struct Broker {
     kinds: HashMap<String, KindConfig>,
     agents: Arc<Mutex<HashMap<AgentId, AgentHandle>>>,
     replacements: Mutex<()>,
+    closing: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     startup_pause: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
     #[cfg(test)]
@@ -249,6 +297,7 @@ impl Broker {
             kinds: by_kind,
             agents: Arc::new(Mutex::new(HashMap::new())),
             replacements: Mutex::new(()),
+            closing: Default::default(),
             #[cfg(test)]
             startup_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -297,13 +346,78 @@ impl Broker {
     pub async fn restore(&self, spec: AgentSpec) -> Result<AgentHandle> {
         self.spawn_inner(spec, true).await
     }
-    async fn spawn_inner(&self, mut spec: AgentSpec, restore: bool) -> Result<AgentHandle> {
+    /// Stops or restarts an agent. An actor that exited in `Failed` or panicked
+    /// is respawned from its saved spec and reads the persisted stop flag, so
+    /// both work from any phase. An actor ended by shutdown or replacement
+    /// exits in `Ended` and is never respawned.
+    pub async fn operate(&self, id: AgentId, op: Operation) -> Result<()> {
+        loop {
+            if let Some(handle) = self.handle(id).await {
+                match handle.operate(op).await {
+                    Err(Error::Closed) => {}
+                    result => return result,
+                }
+            }
+            let _replacement = self.replacements.lock().await;
+            let previous = self.handle(id).await;
+            if previous.as_ref().is_some_and(|h| !h.commands.is_closed()) {
+                // Another caller respawned the actor first. Ask that actor, so
+                // a reply never comes from anywhere but an actor or `halt_reply`.
+                continue;
+            }
+            let result = self.respawn(id, op, previous.as_ref()).await;
+            return halt_reply(op, result, previous.and_then(|h| h.warning()).as_deref());
+        }
+    }
+    async fn respawn(
+        &self,
+        id: AgentId,
+        op: Operation,
+        previous: Option<&AgentHandle>,
+    ) -> Result<()> {
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Rejected("agentd is shutting down".into()));
+        }
+        if previous.is_some_and(|h| h.phase() == Phase::Ended) {
+            return Err(Error::Closed);
+        }
+        let (_, spec) = self
+            .mailroom
+            .specs()
+            .await?
+            .into_iter()
+            .find(|(saved, _)| *saved == id)
+            .ok_or_else(|| Error::Rejected("agent has never been spawned".into()))?;
+        if !self.kinds.contains_key(&spec.kind) {
+            return Err(Error::Rejected("unknown kind".into()));
+        }
+        // These writes are the end state the operator asked for. If the spawn
+        // fails, the actor stays dead in Failed and a repeated command converges.
+        self.mailroom.set_stopped(id, op == Operation::Stop).await?;
+        if previous.is_some_and(|h| {
+            matches!(
+                h.phase(),
+                Phase::Failed { .. } | Phase::NeedsRecovery { .. }
+            )
+        }) {
+            // Leaving these phases discards the resume token, as in the actor.
+            self.mailroom.forget_resume(id).await?;
+        }
+        self.spawn_locked(spec, true).await.map(drop)
+    }
+    async fn spawn_inner(&self, spec: AgentSpec, restore: bool) -> Result<AgentHandle> {
+        let _replacement = self.replacements.lock().await;
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Closed);
+        }
+        self.spawn_locked(spec, restore).await
+    }
+    async fn spawn_locked(&self, mut spec: AgentSpec, restore: bool) -> Result<AgentHandle> {
         let kind = self
             .kinds
             .get(&spec.kind)
             .ok_or_else(|| Error::Rejected("unknown kind".into()))?
             .clone();
-        let _replacement = self.replacements.lock().await;
         let saved_specs = self.mailroom.specs().await?;
         if !restore && let Some((_, cfg)) = &self.isolation {
             let workspaces = saved_specs
@@ -342,6 +456,9 @@ impl Broker {
         }
         let id = self.mailroom.register(spec.name.clone()).await?;
         let previous = self.agents.lock().await.get(&id).cloned();
+        let warning = previous
+            .as_ref()
+            .map_or_else(|| watch::channel(None).0, |h| h.warning.clone());
         if let Some(handle) = previous.filter(|h| !h.commands.is_closed()) {
             if !restore && matches!(handle.phase(), Phase::Failed { .. }) {
                 if let Some(pin) = saved_specs
@@ -363,10 +480,16 @@ impl Broker {
         }
         let (lease, incarnation, resume) = self.mailroom.claim_actor(id, spec.kind.clone()).await?;
         self.mailroom.save_spec(id, spec.clone()).await?;
+        let initial = if self.mailroom.stopped(id).await? {
+            Phase::Stopped
+        } else {
+            Phase::Dormant
+        };
         let (tx, commands) = mpsc::channel(64);
-        let (phase_tx, phase) = watch::channel(Phase::Dormant);
+        let (phase_tx, phase) = watch::channel(initial.clone());
         let (isolation_tx, isolation) = watch::channel("none");
         let (incarnation_tx, incarnation_rx) = watch::channel(incarnation);
+        let (hint_tx, hint) = watch::channel(None);
         let handle = AgentHandle {
             id,
             cwd: spec.cwd.clone(),
@@ -374,6 +497,8 @@ impl Broker {
             phase,
             isolation,
             incarnation: incarnation_rx,
+            hint,
+            warning: warning.clone(),
         };
         #[cfg(test)]
         let adapter = self
@@ -390,6 +515,8 @@ impl Broker {
             credentials: self.credentials.clone(),
             isolation_tx,
             incarnation_tx,
+            hint_tx,
+            warning,
             kind: kind.clone(),
             id,
             idle_after: if model_agent {
@@ -410,11 +537,13 @@ impl Broker {
             config: self.config.clone(),
             commands,
             phase_tx,
-            phase: Phase::Dormant,
+            phase: initial,
             incarnation,
             resume,
             session: None,
             cancelling: false,
+            halting: None,
+            fresh: false,
             offered: Vec::new(),
             pending: HashMap::new(),
             crashes: VecDeque::new(),
@@ -466,6 +595,10 @@ impl Broker {
         .map_err(crate::mailroom::Error::from)?
     }
     pub async fn shutdown(&self) -> Result<()> {
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // A respawn that began before `closing` publishes its handle before this lock frees.
+        drop(self.replacements.lock().await);
         let handles = self
             .agents
             .lock()
@@ -507,17 +640,29 @@ struct AgentActor {
     phase_tx: watch::Sender<Phase>,
     isolation_tx: watch::Sender<&'static str>,
     incarnation_tx: watch::Sender<Incarnation>,
+    hint_tx: watch::Sender<Option<String>>,
+    warning: watch::Sender<Option<String>>,
     phase: Phase,
     incarnation: Incarnation,
     resume: Option<ResumeToken>,
     session: Option<Box<dyn Session>>,
     cancelling: bool,
+    halting: Option<Halting>,
+    /// The next settled stop or restart discards the resume token. Kept here,
+    /// not on `Halting`, so a settlement that fails does not forget it.
+    fresh: bool,
     offered: Vec<MessageId>,
     pending: HashMap<PermissionId, (PermissionRequest, Option<Instant>)>,
     crashes: VecDeque<Instant>,
     unavailable_attempts: u32,
     interrupt_since: Option<Instant>,
     idle_since: Instant,
+}
+
+struct Halting {
+    op: Operation,
+    replies: Vec<Reply>,
+    deadline: Instant,
 }
 
 impl AgentActor {
@@ -533,11 +678,48 @@ impl AgentActor {
             phase,
         });
     }
+    fn set_error(&self, cell: &watch::Sender<Option<String>>, value: Option<String>) {
+        if cell.send_if_modified(|v| std::mem::replace(v, value.clone()) != value) {
+            self.emit(Event::ErrorChanged {
+                agent: self.id,
+                incarnation: self.incarnation,
+                phase: self.phase.clone(),
+            });
+        }
+    }
+    /// A halt cancelled an Infinity turn. Suspend only detaches from its
+    /// thread, so the turn may run on until evidence says it ended.
+    fn warn(&self) {
+        if self.model_agent {
+            self.set_error(&self.warning, Some(UNACKNOWLEDGED.into()));
+        }
+    }
+    /// Evidence that the thread's turn is over: it ended, or an attached
+    /// session reports the thread idle.
+    fn turn_over(&self) {
+        self.set_error(&self.warning, None);
+    }
+    /// The reply to a stop or restart always carries the warning.
+    fn reply(&self, op: Operation, result: Result<()>) -> Result<()> {
+        halt_reply(op, result, self.warning.borrow().as_deref())
+    }
     fn session(&mut self) -> Result<&mut Box<dyn Session>> {
         self.session.as_mut().ok_or(Error::Closed)
     }
     async fn run(mut self) {
         let result = self.drive().await;
+        if let Some(halting) = self.halting.take() {
+            let reason = match &result {
+                Ok(()) => "the agent actor was stopped before the command finished".to_owned(),
+                Err(error) => format!("the agent actor failed: {error}"),
+            };
+            for reply in halting.replies {
+                respond(
+                    reply,
+                    self.reply(halting.op, Err(Error::Rejected(reason.clone()))),
+                );
+            }
+        }
         self.clear_pending();
         if let Err(error) = &result {
             tracing::error!(agent=%self.id,%error,"agent actor failed");
@@ -579,9 +761,14 @@ impl AgentActor {
                 self.model_agent,
             )
             .await?;
-        self.start().await?;
+        if self.phase == Phase::Stopped {
+            self.phase(self.phase.clone());
+        } else {
+            self.start().await?;
+        }
         let mut credentials_tick = tokio::time::interval(Duration::from_secs(2));
         loop {
+            self.settle_halt().await?;
             self.pump().await?;
             let deadline = self.deadline();
             tokio::select! {
@@ -609,6 +796,7 @@ impl AgentActor {
                         let result = self.answer(id,incarnation,answer).await;
                         respond(reply,result);
                     },
+                    Some(Command::Operate { op, reply }) => self.operate(op, reply).await?,
                     }
                 },
                 event = async { match &mut self.session { Some(s) => s.next_event().await, None => std::future::pending().await } } => {
@@ -736,6 +924,9 @@ impl AgentActor {
                         self.cancelling = false;
                     }
                 }
+                if !busy && self.resume.is_some() {
+                    self.turn_over();
+                }
                 let token = session.resume_token();
                 self.session = Some(session);
                 self.mailroom.save_resume(self.id, token.clone()).await?;
@@ -773,6 +964,9 @@ impl AgentActor {
         self.start().await
     }
     async fn pump(&mut self) -> Result<()> {
+        if self.halting.is_some() {
+            return Ok(());
+        }
         let busy_delivery = self.phase == Phase::Busy
             && self.pending.is_empty()
             && self.session.as_ref().is_some_and(|s| s.accepts_busy_mail());
@@ -877,6 +1071,7 @@ impl AgentActor {
                     ids,
                 });
             }
+            // A new completion began after the interrupt, so the thread is still busy.
             SessionEvent::CancelComplete => {
                 self.unavailable_attempts = 0;
                 self.interrupt_since = None;
@@ -890,6 +1085,7 @@ impl AgentActor {
                 self.phase(Phase::Busy);
             }
             SessionEvent::TurnEnded { outcome } => {
+                self.turn_over();
                 if !self.offered.is_empty() {
                     self.end("turn ended without receipt".into()).await?;
                 } else {
@@ -951,6 +1147,10 @@ impl AgentActor {
             SessionEvent::CancelTimedOut => {
                 tracing::warn!(agent=%self.id, "cancel deadline expired, waiting for session recovery");
                 self.stop_session().await?;
+                if self.halting.is_some() {
+                    // The pending stop or restart publishes the outcome.
+                    return Ok(());
+                }
                 self.unavailable_attempts = self.unavailable_attempts.saturating_add(1);
                 let since = self.interrupt_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= Duration::from_secs(10 * 60) {
@@ -1088,11 +1288,125 @@ impl AgentActor {
             self.emit(Event::PermissionAnswered { agent: self.id, id });
         }
     }
+    async fn operate(&mut self, op: Operation, reply: Reply) -> Result<()> {
+        if op == Operation::Stop && self.halting.is_none() && self.phase == Phase::Stopped {
+            respond(reply, self.reply(op, Ok(())));
+            return Ok(());
+        }
+        if let Err(error) = self
+            .mailroom
+            .set_stopped(self.id, op == Operation::Stop)
+            .await
+        {
+            respond(reply, self.reply(op, Err(error.into())));
+            return Ok(());
+        }
+        self.fresh |= self.needs_fresh_session();
+        if let Some(halting) = &mut self.halting {
+            halting.op = op;
+            halting.replies.push(reply);
+            return Ok(());
+        }
+        self.halting = Some(Halting {
+            op,
+            replies: vec![reply],
+            deadline: Instant::now() + self.kind.cancel_timeout,
+        });
+        if self.turn_in_flight() {
+            self.warn();
+            if let Err(error) = self.cancel().await {
+                self.end(error.to_string()).await?;
+            }
+        }
+        Ok(())
+    }
+    /// Leaving NeedsRecovery or Failed discards the resume token.
+    fn needs_fresh_session(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::NeedsRecovery { .. } | Phase::Failed { .. }
+        )
+    }
+    /// An Infinity thread can be busy with work agentd did not submit.
+    fn turn_in_flight(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| self.phase == Phase::Busy || s.busy())
+    }
+    /// Finishes a stop or restart once the cancelled turn has ended or its deadline passed.
+    async fn settle_halt(&mut self) -> Result<()> {
+        let Some(halting) = &self.halting else {
+            return Ok(());
+        };
+        if self.turn_in_flight() && halting.deadline > Instant::now() {
+            return Ok(());
+        }
+        let Halting { op, replies, .. } = self.halting.take().expect("bug: halting checked above");
+        if self.session.as_ref().is_some_and(|s| s.busy()) {
+            self.warn();
+        }
+        if let Err(error) = self.stop_session().await {
+            // The session is gone but its mail may still be offered. A repeated
+            // command settles again, so the agent waits in Ended until then.
+            let command = match op {
+                Operation::Stop => "stop",
+                Operation::Restart => "restart",
+            };
+            let reason = format!(
+                "{command} did not settle the session: {error}; repeat `agentctl {command}` to settle it"
+            );
+            self.set_error(&self.hint_tx, Some(reason.clone()));
+            self.phase(Phase::Ended);
+            for reply in replies {
+                respond(reply, self.reply(op, Err(Error::Rejected(reason.clone()))));
+            }
+            return Ok(());
+        }
+        self.set_error(&self.hint_tx, None);
+        let fresh = std::mem::take(&mut self.fresh) || self.needs_fresh_session();
+        let result = match op {
+            Operation::Stop => self.stopped(fresh).await,
+            Operation::Restart => self.restart(fresh).await,
+        };
+        for reply in replies {
+            let shown = match &result {
+                // A restart that could not open its session did not restart.
+                Ok(()) => phase_error(&self.phase).map_or(Ok(()), |e| Err(Error::Rejected(e))),
+                Err(error) => Err(Error::Rejected(error.to_string())),
+            };
+            respond(reply, self.reply(op, shown));
+        }
+        result
+    }
+    async fn stopped(&mut self, fresh: bool) -> Result<()> {
+        if fresh {
+            // A later restart leaves NeedsRecovery or Failed fresh, as restart does directly.
+            self.mailroom.forget_resume(self.id).await?;
+        }
+        self.phase(Phase::Stopped);
+        Ok(())
+    }
+    async fn restart(&mut self, fresh: bool) -> Result<()> {
+        if fresh {
+            self.mailroom.forget_resume(self.id).await?;
+        }
+        self.crashes.clear();
+        self.unavailable_attempts = 0;
+        self.interrupt_since = None;
+        self.reopen().await
+    }
     async fn stop_session(&mut self) -> Result<()> {
         if let Some(mcp) = &self.mcp {
             mcp.revoke(self.id).await;
         }
         if let Some(session) = self.session.take() {
+            if self.phase == Phase::Busy && !session.busy() {
+                // The thread reported idle after this session's turn began,
+                // whatever mail receipts are still missing. A session that ran
+                // no turn is no evidence: it can be a fresh thread, and the
+                // warning is about the thread before it.
+                self.turn_over();
+            }
             let token = session
                 .suspend()
                 .await
@@ -1112,6 +1426,11 @@ impl AgentActor {
         Ok(())
     }
     async fn end(&mut self, reason: String) -> Result<()> {
+        if self.halting.is_some() {
+            // The pending stop or restart publishes the outcome. This is not a crash.
+            tracing::warn!(agent=%self.id, %reason, "agent session ended during a stop or restart");
+            return self.stop_session().await;
+        }
         let idle = self.phase == Phase::Idle;
         self.phase(Phase::Ended);
         self.stop_session().await?;
@@ -1140,6 +1459,10 @@ impl AgentActor {
         }
     }
     fn retry(&mut self, attempt: u32) {
+        if self.halting.is_some() {
+            // The pending stop or restart publishes the outcome.
+            return;
+        }
         let delay = self
             .config
             .backoff_initial
@@ -1170,6 +1493,9 @@ impl AgentActor {
             }
             _ => None,
         };
+        if let Some(halting) = &self.halting {
+            deadline = Some(deadline.map_or(halting.deadline, |d| d.min(halting.deadline)));
+        }
         for (_, timeout) in self.pending.values() {
             if let Some(t) = timeout {
                 deadline = Some(deadline.map_or(*t, |d| d.min(*t)));
@@ -1227,6 +1553,30 @@ impl AgentActor {
     }
 }
 
+const UNACKNOWLEDGED: &str =
+    "the Infinity turn has not acknowledged the cancel and may still be running in the daemon";
+
+fn halt_reply(op: Operation, result: Result<()>, warning: Option<&str>) -> Result<()> {
+    let Some(warning) = warning else {
+        return result;
+    };
+    let done = match op {
+        Operation::Stop => "stopped",
+        Operation::Restart => "restarted",
+    };
+    Err(Error::Rejected(match result {
+        Ok(()) => format!("agent {done}, but {warning}"),
+        Err(error) => format!("{error}; {warning}"),
+    }))
+}
+/// The reason a phase carries, as `agentctl ls` and the feed show it.
+pub fn phase_error(phase: &Phase) -> Option<String> {
+    match phase {
+        Phase::Failed { last } => Some(last.clone()),
+        Phase::NeedsRecovery { reason } => Some(reason.clone()),
+        _ => None,
+    }
+}
 fn respond(reply: Reply, result: Result<()>) {
     if reply.send(result).is_err() {
         tracing::trace!("actor command caller dropped");
@@ -1308,6 +1658,8 @@ mod replacement_tests {
                     phase,
                     isolation,
                     incarnation,
+                    hint: watch::channel(None).1,
+                    warning: watch::channel(None).0,
                 },
             );
             let (stopping, stopped) = oneshot::channel();
@@ -1402,6 +1754,8 @@ mod publication_tests {
                 phase,
                 isolation,
                 incarnation,
+                hint: watch::channel(None).1,
+                warning: watch::channel(None).0,
             },
         );
         let pause = Arc::new(tokio::sync::Notify::new());
@@ -1468,6 +1822,8 @@ mod stale_phase_tests {
                 phase,
                 isolation,
                 incarnation,
+                hint: watch::channel(None).1,
+                warning: watch::channel(None).0,
             },
         );
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -1726,5 +2082,1033 @@ mod cleanup_panic_tests {
             answered.is_ok(),
             "permission_answered missing after cleanup panic"
         );
+    }
+}
+
+#[cfg(test)]
+mod halt_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+    const CANCEL: Duration = Duration::from_millis(100);
+
+    /// A session whose cancel is never acknowledged, so only the halt deadline ends a turn.
+    #[derive(Default)]
+    struct Script {
+        opens: AtomicUsize,
+        resumed: AtomicUsize,
+        submits: AtomicUsize,
+        cancels: AtomicUsize,
+        failing_suspends: AtomicUsize,
+        /// Work the agent runs that agentd did not submit.
+        thread_busy: AtomicBool,
+        accepts_busy_mail: AtomicBool,
+        cancel_times_out: AtomicBool,
+        /// What a cancel does to the session besides counting.
+        on_cancel: std::sync::Mutex<OnCancel>,
+        panic_on_submit: AtomicBool,
+        latest: std::sync::Mutex<Option<mpsc::UnboundedSender<SessionEvent>>>,
+    }
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    enum OnCancel {
+        #[default]
+        Nothing,
+        /// The session reports that it ended.
+        EndSession,
+        /// The event stream closes, as when the daemon socket drops.
+        Disconnect,
+        /// The cancel cannot be sent.
+        Fail,
+        /// The actor dies before it answers the command.
+        Panic,
+    }
+    struct Scripted(Arc<Script>);
+    struct ScriptedSession {
+        script: Arc<Script>,
+        tx: mpsc::UnboundedSender<SessionEvent>,
+        events: mpsc::UnboundedReceiver<SessionEvent>,
+    }
+    #[async_trait::async_trait]
+    impl Adapter for Scripted {
+        async fn open(
+            &self,
+            r: OpenRequest<'_>,
+        ) -> std::result::Result<Box<dyn Session>, AdapterError> {
+            self.0.opens.fetch_add(1, SeqCst);
+            if r.resume.is_some() {
+                self.0.resumed.fetch_add(1, SeqCst);
+            }
+            let (tx, events) = mpsc::unbounded_channel();
+            *self.0.latest.lock().expect("bug: script lock") = Some(tx.clone());
+            Ok(Box::new(ScriptedSession {
+                script: self.0.clone(),
+                tx,
+                events,
+            }))
+        }
+    }
+    #[async_trait::async_trait]
+    impl Session for ScriptedSession {
+        fn resume_token(&self) -> ResumeToken {
+            ResumeToken::encode(&"scripted")
+        }
+        fn resumable(&self) -> bool {
+            true
+        }
+        fn busy(&self) -> bool {
+            self.script.thread_busy.load(SeqCst)
+        }
+        fn accepts_busy_mail(&self) -> bool {
+            self.script.accepts_busy_mail.load(SeqCst)
+        }
+        async fn submit(&mut self, _: Turn) -> std::result::Result<(), AdapterError> {
+            self.script.submits.fetch_add(1, SeqCst);
+            assert!(
+                !self.script.panic_on_submit.load(SeqCst),
+                "injected actor panic"
+            );
+            Ok(())
+        }
+        async fn cancel(&mut self) -> std::result::Result<(), AdapterError> {
+            self.script.cancels.fetch_add(1, SeqCst);
+            if self.script.cancel_times_out.load(SeqCst) {
+                self.tx
+                    .send(SessionEvent::CancelTimedOut)
+                    .expect("bug: session owns its receiver");
+            }
+            // Copied out so an injected panic does not poison the lock.
+            let mode = *self.script.on_cancel.lock().expect("bug: script lock");
+            match mode {
+                OnCancel::Nothing => {}
+                OnCancel::EndSession => self
+                    .tx
+                    .send(SessionEvent::Ended {
+                        reason: "injected session end".into(),
+                    })
+                    .expect("bug: session owns its receiver"),
+                OnCancel::Disconnect => self.events.close(),
+                OnCancel::Fail => return Err(AdapterError::Spawn("injected dead socket".into())),
+                OnCancel::Panic => panic!("injected actor panic on cancel"),
+            }
+            Ok(())
+        }
+        async fn answer_permission(
+            &mut self,
+            _: PermissionId,
+            _: &str,
+        ) -> std::result::Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            self.events.recv().await
+        }
+        async fn suspend(self: Box<Self>) -> std::result::Result<ResumeToken, AdapterError> {
+            if self
+                .script
+                .failing_suspends
+                .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(AdapterError::Spawn("injected suspend failure".into()));
+            }
+            Ok(self.resume_token())
+        }
+    }
+
+    struct Harness {
+        _dir: tempfile::TempDir,
+        room: Arc<Mailroom>,
+        broker: Arc<Broker>,
+        script: Arc<Script>,
+        agent: AgentHandle,
+    }
+    async fn harness(infinity: bool) -> Harness {
+        let dir = tempfile::tempdir().expect("dir");
+        let room = Arc::new(
+            Mailroom::open(dir.path().join("mail.db"), Default::default())
+                .await
+                .expect("room"),
+        );
+        let mut kind = if infinity {
+            KindConfig::infinity(dir.path().join("unused.sock"))
+        } else {
+            KindConfig::claude("unused-fixture")
+        };
+        kind.isolation = crate::sandbox::Isolation::None;
+        kind.idle_after = None;
+        kind.cancel_timeout = CANCEL;
+        let mut broker = Broker::new(
+            room.clone(),
+            vec![kind.clone()],
+            Config {
+                backoff_initial: Duration::from_millis(1),
+                backoff_max: Duration::from_millis(1),
+                ..Default::default()
+            },
+        )
+        .expect("broker");
+        let script = Arc::new(Script::default());
+        broker.test_adapter = Some(Arc::new(Scripted(script.clone())));
+        let broker = Arc::new(broker);
+        let agent = broker
+            .spawn(AgentSpec {
+                name: AgentName::parse("a").expect("name"),
+                kind: kind.name.clone(),
+                cwd: dir.path().into(),
+                workspace: None,
+                model: None,
+                permissions: Default::default(),
+                idle_after: None,
+            })
+            .await
+            .expect("spawn");
+        let h = Harness {
+            _dir: dir,
+            room,
+            broker,
+            script,
+            agent,
+        };
+        h.wait(|p| *p == Phase::Idle).await;
+        h
+    }
+    impl Harness {
+        async fn wait(&self, matches: impl Fn(&Phase) -> bool) {
+            let mut phases = self.agent.phases();
+            tokio::time::timeout(Duration::from_secs(5), phases.wait_for(|p| matches(p)))
+                .await
+                .expect("phase timeout")
+                .expect("phase channel");
+        }
+        async fn send(&self, body: &str) -> MessageId {
+            self.broker
+                .send(NewMessage {
+                    from: Sender::Human,
+                    to: self.agent.id,
+                    body: Body::new(body).expect("body"),
+                    reply_to: None,
+                    client_key: ClientKey(ulid::Ulid::new().to_string()),
+                    act: crate::swarm::Act::Inform,
+                    task: None,
+                })
+                .await
+                .expect("send")
+                .1
+                .id()
+        }
+        /// Offers one message and leaves the turn running.
+        async fn busy(&self) -> MessageId {
+            let id = self.send("work").await;
+            self.wait(|p| *p == Phase::Busy).await;
+            assert!(matches!(
+                self.state(id).await,
+                DeliveryState::Offered { .. }
+            ));
+            id
+        }
+        async fn operate(&self, op: Operation) -> Result<()> {
+            tokio::time::timeout(CANCEL * 20, self.broker.operate(self.agent.id, op))
+                .await
+                .expect("operator command must finish within the halt deadline")
+        }
+        /// Every command sent before this one has been handled.
+        async fn barrier(&self) {
+            self.broker
+                .handle(self.agent.id)
+                .await
+                .expect("handle")
+                .pending_permissions()
+                .await
+                .expect("actor round trip");
+        }
+        async fn state(&self, id: MessageId) -> DeliveryState {
+            self.room.delivery(id).await.expect("delivery").state
+        }
+        async fn sql(&self, sql: &'static str) {
+            self.room
+                .observe(move |s| Ok(s.db.execute_batch(sql)?))
+                .await
+                .expect("inject SQL");
+        }
+        fn inject(&self, event: SessionEvent) {
+            self.script
+                .latest
+                .lock()
+                .expect("bug: script lock")
+                .as_ref()
+                .expect("a session was opened")
+                .send(event)
+                .expect("session is listening");
+        }
+        fn on_cancel(&self, mode: OnCancel) {
+            *self.script.on_cancel.lock().expect("bug: script lock") = mode;
+        }
+        fn count(&self, counter: fn(&Script) -> &AtomicUsize) -> usize {
+            counter(&self.script).load(SeqCst)
+        }
+    }
+    /// Polls `operation` once so its command is queued, then waits until the actor took it.
+    async fn queue(h: &Harness, operation: std::pin::Pin<&mut impl Future<Output = Result<()>>>) {
+        tokio::select! {
+            biased;
+            result = operation => panic!("operation finished before its deadline: {result:?}"),
+            () = h.barrier() => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn halt_deadline_ends_a_turn_whose_cancel_is_never_acknowledged() {
+        for op in [Operation::Stop, Operation::Restart] {
+            let h = harness(false).await;
+            let mail = h.busy().await;
+            h.operate(op).await.expect("operator command");
+            assert_eq!(h.count(|s| &s.cancels), 1, "{op:?} cancels the turn");
+            match op {
+                Operation::Stop => {
+                    assert_eq!(h.agent.phase(), Phase::Stopped);
+                    assert_eq!(h.state(mail).await, DeliveryState::Queued);
+                    assert_eq!(h.count(|s| &s.opens), 1);
+                }
+                Operation::Restart => {
+                    assert_eq!(h.count(|s| &s.opens), 2);
+                    assert_eq!(
+                        h.count(|s| &s.resumed),
+                        1,
+                        "restart of a busy agent resumes its session"
+                    );
+                }
+            }
+            h.broker.shutdown().await.expect("shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn mail_sent_during_a_halt_is_not_offered_to_the_halting_session() {
+        for op in [Operation::Stop, Operation::Restart] {
+            let h = harness(false).await;
+            h.script.accepts_busy_mail.store(true, SeqCst);
+            h.busy().await;
+            let halt = h.broker.operate(h.agent.id, op);
+            tokio::pin!(halt);
+            queue(&h, halt.as_mut()).await;
+            let late = h.send("late").await;
+            h.barrier().await;
+            assert_eq!(h.state(late).await, DeliveryState::Queued, "{op:?}");
+            assert_eq!(h.count(|s| &s.submits), 1, "{op:?}");
+            tokio::time::timeout(CANCEL * 20, halt)
+                .await
+                .expect("halt deadline")
+                .expect("operator command");
+            h.broker.shutdown().await.expect("shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_halt_that_cannot_settle_says_so_and_a_repeat_repairs_it() {
+        const REFUSE: &str = "CREATE TEMP TRIGGER refuse_settle BEFORE UPDATE OF state ON deliveries WHEN OLD.state='offered' BEGIN SELECT RAISE(ABORT,'injected settlement failure'); END;";
+        for op in [Operation::Stop, Operation::Restart] {
+            for suspend_fails in [true, false] {
+                let case = format!("{op:?}, suspend fails: {suspend_fails}");
+                let h = harness(false).await;
+                let mail = h.busy().await;
+                if suspend_fails {
+                    h.script.failing_suspends.store(1, SeqCst);
+                } else {
+                    h.sql(REFUSE).await;
+                }
+                assert!(h.operate(op).await.is_err(), "{case}");
+                assert_ne!(h.agent.phase(), Phase::Stopped, "{case}");
+                assert_eq!(
+                    h.count(|s| &s.opens),
+                    1,
+                    "{case}: no session before settlement"
+                );
+                assert!(
+                    matches!(h.state(mail).await, DeliveryState::Offered { .. }),
+                    "{case}"
+                );
+                if !suspend_fails {
+                    h.sql("DROP TRIGGER temp.refuse_settle").await;
+                }
+                h.operate(op).await.expect("a repeated command settles");
+                match op {
+                    Operation::Stop => {
+                        assert_eq!(h.agent.phase(), Phase::Stopped, "{case}");
+                        assert_eq!(h.state(mail).await, DeliveryState::Queued, "{case}");
+                    }
+                    Operation::Restart => {
+                        assert_eq!(h.count(|s| &s.opens), 2, "{case}");
+                        assert_eq!(h.count(|s| &s.resumed), 1, "{case}");
+                        assert_ne!(
+                            h.state(mail).await,
+                            DeliveryState::Offered {
+                                incarnation: Incarnation(1)
+                            },
+                            "{case}"
+                        );
+                    }
+                }
+                h.broker.shutdown().await.expect("shutdown");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_reports_infinity_work_that_may_still_be_running() {
+        for timed_out in [false, true] {
+            let h = harness(true).await;
+            h.script.cancel_times_out.store(timed_out, SeqCst);
+            h.script.thread_busy.store(true, SeqCst);
+            let mut events = h.broker.events();
+            let result = h.operate(Operation::Stop).await;
+            assert_eq!(crashes(&mut events), vec![], "a halt is not a crash");
+            assert_eq!(
+                h.count(|s| &s.cancels),
+                1,
+                "stop interrupts daemon work agentd did not submit"
+            );
+            let error = result.expect_err("an unacknowledged interrupt is not a confirmed stop");
+            assert!(
+                error.to_string().contains("may still be running"),
+                "{error}"
+            );
+            assert_eq!(h.agent.phase(), Phase::Stopped);
+            let note = h.agent.error().expect("ls shows the warning");
+            assert!(note.contains("may still be running"), "{note}");
+            assert_eq!(
+                h.operate(Operation::Stop).await.map_err(|e| e.to_string()),
+                Err(format!("agent stopped, but {note}")),
+                "a repeated stop repeats the note"
+            );
+            h.broker.shutdown().await.expect("shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn operate_respawns_a_failed_actor_and_nothing_else() {
+        let h = harness(false).await;
+        h.sql("CREATE TEMP TRIGGER refuse_offer BEFORE UPDATE OF state ON deliveries WHEN NEW.state='offered' BEGIN SELECT RAISE(ABORT,'injected storage failure'); END;").await;
+        h.send("kills the actor").await;
+        tokio::time::timeout(Duration::from_secs(5), h.agent.commands.closed())
+            .await
+            .expect("actor dies");
+        assert!(matches!(h.agent.phase(), Phase::Failed { .. }));
+        h.sql("DROP TRIGGER temp.refuse_offer").await;
+
+        h.operate(Operation::Stop)
+            .await
+            .expect("stop respawns a failed actor");
+        let current = h.broker.handle(h.agent.id).await.expect("handle");
+        assert!(!current.commands.same_channel(&h.agent.commands));
+        assert_eq!(current.phase(), Phase::Stopped);
+        assert_eq!(h.count(|s| &s.opens), 1, "a stopped respawn opens nothing");
+        h.operate(Operation::Restart).await.expect("restart");
+        assert_eq!(h.count(|s| &s.opens), 2);
+        assert_eq!(
+            h.count(|s| &s.resumed),
+            0,
+            "leaving Failed through stop and restart is a fresh session"
+        );
+
+        h.broker.shutdown().await.expect("shutdown");
+        assert!(
+            h.operate(Operation::Restart).await.is_err(),
+            "an actor ended by shutdown is not respawned"
+        );
+        assert_eq!(h.count(|s| &s.opens), 2);
+    }
+
+    #[tokio::test]
+    async fn a_second_command_replaces_a_pending_halt_and_both_callers_hear() {
+        use Operation::{Restart, Stop};
+        for (first, second) in [
+            (Stop, Stop),
+            (Stop, Restart),
+            (Restart, Stop),
+            (Restart, Restart),
+        ] {
+            let case = format!("{first:?} then {second:?}");
+            let h = harness(false).await;
+            h.busy().await;
+            let a = h.broker.operate(h.agent.id, first);
+            tokio::pin!(a);
+            queue(&h, a.as_mut()).await;
+            let b = h.broker.operate(h.agent.id, second);
+            let (a, b) = tokio::time::timeout(CANCEL * 20, async { tokio::join!(a, b) })
+                .await
+                .expect("the first command's deadline bounds both");
+            a.expect("first caller");
+            b.expect("second caller");
+            assert_eq!(h.count(|s| &s.cancels), 1, "{case}");
+            match second {
+                Stop => {
+                    assert_eq!(h.agent.phase(), Phase::Stopped, "{case}");
+                    assert_eq!(h.count(|s| &s.opens), 1, "{case}");
+                }
+                Restart => {
+                    assert_eq!(h.count(|s| &s.opens), 2, "{case}");
+                    assert!(!h.room.stopped(h.agent.id).await.expect("flag"), "{case}");
+                }
+            }
+            h.broker.shutdown().await.expect("shutdown");
+        }
+    }
+
+    const REFUSE_SETTLE: &str = "CREATE TEMP TRIGGER refuse_settle BEFORE UPDATE OF state ON deliveries WHEN OLD.state='offered' BEGIN SELECT RAISE(ABORT,'injected settlement failure'); END;";
+
+    fn assert_detached(result: Result<()>, prefix: &str, case: &str) -> String {
+        let error = result
+            .expect_err(&format!(
+                "{case}: an unacknowledged interrupt is not a clean halt"
+            ))
+            .to_string();
+        assert!(error.starts_with(prefix), "{case}: {error}");
+        assert!(error.contains("may still be running"), "{case}: {error}");
+        error
+    }
+
+    /// The phases a crash publishes. A session that goes away during a halt publishes none.
+    fn crashes(events: &mut broadcast::Receiver<Event>) -> Vec<Phase> {
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::PhaseChanged {
+                phase: phase @ (Phase::Ended | Phase::Crashed { .. } | Phase::Failed { .. }),
+                ..
+            } = event
+            {
+                seen.push(phase);
+            }
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn stop_keeps_the_detached_note_when_the_session_goes_away_first() {
+        let mut wrong = Vec::new();
+        for mode in [OnCancel::EndSession, OnCancel::Disconnect, OnCancel::Fail] {
+            for timed_out in [false, true] {
+                let case = format!("{mode:?}, cancel times out: {timed_out}");
+                let h = harness(true).await;
+                h.script.thread_busy.store(true, SeqCst);
+                h.script.cancel_times_out.store(timed_out, SeqCst);
+                h.on_cancel(mode);
+                let mut events = h.broker.events();
+                let reply = h.operate(Operation::Stop).await.map_err(|e| e.to_string());
+                let phase = h.agent.phase();
+                let crashed = crashes(&mut events);
+                if !reply.as_ref().is_err_and(|e| {
+                    e.starts_with("agent stopped, but ") && e.contains("may still be running")
+                }) || phase != Phase::Stopped
+                    || h.agent.error().is_none()
+                    || !crashed.is_empty()
+                {
+                    wrong.push(format!(
+                        "{case}: reply {reply:?}, phase {phase:?}, crashes {crashed:?}"
+                    ));
+                }
+                h.broker.shutdown().await.expect("shutdown");
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_stop_after_a_failed_settlement_keeps_the_detached_note() {
+        let h = harness(true).await;
+        h.script.thread_busy.store(true, SeqCst);
+        h.script.failing_suspends.store(1, SeqCst);
+        let first = h
+            .operate(Operation::Stop)
+            .await
+            .expect_err("settlement failed")
+            .to_string();
+        assert!(first.contains("did not settle"), "{first}");
+        assert_eq!(h.agent.phase(), Phase::Ended);
+        assert_eq!(
+            h.agent.error().as_deref(),
+            Some(first.as_str()),
+            "ls and the feed show why the agent is Ended and that the turn may still run"
+        );
+        assert!(first.contains("repeat `agentctl stop`"), "{first}");
+        assert!(first.contains("may still be running"), "{first}");
+        let result = h.operate(Operation::Stop).await;
+        assert_detached(result, "agent stopped, but ", "repeat");
+        assert_eq!(h.agent.phase(), Phase::Stopped);
+        assert!(
+            h.agent
+                .error()
+                .is_some_and(|e| e.contains("may still be running"))
+        );
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn restart_reports_infinity_work_that_may_still_be_running() {
+        let h = harness(true).await;
+        h.script.thread_busy.store(true, SeqCst);
+        let result = h.operate(Operation::Restart).await;
+        let error = assert_detached(result, "agent restarted, but ", "restart");
+        assert_eq!(h.count(|s| &s.opens), 2, "restart still reattaches");
+        assert_eq!(
+            h.agent.error().as_deref(),
+            error.strip_prefix("agent restarted, but "),
+            "ls and the feed show the note"
+        );
+        h.inject(SessionEvent::TurnEnded {
+            outcome: TurnOutcome::Completed,
+        });
+        h.wait(|p| *p == Phase::Idle).await;
+        assert_eq!(h.agent.error(), None, "the note clears when the turn ends");
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn restart_from_needs_recovery_stays_fresh_after_a_failed_settlement() {
+        let h = harness(false).await;
+        h.inject(SessionEvent::ResumeFailed {
+            reason: "injected rejected token".into(),
+        });
+        h.wait(|p| matches!(p, Phase::NeedsRecovery { .. })).await;
+        let mail = h.send("queued during recovery").await;
+        h.barrier().await;
+        h.sql("UPDATE deliveries SET state='offered', incarnation=1")
+            .await;
+        h.sql(REFUSE_SETTLE).await;
+        assert!(matches!(h.state(mail).await, DeliveryState::Offered { .. }));
+        let failure = h
+            .operate(Operation::Restart)
+            .await
+            .expect_err("settlement failed")
+            .to_string();
+        assert_eq!(h.agent.phase(), Phase::Ended);
+        assert!(failure.contains("repeat `agentctl restart`"), "{failure}");
+        assert_eq!(h.agent.error(), Some(failure));
+        h.sql("DROP TRIGGER temp.refuse_settle").await;
+        h.operate(Operation::Restart)
+            .await
+            .expect("a repeated restart settles");
+        assert_eq!(h.count(|s| &s.opens), 2);
+        assert_eq!(
+            h.count(|s| &s.resumed),
+            0,
+            "the rejected token is not resumed again"
+        );
+        assert!(!matches!(h.agent.phase(), Phase::NeedsRecovery { .. }));
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn spawn_after_shutdown_is_refused() {
+        let h = harness(false).await;
+        h.broker.shutdown().await.expect("shutdown");
+        let late = h
+            .broker
+            .spawn(AgentSpec {
+                name: AgentName::parse("late").expect("name"),
+                kind: "claude".into(),
+                cwd: h._dir.path().into(),
+                workspace: None,
+                model: None,
+                permissions: Default::default(),
+                idle_after: None,
+            })
+            .await;
+        assert!(
+            matches!(late, Err(Error::Closed)),
+            "{:?}",
+            late.map(|h| h.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn operate_respawns_an_actor_that_panicked() {
+        let h = harness(false).await;
+        h.script.panic_on_submit.store(true, SeqCst);
+        h.send("panics the actor").await;
+        tokio::time::timeout(Duration::from_secs(5), h.agent.commands.closed())
+            .await
+            .expect("actor dies");
+        h.script.panic_on_submit.store(false, SeqCst);
+        h.operate(Operation::Restart)
+            .await
+            .expect("restart respawns a panicked actor");
+        let current = h.broker.handle(h.agent.id).await.expect("handle");
+        assert!(!current.commands.same_channel(&h.agent.commands));
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    const WARNED: &str = "may still be running";
+    const REFUSE_STOPPED: &str = "CREATE TEMP TRIGGER refuse_stopped BEFORE UPDATE OF stopped ON agent_specs BEGIN SELECT RAISE(ABORT,'injected flag failure'); END;";
+    const REFUSE_FORGET: &str = "CREATE TEMP TRIGGER refuse_forget BEFORE UPDATE OF resume ON actor_state WHEN NEW.resume IS NULL BEGIN SELECT RAISE(ABORT,'injected forget failure'); END;";
+    const REFUSE_REOPEN: &str = "CREATE TEMP TRIGGER refuse_reopen BEFORE UPDATE OF incarnation ON actor_state BEGIN SELECT RAISE(ABORT,'injected reopen failure'); END;";
+    const REFUSE_OFFER: &str = "CREATE TEMP TRIGGER refuse_offer BEFORE UPDATE OF state ON deliveries WHEN NEW.state='offered' BEGIN SELECT RAISE(ABORT,'injected offer failure'); END;";
+
+    #[derive(Clone, Copy, Debug)]
+    enum Fault {
+        SessionEndsAndSuspendFails,
+        SuspendFails,
+        SettleFails,
+        SetStoppedFails,
+        ForgetResumeFails,
+        ReopenFails,
+        OfferFails,
+        Panic,
+        RepeatedStop,
+        RestartAfterStop,
+    }
+
+    /// Records every step at which the operator would lose the warning.
+    struct Probe<'a> {
+        h: &'a Harness,
+        fault: Fault,
+        wrong: &'a mut Vec<String>,
+    }
+    impl Probe<'_> {
+        async fn shown(&mut self, step: &str) {
+            let error = self.h.current().await.error();
+            if !error.as_ref().is_some_and(|e| e.contains(WARNED)) {
+                self.wrong
+                    .push(format!("{:?}, {step}: error {error:?}", self.fault));
+            }
+        }
+        async fn replied(&mut self, step: &str, reply: Result<()>) {
+            let reply = reply.map_err(|e| e.to_string());
+            if !reply.as_ref().is_err_and(|e| e.contains(WARNED)) {
+                self.wrong
+                    .push(format!("{:?}, {step}: reply {reply:?}", self.fault));
+            }
+            self.shown(step).await;
+        }
+        async fn operate(&mut self, step: &str, op: Operation) {
+            let reply = self.h.operate(op).await;
+            self.replied(step, reply).await;
+        }
+    }
+
+    impl Harness {
+        async fn current(&self) -> AgentHandle {
+            self.broker.handle(self.agent.id).await.expect("handle")
+        }
+        async fn dies(&self) {
+            let current = self.current().await;
+            tokio::time::timeout(Duration::from_secs(5), current.commands.closed())
+                .await
+                .expect("actor dies");
+        }
+        /// Restarts onto a thread that is still busy, leaving the warning on a running agent.
+        async fn restarted_busy(&self, p: &mut Probe<'_>) {
+            p.operate("restart onto the busy thread", Operation::Restart)
+                .await;
+            let mut phases = self.current().await.phases();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                phases.wait_for(|p| *p == Phase::Busy),
+            )
+            .await
+            .expect("phase timeout")
+            .expect("phase channel");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_lost_the_respawn_race_still_gets_the_warning() {
+        let h = harness(true).await;
+        h.script.thread_busy.store(true, SeqCst);
+        h.busy().await;
+        let stopped = h.operate(Operation::Stop).await;
+        assert!(stopped.is_err_and(|e| e.to_string().contains(WARNED)));
+        h.operate(Operation::Restart)
+            .await
+            .expect_err("the thread is still busy");
+        let mut phases = h.current().await.phases();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            phases.wait_for(|p| *p == Phase::Busy),
+        )
+        .await
+        .expect("phase timeout")
+        .expect("phase channel");
+        h.script.panic_on_submit.store(true, SeqCst);
+        h.script.accepts_busy_mail.store(true, SeqCst);
+        h.send("panics the actor").await;
+        h.dies().await;
+        h.script.panic_on_submit.store(false, SeqCst);
+        h.script.accepts_busy_mail.store(false, SeqCst);
+
+        // The first caller respawns the dead actor. The second waited for that,
+        // then asks the new actor, which dies on the cancel before it answers.
+        h.on_cancel(OnCancel::Panic);
+        let id = h.agent.id;
+        let (first, second) = tokio::join!(
+            h.broker.operate(id, Operation::Restart),
+            h.broker.operate(id, Operation::Restart),
+        );
+        for (caller, reply) in [("first", first), ("second", second)] {
+            let reply = reply.expect_err("the turn is unacknowledged").to_string();
+            assert!(reply.contains(WARNED), "{caller}: {reply}");
+        }
+        assert!(
+            h.script.cancels.load(SeqCst) >= 2,
+            "the second caller reached the respawned actor"
+        );
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn no_single_fault_loses_the_unacknowledged_turn_warning() {
+        use Fault::*;
+        let mut wrong = Vec::new();
+        for fault in [
+            SessionEndsAndSuspendFails,
+            SuspendFails,
+            SettleFails,
+            SetStoppedFails,
+            ForgetResumeFails,
+            ReopenFails,
+            OfferFails,
+            Panic,
+            RepeatedStop,
+            RestartAfterStop,
+        ] {
+            let h = harness(true).await;
+            h.script.thread_busy.store(true, SeqCst);
+            h.busy().await;
+            let mut p = Probe {
+                h: &h,
+                fault,
+                wrong: &mut wrong,
+            };
+            match fault {
+                SessionEndsAndSuspendFails => {
+                    h.on_cancel(OnCancel::EndSession);
+                    h.script.failing_suspends.store(1, SeqCst);
+                    p.operate("stop", Operation::Stop).await;
+                    h.dies().await;
+                    p.shown("dead actor").await;
+                    p.operate("stop respawns", Operation::Stop).await;
+                }
+                SuspendFails => {
+                    h.script.failing_suspends.store(1, SeqCst);
+                    p.operate("unsettled stop", Operation::Stop).await;
+                    p.operate("repeated stop", Operation::Stop).await;
+                }
+                SettleFails => {
+                    h.sql(REFUSE_SETTLE).await;
+                    p.operate("unsettled stop", Operation::Stop).await;
+                    h.sql("DROP TRIGGER temp.refuse_settle").await;
+                    p.operate("repeated stop", Operation::Stop).await;
+                }
+                SetStoppedFails => {
+                    p.operate("stop", Operation::Stop).await;
+                    h.sql(REFUSE_STOPPED).await;
+                    p.operate("restart without the flag", Operation::Restart)
+                        .await;
+                    h.sql("DROP TRIGGER temp.refuse_stopped").await;
+                    p.operate("repeated restart", Operation::Restart).await;
+                }
+                ForgetResumeFails => {
+                    p.operate("stop", Operation::Stop).await;
+                    h.restarted_busy(&mut p).await;
+                    h.inject(SessionEvent::ResumeFailed {
+                        reason: "injected rejected token".into(),
+                    });
+                    let mut phases = h.current().await.phases();
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        phases.wait_for(|p| matches!(p, Phase::NeedsRecovery { .. })),
+                    )
+                    .await
+                    .expect("phase timeout")
+                    .expect("phase channel");
+                    p.shown("needs recovery").await;
+                    h.sql(REFUSE_FORGET).await;
+                    p.operate("stop that cannot forget", Operation::Stop).await;
+                    h.dies().await;
+                    p.shown("dead actor").await;
+                    h.sql("DROP TRIGGER temp.refuse_forget").await;
+                    p.operate("stop respawns", Operation::Stop).await;
+                }
+                ReopenFails => {
+                    p.operate("stop", Operation::Stop).await;
+                    h.sql(REFUSE_REOPEN).await;
+                    p.operate("restart that cannot reopen", Operation::Restart)
+                        .await;
+                    h.dies().await;
+                    p.shown("dead actor").await;
+                    h.sql("DROP TRIGGER temp.refuse_reopen").await;
+                    p.operate("restart respawns", Operation::Restart).await;
+                }
+                OfferFails => {
+                    p.operate("stop", Operation::Stop).await;
+                    h.restarted_busy(&mut p).await;
+                    h.sql(REFUSE_OFFER).await;
+                    h.script.accepts_busy_mail.store(true, SeqCst);
+                    h.send("cannot be offered").await;
+                    h.dies().await;
+                    p.shown("dead actor").await;
+                    h.sql("DROP TRIGGER temp.refuse_offer").await;
+                    p.operate("stop respawns", Operation::Stop).await;
+                }
+                Panic => {
+                    p.operate("stop", Operation::Stop).await;
+                    h.restarted_busy(&mut p).await;
+                    h.script.panic_on_submit.store(true, SeqCst);
+                    h.script.accepts_busy_mail.store(true, SeqCst);
+                    h.send("panics the actor").await;
+                    h.dies().await;
+                    h.script.panic_on_submit.store(false, SeqCst);
+                    p.shown("dead actor").await;
+                    p.operate("restart respawns", Operation::Restart).await;
+                }
+                RepeatedStop => {
+                    p.operate("stop", Operation::Stop).await;
+                    p.operate("repeated stop", Operation::Stop).await;
+                }
+                RestartAfterStop => {
+                    p.operate("stop", Operation::Stop).await;
+                    p.operate("restart", Operation::Restart).await;
+                }
+            }
+            h.broker.shutdown().await.expect("shutdown");
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_cancel_acknowledged_by_a_new_completion_is_not_a_turn_end() {
+        let h = harness(true).await;
+        h.script.thread_busy.store(true, SeqCst);
+        h.busy().await;
+        let stop = h.broker.operate(h.agent.id, Operation::Stop);
+        tokio::pin!(stop);
+        queue(&h, stop.as_mut()).await;
+        h.inject(SessionEvent::CancelComplete);
+        h.inject(SessionEvent::Ended {
+            reason: "injected session end".into(),
+        });
+        let result = tokio::time::timeout(CANCEL * 20, stop)
+            .await
+            .expect("halt deadline");
+        assert_detached(result, "agent stopped, but ", "cancel complete, then end");
+        assert!(h.agent.error().is_some_and(|e| e.contains(WARNED)));
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_restarted_actor_that_panicked_while_busy_resumes_its_session() {
+        let h = harness(false).await;
+        h.busy().await;
+        h.script.panic_on_submit.store(true, SeqCst);
+        h.script.accepts_busy_mail.store(true, SeqCst);
+        h.send("panics the actor").await;
+        h.dies().await;
+        assert_eq!(h.agent.phase(), Phase::Busy, "the actor died busy");
+        h.script.panic_on_submit.store(false, SeqCst);
+        h.operate(Operation::Restart).await.expect("restart");
+        let mut phases = h.current().await.phases();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            phases.wait_for(|p| matches!(p, Phase::Idle | Phase::Busy)),
+        )
+        .await
+        .expect("phase timeout")
+        .expect("phase channel");
+        assert_eq!(h.count(|s| &s.opens), 2);
+        assert_eq!(
+            h.count(|s| &s.resumed),
+            1,
+            "a respawned busy actor resumes, as a live busy restart does"
+        );
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_goes_unavailable_during_a_halt_is_not_a_crash() {
+        let h = harness(true).await;
+        h.script.thread_busy.store(true, SeqCst);
+        h.busy().await;
+        let mut events = h.broker.events();
+        let stop = h.broker.operate(h.agent.id, Operation::Stop);
+        tokio::pin!(stop);
+        queue(&h, stop.as_mut()).await;
+        h.inject(SessionEvent::Unavailable {
+            reason: "injected unavailable daemon".into(),
+        });
+        let result = tokio::time::timeout(CANCEL * 20, stop)
+            .await
+            .expect("halt deadline");
+        assert_detached(result, "agent stopped, but ", "unavailable");
+        assert_eq!(crashes(&mut events), vec![], "a halt is not a crash");
+        assert_eq!(h.agent.phase(), Phase::Stopped);
+        assert_eq!(h.count(|s| &s.opens), 1, "a stop reopens nothing");
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn the_feed_shows_the_warning_when_it_changes_without_a_phase_change() {
+        let h = harness(true).await;
+        let (bound, _) = mpsc::unbounded_channel();
+        let api = crate::surfaces::ControlApi {
+            broker: h.broker.clone(),
+            mailroom: h.room.clone(),
+            bindings: Arc::new(crate::surfaces::Bindings::new(
+                h._dir.path().join("mcp"),
+                "agentd".into(),
+                bound,
+            )),
+            control_path: h._dir.path().join("control"),
+            ui_url: None,
+        };
+        let mut states = h.broker.event_hub().state();
+        let mut cache = HashMap::new();
+        let mut rows = async || {
+            let mut rows = Vec::new();
+            while let Ok(event) = states.try_recv() {
+                if let Some(row) = crate::surfaces::events::state(&api, event, &mut cache)
+                    .await
+                    .expect("row")
+                    && row["event"] == "agent"
+                {
+                    rows.push((row["phase"].clone(), row["error"].clone()));
+                }
+            }
+            rows
+        };
+        // The daemon thread runs work agentd did not submit, so the phase stays Idle.
+        h.script.thread_busy.store(true, SeqCst);
+        rows().await;
+        let stop = h.broker.operate(h.agent.id, Operation::Stop);
+        tokio::pin!(stop);
+        queue(&h, stop.as_mut()).await;
+        assert_eq!(h.agent.phase(), Phase::Idle);
+        let pending = rows().await;
+        assert!(
+            pending.iter().any(|(phase, error)| phase == "idle"
+                && error.as_str().is_some_and(|e| e.contains(WARNED))),
+            "the warning reaches the feed while the phase is unchanged: {pending:?}"
+        );
+        tokio::time::timeout(CANCEL * 20, stop)
+            .await
+            .expect("halt deadline")
+            .expect_err("unacknowledged");
+        let stopped = rows().await;
+        assert!(
+            stopped
+                .last()
+                .is_some_and(|(phase, error)| phase == "stopped"
+                    && error.as_str().is_some_and(|e| e.contains(WARNED))),
+            "{stopped:?}"
+        );
+        h.script.thread_busy.store(false, SeqCst);
+        h.operate(Operation::Restart)
+            .await
+            .expect("the reattached thread is idle, which clears the warning");
+        assert_eq!(h.agent.error(), None);
+        let cleared = rows().await;
+        assert!(
+            cleared.last().is_some_and(|(_, error)| error.is_null()),
+            "{cleared:?}"
+        );
+        h.broker.shutdown().await.expect("shutdown");
     }
 }

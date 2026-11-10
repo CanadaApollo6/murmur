@@ -65,9 +65,10 @@ const PHASE_RANK: Record<NodeKind, number> = {
   suspending: 5,
   idle: 6,
   dormant: 7,
-  ended: 8,
-  unknown: 9,
-  human: 10,
+  stopped: 8,
+  ended: 9,
+  unknown: 10,
+  human: 11,
 };
 
 export function phaseRank(phase: NodeKind): number {
@@ -87,6 +88,7 @@ export const PHASE_LABEL: Record<NodeKind, string> = {
   suspending: "suspending",
   idle: "idle",
   dormant: "dormant",
+  stopped: "stopped by operator",
   ended: "ended",
   unknown: "not listed",
   human: "you",

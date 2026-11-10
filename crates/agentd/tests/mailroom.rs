@@ -869,7 +869,7 @@ async fn schema_version_and_attempt_configuration_are_checked() {
     let dir = tempfile::tempdir().expect("dir");
     let path = dir.path().join("future.db");
     let db = rusqlite::Connection::open(&path).expect("db");
-    db.execute_batch("PRAGMA user_version=3").expect("version");
+    db.execute_batch("PRAGMA user_version=4").expect("version");
     db.close().expect("close");
     assert!(Mailroom::open(&path, Config::default()).await.is_err());
     assert!(
@@ -883,6 +883,44 @@ async fn schema_version_and_attempt_configuration_are_checked() {
         .await
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn version_two_database_upgrades_with_agents_running() {
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("v2.db");
+    let db = rusqlite::Connection::open(&path).expect("db");
+    db.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
+    db.execute_batch(include_str!("../src/schema.sql"))
+        .expect("v1 schema");
+    db.execute_batch(include_str!("../src/schema-v2.sql"))
+        .expect("v2 schema");
+    let id = AgentId::new();
+    let spec = serde_json::json!({"name":"old","kind":"claude","cwd":"/","model":null,
+        "permissions":PermissionPolicy::default(),"idle_after":null});
+    db.execute(
+        "INSERT INTO agents(id,name) VALUES (?,?)",
+        [serde_json::to_string(&id).expect("id"), "old".into()],
+    )
+    .expect("agent");
+    db.execute(
+        "INSERT INTO agent_specs(agent,spec) VALUES (?,?)",
+        [serde_json::to_string(&id).expect("id"), spec.to_string()],
+    )
+    .expect("spec");
+    db.close().expect("close");
+
+    let mail = Mailroom::open(&path, Config::default())
+        .await
+        .expect("upgrade");
+    assert!(!mail.stopped(id).await.expect("stop flag"));
+    assert_eq!(mail.specs().await.expect("specs").len(), 1);
+    mail.close().await.expect("close");
+    let db = rusqlite::Connection::open(&path).expect("db");
+    let version: u32 = db
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("version");
+    assert_eq!(version, 3);
 }
 
 #[tokio::test]

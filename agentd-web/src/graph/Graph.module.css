@@ -160,6 +160,12 @@
   font-weight: 500;
 }
 
+.stopped .shape {
+  stroke: var(--text-muted);
+  stroke-width: 2.5;
+  fill: none;
+}
+
 .ended .shape {
   stroke: var(--text-muted);
   fill: none;

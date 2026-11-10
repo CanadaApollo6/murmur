@@ -64,7 +64,8 @@ export type Phase =
   | "ended"
   | "crashed"
   | "failed"
-  | "needs-recovery";
+  | "needs-recovery"
+  | "stopped";
 
 export interface AgentRow {
   id: string;

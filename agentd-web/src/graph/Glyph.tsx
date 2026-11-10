@@ -24,6 +24,7 @@ const PHASE_CLASS: Record<NodeKind, string> = {
   idle: styles.idle!,
   dormant: styles.dormant!,
   ended: styles.ended!,
+  stopped: styles.stopped!,
   unknown: styles.unknown!,
   human: styles.human!,
 };
@@ -103,6 +104,13 @@ export function Glyph({ phase, r }: { phase: NodeKind; r: number }) {
             y2={-r * 0.58}
           />
         </>
+      );
+    case "stopped":
+      return (
+        <polygon
+          className={styles.shape}
+          points={polygon(4, r * 1.05, Math.PI / 4)}
+        />
       );
     case "unknown":
       return (

@@ -189,6 +189,7 @@ function Legend() {
               "idle",
               "starting",
               "dormant",
+              "stopped",
               "ended",
               "unknown",
               "human",
