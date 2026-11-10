@@ -1594,3 +1594,91 @@ async fn task_acts_keep_sender_text_in_the_mail_tag_and_route_reports() {
     assert_eq!(row(&children[1])["state"], "closed");
     d.stop(nix::sys::signal::Signal::SIGTERM).await;
 }
+
+#[tokio::test]
+async fn a_report_to_a_retired_requester_tells_the_assignee_what_to_do() {
+    use agentd::mailroom::{Mailroom, NewMessage};
+    use agentd::model::*;
+    use agentd::swarm::{Act, Budget, Stakes};
+
+    let mut d = Daemon::new(None).await;
+    d.spawn("b", "codex", Some("start")).await;
+    d.wait_wire("b", |v| !prompts(v).is_empty()).await;
+    // No surface retires an agent yet, so the test does it in the database
+    // while the daemon is down.
+    d.stop(nix::sys::signal::Signal::SIGTERM).await;
+    let mail = Mailroom::open(d.root.path().join("state/mail.db"), Default::default())
+        .await
+        .expect("mailroom");
+    let a = mail
+        .register(AgentName::parse("a").expect("name"))
+        .await
+        .expect("register a");
+    let b = mail
+        .resolve(Recipient::parse("@b").expect("recipient"))
+        .await
+        .expect("resolve b");
+    let request = |from, to, parent, amount: u16| NewMessage {
+        from,
+        to,
+        body: Body::new("work").expect("body"),
+        reply_to: None,
+        client_key: ClientKey(MessageId::new().to_string()),
+        task: parent,
+        act: Act::Request {
+            deliverable: "result".into(),
+            budget: Budget {
+                wall_secs: amount.into(),
+                messages: amount.into(),
+                hops: amount,
+                tokens: None,
+            },
+            stakes: Stakes::Normal,
+        },
+    };
+    let root = mail
+        .accept(request(Sender::Human, a, None, 10))
+        .await
+        .expect("root request")
+        .1
+        .task()
+        .expect("root task");
+    let child = mail
+        .accept(request(Sender::Agent(a), b, Some(root), 2))
+        .await
+        .expect("child request")
+        .1
+        .task()
+        .expect("child task");
+    mail.retire(a).await.expect("retire a");
+    mail.close().await.expect("close");
+    std::fs::write(d.root.path().join("b/wire.jsonl"), "").expect("clear wire");
+    d.child = Daemon::start(&d.root);
+    d.ready().await;
+    let opens = |r: &&Value| r["method"] == "session/new" || r["method"] == "session/load";
+    let wire = d.wait_wire("b", |v| v.iter().any(|r| opens(&r))).await;
+    let token =
+        wire.iter().find(opens).expect("session")["params"]["mcpServers"][0]["env"][0]["value"]
+            .as_str()
+            .expect("token")
+            .to_owned();
+
+    let report = |to: String| json!({"to":to,"body":"report","act":{"kind":"report","task":child,"outcome":{"kind":"done"}}});
+    let (error, text) = send_tool(&d, &token, "to-retired", report(format!("agent:{a}"))).await;
+    assert!(error, "{text}");
+    assert!(
+        text.contains("address the report to yourself"),
+        "the assignee must learn how to close the task: {text}"
+    );
+    let (error, text) = send_tool(&d, &token, "to-self", report(format!("agent:{b}"))).await;
+    assert!(!error, "{text}");
+    let tasks = d.ctl(&["tasks"]).await;
+    let row = tasks
+        .as_array()
+        .expect("tasks")
+        .iter()
+        .find(|t| t["id"] == child.to_string())
+        .expect("child task row");
+    assert_eq!(row["state"], "closed", "{row}");
+    d.stop(nix::sys::signal::Signal::SIGTERM).await;
+}

@@ -292,7 +292,12 @@ impl ControlApi {
         key: ClientKey,
         act: Option<acts::ActArgs>,
     ) -> Result<Value> {
-        let id = self.mailroom.resolve(Recipient::parse(to)?).await?;
+        let id = match (&act, Recipient::parse(to)?) {
+            // The mailroom checks a report's recipient against the task, so a
+            // report to a retired requester gets its guidance.
+            (Some(acts::ActArgs::Report { .. }), Recipient::Id(id)) => id,
+            (_, recipient) => self.mailroom.resolve(recipient).await?,
+        };
         let (act, task) = act.map_or((Act::Inform, None), acts::ActArgs::into_act);
         let (outcome, env) = self
             .broker
