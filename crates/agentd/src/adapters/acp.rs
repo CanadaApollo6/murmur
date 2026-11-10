@@ -51,8 +51,13 @@ struct AcpSession {
     next_id: u64,
     flight: Option<Flight>,
     pending: HashMap<PermissionId, Pending>,
+    /// Titles of this turn's tool calls, newest last, for permission requests that omit one.
+    tool_titles: VecDeque<(String, String)>,
     ended: bool,
 }
+
+/// Enough recent tool calls to cover one whose approval is pending.
+const TOOL_TITLES: usize = 64;
 
 fn protocol(e: impl std::fmt::Display) -> AdapterError {
     AdapterError::Protocol(e.to_string())
@@ -174,6 +179,7 @@ impl Adapter for AcpAdapter {
             next_id: 1,
             flight: None,
             pending: HashMap::new(),
+            tool_titles: VecDeque::new(),
             ended: false,
         });
         let result = session.initialize(&req).await;
@@ -338,6 +344,7 @@ impl AcpSession {
                             update["content"]["text"].as_str()
                         }
                         Some("tool_call" | "tool_call_update") => {
+                            self.remember_title(update);
                             Some(update["title"].as_str().unwrap_or("tool activity"))
                         }
                         Some("plan") => Some("plan updated"),
@@ -376,8 +383,11 @@ impl AcpSession {
                             })
                         })
                         .collect::<Result<Vec<_>, AdapterError>>()?;
+                    if !params["toolCall"].is_object() {
+                        return Err(protocol("missing toolCall"));
+                    }
                     let id = PermissionId::new();
-                    let title = string(&params["toolCall"], "title")?;
+                    let title = self.permission_title(&params["toolCall"]);
                     let tool = match params["toolCall"]["kind"].as_str() {
                         Some("execute") => "shell",
                         Some("edit") => "edit",
@@ -431,11 +441,46 @@ impl AcpSession {
             self.started();
             let flight = self.flight.take().ok_or(AdapterError::Ended)?;
             self.pending.clear();
+            self.tool_titles.clear();
             self.events
                 .push_back(SessionEvent::Committed { ids: flight.ids });
             self.events.push_back(SessionEvent::TurnEnded { outcome });
         }
         Ok(())
+    }
+
+    fn remember_title(&mut self, update: &Value) {
+        let (Some(id), Some(title)) = (
+            update["toolCallId"].as_str(),
+            update["title"].as_str().filter(|t| !t.is_empty()),
+        ) else {
+            return;
+        };
+        self.tool_titles.retain(|(known, _)| known != id);
+        if self.tool_titles.len() == TOOL_TITLES {
+            self.tool_titles.pop_front();
+        }
+        self.tool_titles.push_back((id.into(), title.into()));
+    }
+
+    /// ACP makes `title` optional here, and codex-acp omits it when it approves an MCP call it
+    /// already announced, so fall back to that call's title, then to `name` and `kind`.
+    fn permission_title(&self, tool_call: &Value) -> String {
+        let text = |key| tool_call[key].as_str().filter(|s: &&str| !s.is_empty());
+        if let Some(title) = text("title") {
+            return title.into();
+        }
+        if let Some(id) = text("toolCallId")
+            && let Some((_, title)) = self.tool_titles.iter().rev().find(|(known, _)| known == id)
+        {
+            return title.clone();
+        }
+        match (text("name"), text("kind")) {
+            (Some(name), Some(kind)) => format!("{name} ({kind})"),
+            (Some(name), None) => name.into(),
+            (None, Some(kind)) => format!("{kind} tool call"),
+            (None, None) => "unnamed tool call".into(),
+        }
     }
 
     fn kill_group(&self) {
@@ -659,6 +704,7 @@ mod tests {
                 cancel_deadline: Some(Instant::now() + kind.cancel_timeout),
             }),
             pending: HashMap::new(),
+            tool_titles: VecDeque::new(),
             ended: false,
             kind,
         };
