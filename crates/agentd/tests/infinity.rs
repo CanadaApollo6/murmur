@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +21,16 @@ struct Test {
     broker: Broker,
     agent: AgentHandle,
     events: broadcast::Receiver<Event>,
+}
+/// Prints agentd warnings into captured test output, so a failure shows why a session ended.
+fn log_warnings() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::WARN)
+            .init();
+    });
 }
 fn spec(root: &std::path::Path) -> AgentSpec {
     AgentSpec {
@@ -47,6 +58,7 @@ impl Test {
         stall: Duration,
         mail: agentd::mailroom::Config,
     ) -> Self {
+        log_warnings();
         let root = tempfile::tempdir().expect("tempdir");
         let socket = root.path().join("daemon.sock");
         let daemon = fake::FakeDaemon::bind(&socket);
@@ -2084,26 +2096,69 @@ async fn r18_admission_probe(matching_root: bool) {
     });
     t.event(|e| matches!(e, Event::Activity { text, .. } if text == "admission barrier"))
         .await;
-    let next = tokio::time::timeout(Duration::from_millis(700), t.daemon.next()).await;
-    let interrupted = next
-        .as_ref()
-        .is_ok_and(|r| matches!(r.message, ClientMessage::Interrupt { .. }));
+    // From here virtual time moves only by `advance`. The stall deadline (300 ms after the
+    // barrier) is then past, so a still-Waiting offer is cancelled as soon as the supervisor
+    // runs, without waiting for real time. The frozen clock also keeps the 200 ms cancel
+    // deadline from expiring while the test replies on this connection.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_millis(700)).await;
+    let stall = hold_clock_for(
+        Duration::from_millis(700),
+        t.event(|e| matches!(e, Event::Activity { text, .. } if text.starts_with("mail-starvation stall"))),
+    )
+    .await;
+    let interrupted = stall.is_some();
     assert_eq!(
         interrupted, !matching_root,
         "only exact root admission retires Waiting, including across continuation StartOutput"
     );
+    if interrupted {
+        let interrupt = hold_clock(t.daemon.next()).await;
+        assert!(matches!(interrupt.message, ClientMessage::Interrupt { .. }));
+    }
     assert!(
         matches!(
-            t.mailroom.delivery(id).await.expect("delivery").state,
+            hold_clock(t.mailroom.delivery(id))
+                .await
+                .expect("delivery")
+                .state,
             DeliveryState::Offered { .. }
         ),
         "admission never consumes mail"
     );
     offer.emit(fake::receipt(format!("peer-{id}")));
-    t.consumed(id).await;
+    hold_clock(t.consumed(id)).await;
     offer.emit(fake::idle());
-    t.idle().await;
+    hold_clock(t.idle()).await;
+    tokio::time::resume();
     t.finish().await;
+}
+
+/// Awaits `work` without letting a paused clock move, or gives up after `limit` of real time.
+/// A plain await parks the runtime whenever agentd waits on the mailroom thread or a socket,
+/// and tokio then auto-advances to the next timer, which can expire agentd's deadlines before
+/// the fake daemon's reply is read. Yielding keeps the runtime busy, so virtual time holds.
+async fn hold_clock_for<F: Future>(limit: Duration, work: F) -> Option<F::Output> {
+    let give_up = std::time::Instant::now() + limit;
+    let mut work = std::pin::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut work => return Some(output),
+            () = tokio::task::yield_now() => {
+                if std::time::Instant::now() >= give_up {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Like [`hold_clock_for`], for work that must finish within 5 s of real time.
+async fn hold_clock<F: Future>(work: F) -> F::Output {
+    hold_clock_for(Duration::from_secs(5), work)
+        .await
+        .expect("held work did not finish within 5 s of real time")
 }
 
 #[tokio::test]
