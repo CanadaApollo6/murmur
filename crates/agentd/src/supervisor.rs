@@ -351,20 +351,23 @@ impl Broker {
     /// both work from any phase. An actor ended by shutdown or replacement
     /// exits in `Ended` and is never respawned.
     pub async fn operate(&self, id: AgentId, op: Operation) -> Result<()> {
-        if let Some(handle) = self.handle(id).await {
-            match handle.operate(op).await {
-                Err(Error::Closed) => {}
-                result => return result,
+        loop {
+            if let Some(handle) = self.handle(id).await {
+                match handle.operate(op).await {
+                    Err(Error::Closed) => {}
+                    result => return result,
+                }
             }
+            let _replacement = self.replacements.lock().await;
+            let previous = self.handle(id).await;
+            if previous.as_ref().is_some_and(|h| !h.commands.is_closed()) {
+                // Another caller respawned the actor first. Ask that actor, so
+                // a reply never comes from anywhere but an actor or `halt_reply`.
+                continue;
+            }
+            let result = self.respawn(id, op, previous.as_ref()).await;
+            return halt_reply(op, result, previous.and_then(|h| h.warning()).as_deref());
         }
-        let replacement = self.replacements.lock().await;
-        let previous = self.handle(id).await;
-        if let Some(handle) = previous.as_ref().filter(|h| !h.commands.is_closed()) {
-            drop(replacement);
-            return handle.operate(op).await;
-        }
-        let result = self.respawn(id, op, previous.as_ref()).await;
-        halt_reply(op, result, previous.and_then(|h| h.warning()).as_deref())
     }
     async fn respawn(
         &self,
@@ -2113,6 +2116,8 @@ mod halt_tests {
         Disconnect,
         /// The cancel cannot be sent.
         Fail,
+        /// The actor dies before it answers the command.
+        Panic,
     }
     struct Scripted(Arc<Script>);
     struct ScriptedSession {
@@ -2168,7 +2173,9 @@ mod halt_tests {
                     .send(SessionEvent::CancelTimedOut)
                     .expect("bug: session owns its receiver");
             }
-            match *self.script.on_cancel.lock().expect("bug: script lock") {
+            // Copied out so an injected panic does not poison the lock.
+            let mode = *self.script.on_cancel.lock().expect("bug: script lock");
+            match mode {
                 OnCancel::Nothing => {}
                 OnCancel::EndSession => self
                     .tx
@@ -2178,6 +2185,7 @@ mod halt_tests {
                     .expect("bug: session owns its receiver"),
                 OnCancel::Disconnect => self.events.close(),
                 OnCancel::Fail => return Err(AdapterError::Spawn("injected dead socket".into())),
+                OnCancel::Panic => panic!("injected actor panic on cancel"),
             }
             Ok(())
         }
@@ -2796,6 +2804,50 @@ mod halt_tests {
             .expect("phase timeout")
             .expect("phase channel");
         }
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_lost_the_respawn_race_still_gets_the_warning() {
+        let h = harness(true).await;
+        h.script.thread_busy.store(true, SeqCst);
+        h.busy().await;
+        let stopped = h.operate(Operation::Stop).await;
+        assert!(stopped.is_err_and(|e| e.to_string().contains(WARNED)));
+        h.operate(Operation::Restart)
+            .await
+            .expect_err("the thread is still busy");
+        let mut phases = h.current().await.phases();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            phases.wait_for(|p| *p == Phase::Busy),
+        )
+        .await
+        .expect("phase timeout")
+        .expect("phase channel");
+        h.script.panic_on_submit.store(true, SeqCst);
+        h.script.accepts_busy_mail.store(true, SeqCst);
+        h.send("panics the actor").await;
+        h.dies().await;
+        h.script.panic_on_submit.store(false, SeqCst);
+        h.script.accepts_busy_mail.store(false, SeqCst);
+
+        // The first caller respawns the dead actor. The second waited for that,
+        // then asks the new actor, which dies on the cancel before it answers.
+        h.on_cancel(OnCancel::Panic);
+        let id = h.agent.id;
+        let (first, second) = tokio::join!(
+            h.broker.operate(id, Operation::Restart),
+            h.broker.operate(id, Operation::Restart),
+        );
+        for (caller, reply) in [("first", first), ("second", second)] {
+            let reply = reply.expect_err("the turn is unacknowledged").to_string();
+            assert!(reply.contains(WARNED), "{caller}: {reply}");
+        }
+        assert!(
+            h.script.cancels.load(SeqCst) >= 2,
+            "the second caller reached the respawned actor"
+        );
+        h.broker.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]
