@@ -2,7 +2,6 @@
 members = [
     "crates/agentd",
     "crates/infinity-agent-core",
-    "crates/infinity-agent-lambda",
     "crates/infinity-mcp-bridge",
     "crates/infinity-rap-bridge",
     "crates/infinity-agent-cli",
@@ -48,15 +47,10 @@ strkind = "0.0.1"
 
 # AWS crates
 aws-sdk-dynamodb = { version = "1", default-features = false }
-aws-sdk-sqs = { version = "1", default-features = false }
-aws-sdk-scheduler = { version = "1", default-features = false }
-aws-sdk-dsql = { version = "1", default-features = false }
 aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "credentials-process", "sso"] }
-aws-types = { version = "1", default-features = false }
 aws-sigv4 = { version = "1", default-features = false }
 aws-credential-types = { version = "1", default-features = false }
 aws-smithy-runtime-api = { version = "1", default-features = false }
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "json", "chrono", "uuid"] }
 
 # Sandbox crates
 similar = "2"
