@@ -3176,20 +3176,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rap-steering-server"
-version = "0.2.0"
-dependencies = [
- "axum",
- "clap",
- "rap-protocol",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "rap-test-servers"
 version = "0.1.0"
 dependencies = [

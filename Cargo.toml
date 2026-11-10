@@ -10,7 +10,6 @@ members = [
     "crates/sandbox-local",
     "crates/rap-protocol",
     "crates/rap-client",
-    "crates/rap-steering-server",
     "crates/rap-test-servers",
     "crates/infinity-protocol",
     "crates/infinity-provider-protocol",
