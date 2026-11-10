@@ -161,7 +161,6 @@ const config: Config = {
               label: "Background Agents",
               to: "/docs/infinity-code/background-agents",
             },
-            { label: "Slack Bot", to: "/docs/infinity-code/slack-bot" },
           ],
         },
       ],

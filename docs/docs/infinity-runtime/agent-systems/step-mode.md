@@ -102,7 +102,7 @@ While a thread waits on a non-passive tool call, subscription events and child r
 - Your own `DeferQueue` implementation can park events durably (a database table, a delay queue) for a step-mode platform that wants driver-grade semantics.
 
 ## The Lambda Embedding
-`infinity-agent-lambda` (`src/event_handler.rs`) is the production step-mode application and the reference implementation. An SQS FIFO input queue keyed by thread ID supplies the transport guarantees required by `step`: FIFO ordering within each message group, automatic batching of messages that arrive together, and stable message IDs for deduplication.
+`infinity-agent-lambda` (`src/event_handler.rs`) is the production step-mode application and the reference implementation. murmur does not carry this crate. Its source is in [upstream Infinity](https://github.com/hydro-project/infinity/blob/1abc6fcff1f186124f924b56aa92c3a3684c90c5/crates/infinity-agent-lambda/src/event_handler.rs). An SQS FIFO input queue keyed by thread ID supplies the transport guarantees required by `step`: FIFO ordering within each message group, automatic batching of messages that arrive together, and stable message IDs for deduplication.
 
 Each invocation builds the stores, model source, tools, sender, and system before processing its batch:
 
