@@ -845,27 +845,39 @@ impl Store {
             .optional()?
         {
             let stored = message(&tx, id)?;
-            let named_task = match stored.act {
-                Act::Request { .. } => stored
-                    .task
-                    .map(|t| task(&tx, t))
-                    .transpose()?
-                    .and_then(|t| t.parent),
-                _ => stored.task,
-            };
+            let reused =
+                || Error::Rejected("client_key was already used for a different message".into());
             if stored.to != msg.to
                 || stored.body != msg.body
                 || stored.in_reply_to != msg.reply_to
                 || stored.act != msg.act
-                || msg.task.is_some_and(|t| Some(t) != named_task)
             {
-                return Err(Error::Rejected(
-                    "client_key was already used for a different message".into(),
-                ));
+                return Err(reused());
+            }
+            let incoming_task = match (msg.task, msg.reply_to) {
+                (Some(t), _) => Some(t),
+                (None, Some(parent)) => message(&tx, parent)?.task,
+                (None, None) => None,
+            };
+            let same_task = match stored.act {
+                Act::Request { .. } => {
+                    let opened = stored.task.map(|t| task(&tx, t)).transpose()?;
+                    incoming_task == opened.and_then(|t| t.parent)
+                }
+                // The act pins the task, and the first send accepted either no
+                // context task or this one.
+                Act::Report { task: reported, .. } => incoming_task.is_none_or(|t| t == reported),
+                _ => incoming_task == stored.task,
+            };
+            if !same_task {
+                return Err(reused());
             }
             return Ok((SendOutcome::Duplicate { id }, stored));
         }
-        active(&tx, msg.to)?;
+        // A report's recipient is checked against the task below.
+        if !matches!(msg.act, Act::Report { .. }) {
+            active(&tx, msg.to)?;
+        }
         if let Sender::Agent(id) = msg.from {
             active(&tx, id)?;
             if let Some(limit) = self.config.limits.per_sender {
@@ -998,13 +1010,20 @@ impl Store {
                     return Err(Error::Rejected("Report task mismatch".into()));
                 }
                 let mut t = owned_task(&tx, *id, owner)?;
-                let requester = match t.requested_by {
-                    Sender::Agent(requester) => requester,
-                    Sender::Human => owner,
+                // Agents cannot mail the operator or a retired agent, so those
+                // reports go to the assignee itself.
+                let report_to = match t.requested_by {
+                    Sender::Agent(requester) if !retired(&tx, requester)? => requester,
+                    Sender::Agent(requester) if env.to == requester => {
+                        return Err(Error::Rejected(format!(
+                            "requester agent:{requester} is retired; address the report to yourself to close the task"
+                        )));
+                    }
+                    Sender::Agent(_) | Sender::Human => owner,
                 };
-                if env.to != requester {
+                if env.to != report_to {
                     return Err(Error::Rejected(format!(
-                        "report must be addressed to agent:{requester}"
+                        "report must be addressed to agent:{report_to}"
                     )));
                 }
                 validate_outcome(outcome)?;
@@ -1138,17 +1157,18 @@ fn message(db: &Connection, id: MessageId) -> Result<Envelope> {
     .optional()?
     .ok_or_else(|| Error::NotFound(id.to_string()))
 }
+fn retired(db: &Connection, id: AgentId) -> Result<bool> {
+    db.query_row("SELECT retired FROM agents WHERE id=?", [json(&id)?], |r| {
+        r.get::<_, bool>(0)
+    })
+    .optional()?
+    .ok_or_else(|| Error::NotFound(id.to_string()))
+}
 fn active(db: &Connection, id: AgentId) -> Result<()> {
-    match db
-        .query_row("SELECT retired FROM agents WHERE id=?", [json(&id)?], |r| {
-            r.get::<_, bool>(0)
-        })
-        .optional()?
-    {
-        Some(false) => Ok(()),
-        Some(true) => Err(Error::Rejected(format!("agent {id} is retired"))),
-        None => Err(Error::NotFound(id.to_string())),
+    if retired(db, id)? {
+        return Err(Error::Rejected(format!("agent {id} is retired")));
     }
+    Ok(())
 }
 fn delivery(db: &Connection, id: MessageId) -> Result<Delivery> {
     let (state, incarnation, reason, attempts, turn_started): (String, Option<u64>, Option<String>, u32, bool) = db.query_row("SELECT state,incarnation,reason,attempts,turn_started FROM deliveries WHERE message_id=?", [json(&id)?], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?.ok_or_else(|| Error::NotFound(id.to_string()))?;

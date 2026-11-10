@@ -1232,7 +1232,7 @@ fn respond(reply: Reply, result: Result<()>) {
         tracing::trace!("actor command caller dropped");
     }
 }
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

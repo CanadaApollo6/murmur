@@ -347,8 +347,9 @@ to send. For a report, it is the outcome kind and whether the task closed or wai
 for verification. These notes replace the usual "Reply with send_message" line.
 
 A report must be addressed to the agent that requested the task. Agents cannot
-mail the operator, so a task the operator requested is reported to the assignee's
-own address; the operator reads the outcome with `agentctl tasks`. The mailroom
+mail the operator or a retired agent, so a task the operator requested, or one
+whose requester has retired, is reported to the assignee's own address; the
+operator reads the outcome with `agentctl tasks`. The mailroom
 accepts reports only from the task's owner, so `agentctl send --act` with a
 report is always rejected.
 

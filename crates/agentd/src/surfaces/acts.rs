@@ -302,11 +302,14 @@ pub(crate) fn task_note(env: &Envelope) -> Option<String> {
     }
 }
 
+/// Matches a character outside Unicode `White_Space`, which `str::trim` strips.
+/// Regex engines disagree on `\S`, so the class lists the code points.
+const NON_WHITESPACE: &str = "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]";
+
 /// The `act` property of the `send_message` tool schema: one `oneOf` branch
 /// per kind, each closed to the fields that kind takes.
 pub(crate) fn schema() -> Value {
-    let text =
-        |description: &str| json!({"type":"string","pattern":"\\S","description":description});
+    let text = |description: &str| json!({"type":"string","pattern":NON_WHITESPACE,"description":description});
     let task_id = |description: &str| json!({"type":"string","pattern":"^[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{26}$","description":description});
     let kind = |k: &str| json!({"const":k});
     let artifacts = json!({"type":"array","items":text("A locator such as commit:abc123 or a file path."),"description":"Locators of what you produced."});
@@ -316,7 +319,7 @@ pub(crate) fn schema() -> Value {
         "properties":{
             "tried":text("What you tried."),
             "obstacle":text("Where it stopped and why the obstacle cannot be removed within the task."),
-            "reproduction":{"type":["string","null"],"pattern":"\\S","description":"Optional. How someone else can see the obstacle."}
+            "reproduction":{"type":["string","null"],"pattern":NON_WHITESPACE,"description":"Optional. How someone else can see the obstacle."}
         },
         "required":["tried","obstacle"],
         "additionalProperties":false
