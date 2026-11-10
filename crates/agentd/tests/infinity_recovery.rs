@@ -2788,7 +2788,7 @@ async fn r12o_repeated_cli_quit_crash_budget() {
             };
             let r = r12o::rig(
                 &h,
-                Duration::from_secs(1),
+                Duration::from_secs(10),
                 Duration::from_secs(1),
                 cfg,
                 None,
