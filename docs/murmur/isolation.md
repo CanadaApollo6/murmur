@@ -366,7 +366,9 @@ evidence. The implementation handoff report records local run results separately
 - R9. Read-only `/etc` exposes whatever the host user can read there.
 - R10. Future CLIs may require currently denied telemetry or asset endpoints.
 
-There are no resource budgets or mail quotas in this change. The swarm can extend
+This change added no resource budgets or mail quotas. Per-sender and per-pair
+mail limits were added later. The [agentd README](../../crates/agentd/README.md)
+describes them. The swarm can extend
 a broker-controlled task egress policy, use egress-denial events for scope escalation, substitute an
 API-auth forwarder for the proxy, create per-agent clones, and launch bubblewrap
 inside broker-owned resource scopes. No sandboxed process receives the host user bus.

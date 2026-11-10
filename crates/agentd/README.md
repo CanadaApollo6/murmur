@@ -5,6 +5,10 @@ server for Claude and Codex agents. The SQLite mailroom remains the delivery aut
 
 ## Run
 
+For a first run with one Claude agent and one Codex agent, follow the
+[quickstart](../../docs/murmur/quickstart.md). It lists only commands that
+were run against a live daemon.
+
 ```sh
 cargo build -p agentd --bins
 agentd --config /path/to/kinds.toml
@@ -22,6 +26,7 @@ agentctl held [@builder]
 agentctl release <message-id>
 agentctl drop <message-id>
 agentctl watch
+agentctl tasks
 ```
 
 `agentctl stop @name` ends the agent's session and keeps the agent stopped.
@@ -67,8 +72,12 @@ or restart waits for the cancel, the command fails and nothing is started. Mail 
 named agent.
 
 The default state directory is `~/.local/state/agentd/`. `--state-dir` overrides it.
+`agentctl` has no `--state-dir` flag. With a custom state directory, set
+`AGENTD_SOCKET` or pass `--socket` to every `agentctl` command.
 The daemon reads `kinds.toml` there when present. An explicit `--config` must exist.
 Without a config, commands default to `claude-agent-acp` and `codex-acp` on PATH.
+On Linux, that is the PATH inside the sandbox. A `command` outside the default
+binds also needs its directory in `[bwrap] ro_binds`.
 On Linux, both kinds are preflighted inside bubblewrap. Non-Linux targets default
 to `sandbox = "none"`. Install both commands or explicitly
 set `sandbox = "none"` for kinds you do not intend to sandbox. An Infinity-only
@@ -349,11 +358,61 @@ in `claude --mcp-config <json>`. The token is therefore visible in
 `/proc/<pid>/cmdline`. The broker does not include it in control responses.
 The token contains 256 bits from the OS random source and binds one agent and
 incarnation. Session cleanup revokes it; restart mints a new one. The two tools
-are `send_message { to, body, reply_to? }` and `list_agents {}`. Send keys derive
+are `send_message { to, body, reply_to?, act? }` and `list_agents {}`. Send keys derive
 from the incarnation, a random namespace created at each MCP shim startup, and
 the MCP request ID. Retries within one shim session recover the original mail.
 A replacement shim can reuse request IDs without losing new mail. A retry across
 shim restarts can produce a duplicate. Recipient execution remains at least once.
+
+### Tasks
+
+`send_message` and `agentctl send` take an optional `act`. Without it, mail is an
+`Inform`, as before. Both surfaces share one JSON shape:
+
+```json
+{"kind":"request","deliverable":"a passing test","budget":{"wall_secs":600,"messages":20,"hops":2,"tokens":null},"stakes":"normal","parent_task":"<task id>"}
+{"kind":"report","task":"<task id>","outcome":{"kind":"done","artifacts":["commit:abc123"]}}
+```
+
+A request opens a task owned by the recipient. `stakes` defaults to `normal` and
+`tokens` to unmetered. `wall_secs` and `messages` must be at least 1, and
+`tokens` must be null or at least 1: a zero budget costs the parent nothing, so
+it would allow unlimited children. Every text field needs a non-whitespace
+character. The body and the act together must fit in 64 KiB. An agent must name its own open task in `parent_task`
+(or reply to a message of that task); the child's budget is carved from it. The
+operator's request opens a root task and must omit `parent_task`. Outcomes are
+`done { artifacts }`, `partial { artifacts, not_possible, evidence }`,
+`infeasible { evidence }`, `failed { tried }` and `blocked { on }`, where
+`evidence` is `{ tried, obstacle, reproduction? }`. `partial` and `infeasible`
+move the task to `Verifying`; the others close it. `propose` and `decide` have no
+wire form and are rejected. Unknown fields are rejected for every kind,
+`inform` included. An invalid act returns an error and stores nothing. The tool
+schema lists each kind as a `oneOf` branch with its own required fields, and a
+unit test holds the schema and the parser to one table of cases.
+
+The rendered mail tag carries `act="request"` or `act="report"` and `task="<id>"`.
+Everything the sender wrote stays inside the tag, escaped like the body: the
+deliverable follows the body as `Deliverable: ...`, and a report's outcome
+follows it as `Outcome: {...}`. After the tag, the broker writes only values it
+produced. For a request, that is the task id, stakes, budget and the exact report
+to send. For a report, it is the outcome kind and whether the task closed or waits
+for verification. These notes replace the usual "Reply with send_message" line.
+
+A report must be addressed to the agent that requested the task. Agents cannot
+mail the operator or a retired agent, so a task the operator requested, or one
+whose requester has retired, is reported to the assignee's own address; the
+operator reads the outcome with `agentctl tasks`. The mailroom
+accepts reports only from the task's owner, so `agentctl send --act` with a
+report is always rejected.
+
+```sh
+agentctl send @builder "Fix the flaky test." --act '{"kind":"request","deliverable":"a passing test","budget":{"wall_secs":600,"messages":20,"hops":2}}'
+agentctl tasks
+```
+
+`agentctl tasks` prints every task with its `id`, `parent`, `state` (`open`,
+`verifying` or `closed`), `requester`, `assignee`, `deliverable`, `stakes`,
+`budget`, `spent` and `outcome`.
 
 Agent specs, resume handles and mail survive daemon restarts. SIGINT and SIGTERM
 stop connections, shut down broker actors, then drain and close the mailroom.
@@ -384,13 +443,15 @@ as the human and reach every agent's socket.
 
 The broker copies only `~/.claude/.credentials.json` or `~/.codex/auth.json` into
 the private home. It never mounts the human's CLI directory. Credential reads use
-no-follow directory descriptors and accept regular files up to 1 MiB. Valid JSON
+no-follow directory descriptors and accept regular files up to 256 KiB. Valid JSON
 refreshes return through compare-and-swap and propagate to unchanged live
 siblings. Conflicts and superseded values are skipped and logged. Refresh checks
 run every two seconds and once after session exit.
 
-An agent can write arbitrary valid JSON into the human's credential file. A CLI
-that caches tokens in memory may need a restart after a sibling's refresh.
+An agent can replace the values in the human's credential file. A refresh must
+be a JSON object with the same top-level keys as the copy that the agent
+started with. A CLI that caches tokens in memory may need a restart after a
+sibling's refresh.
 An unrelated host writer can still race the final comparison and rename.
 Use `credentials = []` and `CLAUDE_CODE_OAUTH_TOKEN` or `OPENAI_API_KEY` in
 `kind.env` to avoid exposing the human's refresh token.
@@ -404,9 +465,10 @@ closed. A denial names the agent in its HTTP 403 response.
 
 ## Other V1 limitations
 
-There is no per-sender mail quota. An agent can flood another agent's queue
-because leaving out `reply_to` restarts the hop count. A per-sender cap and a
-per-turn batch limit are follow-up work.
+Agent mail is bounded by the `[mail]` limits described under Run. Leaving out
+`reply_to` restarts the hop count, so the hop limit does not stop a long
+exchange. The per-sender and per-pair caps still bound how much undelivered
+mail one agent can queue. Human sends are exempt.
 
 For unsandboxed agents, token redaction in activity output works per frame and is best-effort. A token
 split across frames may appear without redaction.
@@ -473,7 +535,9 @@ mode with full synchronous commits. One dedicated thread owns the connection.
 An exclusive SQLite lock rejects a second owner, including another process.
 Methods enqueue a transaction and await its result without blocking Tokio.
 Cancelling the caller after submission does not cancel the transaction. Retry
-`accept` with the same sender and client key to recover its original result.
+`accept` with the same sender, client key and content to recover its original
+result. Reusing a client key for a different recipient, body, reply or act is
+rejected.
 Call `close().await` to drain submissions, join the thread, and release the file.
 Dropping the handle also drains submissions, but does not wait for thread exit.
 
@@ -486,7 +550,8 @@ Dropping the handle also drains submissions, but does not wait for thread exit.
 - Delivery operations are `pending_for`, `delivery`, `mark_offered`,
   `mark_started`, `mark_consumed`, `session_ended`, `held`, `release`,
   `drop_held` and `retire`.
-- Ledger operations are `task`, `record_spend`, `new_epoch` and `exposures`.
+- Ledger operations are `task`, `tasks`, `record_spend`, `new_epoch` and
+  `exposures`.
   A Request creates its task inside `accept`; there is no separate creation path.
 - `Interceptor`, `Verdict`, `ConversationView`, `HopLimit`, `Config` and typed
   outcomes and errors describe the acceptance and storage boundary.

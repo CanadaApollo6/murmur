@@ -768,6 +768,17 @@ impl Mailroom {
         self.call(move |s| task(&s.db, id)).await
     }
 
+    /// Every task in the ledger, oldest first.
+    pub async fn tasks(&self) -> Result<Vec<Task>> {
+        self.call(|s| {
+            Ok(s.db
+                .prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY rowid"))?
+                .query_map([], task_row)?
+                .collect::<rusqlite::Result<_>>()?)
+        })
+        .await
+    }
+
     pub async fn record_spend(&self, id: TaskId, spend: Budget) -> Result<()> {
         self.call(move |s| {
             let tx = s.db.transaction()?;
@@ -876,9 +887,40 @@ impl Store {
             )
             .optional()?
         {
-            return Ok((SendOutcome::Duplicate { id }, message(&tx, id)?));
+            let stored = message(&tx, id)?;
+            let reused =
+                || Error::Rejected("client_key was already used for a different message".into());
+            if stored.to != msg.to
+                || stored.body != msg.body
+                || stored.in_reply_to != msg.reply_to
+                || stored.act != msg.act
+            {
+                return Err(reused());
+            }
+            let incoming_task = match (msg.task, msg.reply_to) {
+                (Some(t), _) => Some(t),
+                (None, Some(parent)) => message(&tx, parent)?.task,
+                (None, None) => None,
+            };
+            let same_task = match stored.act {
+                Act::Request { .. } => {
+                    let opened = stored.task.map(|t| task(&tx, t)).transpose()?;
+                    incoming_task == opened.and_then(|t| t.parent)
+                }
+                // The act pins the task, and the first send accepted either no
+                // context task or this one.
+                Act::Report { task: reported, .. } => incoming_task.is_none_or(|t| t == reported),
+                _ => incoming_task == stored.task,
+            };
+            if !same_task {
+                return Err(reused());
+            }
+            return Ok((SendOutcome::Duplicate { id }, stored));
         }
-        active(&tx, msg.to)?;
+        // A report's recipient is checked against the task below.
+        if !matches!(msg.act, Act::Report { .. }) {
+            active(&tx, msg.to)?;
+        }
         if let Sender::Agent(id) = msg.from {
             active(&tx, id)?;
             if let Some(limit) = self.config.limits.per_sender {
@@ -941,6 +983,13 @@ impl Store {
             body: msg.body,
             sent_at: OffsetDateTime::now_utc(),
         };
+        if env.act != Act::Inform
+            && env.body.as_str().len() + json(&env.act)?.len() > MAX_BODY_BYTES
+        {
+            return Err(Error::Rejected(format!(
+                "body and act together exceed {MAX_BODY_BYTES} bytes"
+            )));
+        }
         let mut new_task = None;
         let mut updated_task = None;
         match &env.act {
@@ -951,6 +1000,13 @@ impl Store {
             } => {
                 if deliverable.trim().is_empty() {
                     return Err(Error::Rejected("Request needs a deliverable".into()));
+                }
+                // `charge` adds zero for free, so a zero budget would let one
+                // parent open unlimited children.
+                if budget.wall_secs == 0 || budget.messages == 0 || budget.tokens == Some(0) {
+                    return Err(Error::Rejected(
+                        "Request budget needs nonzero wall_secs, messages and tokens".into(),
+                    ));
                 }
                 let parent = match env.from {
                     Sender::Human => {
@@ -997,6 +1053,22 @@ impl Store {
                     return Err(Error::Rejected("Report task mismatch".into()));
                 }
                 let mut t = owned_task(&tx, *id, owner)?;
+                // Agents cannot mail the operator or a retired agent, so those
+                // reports go to the assignee itself.
+                let report_to = match t.requested_by {
+                    Sender::Agent(requester) if !retired(&tx, requester)? => requester,
+                    Sender::Agent(requester) if env.to == requester => {
+                        return Err(Error::Rejected(format!(
+                            "requester agent:{requester} is retired; address the report to yourself to close the task"
+                        )));
+                    }
+                    Sender::Agent(_) | Sender::Human => owner,
+                };
+                if env.to != report_to {
+                    return Err(Error::Rejected(format!(
+                        "report must be addressed to agent:{report_to}"
+                    )));
+                }
                 validate_outcome(outcome)?;
                 t.state = match outcome {
                     Outcome::Partial { .. } | Outcome::Infeasible { .. } => {
@@ -1128,17 +1200,18 @@ fn message(db: &Connection, id: MessageId) -> Result<Envelope> {
     .optional()?
     .ok_or_else(|| Error::NotFound(id.to_string()))
 }
+fn retired(db: &Connection, id: AgentId) -> Result<bool> {
+    db.query_row("SELECT retired FROM agents WHERE id=?", [json(&id)?], |r| {
+        r.get::<_, bool>(0)
+    })
+    .optional()?
+    .ok_or_else(|| Error::NotFound(id.to_string()))
+}
 fn active(db: &Connection, id: AgentId) -> Result<()> {
-    match db
-        .query_row("SELECT retired FROM agents WHERE id=?", [json(&id)?], |r| {
-            r.get::<_, bool>(0)
-        })
-        .optional()?
-    {
-        Some(false) => Ok(()),
-        Some(true) => Err(Error::Rejected(format!("agent {id} is retired"))),
-        None => Err(Error::NotFound(id.to_string())),
+    if retired(db, id)? {
+        return Err(Error::Rejected(format!("agent {id} is retired")));
     }
+    Ok(())
 }
 fn delivery(db: &Connection, id: MessageId) -> Result<Delivery> {
     let (state, incarnation, reason, attempts, turn_started): (String, Option<u64>, Option<String>, u32, bool) = db.query_row("SELECT state,incarnation,reason,attempts,turn_started FROM deliveries WHERE message_id=?", [json(&id)?], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?.ok_or_else(|| Error::NotFound(id.to_string()))?;
@@ -1246,8 +1319,30 @@ fn exposure_ref(db: &Connection, agent: AgentId) -> Result<ExposureRef> {
         seq,
     })
 }
+const TASK_COLUMNS: &str =
+    "id,parent,owner,requested_by,request_msg,deliverable,stakes,budget,spent,state";
+fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
+    Ok(Task {
+        id: json_col(r, 0)?,
+        parent: optional_json_col(r, 1)?,
+        owner: json_col(r, 2)?,
+        requested_by: json_col(r, 3)?,
+        request: json_col(r, 4)?,
+        deliverable: r.get(5)?,
+        stakes: json_col(r, 6)?,
+        budget: json_col(r, 7)?,
+        spent: json_col(r, 8)?,
+        state: json_col(r, 9)?,
+    })
+}
 fn task(db: &Connection, id: TaskId) -> Result<Task> {
-    db.query_row("SELECT id,parent,owner,requested_by,request_msg,deliverable,stakes,budget,spent,state FROM tasks WHERE id=?", [json(&id)?], |r| Ok(Task { id: json_col(r,0)?, parent: optional_json_col(r,1)?, owner: json_col(r,2)?, requested_by: json_col(r,3)?, request: json_col(r,4)?, deliverable: r.get(5)?, stakes: json_col(r,6)?, budget: json_col(r,7)?, spent: json_col(r,8)?, state: json_col(r,9)? })).optional()?.ok_or_else(|| Error::NotFound(id.to_string()))
+    db.query_row(
+        &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id=?"),
+        [json(&id)?],
+        task_row,
+    )
+    .optional()?
+    .ok_or_else(|| Error::NotFound(id.to_string()))
 }
 fn owned_task(db: &Connection, id: TaskId, owner: AgentId) -> Result<Task> {
     let t = task(db, id)?;
