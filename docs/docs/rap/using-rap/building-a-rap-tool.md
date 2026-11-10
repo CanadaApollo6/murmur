@@ -277,4 +277,4 @@ Point Infinity Code at your server with a RAP config file, either `.infinity/rap
 
 The daemon reads both files at session startup and merges them. The same `tool_sets` array also accepts MCP server entries (see [Configuring MCP Servers](/docs/infinity-code/configuring-mcp)) and installed RAP server commands (see [RAP Servers in the Infinity Code docs](/docs/infinity-code/rap-servers)).
 
-The `get-time` tool includes a ready-to-run local server at `agent/lib/toolsets/get-time/get-time-tool/local.mjs`, which you can use as a reference when building local RAP tools.
+The `get-time` tool includes a ready-to-run local server at [`agent/lib/toolsets/get-time/get-time-tool/local.mjs`](https://github.com/hydro-project/infinity/blob/main/agent/lib/toolsets/get-time/get-time-tool/local.mjs) in the Infinity repo, which you can use as a reference when building local RAP tools.
