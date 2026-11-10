@@ -494,6 +494,84 @@ async fn permission_escalation_answer_and_stale_incarnation() {
     t.finish().await;
 }
 
+/// Sends warnings to the output that libtest captures, so a failed test shows why the session ended.
+fn log_warnings() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .init();
+    });
+}
+
+#[tokio::test]
+async fn permission_without_title_reaches_the_operator() {
+    log_warnings();
+    for (variant, title) in [
+        ("after-tool-call", "mcp.agentd.send_message"),
+        ("named", "send_message (execute)"),
+        ("bare", "unnamed tool call"),
+    ] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut t = Test::at(root, Default::default(), config(), true, None).await;
+        let id = t.send(&format!("untitled-permission:{variant}")).await;
+        let event = t
+            .event(|e| {
+                matches!(
+                    e,
+                    Event::PermissionPending(_)
+                        | Event::PhaseChanged {
+                            phase: Phase::Crashed { .. },
+                            ..
+                        }
+                )
+            })
+            .await;
+        let Event::PermissionPending(request) = event else {
+            panic!(
+                "the {variant} permission crashed the session instead of reaching the operator; the WARN line above gives the reason"
+            );
+        };
+        assert_eq!(request.title, title, "title for the {variant} permission");
+        t.agent
+            .answer_permission(
+                request.id,
+                request.incarnation,
+                PermissionAnswer::Choose("yes".into()),
+            )
+            .await
+            .expect("answer");
+        t.consumed(id).await;
+        t.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn permission_without_tool_call_ends_the_session() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut t = Test::at(root, Default::default(), config(), true, None).await;
+    t.send("untitled-permission:absent").await;
+    let event = t
+        .event(|e| {
+            matches!(
+                e,
+                Event::PermissionPending(_)
+                    | Event::PhaseChanged {
+                        phase: Phase::Crashed { .. },
+                        ..
+                    }
+            )
+        })
+        .await;
+    assert!(
+        matches!(event, Event::PhaseChanged { .. }),
+        "a permission request without toolCall reached the operator: {event:?}"
+    );
+    t.finish().await;
+}
+
 #[tokio::test]
 async fn permission_timeout_and_per_agent_rules() {
     for decision in [None, Some(RuleDecision::Allow), Some(RuleDecision::Deny)] {

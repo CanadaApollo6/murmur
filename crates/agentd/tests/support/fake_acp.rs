@@ -47,6 +47,42 @@ fn permission(session: &str, id: &str, reject: bool) {
         "options":options}}),
     );
 }
+/// Asks approval for a tool call whose `toolCall` has no `title`, which ACP allows. The variant
+/// picks what else the agent sends: `after-tool-call` mirrors codex-acp approving an MCP call it
+/// already announced, `named` gives only `name` and `kind`, and `bare` gives only the ID.
+/// `absent` leaves out `toolCall` itself, which ACP does not allow.
+fn untitled_permission(session: &str, variant: &str) {
+    if variant.starts_with("absent") {
+        emit(
+            json!({"jsonrpc":"2.0","id":"permission-1","method":"session/request_permission",
+            "params":{"sessionId":session,
+            "options":[{"optionId":"yes","name":"Allow once","kind":"allow_once"}]}}),
+        );
+        return;
+    }
+    let tool_call = if variant.starts_with("after-tool-call") {
+        emit(
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,
+            "update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"mcp.agentd.send_message","kind":"execute","status":"pending"}}}),
+        );
+        json!({"toolCallId":"call-1","kind":"execute","status":"pending"})
+    } else if variant.starts_with("named") {
+        emit(
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,
+            "update":{"sessionUpdate":"tool_call","toolCallId":"call-0","title":"another call","kind":"read"}}}),
+        );
+        json!({"toolCallId":"call-1","kind":"execute","name":"send_message"})
+    } else if variant.starts_with("bare") {
+        json!({"toolCallId":"call-1"})
+    } else {
+        panic!("unknown untitled permission variant {variant}")
+    };
+    emit(
+        json!({"jsonrpc":"2.0","id":"permission-1","method":"session/request_permission",
+        "params":{"sessionId":session,"toolCall":tool_call,
+        "options":[{"optionId":"yes","name":"Allow once","kind":"allow_once"}]}}),
+    );
+}
 struct Mcp {
     child: std::process::Child,
     input: std::process::ChildStdin,
@@ -286,6 +322,9 @@ fn main() {
                     permission_responses_remaining = Some(2);
                     permission(session, "permission-1", false);
                     permission(session, "permission-2", false);
+                } else if let Some(variant) = text.split("untitled-permission:").nth(1) {
+                    flight = Some(id.clone());
+                    untitled_permission(session, variant);
                 } else if text.contains("die-after") {
                     std::process::exit(18);
                 } else if text.contains("exit-after-turn") {
