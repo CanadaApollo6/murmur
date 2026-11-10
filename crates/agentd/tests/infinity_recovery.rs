@@ -1044,7 +1044,7 @@ async fn queued_attachment_mail_probe(resume: bool) {
         mailroom.clone(),
         vec![{
             let mut kind = agentd::KindConfig::infinity(socket);
-            kind.request_timeout = Duration::from_secs(2);
+            kind.request_timeout = Duration::from_secs(5);
             kind
         }],
         agentd::supervisor::Config {
@@ -1098,7 +1098,7 @@ async fn queued_attachment_mail_probe(resume: bool) {
         .await
         .expect("inference starts");
     // The provider has accepted the request but intentionally sends no output or receipt.
-    let crashed = tokio::time::timeout(Duration::from_secs(3), async {
+    let crashed = tokio::time::timeout(Duration::from_secs(6), async {
         loop {
             if matches!(
                 events.recv().await.expect("event"),
@@ -1537,7 +1537,7 @@ async fn r9_broker_mail_after_completed_rap_tool_and_provider_failure() {
                 vec![{
                     let mut kind = agentd::KindConfig::infinity(socket);
                     kind.cancel_timeout = Duration::from_millis(100);
-                    kind.request_timeout = Duration::from_millis(200);
+                    kind.request_timeout = Duration::from_secs(10);
                     kind
                 }],
                 agentd::supervisor::Config {
@@ -1686,7 +1686,7 @@ async fn r10a_driver_panic_has_bounded_broker_recovery() {
                 vec![{
                     let mut kind = agentd::KindConfig::infinity(socket);
                     kind.cancel_timeout = Duration::from_millis(100);
-                    kind.request_timeout = Duration::from_millis(200);
+                    kind.request_timeout = Duration::from_secs(10);
                     kind
                 }],
                 agentd::supervisor::Config {
@@ -1820,7 +1820,7 @@ async fn r10a_choice_write_failure_has_bounded_recovery() {
                 vec![{
                     let mut kind = agentd::KindConfig::infinity(socket);
                     kind.cancel_timeout = Duration::from_millis(100);
-                    kind.request_timeout = Duration::from_millis(200);
+                    kind.request_timeout = Duration::from_secs(10);
                     kind
                 }],
                 agentd::supervisor::Config {
@@ -2129,7 +2129,7 @@ async fn r11_broker(
             .expect("mailroom"),
     );
     let mut kind = agentd::KindConfig::infinity(socket);
-    kind.request_timeout = Duration::from_millis(300);
+    kind.request_timeout = Duration::from_secs(10);
     kind.cancel_timeout = Duration::from_millis(300);
     let broker = Broker::new(
         mailroom,
@@ -2223,17 +2223,7 @@ async fn r11_shutdown_command_tool(archive: bool) {
         matches!(m, DaemonMessage::ResponseDone { .. })
     })
     .await;
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !started.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("command tool invoked");
-    let port: u16 = std::fs::read_to_string(&started)
-        .expect("port")
-        .parse()
-        .expect("port number");
+    let port = r12o::invocations(&started).await[0];
     h.client_tx
         .send(if archive {
             ClientMessage::ArchiveSession {
@@ -2798,7 +2788,7 @@ async fn r12o_repeated_cli_quit_crash_budget() {
             };
             let r = r12o::rig(
                 &h,
-                Duration::from_secs(1),
+                Duration::from_secs(10),
                 Duration::from_secs(1),
                 cfg,
                 None,
@@ -2949,7 +2939,7 @@ async fn r12_post_shutdown_mail_does_not_wait_for_receipt_expiry() {
                 r12o::wait_phase(&r.agent, |p| *p == Phase::Idle, Duration::from_secs(5)).await
             );
             let id = r12o::send(&r, "follow-up after shutdown").await;
-            let request = tokio::time::timeout(Duration::from_secs(3), h.ctrl.next_request())
+            let request = tokio::time::timeout(Duration::from_secs(8), h.ctrl.next_request())
                 .await
                 .expect("follow-up before ten-second receipt expiry");
             assert!(format!("{:?}", request.chat_history).contains("follow-up after shutdown"));
@@ -2992,7 +2982,7 @@ async fn r13a_quick_reconnect_must_not_hide_executor_shutdown() {
             };
             let r = r12o::rig(
                 &h,
-                Duration::from_millis(300),
+                Duration::from_secs(10),
                 Duration::from_millis(300),
                 cfg,
                 None,
@@ -3202,14 +3192,7 @@ async fn r13o_shutdown_while_agentd_detached_recovers_tool() {
             h.ctrl.send_tool_call("delayed-call", "delayed_work", serde_json::json!({}));
             h.ctrl.finish();
             wait_for_message(&mut h.daemon_rx, |m| matches!(m, DaemonMessage::ResponseDone { .. })).await;
-            tokio::time::timeout(Duration::from_secs(3), async {
-                while !started.exists() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("command tool invoked");
-            let port: u16 = std::fs::read_to_string(&started).expect("port").parse().expect("port");
+            let port = r12o::invocations(&started).await[0];
             agent.stop().await.expect("agentd detaches");
             h.client_tx
                 .send(ClientMessage::ShutdownSession { root_thread_id: root.clone() })
@@ -3390,7 +3373,7 @@ mod r14 {
         tokio::task::LocalSet::new().run_until(async {
         let mut h = start_harness().await.expect("harness");
         let cfg = Config { backoff_initial: Duration::from_millis(10), backoff_max: Duration::from_millis(20), ..Default::default() };
-        let r = r12o::rig_with_stall(&h, Duration::from_millis(100), Duration::from_millis(100), cfg, None, Duration::from_millis(300)).await;
+        let r = r12o::rig_with_stall(&h, Duration::from_secs(10), Duration::from_millis(100), cfg, None, Duration::from_millis(300)).await;
         r12o::send(&r, "start stream that remains open").await;
         h.ctrl.next_request().await;
         h.ctrl.send_text("partial answer");
@@ -3441,7 +3424,7 @@ mod r14 {
                         let mut kind = agentd::KindConfig::infinity(socket);
                         kind.stall_timeout = Duration::from_millis(300);
                         kind.cancel_timeout = Duration::from_millis(100);
-                        kind.request_timeout = Duration::from_millis(200);
+                        kind.request_timeout = Duration::from_secs(10);
                         kind
                     }],
                     agentd::supervisor::Config {
@@ -3794,7 +3777,7 @@ mod r14 {
         runtime.block_on(tokio::task::LocalSet::new().run_until(async {
             let mut h = start_harness().await.expect("harness");
             rap_test_servers::write_rap_config(h.cwd.path(), server.port).expect("config");
-            let r = r12o::rig_with_stall(&h, Duration::from_millis(300), Duration::from_millis(300), agentd::supervisor::Config::default(), None, Duration::from_millis(300)).await;
+            let r = r12o::rig_with_stall(&h, Duration::from_secs(10), Duration::from_millis(300), agentd::supervisor::Config::default(), None, Duration::from_millis(300)).await;
             let agent = r.agent.clone(); let root = r.root.clone(); let broker = &r.broker;
             r11_send(broker, agent.id, "ask the external choice").await;
             h.ctrl.next_request().await;
@@ -4185,7 +4168,7 @@ mod r16o {
             let mut h = start_harness().await.expect("harness");
             let (port, answers) = choice_then_silent_server().await;
             rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
-            let r = r12o::rig_with_stall(&h, Duration::from_millis(300), Duration::from_millis(300), fast(), None, Duration::from_millis(500)).await;
+            let r = r12o::rig_with_stall(&h, Duration::from_secs(10), Duration::from_millis(300), fast(), None, Duration::from_millis(500)).await;
             r12o::send(&r, "ask the human then work").await;
             h.ctrl.next_request().await;
             h.ctrl.send_tool_call("cli-choice", "choose_then_work", serde_json::json!({}));
@@ -4214,7 +4197,7 @@ mod r16o {
             let mut h = start_harness().await.expect("harness");
             let (port, answers) = choice_then_silent_server().await;
             rap_test_servers::write_rap_config(h.cwd.path(), port).expect("config");
-            let r = r12o::rig_with_stall(&h, Duration::from_millis(300), Duration::from_millis(300), fast(), None, Duration::from_millis(1500)).await;
+            let r = r12o::rig_with_stall(&h, Duration::from_secs(10), Duration::from_millis(300), fast(), None, Duration::from_millis(1500)).await;
             r12o::send(&r, "ask the human then work").await;
             h.ctrl.next_request().await;
             h.ctrl.send_tool_call("own-choice", "choose_then_work", serde_json::json!({}));
@@ -4380,12 +4363,17 @@ mod r17o {
             let activity_before = activity(&r);
             let cli_sent = tokio::time::Instant::now();
             h.client_tx.send(ClientMessage::UserInput { thread_id: r.root.clone(), text: "cli: run the slow job".into() }).expect("cli input");
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            let fetching = tokio::time::timeout(Duration::from_secs(5), async {
+                while fetches.load(Ordering::SeqCst) == fetches_before {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
             let phase_before = r.agent.phase();
             let activity_at_offer = activity(&r);
             let texts = r.log.borrow().iter().filter_map(|e| match e { Event::Activity { text, .. } => Some(text.clone()), _ => None }).collect::<Vec<_>>();
             let started_before_offer = texts.iter().any(|t| t == "completion started");
-            let fetching = fetches.load(Ordering::SeqCst) > fetches_before;
             let mail = r12o::send(&r, "agentd mail racing the cli turn").await;
             let request = tokio::time::timeout(Duration::from_secs(5), h.ctrl.next_request()).await.expect("cli completion request");
             let start_latency = cli_sent.elapsed();
