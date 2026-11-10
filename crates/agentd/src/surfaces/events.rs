@@ -996,15 +996,21 @@ mod quiet_tests {
             }
         }
         let task = tokio::spawn(async move { feed(&api, &mut Discard, None).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let before = room.jobs_run.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(before, 3, "snapshot, specs, then initial page");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            room.jobs_run.load(std::sync::atomic::Ordering::SeqCst),
-            before,
-            "idle feed polled worker"
-        );
+        let jobs = || room.jobs_run.load(std::sync::atomic::Ordering::SeqCst);
+        // Storage jobs run on their own thread and take longer under load.
+        let started = std::time::Instant::now();
+        while jobs() < 3 {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the feed never read its snapshot: jobs={}",
+                jobs()
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(jobs(), 3, "snapshot, specs, then initial page");
+        // Idle past the 100 ms activity flush. A stray job needs real time to show.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(jobs(), 3, "idle feed polled worker");
         task.abort();
         assert!(task.await.expect_err("abort").is_cancelled());
     }
