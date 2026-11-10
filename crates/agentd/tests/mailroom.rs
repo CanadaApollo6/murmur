@@ -1415,3 +1415,170 @@ async fn a_client_key_reused_for_different_content_is_an_error() {
     mail.close().await.expect("close");
     assert_eq!(message_count(&dir), 2);
 }
+
+#[tokio::test]
+async fn a_client_key_retry_must_name_the_same_parent_task() {
+    let (dir, mail, a, b) = setup(Config::default()).await;
+    let root_msg = request(&mail, Sender::Human, a, None, budget(10))
+        .await
+        .expect("root");
+    let root = root_msg.task().expect("task");
+    let keyed = |key: &str, act: Act, task: Option<TaskId>, reply_to: Option<MessageId>| {
+        let mut msg = send(Sender::Agent(a), b);
+        msg.client_key = ClientKey(key.into());
+        msg.act = act;
+        msg.task = task;
+        msg.reply_to = reply_to;
+        msg
+    };
+    let child_act = Act::Request {
+        deliverable: "work".into(),
+        budget: budget(2),
+        stakes: Stakes::Low,
+    };
+    let (_, child) = mail
+        .accept(keyed("child", child_act.clone(), Some(root), None))
+        .await
+        .expect("child");
+    let (_, inform) = mail
+        .accept(keyed("inform", Act::Inform, Some(root), None))
+        .await
+        .expect("inform");
+    let mut threaded = keyed("threaded", Act::Inform, None, Some(root_msg.id()));
+    threaded.to = a;
+    let (_, threaded_env) = mail.accept(threaded).await.expect("threaded");
+    assert_eq!(threaded_env.task(), Some(root));
+    for (key, act) in [("child", child_act.clone()), ("inform", Act::Inform)] {
+        let result = mail.accept(keyed(key, act, None, None)).await;
+        assert!(
+            matches!(result, Err(Error::Rejected(_))),
+            "{key} retry without parent_task: {result:?}"
+        );
+    }
+    let honest_retries = || {
+        let mut threaded = keyed("threaded", Act::Inform, None, Some(root_msg.id()));
+        threaded.to = a;
+        [
+            (
+                keyed("child", child_act.clone(), Some(root), None),
+                child.id(),
+            ),
+            (keyed("inform", Act::Inform, Some(root), None), inform.id()),
+            (threaded, threaded_env.id()),
+        ]
+    };
+    for (msg, id) in honest_retries() {
+        assert_eq!(
+            mail.accept(msg).await.expect("honest retry").0,
+            SendOutcome::Duplicate { id }
+        );
+    }
+    let mut close = send(Sender::Agent(a), a);
+    close.act = Act::Report {
+        task: root,
+        outcome: Outcome::Done { artifacts: vec![] },
+    };
+    mail.accept(close).await.expect("close root");
+    for (msg, id) in honest_retries() {
+        assert_eq!(
+            mail.accept(msg).await.expect("honest retry").0,
+            SendOutcome::Duplicate { id }
+        );
+    }
+    mail.retire(b).await.expect("retire");
+    for (msg, id) in honest_retries() {
+        assert_eq!(
+            mail.accept(msg).await.expect("honest retry").0,
+            SendOutcome::Duplicate { id }
+        );
+    }
+    mail.close().await.expect("close");
+    assert_eq!(message_count(&dir), 5);
+}
+
+#[tokio::test]
+async fn the_assignee_reports_to_itself_when_the_requester_is_retired() {
+    let (dir, mail, a, b) = setup(Config::default()).await;
+    let c = mail
+        .register(AgentName::parse("carol").expect("name"))
+        .await
+        .expect("register");
+    let root = request(&mail, Sender::Human, a, None, budget(10))
+        .await
+        .expect("root")
+        .task()
+        .expect("task");
+    let mut children = Vec::new();
+    for _ in 0..2 {
+        children.push(
+            request(&mail, Sender::Agent(a), b, Some(root), budget(2))
+                .await
+                .expect("child")
+                .task()
+                .expect("task"),
+        );
+    }
+    mail.retire(a).await.expect("retire requester");
+    let report = |task: TaskId, to: AgentId, outcome: Outcome| {
+        let mut msg = send(Sender::Agent(b), to);
+        msg.act = Act::Report { task, outcome };
+        msg
+    };
+    let done = Outcome::Done { artifacts: vec![] };
+    mail.close().await.expect("close");
+    let before = message_count(&dir);
+    let mail = Mailroom::open(dir.path().join("broker.db"), Config::default())
+        .await
+        .expect("reopen");
+    match mail.accept(report(children[0], a, done.clone())).await {
+        Err(Error::Rejected(reason)) => assert!(
+            reason.contains("is retired") && reason.contains("address the report to yourself"),
+            "{reason}"
+        ),
+        other => panic!("report to a retired requester: {other:?}"),
+    }
+    assert!(matches!(
+        mail.accept(report(children[0], c, done.clone())).await,
+        Err(Error::Rejected(_))
+    ));
+    for child in &children {
+        assert_eq!(
+            mail.task(*child).await.expect("task").state,
+            TaskState::Open
+        );
+    }
+    mail.accept(report(children[0], b, done.clone()))
+        .await
+        .expect("done to self");
+    assert_eq!(
+        mail.task(children[0]).await.expect("task").state,
+        TaskState::Closed {
+            outcome: done,
+            success: true
+        }
+    );
+    let (_, partial) = mail
+        .accept(report(
+            children[1],
+            b,
+            Outcome::Partial {
+                artifacts: vec![],
+                not_possible: "missing input".into(),
+                evidence: Evidence {
+                    tried: "ran tests".into(),
+                    obstacle: "missing input".into(),
+                    reproduction: None,
+                },
+            },
+        ))
+        .await
+        .expect("partial to self");
+    assert_eq!(
+        mail.task(children[1]).await.expect("task").state,
+        TaskState::Verifying {
+            report: partial.id()
+        }
+    );
+    mail.close().await.expect("close");
+    assert_eq!(message_count(&dir), before + 2);
+}

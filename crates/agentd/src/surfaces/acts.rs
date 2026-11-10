@@ -453,6 +453,8 @@ mod tests {
             (request(json!({"task":task})), false),
             (request(json!({"deliverable":""})), false),
             (request(json!({"deliverable":" \n"})), false),
+            (request(json!({"deliverable":"\u{0085}"})), false),
+            (request(json!({"deliverable":"\u{feff}"})), true),
             (request(json!({"stakes":"extreme"})), false),
             (request(json!({"stakes":null})), false),
             (request(json!({"parent_task":"not-a-task"})), false),
@@ -499,6 +501,16 @@ mod tests {
             assert_eq!(schema.is_valid(&case), valid, "schema on {case}");
             let parsed = serde_json::from_value::<ActArgs>(case.clone());
             assert_eq!(parsed.is_ok(), valid, "parser on {case}: {parsed:?}");
+        }
+    }
+
+    #[test]
+    fn schema_text_pattern_matches_the_parser_for_every_bmp_char() {
+        let schema = jsonschema::validator_for(&schema()).expect("bug: act schema compiles");
+        for c in (0..=0xFFFF).filter_map(char::from_u32) {
+            let act = json!({"kind":"request","deliverable":c.to_string(),"budget":{"wall_secs":1,"messages":1,"hops":0}});
+            let parsed = serde_json::from_value::<ActArgs>(act.clone()).is_ok();
+            assert_eq!(schema.is_valid(&act), parsed, "U+{:04X}", u32::from(c));
         }
     }
 
