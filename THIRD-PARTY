@@ -6881,7 +6881,6 @@ Used by:
   infinity-provider-rig 0.2.0
   infinity-rap-bridge 0.2.0
   rap-client 0.2.0
-  rap-github-event-poller 0.2.0
   rap-protocol 0.2.0
   rap-steering-server 0.2.0
   rap-test-servers 0.1.0

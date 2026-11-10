@@ -3163,21 +3163,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rap-github-event-poller"
-version = "0.2.0"
-dependencies = [
- "axum",
- "clap",
- "rap-protocol",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "rap-protocol"
 version = "0.2.0"
 dependencies = [
