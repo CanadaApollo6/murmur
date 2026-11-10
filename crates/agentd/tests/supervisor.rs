@@ -549,6 +549,30 @@ async fn permission_without_title_reaches_the_operator() {
 }
 
 #[tokio::test]
+async fn permission_without_tool_call_ends_the_session() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut t = Test::at(root, Default::default(), config(), true, None).await;
+    t.send("untitled-permission:absent").await;
+    let event = t
+        .event(|e| {
+            matches!(
+                e,
+                Event::PermissionPending(_)
+                    | Event::PhaseChanged {
+                        phase: Phase::Crashed { .. },
+                        ..
+                    }
+            )
+        })
+        .await;
+    assert!(
+        matches!(event, Event::PhaseChanged { .. }),
+        "a permission request without toolCall reached the operator: {event:?}"
+    );
+    t.finish().await;
+}
+
+#[tokio::test]
 async fn permission_timeout_and_per_agent_rules() {
     for decision in [None, Some(RuleDecision::Allow), Some(RuleDecision::Deny)] {
         let policy = PermissionPolicy {

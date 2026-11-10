@@ -383,6 +383,9 @@ impl AcpSession {
                             })
                         })
                         .collect::<Result<Vec<_>, AdapterError>>()?;
+                    if !params["toolCall"].is_object() {
+                        return Err(protocol("missing toolCall"));
+                    }
                     let id = PermissionId::new();
                     let title = self.permission_title(&params["toolCall"]);
                     let tool = match params["toolCall"]["kind"].as_str() {

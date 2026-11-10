@@ -50,7 +50,16 @@ fn permission(session: &str, id: &str, reject: bool) {
 /// Asks approval for a tool call whose `toolCall` has no `title`, which ACP allows. The variant
 /// picks what else the agent sends: `after-tool-call` mirrors codex-acp approving an MCP call it
 /// already announced, `named` gives only `name` and `kind`, and `bare` gives only the ID.
+/// `absent` leaves out `toolCall` itself, which ACP does not allow.
 fn untitled_permission(session: &str, variant: &str) {
+    if variant.starts_with("absent") {
+        emit(
+            json!({"jsonrpc":"2.0","id":"permission-1","method":"session/request_permission",
+            "params":{"sessionId":session,
+            "options":[{"optionId":"yes","name":"Allow once","kind":"allow_once"}]}}),
+        );
+        return;
+    }
     let tool_call = if variant.starts_with("after-tool-call") {
         emit(
             json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,
