@@ -1345,32 +1345,28 @@ impl AgentActor {
         } else if self.session.is_some() {
             self.turn_over();
         }
-        let result = match self.stop_session().await {
-            Err(error) => {
-                // The session is gone but its mail may still be offered. A repeated
-                // command settles again, so the agent waits in Ended until then.
-                let command = match op {
-                    Operation::Stop => "stop",
-                    Operation::Restart => "restart",
-                };
-                let reason = format!(
-                    "{command} did not settle the session: {error}; repeat `agentctl {command}` to settle it"
-                );
-                self.set_error(&self.hint_tx, Some(reason.clone()));
-                self.phase(Phase::Ended);
-                for reply in replies {
-                    respond(reply, self.reply(op, Err(Error::Rejected(reason.clone()))));
-                }
-                return Ok(());
+        if let Err(error) = self.stop_session().await {
+            // The session is gone but its mail may still be offered. A repeated
+            // command settles again, so the agent waits in Ended until then.
+            let command = match op {
+                Operation::Stop => "stop",
+                Operation::Restart => "restart",
+            };
+            let reason = format!(
+                "{command} did not settle the session: {error}; repeat `agentctl {command}` to settle it"
+            );
+            self.set_error(&self.hint_tx, Some(reason.clone()));
+            self.phase(Phase::Ended);
+            for reply in replies {
+                respond(reply, self.reply(op, Err(Error::Rejected(reason.clone()))));
             }
-            Ok(()) => {
-                self.set_error(&self.hint_tx, None);
-                let fresh = std::mem::take(&mut self.fresh) || self.needs_fresh_session();
-                match op {
-                    Operation::Stop => self.stopped(fresh).await,
-                    Operation::Restart => self.restart(fresh).await,
-                }
-            }
+            return Ok(());
+        }
+        self.set_error(&self.hint_tx, None);
+        let fresh = std::mem::take(&mut self.fresh) || self.needs_fresh_session();
+        let result = match op {
+            Operation::Stop => self.stopped(fresh).await,
+            Operation::Restart => self.restart(fresh).await,
         };
         for reply in replies {
             let shown = match &result {
