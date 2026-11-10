@@ -16,11 +16,27 @@ agentctl ls
 agentctl approvals
 agentctl approve <permission-id> <option-key>
 agentctl cancel @builder
+agentctl stop @builder
+agentctl restart @builder
 agentctl held [@builder]
 agentctl release <message-id>
 agentctl drop <message-id>
 agentctl watch
 ```
+
+`agentctl stop @name` ends the agent's session and keeps the agent stopped.
+A running turn is cancelled first. If the agent does not finish the turn within
+the kind's cancel timeout (two seconds by default), agentd ends the session anyway.
+Mail to a stopped agent stays queued under the normal mail limits. `agentctl ls`
+shows the phase `stopped`, and the agent stays stopped across an agentd restart.
+
+`agentctl restart @name` ends any current session the same way and starts a new
+one. From `stopped` or a live phase, the new session resumes the saved
+conversation. From `needs-recovery` or `failed`, restart discards the saved
+conversation and starts a fresh session. This is the only way out of
+`needs-recovery`. Mail held from an uncertain turn stays held; use `agentctl held`,
+`release` and `drop` for it. Both commands are idempotent and affect only the
+named agent.
 
 The default state directory is `~/.local/state/agentd/`. `--state-dir` overrides it.
 The daemon reads `kinds.toml` there when present. An explicit `--config` must exist.
@@ -392,13 +408,17 @@ diagnosed, so the twelve tests that use them are ignored there.
   Rules match an exact normalized tool name, or `*`; the first match wins.
   No rule means escalate to the caller. An optional timeout rejects once, or
   cancels if the agent provides no single-use rejection option.
+- `operate(id, Operation::Stop | Operation::Restart)` stops or restarts an agent.
+  It cancels a running turn and waits at most the kind's `cancel_timeout` before
+  it ends the session. The stop flag persists in `agent_specs.stopped` (schema
+  version 3). An actor that died is respawned from its saved spec.
 - `events()` returns a bounded display-only broadcast receiver. Subscribers can
   lag; SQLite remains delivery authority. Activity never becomes agent input.
 - `shutdown()` stops and reaps sessions, settles outstanding delivery, and waits
   for the actors to release storage. Call it before closing the mailroom.
 
 `Phase` covers Dormant, Starting, Idle, Busy, Suspending, Ended, Crashed, Failed,
-and NeedsRecovery. Busy CLI agents wait for a turn boundary. Infinity accepts
+NeedsRecovery and Stopped. Busy CLI agents wait for a turn boundary. Infinity accepts
 deferrable mail while busy. Five crashes in ten
 minutes stop retries; backoff doubles from one second to a 60-second cap.
 A failed ACP resume or a missing Infinity root enters NeedsRecovery without

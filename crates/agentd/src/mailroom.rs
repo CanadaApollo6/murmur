@@ -476,6 +476,46 @@ impl Mailroom {
         }).await
     }
 
+    /// An operator stop outlives the actor and the daemon, so the actor reads it at startup.
+    pub(crate) async fn set_stopped(&self, agent: AgentId, stopped: bool) -> Result<()> {
+        self.call(move |s| {
+            if s.db.execute(
+                "UPDATE agent_specs SET stopped=? WHERE agent=?",
+                params![stopped, json(&agent)?],
+            )? == 0
+            {
+                return Err(Error::NotFound(agent.to_string()));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn stopped(&self, agent: AgentId) -> Result<bool> {
+        self.call(move |s| {
+            Ok(s.db
+                .query_row(
+                    "SELECT stopped FROM agent_specs WHERE agent=?",
+                    [json(&agent)?],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(false))
+        })
+        .await
+    }
+
+    pub(crate) async fn forget_resume(&self, agent: AgentId) -> Result<()> {
+        self.call(move |s| {
+            s.db.execute(
+                "UPDATE actor_state SET resume=NULL WHERE agent=?",
+                [json(&agent)?],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn specs(&self) -> Result<Vec<(AgentId, crate::supervisor::AgentSpec)>> {
         self.call(|s| {
             let mut q = s.db.prepare("SELECT agent,spec FROM agent_specs JOIN agents ON agent=agents.id WHERE retired=0 ORDER BY name")?;
@@ -802,7 +842,7 @@ impl Store {
             ));
         }
         let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 2 {
+        if version > 3 {
             return Err(Error::Rejected(format!(
                 "unsupported schema version {version}"
             )));
@@ -810,6 +850,9 @@ impl Store {
         db.execute_batch(include_str!("schema.sql"))?;
         if version < 2 {
             db.execute_batch(include_str!("schema-v2.sql"))?;
+        }
+        if version < 3 {
+            db.execute_batch(include_str!("schema-v3.sql"))?;
         }
         let last_prune = feed::head(&db)?;
         Ok(Self {

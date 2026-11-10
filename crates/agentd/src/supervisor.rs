@@ -25,6 +25,7 @@ pub struct AgentSpec {
     pub idle_after: Option<Duration>,
 }
 
+/// `Stopped` is set only by the operator. Mail queues until `restart`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
     Dormant,
@@ -36,6 +37,15 @@ pub enum Phase {
     Crashed { attempt: u32, retry_at: Instant },
     Failed { last: String },
     NeedsRecovery { reason: String },
+    Stopped,
+}
+
+/// An operator command that ends the agent's session. A turn in flight is
+/// cancelled first and waited for at most the kind's `cancel_timeout`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operation {
+    Stop,
+    Restart,
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +130,10 @@ enum Command {
         reply: Reply,
     },
     Stop(Reply),
+    Operate {
+        op: Operation,
+        reply: Reply,
+    },
 }
 
 #[derive(Clone)]
@@ -182,6 +196,14 @@ impl AgentHandle {
                 answer,
                 reply: tx,
             })
+            .await
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
+    }
+    async fn operate(&self, op: Operation) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.commands
+            .send(Command::Operate { op, reply: tx })
             .await
             .map_err(|_| Error::Closed)?;
         rx.await.map_err(|_| Error::Closed)?
@@ -297,13 +319,44 @@ impl Broker {
     pub async fn restore(&self, spec: AgentSpec) -> Result<AgentHandle> {
         self.spawn_inner(spec, true).await
     }
-    async fn spawn_inner(&self, mut spec: AgentSpec, restore: bool) -> Result<AgentHandle> {
+    /// Stops or restarts an agent. An actor that died is respawned from its saved
+    /// spec and reads the persisted stop flag, so both work from any phase.
+    pub async fn operate(&self, id: AgentId, op: Operation) -> Result<()> {
+        if let Some(handle) = self.handle(id).await {
+            match handle.operate(op).await {
+                Err(Error::Closed) => {}
+                result => return result,
+            }
+        }
+        let replacement = self.replacements.lock().await;
+        if let Some(handle) = self.handle(id).await.filter(|h| !h.commands.is_closed()) {
+            drop(replacement);
+            return handle.operate(op).await;
+        }
+        let (_, spec) = self
+            .mailroom
+            .specs()
+            .await?
+            .into_iter()
+            .find(|(saved, _)| *saved == id)
+            .ok_or_else(|| Error::Rejected("agent has never been spawned".into()))?;
+        self.mailroom.set_stopped(id, op == Operation::Stop).await?;
+        if op == Operation::Restart {
+            // Only a failed actor dies, and restart from Failed is a fresh session.
+            self.mailroom.forget_resume(id).await?;
+        }
+        self.spawn_locked(spec, true).await.map(drop)
+    }
+    async fn spawn_inner(&self, spec: AgentSpec, restore: bool) -> Result<AgentHandle> {
+        let _replacement = self.replacements.lock().await;
+        self.spawn_locked(spec, restore).await
+    }
+    async fn spawn_locked(&self, mut spec: AgentSpec, restore: bool) -> Result<AgentHandle> {
         let kind = self
             .kinds
             .get(&spec.kind)
             .ok_or_else(|| Error::Rejected("unknown kind".into()))?
             .clone();
-        let _replacement = self.replacements.lock().await;
         let saved_specs = self.mailroom.specs().await?;
         if !restore && let Some((_, cfg)) = &self.isolation {
             let workspaces = saved_specs
@@ -363,8 +416,13 @@ impl Broker {
         }
         let (lease, incarnation, resume) = self.mailroom.claim_actor(id, spec.kind.clone()).await?;
         self.mailroom.save_spec(id, spec.clone()).await?;
+        let initial = if self.mailroom.stopped(id).await? {
+            Phase::Stopped
+        } else {
+            Phase::Dormant
+        };
         let (tx, commands) = mpsc::channel(64);
-        let (phase_tx, phase) = watch::channel(Phase::Dormant);
+        let (phase_tx, phase) = watch::channel(initial.clone());
         let (isolation_tx, isolation) = watch::channel("none");
         let (incarnation_tx, incarnation_rx) = watch::channel(incarnation);
         let handle = AgentHandle {
@@ -410,11 +468,12 @@ impl Broker {
             config: self.config.clone(),
             commands,
             phase_tx,
-            phase: Phase::Dormant,
+            phase: initial,
             incarnation,
             resume,
             session: None,
             cancelling: false,
+            halting: None,
             offered: Vec::new(),
             pending: HashMap::new(),
             crashes: VecDeque::new(),
@@ -512,12 +571,21 @@ struct AgentActor {
     resume: Option<ResumeToken>,
     session: Option<Box<dyn Session>>,
     cancelling: bool,
+    halting: Option<Halting>,
     offered: Vec<MessageId>,
     pending: HashMap<PermissionId, (PermissionRequest, Option<Instant>)>,
     crashes: VecDeque<Instant>,
     unavailable_attempts: u32,
     interrupt_since: Option<Instant>,
     idle_since: Instant,
+}
+
+struct Halting {
+    op: Operation,
+    /// Leaving NeedsRecovery or Failed discards the resume token.
+    fresh: bool,
+    replies: Vec<Reply>,
+    deadline: Instant,
 }
 
 impl AgentActor {
@@ -579,9 +647,14 @@ impl AgentActor {
                 self.model_agent,
             )
             .await?;
-        self.start().await?;
+        if self.phase == Phase::Stopped {
+            self.phase(Phase::Stopped);
+        } else {
+            self.start().await?;
+        }
         let mut credentials_tick = tokio::time::interval(Duration::from_secs(2));
         loop {
+            self.settle_halt().await?;
             self.pump().await?;
             let deadline = self.deadline();
             tokio::select! {
@@ -609,6 +682,7 @@ impl AgentActor {
                         let result = self.answer(id,incarnation,answer).await;
                         respond(reply,result);
                     },
+                    Some(Command::Operate { op, reply }) => self.operate(op, reply).await?,
                     }
                 },
                 event = async { match &mut self.session { Some(s) => s.next_event().await, None => std::future::pending().await } } => {
@@ -773,6 +847,9 @@ impl AgentActor {
         self.start().await
     }
     async fn pump(&mut self) -> Result<()> {
+        if self.halting.is_some() {
+            return Ok(());
+        }
         let busy_delivery = self.phase == Phase::Busy
             && self.pending.is_empty()
             && self.session.as_ref().is_some_and(|s| s.accepts_busy_mail());
@@ -1088,6 +1165,86 @@ impl AgentActor {
             self.emit(Event::PermissionAnswered { agent: self.id, id });
         }
     }
+    async fn operate(&mut self, op: Operation, reply: Reply) -> Result<()> {
+        if op == Operation::Stop && self.phase == Phase::Stopped && self.halting.is_none() {
+            respond(reply, Ok(()));
+            return Ok(());
+        }
+        if let Err(error) = self
+            .mailroom
+            .set_stopped(self.id, op == Operation::Stop)
+            .await
+        {
+            respond(reply, Err(error.into()));
+            return Ok(());
+        }
+        let fresh = matches!(
+            self.phase,
+            Phase::NeedsRecovery { .. } | Phase::Failed { .. }
+        );
+        if let Some(halting) = &mut self.halting {
+            halting.op = op;
+            halting.fresh |= fresh;
+            halting.replies.push(reply);
+            return Ok(());
+        }
+        self.halting = Some(Halting {
+            op,
+            fresh,
+            replies: vec![reply],
+            deadline: Instant::now() + self.kind.cancel_timeout,
+        });
+        if self.turn_in_flight()
+            && let Err(error) = self.cancel().await
+        {
+            self.end(error.to_string()).await?;
+        }
+        Ok(())
+    }
+    fn turn_in_flight(&self) -> bool {
+        self.phase == Phase::Busy && self.session.is_some()
+    }
+    /// Finishes a stop or restart once the cancelled turn has ended or its deadline passed.
+    async fn settle_halt(&mut self) -> Result<()> {
+        let Some(halting) = &self.halting else {
+            return Ok(());
+        };
+        if self.turn_in_flight() && halting.deadline > Instant::now() {
+            return Ok(());
+        }
+        let Halting {
+            op, fresh, replies, ..
+        } = self.halting.take().expect("bug: halting checked above");
+        let stopped = self.stop_session().await;
+        let started = match op {
+            Operation::Stop => {
+                self.phase(Phase::Stopped);
+                Ok(())
+            }
+            Operation::Restart => self.restart(fresh).await,
+        };
+        let failure = stopped
+            .as_ref()
+            .err()
+            .or(started.as_ref().err())
+            .map(ToString::to_string);
+        for reply in replies {
+            respond(
+                reply,
+                failure.clone().map_or(Ok(()), |e| Err(Error::Rejected(e))),
+            );
+        }
+        started
+    }
+    async fn restart(&mut self, fresh: bool) -> Result<()> {
+        if fresh {
+            self.mailroom.forget_resume(self.id).await?;
+        }
+        self.crashes.clear();
+        self.unavailable_attempts = 0;
+        self.interrupt_since = None;
+        self.reopen().await
+    }
     async fn stop_session(&mut self) -> Result<()> {
         if let Some(mcp) = &self.mcp {
             mcp.revoke(self.id).await;
@@ -1170,6 +1327,9 @@ impl AgentActor {
             }
             _ => None,
         };
+        if let Some(halting) = &self.halting {
+            deadline = Some(deadline.map_or(halting.deadline, |d| d.min(halting.deadline)));
+        }
         for (_, timeout) in self.pending.values() {
             if let Some(t) = timeout {
                 deadline = Some(deadline.map_or(*t, |d| d.min(*t)));

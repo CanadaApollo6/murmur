@@ -14,7 +14,7 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::KindConfig;
 use crate::mailroom::{Mailroom, NewMessage, SendOutcome};
 use crate::model::*;
-use crate::supervisor::{AgentSpec, Broker, Phase};
+use crate::supervisor::{AgentSpec, Broker, Operation, Phase};
 use crate::swarm::Act;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -237,6 +237,12 @@ pub enum ControlRequest {
     Cancel {
         to: String,
     },
+    Stop {
+        to: String,
+    },
+    Restart {
+        to: String,
+    },
     Held {
         to: Option<String>,
     },
@@ -305,15 +311,10 @@ impl ControlApi {
             SendOutcome::Duplicate { .. } => "Already queued".to_owned(),
             SendOutcome::Held { reason, .. } => format!("Held ({reason})"),
         };
-        let busy = self
-            .broker
-            .handle(id)
-            .await
-            .is_some_and(|h| h.phase() == Phase::Busy);
-        let suffix = if busy {
-            " (busy; it sees this when its turn ends)"
-        } else {
-            ""
+        let suffix = match self.broker.handle(id).await.map(|h| h.phase()) {
+            Some(Phase::Busy) => " (busy; it sees this when its turn ends)",
+            Some(Phase::Stopped) => " (stopped; it sees this after agentctl restart)",
+            _ => "",
         };
         Ok(json!({"id":env.id(),"status":format!("{status} {} for {to}{suffix}.",env.id())}))
     }
@@ -383,6 +384,16 @@ impl ControlApi {
                     .cancel()
                     .await?;
                 Ok(json!({"cancelled":to}))
+            }
+            ControlRequest::Stop { to } => {
+                let id = self.mailroom.resolve(Recipient::parse(&to)?).await?;
+                self.broker.operate(id, Operation::Stop).await?;
+                Ok(json!({"stopped":to}))
+            }
+            ControlRequest::Restart { to } => {
+                let id = self.mailroom.resolve(Recipient::parse(&to)?).await?;
+                self.broker.operate(id, Operation::Restart).await?;
+                Ok(json!({"restarted":to}))
             }
             ControlRequest::Held { to } => {
                 let agent = match to {
@@ -560,6 +571,7 @@ fn phase_name(phase: &Phase) -> &'static str {
         Phase::Crashed { .. } => "crashed",
         Phase::Failed { .. } => "failed",
         Phase::NeedsRecovery { .. } => "needs-recovery",
+        Phase::Stopped => "stopped",
     }
 }
 pub async fn read_frame(read: &mut (impl AsyncBufRead + Unpin)) -> Result<Option<Vec<u8>>> {
