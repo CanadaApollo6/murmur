@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +21,16 @@ struct Test {
     broker: Broker,
     agent: AgentHandle,
     events: broadcast::Receiver<Event>,
+}
+/// Prints agentd warnings into captured test output, so a failure shows why a session ended.
+fn log_warnings() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::WARN)
+            .init();
+    });
 }
 fn spec(root: &std::path::Path) -> AgentSpec {
     AgentSpec {
@@ -47,6 +58,7 @@ impl Test {
         stall: Duration,
         mail: agentd::mailroom::Config,
     ) -> Self {
+        log_warnings();
         let root = tempfile::tempdir().expect("tempdir");
         let socket = root.path().join("daemon.sock");
         let daemon = fake::FakeDaemon::bind(&socket);
@@ -2061,8 +2073,12 @@ async fn r17_choice_id_reuse_after_turn_gets_new_deadline() {
 #[cfg(test)]
 async fn r18_admission_probe(matching_root: bool) {
     let mut t = Test::with_stall(Default::default(), Duration::from_millis(300)).await;
-    let id = t.send(true, "waiting mail").await;
-    let offer = t.daemon.next().await;
+    // From here virtual time moves only by `advance`. Neither the 300 ms stall deadline nor the
+    // 200 ms cancel deadline that follows it can then expire because this test or agentd was
+    // scheduled late.
+    tokio::time::pause();
+    let id = hold_clock(t.send(true, "waiting mail")).await;
+    let offer = hold_clock(t.daemon.next()).await;
     offer.emit(fake::start());
     offer.emit(fake::round_done());
     offer.emit(DaemonMessage::InputAdmitted {
@@ -2082,28 +2098,67 @@ async fn r18_admission_probe(matching_root: bool) {
         thread_id: fake::thread(),
         text: "admission barrier".into(),
     });
-    t.event(|e| matches!(e, Event::Activity { text, .. } if text == "admission barrier"))
-        .await;
-    let next = tokio::time::timeout(Duration::from_millis(700), t.daemon.next()).await;
+    hold_clock(
+        t.event(|e| matches!(e, Event::Activity { text, .. } if text == "admission barrier")),
+    )
+    .await;
+    // The stall deadline is now past. A still-Waiting offer is interrupted as soon as the
+    // supervisor runs. An offer that admission retired must stay silent on the wire.
+    tokio::time::advance(Duration::from_millis(700)).await;
+    // Silence can only be watched for a bounded real time. An expected interrupt gets the long
+    // limit, so a supervisor that is scheduled late does not fail the test.
+    let window = Duration::from_millis(if matching_root { 700 } else { 5000 });
+    let next = hold_clock_for(window, t.daemon.next()).await;
     let interrupted = next
         .as_ref()
-        .is_ok_and(|r| matches!(r.message, ClientMessage::Interrupt { .. }));
+        .is_some_and(|r| matches!(r.message, ClientMessage::Interrupt { .. }));
     assert_eq!(
         interrupted, !matching_root,
         "only exact root admission retires Waiting, including across continuation StartOutput"
     );
     assert!(
         matches!(
-            t.mailroom.delivery(id).await.expect("delivery").state,
+            hold_clock(t.mailroom.delivery(id))
+                .await
+                .expect("delivery")
+                .state,
             DeliveryState::Offered { .. }
         ),
         "admission never consumes mail"
     );
     offer.emit(fake::receipt(format!("peer-{id}")));
-    t.consumed(id).await;
+    hold_clock(t.consumed(id)).await;
     offer.emit(fake::idle());
-    t.idle().await;
+    hold_clock(t.idle()).await;
+    tokio::time::resume();
     t.finish().await;
+}
+
+/// Awaits `work` without letting a paused clock move, or gives up after `limit` of real time.
+/// A plain await parks the runtime whenever agentd waits on the mailroom thread or a socket,
+/// and tokio then auto-advances to the next timer, which can expire agentd's deadlines before
+/// the fake daemon's reply is read. Yielding keeps the runtime busy, so virtual time holds.
+async fn hold_clock_for<F: Future>(limit: Duration, work: F) -> Option<F::Output> {
+    let give_up = std::time::Instant::now() + limit;
+    let mut work = std::pin::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut work => return Some(output),
+            () = tokio::task::yield_now() => {
+                if std::time::Instant::now() >= give_up {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Like [`hold_clock_for`], for work that must finish within 5 s of real time.
+async fn hold_clock<F: Future>(work: F) -> F::Output {
+    hold_clock_for(Duration::from_secs(5), work)
+        .await
+        .expect("held work did not finish within 5 s of real time")
 }
 
 #[tokio::test]

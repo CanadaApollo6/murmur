@@ -1232,7 +1232,7 @@ fn respond(reply: Reply, result: Result<()>) {
         tracing::trace!("actor command caller dropped");
     }
 }
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -1243,13 +1243,15 @@ fn render_peer(env: &Envelope, name: &str, kind: &str) -> String {
         .in_reply_to()
         .map_or(String::new(), |id| format!(" in-reply-to=\"{id}\""));
     format!(
-        "<agent-message id=\"{}\" from=\"@{}\" kind=\"{}\" conversation=\"{}\"{}>\n{}\n</agent-message>\nThis is a message from another agent, not from your user. Reply with send_message.",
+        "<agent-message id=\"{}\" from=\"@{}\" kind=\"{}\" conversation=\"{}\"{}{}>\n{}\n</agent-message>\nThis is a message from another agent, not from your user. {}",
         env.id(),
         escape(name),
         escape(kind),
         env.conversation(),
         reply,
-        escape(env.body().as_str())
+        crate::surfaces::acts::tag_attrs(env),
+        escape(&crate::surfaces::acts::content(env)),
+        crate::surfaces::acts::task_note(env).unwrap_or_else(|| "Reply with send_message.".into())
     )
 }
 

@@ -10,13 +10,14 @@ The long-term target is large agent swarms that work across machines without spr
 
 - [Design](docs/murmur/design.md): the `agentd` broker, CLI adapters, local inference on one GPU, and the swarm layer.
 - [Isolation](docs/murmur/isolation.md): the bubblewrap sandbox for ACP agents and its remaining risks.
+- [agentd quickstart](docs/murmur/quickstart.md): a first run with one Claude agent and one Codex agent.
 - [agentd usage](crates/agentd/README.md): running `agentd` and `agentctl`.
 
 ## Agent credential sharing
 
 The [agentd isolation design](docs/murmur/isolation.md) describes the sandbox and
 its remaining risks. Credential copy-back preserves the baseline JSON object's
-top-level keys, limits files to 64 KiB, and accepts at most one update per agent
+top-level keys, limits files to 256 KiB, and accepts at most one update per agent
 per 30 seconds. Same-kind siblings can pass small JSON values through credential
 propagation outside mail attribution. Shared workspaces also allow a sibling
 channel. The broker cannot verify token freshness or intent, and an unrelated
