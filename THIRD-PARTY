@@ -6433,7 +6433,7 @@ Used by:
   parking_lot_core 0.9.12
   percent-encoding 2.3.2
   plain 0.2.3
-  regex-automata 0.4.14
+  regex-automata 0.4.18
   regex-lite 0.1.9
   regex-syntax 0.8.10
   regex 1.12.3
@@ -11582,7 +11582,7 @@ SOFTWARE.
 License: MIT License
 
 Used by:
-  zmij 1.0.21
+  zmij 1.0.23
 
 --------------------------------------------------------------------------------
 Permission is hereby granted, free of charge, to any
