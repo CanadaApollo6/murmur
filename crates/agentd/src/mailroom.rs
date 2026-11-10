@@ -844,7 +844,26 @@ impl Store {
             )
             .optional()?
         {
-            return Ok((SendOutcome::Duplicate { id }, message(&tx, id)?));
+            let stored = message(&tx, id)?;
+            let named_task = match stored.act {
+                Act::Request { .. } => stored
+                    .task
+                    .map(|t| task(&tx, t))
+                    .transpose()?
+                    .and_then(|t| t.parent),
+                _ => stored.task,
+            };
+            if stored.to != msg.to
+                || stored.body != msg.body
+                || stored.in_reply_to != msg.reply_to
+                || stored.act != msg.act
+                || msg.task.is_some_and(|t| Some(t) != named_task)
+            {
+                return Err(Error::Rejected(
+                    "client_key was already used for a different message".into(),
+                ));
+            }
+            return Ok((SendOutcome::Duplicate { id }, stored));
         }
         active(&tx, msg.to)?;
         if let Sender::Agent(id) = msg.from {
@@ -909,6 +928,13 @@ impl Store {
             body: msg.body,
             sent_at: OffsetDateTime::now_utc(),
         };
+        if env.act != Act::Inform
+            && env.body.as_str().len() + json(&env.act)?.len() > MAX_BODY_BYTES
+        {
+            return Err(Error::Rejected(format!(
+                "body and act together exceed {MAX_BODY_BYTES} bytes"
+            )));
+        }
         let mut new_task = None;
         let mut updated_task = None;
         match &env.act {
@@ -919,6 +945,13 @@ impl Store {
             } => {
                 if deliverable.trim().is_empty() {
                     return Err(Error::Rejected("Request needs a deliverable".into()));
+                }
+                // `charge` adds zero for free, so a zero budget would let one
+                // parent open unlimited children.
+                if budget.wall_secs == 0 || budget.messages == 0 || budget.tokens == Some(0) {
+                    return Err(Error::Rejected(
+                        "Request budget needs nonzero wall_secs, messages and tokens".into(),
+                    ));
                 }
                 let parent = match env.from {
                     Sender::Human => {
@@ -965,6 +998,15 @@ impl Store {
                     return Err(Error::Rejected("Report task mismatch".into()));
                 }
                 let mut t = owned_task(&tx, *id, owner)?;
+                let requester = match t.requested_by {
+                    Sender::Agent(requester) => requester,
+                    Sender::Human => owner,
+                };
+                if env.to != requester {
+                    return Err(Error::Rejected(format!(
+                        "report must be addressed to agent:{requester}"
+                    )));
+                }
                 validate_outcome(outcome)?;
                 t.state = match outcome {
                     Outcome::Partial { .. } | Outcome::Infeasible { .. } => {

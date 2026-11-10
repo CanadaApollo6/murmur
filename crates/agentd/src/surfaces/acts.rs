@@ -2,19 +2,24 @@
 //!
 //! The stored `Act` keeps serde's default enum encoding, so these types are
 //! the only shape callers write. `Propose` and `Decide` have no wire form.
+//! `schema()` publishes the same shape; `schema_and_parser_agree` holds the
+//! two together.
+
+use std::num::{NonZeroU32, NonZeroU64};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::model::Envelope;
+use crate::model::{Envelope, Sender};
 use crate::swarm::{Act, ArtifactRef, Budget, Evidence, Outcome, Stakes, TaskId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActArgs {
-    Inform,
+    /// A struct variant, because serde ignores unknown fields on a unit variant.
+    Inform {},
     Request {
-        deliverable: String,
+        deliverable: Text,
         budget: BudgetArgs,
         #[serde(default = "normal")]
         stakes: StakesArgs,
@@ -29,14 +34,36 @@ pub enum ActArgs {
     },
 }
 
+/// Sender-written text with at least one non-whitespace character.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Text(String);
+impl TryFrom<String> for Text {
+    type Error = &'static str;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        if s.trim().is_empty() {
+            Err("text must contain a non-whitespace character")
+        } else {
+            Ok(Self(s))
+        }
+    }
+}
+impl From<Text> for String {
+    fn from(t: Text) -> Self {
+        t.0
+    }
+}
+
+/// A zero wall time, message count or token count would let a parent open
+/// any number of children for free, so the wire form cannot express one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetArgs {
-    pub wall_secs: u64,
-    pub messages: u32,
+    pub wall_secs: NonZeroU64,
+    pub messages: NonZeroU32,
     pub hops: u16,
     #[serde(default)]
-    pub tokens: Option<u64>,
+    pub tokens: Option<NonZeroU64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,39 +91,39 @@ impl From<Stakes> for StakesArgs {
 pub enum OutcomeArgs {
     Done {
         #[serde(default)]
-        artifacts: Vec<String>,
+        artifacts: Vec<Text>,
     },
     Partial {
         #[serde(default)]
-        artifacts: Vec<String>,
-        not_possible: String,
+        artifacts: Vec<Text>,
+        not_possible: Text,
         evidence: EvidenceArgs,
     },
     Infeasible {
         evidence: EvidenceArgs,
     },
     Failed {
-        tried: String,
+        tried: Text,
     },
     Blocked {
-        on: String,
+        on: Text,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceArgs {
-    pub tried: String,
-    pub obstacle: String,
+    pub tried: Text,
+    pub obstacle: Text,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reproduction: Option<String>,
+    pub reproduction: Option<Text>,
 }
 
 impl ActArgs {
     /// The act and the task the envelope names: a Request's parent, or none.
     pub fn into_act(self) -> (Act, Option<TaskId>) {
         match self {
-            Self::Inform => (Act::Inform, None),
+            Self::Inform {} => (Act::Inform, None),
             Self::Request {
                 deliverable,
                 budget,
@@ -104,11 +131,11 @@ impl ActArgs {
                 parent_task,
             } => (
                 Act::Request {
-                    deliverable,
+                    deliverable: deliverable.0,
                     budget: Budget {
-                        tokens: budget.tokens,
-                        wall_secs: budget.wall_secs,
-                        messages: budget.messages,
+                        tokens: budget.tokens.map(NonZeroU64::get),
+                        wall_secs: budget.wall_secs.get(),
+                        messages: budget.messages.get(),
                         hops: budget.hops,
                     },
                     stakes: match stakes {
@@ -132,15 +159,15 @@ impl ActArgs {
 
 impl From<OutcomeArgs> for Outcome {
     fn from(o: OutcomeArgs) -> Self {
-        let refs = |v: Vec<String>| {
+        let refs = |v: Vec<Text>| {
             v.into_iter()
-                .map(|locator| ArtifactRef { locator })
+                .map(|locator| ArtifactRef { locator: locator.0 })
                 .collect()
         };
         let evidence = |e: EvidenceArgs| Evidence {
-            tried: e.tried,
-            obstacle: e.obstacle,
-            reproduction: e.reproduction,
+            tried: e.tried.0,
+            obstacle: e.obstacle.0,
+            reproduction: e.reproduction.map(String::from),
         };
         match o {
             OutcomeArgs::Done { artifacts } => Self::Done {
@@ -152,25 +179,27 @@ impl From<OutcomeArgs> for Outcome {
                 evidence: e,
             } => Self::Partial {
                 artifacts: refs(artifacts),
-                not_possible,
+                not_possible: not_possible.0,
                 evidence: evidence(e),
             },
             OutcomeArgs::Infeasible { evidence: e } => Self::Infeasible {
                 evidence: evidence(e),
             },
-            OutcomeArgs::Failed { tried } => Self::Failed { tried },
-            OutcomeArgs::Blocked { on } => Self::Blocked { on },
+            OutcomeArgs::Failed { tried } => Self::Failed { tried: tried.0 },
+            OutcomeArgs::Blocked { on } => Self::Blocked { on: on.0 },
         }
     }
 }
 
+/// Displays a stored outcome. The mailroom validated its text on the way in.
 impl From<&Outcome> for OutcomeArgs {
     fn from(o: &Outcome) -> Self {
-        let locators = |v: &[ArtifactRef]| v.iter().map(|a| a.locator.clone()).collect();
+        let text = |s: &String| Text(s.clone());
+        let locators = |v: &[ArtifactRef]| v.iter().map(|a| text(&a.locator)).collect();
         let evidence = |e: &Evidence| EvidenceArgs {
-            tried: e.tried.clone(),
-            obstacle: e.obstacle.clone(),
-            reproduction: e.reproduction.clone(),
+            tried: text(&e.tried),
+            obstacle: text(&e.obstacle),
+            reproduction: e.reproduction.as_ref().map(text),
         };
         match o {
             Outcome::Done { artifacts } => Self::Done {
@@ -182,22 +211,30 @@ impl From<&Outcome> for OutcomeArgs {
                 evidence: e,
             } => Self::Partial {
                 artifacts: locators(artifacts),
-                not_possible: not_possible.clone(),
+                not_possible: text(not_possible),
                 evidence: evidence(e),
             },
             Outcome::Infeasible { evidence: e } => Self::Infeasible {
                 evidence: evidence(e),
             },
-            Outcome::Failed { tried } => Self::Failed {
-                tried: tried.clone(),
-            },
-            Outcome::Blocked { on } => Self::Blocked { on: on.clone() },
+            Outcome::Failed { tried } => Self::Failed { tried: text(tried) },
+            Outcome::Blocked { on } => Self::Blocked { on: text(on) },
         }
     }
 }
 
 pub(crate) fn outcome_json(o: &Outcome) -> Value {
     serde_json::to_value(OutcomeArgs::from(o)).expect("bug: outcome serializes")
+}
+
+fn outcome_kind(o: &Outcome) -> &'static str {
+    match o {
+        Outcome::Done { .. } => "done",
+        Outcome::Partial { .. } => "partial",
+        Outcome::Infeasible { .. } => "infeasible",
+        Outcome::Failed { .. } => "failed",
+        Outcome::Blocked { .. } => "blocked",
+    }
 }
 
 /// Attributes for the rendered mail tag, such as ` act="request" task="..."`.
@@ -213,38 +250,36 @@ pub(crate) fn tag_attrs(env: &Envelope) -> String {
     format!("{act}{task}")
 }
 
-/// Sender-written text inside the note cannot open or close a mail tag.
-fn inert(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+/// Everything the sender wrote: the body, then the act's free text. Callers
+/// put it inside the mail tag and escape it as they escape a body.
+pub(crate) fn content(env: &Envelope) -> String {
+    let body = env.body().as_str();
+    match env.act() {
+        Act::Request { deliverable, .. } => format!("{body}\n\nDeliverable: {deliverable}"),
+        Act::Report { outcome, .. } => format!("{body}\n\nOutcome: {}", outcome_json(outcome)),
+        _ => body.to_owned(),
+    }
 }
 
-/// What the receiving agent must know to act on a task message, or `None`
-/// for an inform.
+/// What the receiving agent must do with a task message, or `None` for an
+/// inform. It follows the mail tag, so it holds only values the broker
+/// produced: ids, numbers, enum names and the sample act.
 pub(crate) fn task_note(env: &Envelope) -> Option<String> {
     let id = env.task()?;
     match env.act() {
-        Act::Request {
-            deliverable,
-            budget,
-            stakes,
-        } => {
+        Act::Request { budget, stakes, .. } => {
             let tokens = budget
                 .tokens
                 .map_or_else(|| "unmetered".to_owned(), |t| t.to_string());
-            let report_to = match env.from() {
-                crate::model::Sender::Agent(from) => format!("agent:{from}"),
-                crate::model::Sender::Human => format!("agent:{}", env.to()),
-            };
-            let human = if matches!(env.from(), crate::model::Sender::Human) {
-                " The human operator requested it and reads outcomes with agentctl tasks, so address the report to yourself."
-            } else {
-                ""
+            let (report_to, human) = match env.from() {
+                Sender::Agent(from) => (*from, ""),
+                Sender::Human => (
+                    env.to(),
+                    " The human operator requested it and reads outcomes with agentctl tasks, so address the report to yourself.",
+                ),
             };
             Some(format!(
-                "This message opens task {id} and assigns it to you.\nDeliverable: {}\nStakes: {stakes:?}. Budget: {} s wall time, {} messages, {} hops, {tokens} tokens.\nWhen the task ends, report once with send_message: to \"{report_to}\", act {}. Pick the outcome kind that is true and replace LOCATOR with what you produced.{human}",
-                inert(deliverable),
+                "This message opens task {id} and assigns it to you. The deliverable is in the message above. Stakes: {stakes:?}. Budget: {} s wall time, {} messages, {} hops, {tokens} tokens.\nWhen the task ends, report once with send_message: to \"agent:{report_to}\", act {}. Pick the outcome kind that is true and replace LOCATOR with what you produced.{human}",
                 budget.wall_secs,
                 budget.messages,
                 budget.hops,
@@ -259,65 +294,95 @@ pub(crate) fn task_note(env: &Envelope) -> Option<String> {
                 _ => "The task is closed.",
             };
             Some(format!(
-                "This message reports on task {id}: {}. {next} No reply is needed.",
-                inert(&outcome_json(outcome).to_string())
+                "This message reports on task {id} with outcome {}. {next} No reply is needed.",
+                outcome_kind(outcome)
             ))
         }
         _ => None,
     }
 }
 
-/// The `act` property of the `send_message` tool schema.
+/// The `act` property of the `send_message` tool schema: one `oneOf` branch
+/// per kind, each closed to the fields that kind takes.
 pub(crate) fn schema() -> Value {
-    let text = |description: &str| json!({"type":"string","minLength":1,"description":description});
-    json!({
+    let text =
+        |description: &str| json!({"type":"string","pattern":"\\S","description":description});
+    let task_id = |description: &str| json!({"type":"string","pattern":"^[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{26}$","description":description});
+    let kind = |k: &str| json!({"const":k});
+    let artifacts = json!({"type":"array","items":text("A locator such as commit:abc123 or a file path."),"description":"Locators of what you produced."});
+    let evidence = json!({
         "type":"object",
-        "description":"Optional. Leave act out for an ordinary message. Use kind \"request\" to give the recipient a task with a budget. Use kind \"report\" to say how a task assigned to you ended. A rejected act sends nothing.",
+        "description":"Proof that the obstacle is real.",
         "properties":{
-            "kind":{"enum":["inform","request","report"]},
-            "deliverable":text("request: the concrete result you want back."),
-            "budget":{
+            "tried":text("What you tried."),
+            "obstacle":text("Where it stopped and why the obstacle cannot be removed within the task."),
+            "reproduction":{"type":["string","null"],"pattern":"\\S","description":"Optional. How someone else can see the obstacle."}
+        },
+        "required":["tried","obstacle"],
+        "additionalProperties":false
+    });
+    let outcome = |k: &str, description: &str, properties: Value, required: &[&str]| {
+        let mut properties = properties;
+        properties["kind"] = kind(k);
+        let mut required = required.to_vec();
+        required.push("kind");
+        json!({"type":"object","description":description,"properties":properties,"required":required,"additionalProperties":false})
+    };
+    json!({
+        "description":"Optional. Leave act out for an ordinary message. Use kind \"request\" to give the recipient a task with a budget. Use kind \"report\" to say how a task assigned to you ended. The body and the act together must fit in 65536 bytes. A rejected act sends nothing.",
+        "oneOf":[
+            {
                 "type":"object",
-                "description":"request: the most the task may spend. It comes out of parent_task's remaining budget, so the request is rejected if it does not fit.",
-                "properties":{
-                    "wall_secs":{"type":"integer","minimum":0},
-                    "messages":{"type":"integer","minimum":0},
-                    "hops":{"type":"integer","minimum":0},
-                    "tokens":{"type":["integer","null"],"minimum":0,"description":"null or absent means unmetered. Must be set when the parent task meters tokens."}
-                },
-                "required":["wall_secs","messages","hops"],
-                "additionalProperties":false
-            },
-            "stakes":{"enum":["low","normal","high"],"description":"request: how costly a wrong result is. Defaults to normal."},
-            "parent_task":{"type":"string","description":"request: the id of your own open task that this work belongs to. Required for agents unless reply_to points at a message of that task."},
-            "task":{"type":"string","description":"report: the id of the task assigned to you, from the message that opened it."},
-            "outcome":{
-                "type":"object",
-                "description":"report: how the task ended. done: you produced the deliverable; list artifacts. partial: only part is possible as specified; give not_possible and evidence. infeasible: it cannot be done as specified; give evidence. failed: you could not do it, but it may be possible; give tried. blocked: you need something you do not have; give on. partial and infeasible wait for verification; the others close the task.",
-                "properties":{
-                    "kind":{"enum":["done","partial","infeasible","failed","blocked"]},
-                    "artifacts":{"type":"array","items":{"type":"string","minLength":1},"description":"done, partial: locators such as commit:abc123 or a file path."},
-                    "not_possible":text("partial: the part that cannot be done."),
-                    "evidence":{
-                        "type":"object",
-                        "description":"partial, infeasible: proof that the obstacle is real.",
-                        "properties":{
-                            "tried":text("What you tried."),
-                            "obstacle":text("Where it stopped and why the obstacle cannot be removed within the task."),
-                            "reproduction":{"type":"string","description":"Optional. How someone else can see the obstacle."}
-                        },
-                        "required":["tried","obstacle"],
-                        "additionalProperties":false
-                    },
-                    "tried":text("failed: what you tried."),
-                    "on":text("blocked: what you are waiting for.")
-                },
+                "description":"An ordinary message, the same as leaving act out.",
+                "properties":{"kind":kind("inform")},
                 "required":["kind"],
                 "additionalProperties":false
+            },
+            {
+                "type":"object",
+                "description":"Give the recipient a task.",
+                "properties":{
+                    "kind":kind("request"),
+                    "deliverable":text("The concrete result you want back."),
+                    "budget":{
+                        "type":"object",
+                        "description":"The most the task may spend. It comes out of parent_task's remaining budget, so the request is rejected if it does not fit.",
+                        "properties":{
+                            "wall_secs":{"type":"integer","minimum":1,"maximum":u64::MAX},
+                            "messages":{"type":"integer","minimum":1,"maximum":u32::MAX},
+                            "hops":{"type":"integer","minimum":0,"maximum":u16::MAX},
+                            "tokens":{"type":["integer","null"],"minimum":1,"maximum":u64::MAX,"description":"null or absent means unmetered. Must be set when the parent task meters tokens."}
+                        },
+                        "required":["wall_secs","messages","hops"],
+                        "additionalProperties":false
+                    },
+                    "stakes":{"enum":["low","normal","high"],"description":"How costly a wrong result is. Defaults to normal."},
+                    "parent_task":{"type":["string","null"],"pattern":"^[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{26}$","description":"The id of your own open task that this work belongs to. Required for agents unless reply_to points at a message of that task."}
+                },
+                "required":["kind","deliverable","budget"],
+                "additionalProperties":false
+            },
+            {
+                "type":"object",
+                "description":"Say how a task assigned to you ended. Send it to the address the task message names.",
+                "properties":{
+                    "kind":kind("report"),
+                    "task":task_id("The id of the task assigned to you, from the message that opened it."),
+                    "outcome":{
+                        "description":"How the task ended. partial and infeasible wait for verification; the others close the task.",
+                        "oneOf":[
+                            outcome("done", "You produced the deliverable.", json!({"artifacts":artifacts}), &[]),
+                            outcome("partial", "Only part is possible as specified.", json!({"artifacts":artifacts,"not_possible":text("The part that cannot be done."),"evidence":evidence}), &["not_possible","evidence"]),
+                            outcome("infeasible", "It cannot be done as specified.", json!({"evidence":evidence}), &["evidence"]),
+                            outcome("failed", "You could not do it, but it may be possible.", json!({"tried":text("What you tried.")}), &["tried"]),
+                            outcome("blocked", "You need something you do not have.", json!({"on":text("What you are waiting for.")}), &["on"])
+                        ]
+                    }
+                },
+                "required":["kind","task","outcome"],
+                "additionalProperties":false
             }
-        },
-        "required":["kind"],
-        "additionalProperties":false
+        ]
     })
 }
 

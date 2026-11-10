@@ -494,9 +494,10 @@ impl Session for AcpSession {
                 let text = match item {
                     TurnItem::User(env) => {
                         ids.push(env.id());
+                        let content = crate::surfaces::acts::content(&env);
                         match crate::surfaces::acts::task_note(&env) {
-                            Some(note) => format!("{}\n\n{note}", env.body().as_str()),
-                            None => env.body().as_str().into(),
+                            Some(note) => format!("{content}\n\n{note}"),
+                            None => content,
                         }
                     }
                     TurnItem::Peer { envelope, rendered } => {

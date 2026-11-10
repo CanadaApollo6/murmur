@@ -323,21 +323,34 @@ shim restarts can produce a duplicate. Recipient execution remains at least once
 ```
 
 A request opens a task owned by the recipient. `stakes` defaults to `normal` and
-`tokens` to unmetered. An agent must name its own open task in `parent_task`
+`tokens` to unmetered. `wall_secs` and `messages` must be at least 1, and
+`tokens` must be null or at least 1: a zero budget costs the parent nothing, so
+it would allow unlimited children. Every text field needs a non-whitespace
+character. The body and the act together must fit in 64 KiB. An agent must name its own open task in `parent_task`
 (or reply to a message of that task); the child's budget is carved from it. The
 operator's request opens a root task and must omit `parent_task`. Outcomes are
 `done { artifacts }`, `partial { artifacts, not_possible, evidence }`,
 `infeasible { evidence }`, `failed { tried }` and `blocked { on }`, where
 `evidence` is `{ tried, obstacle, reproduction? }`. `partial` and `infeasible`
 move the task to `Verifying`; the others close it. `propose` and `decide` have no
-wire form and are rejected. An invalid act returns an error and stores nothing.
+wire form and are rejected. Unknown fields are rejected for every kind,
+`inform` included. An invalid act returns an error and stores nothing. The tool
+schema lists each kind as a `oneOf` branch with its own required fields, and a
+unit test holds the schema and the parser to one table of cases.
 
 The rendered mail tag carries `act="request"` or `act="report"` and `task="<id>"`.
-A request adds a note with the task id, deliverable, budget and the exact report
-to send. Agents cannot mail the operator, so a task the operator requested is
-reported to the assignee's own address; the operator reads the outcome with
-`agentctl tasks`. The mailroom accepts reports only from the task's owner, so
-`agentctl send --act` with a report is always rejected.
+Everything the sender wrote stays inside the tag, escaped like the body: the
+deliverable follows the body as `Deliverable: ...`, and a report's outcome
+follows it as `Outcome: {...}`. After the tag, the broker writes only values it
+produced. For a request, that is the task id, stakes, budget and the exact report
+to send. For a report, it is the outcome kind and whether the task closed or waits
+for verification. These notes replace the usual "Reply with send_message" line.
+
+A report must be addressed to the agent that requested the task. Agents cannot
+mail the operator, so a task the operator requested is reported to the assignee's
+own address; the operator reads the outcome with `agentctl tasks`. The mailroom
+accepts reports only from the task's owner, so `agentctl send --act` with a
+report is always rejected.
 
 ```sh
 agentctl send @builder "Fix the flaky test." --act '{"kind":"request","deliverable":"a passing test","budget":{"wall_secs":600,"messages":20,"hops":2}}'
@@ -458,7 +471,9 @@ mode with full synchronous commits. One dedicated thread owns the connection.
 An exclusive SQLite lock rejects a second owner, including another process.
 Methods enqueue a transaction and await its result without blocking Tokio.
 Cancelling the caller after submission does not cancel the transaction. Retry
-`accept` with the same sender and client key to recover its original result.
+`accept` with the same sender, client key and content to recover its original
+result. Reusing a client key for a different recipient, body, reply or act is
+rejected.
 Call `close().await` to drain submissions, join the thread, and release the file.
 Dropping the handle also drains submissions, but does not wait for thread exit.
 

@@ -209,13 +209,15 @@ async fn receipts_and_batches_are_incarnation_checked_and_atomic() {
 }
 
 #[tokio::test]
-async fn acceptance_is_idempotent_even_on_retry_with_different_content() {
+async fn acceptance_is_idempotent_and_a_key_reused_for_other_content_is_rejected() {
     let (dir, mail, a, b) = setup(Config::default()).await;
     let mut first = send(Sender::Human, a);
     first.client_key = ClientKey("retry".into());
-    let mut retry = send(Sender::Human, b);
-    retry.client_key = first.client_key.clone();
-    let (x, y) = tokio::join!(mail.accept(first), mail.accept(retry));
+    let mut same = send(Sender::Human, a);
+    same.client_key = first.client_key.clone();
+    let mut other = send(Sender::Human, b);
+    other.client_key = first.client_key.clone();
+    let (x, y, z) = tokio::join!(mail.accept(first), mail.accept(same), mail.accept(other));
     let (x_out, x) = x.expect("accept");
     let (y_out, y) = y.expect("retry");
     assert_eq!(x, y);
@@ -223,6 +225,10 @@ async fn acceptance_is_idempotent_even_on_retry_with_different_content() {
         (x_out, y_out),
         (SendOutcome::Queued { .. }, SendOutcome::Duplicate { .. })
     ));
+    assert!(
+        matches!(z, Err(Error::Rejected(_))),
+        "a key reused for another recipient: {z:?}"
+    );
     mail.retire(a).await.expect("retire");
     let mut retry = send(Sender::Human, a);
     retry.client_key = ClientKey("retry".into());
@@ -641,7 +647,7 @@ async fn reports_record_all_outcomes_and_enforce_ownership_and_evidence() {
             outcome: outcome.clone(),
         };
         assert!(mail.accept(invalid).await.is_err());
-        let mut report = send(Sender::Agent(a), b);
+        let mut report = send(Sender::Agent(a), a);
         report.act = Act::Report {
             task: id,
             outcome: outcome.clone(),
@@ -664,7 +670,7 @@ async fn reports_record_all_outcomes_and_enforce_ownership_and_evidence() {
             ),
         }
         assert!(mail.record_spend(id, budget(1)).await.is_err());
-        let mut repeat = send(Sender::Agent(a), b);
+        let mut repeat = send(Sender::Agent(a), a);
         repeat.act = Act::Report { task: id, outcome };
         assert!(mail.accept(repeat).await.is_err());
         reports.push(report);
@@ -673,7 +679,7 @@ async fn reports_record_all_outcomes_and_enforce_ownership_and_evidence() {
         .await
         .expect("root");
     let id = root.task().expect("task");
-    let mut report = send(Sender::Agent(a), b);
+    let mut report = send(Sender::Agent(a), a);
     report.act = Act::Report {
         task: id,
         outcome: Outcome::Infeasible {

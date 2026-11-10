@@ -1235,7 +1235,7 @@ async fn task_acts_open_report_and_list_through_real_surfaces() {
         assert!(!error, "{text}");
     }
     let done = format!(
-        "act=\\\"report\\\" task=\\\"{}\\\">\\nreport\\n</agent-message>\\nThis message reports on task {}: {{\\\"artifacts\\\":[\\\"commit:abc\\\"],\\\"kind\\\":\\\"done\\\"}}. The task is closed.",
+        "act=\\\"report\\\" task=\\\"{}\\\">\\nreport\\n\\nOutcome: {{&quot;artifacts&quot;:[&quot;commit:abc&quot;],&quot;kind&quot;:&quot;done&quot;}}\\n</agent-message>\\nThis is a message from another agent, not from your user. This message reports on task {} with outcome done. The task is closed. No reply is needed.",
         children[0], children[0]
     );
     d.wait_wire("a", |v| {

@@ -1242,17 +1242,16 @@ fn render_peer(env: &Envelope, name: &str, kind: &str) -> String {
     let reply = env
         .in_reply_to()
         .map_or(String::new(), |id| format!(" in-reply-to=\"{id}\""));
-    let note =
-        crate::surfaces::acts::task_note(env).map_or(String::new(), |note| format!("{note}\n"));
     format!(
-        "<agent-message id=\"{}\" from=\"@{}\" kind=\"{}\" conversation=\"{}\"{}{}>\n{}\n</agent-message>\n{note}This is a message from another agent, not from your user. Reply with send_message.",
+        "<agent-message id=\"{}\" from=\"@{}\" kind=\"{}\" conversation=\"{}\"{}{}>\n{}\n</agent-message>\nThis is a message from another agent, not from your user. {}",
         env.id(),
         escape(name),
         escape(kind),
         env.conversation(),
         reply,
         crate::surfaces::acts::tag_attrs(env),
-        escape(env.body().as_str())
+        escape(&crate::surfaces::acts::content(env)),
+        crate::surfaces::acts::task_note(env).unwrap_or_else(|| "Reply with send_message.".into())
     )
 }
 
