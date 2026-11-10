@@ -728,6 +728,17 @@ impl Mailroom {
         self.call(move |s| task(&s.db, id)).await
     }
 
+    /// Every task in the ledger, oldest first.
+    pub async fn tasks(&self) -> Result<Vec<Task>> {
+        self.call(|s| {
+            Ok(s.db
+                .prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY rowid"))?
+                .query_map([], task_row)?
+                .collect::<rusqlite::Result<_>>()?)
+        })
+        .await
+    }
+
     pub async fn record_spend(&self, id: TaskId, spend: Budget) -> Result<()> {
         self.call(move |s| {
             let tx = s.db.transaction()?;
@@ -1203,8 +1214,30 @@ fn exposure_ref(db: &Connection, agent: AgentId) -> Result<ExposureRef> {
         seq,
     })
 }
+const TASK_COLUMNS: &str =
+    "id,parent,owner,requested_by,request_msg,deliverable,stakes,budget,spent,state";
+fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
+    Ok(Task {
+        id: json_col(r, 0)?,
+        parent: optional_json_col(r, 1)?,
+        owner: json_col(r, 2)?,
+        requested_by: json_col(r, 3)?,
+        request: json_col(r, 4)?,
+        deliverable: r.get(5)?,
+        stakes: json_col(r, 6)?,
+        budget: json_col(r, 7)?,
+        spent: json_col(r, 8)?,
+        state: json_col(r, 9)?,
+    })
+}
 fn task(db: &Connection, id: TaskId) -> Result<Task> {
-    db.query_row("SELECT id,parent,owner,requested_by,request_msg,deliverable,stakes,budget,spent,state FROM tasks WHERE id=?", [json(&id)?], |r| Ok(Task { id: json_col(r,0)?, parent: optional_json_col(r,1)?, owner: json_col(r,2)?, requested_by: json_col(r,3)?, request: json_col(r,4)?, deliverable: r.get(5)?, stakes: json_col(r,6)?, budget: json_col(r,7)?, spent: json_col(r,8)?, state: json_col(r,9)? })).optional()?.ok_or_else(|| Error::NotFound(id.to_string()))
+    db.query_row(
+        &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id=?"),
+        [json(&id)?],
+        task_row,
+    )
+    .optional()?
+    .ok_or_else(|| Error::NotFound(id.to_string()))
 }
 fn owned_task(db: &Connection, id: TaskId, owner: AgentId) -> Result<Task> {
     let t = task(db, id)?;

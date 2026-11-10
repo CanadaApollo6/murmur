@@ -15,11 +15,12 @@ use crate::KindConfig;
 use crate::mailroom::{Mailroom, NewMessage, SendOutcome};
 use crate::model::*;
 use crate::supervisor::{AgentSpec, Broker, Phase};
-use crate::swarm::Act;
+use crate::swarm::{Act, TaskState};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub mod acts;
 pub mod events;
 pub mod rap;
 pub mod ui;
@@ -228,6 +229,8 @@ pub enum ControlRequest {
         to: String,
         body: Body,
         key: ClientKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        act: Option<acts::ActArgs>,
     },
     Approvals,
     Approve {
@@ -251,6 +254,7 @@ pub enum ControlRequest {
         nonce: Option<String>,
     },
     Ui,
+    Tasks,
 }
 
 pub struct ControlApi {
@@ -286,8 +290,10 @@ impl ControlApi {
         body: Body,
         reply_to: Option<MessageId>,
         key: ClientKey,
+        act: Option<acts::ActArgs>,
     ) -> Result<Value> {
         let id = self.mailroom.resolve(Recipient::parse(to)?).await?;
+        let (act, task) = act.map_or((Act::Inform, None), acts::ActArgs::into_act);
         let (outcome, env) = self
             .broker
             .send(NewMessage {
@@ -296,8 +302,8 @@ impl ControlApi {
                 body,
                 reply_to,
                 client_key: key,
-                act: Act::Inform,
-                task: None,
+                act,
+                task,
             })
             .await?;
         let status = match outcome {
@@ -315,7 +321,50 @@ impl ControlApi {
         } else {
             ""
         };
-        Ok(json!({"id":env.id(),"status":format!("{status} {} for {to}{suffix}.",env.id())}))
+        let opened = match (env.act(), env.task()) {
+            (Act::Request { .. }, Some(task)) => format!(" Opened task {task}."),
+            _ => String::new(),
+        };
+        Ok(
+            json!({"id":env.id(),"task":env.task(),"status":format!("{status} {} for {to}{suffix}.{opened}",env.id())}),
+        )
+    }
+    async fn label(&self, sender: &Sender) -> Result<String> {
+        Ok(match sender {
+            Sender::Human => "human".into(),
+            Sender::Agent(id) => format!("@{}", self.mailroom.sender_label(*id).await?.0),
+        })
+    }
+    async fn tasks(&self) -> Result<Value> {
+        let mut rows = Vec::new();
+        for t in self.mailroom.tasks().await? {
+            let (state, outcome) = match &t.state {
+                TaskState::Open => ("open", None),
+                TaskState::Verifying { report } => {
+                    match self.mailroom.message(*report).await?.act() {
+                        Act::Report { outcome, .. } => {
+                            ("verifying", Some(acts::outcome_json(outcome)))
+                        }
+                        _ => {
+                            return Err(format!(
+                                "bug: task {} report {report} is not a report",
+                                t.id
+                            )
+                            .into());
+                        }
+                    }
+                }
+                TaskState::Closed { outcome, .. } => ("closed", Some(acts::outcome_json(outcome))),
+            };
+            rows.push(json!({
+                "id":t.id,"parent":t.parent,"state":state,
+                "requester":self.label(&t.requested_by).await?,
+                "assignee":self.label(&Sender::Agent(t.owner)).await?,
+                "deliverable":t.deliverable,"stakes":acts::StakesArgs::from(t.stakes),
+                "budget":t.budget,"spent":t.spent,"outcome":outcome,
+            }));
+        }
+        Ok(json!(rows))
     }
     async fn control(&self, request: ControlRequest) -> Result<Value> {
         match request {
@@ -330,13 +379,15 @@ impl ControlApi {
                 let to = format!("@{}", spec.name.as_str());
                 let handle = self.broker.spawn(spec).await?;
                 if let Some(body) = first_message {
-                    self.send(Bindings::human(), &to, body, None, key).await?;
+                    self.send(Bindings::human(), &to, body, None, key, None)
+                        .await?;
                 }
                 Ok(json!({"id":format!("agent:{}",handle.id),"name":to,"cwd":handle.cwd}))
             }
             ControlRequest::Ls => self.agents().await,
-            ControlRequest::Send { to, body, key } => {
-                self.send(Bindings::human(), &to, body, None, key).await
+            ControlRequest::Send { to, body, key, act } => {
+                self.send(Bindings::human(), &to, body, None, key, act)
+                    .await
             }
             ControlRequest::Approvals => Ok(json!(
                 self.approvals()?
@@ -401,6 +452,7 @@ impl ControlApi {
                 Ok(json!({"dropped":id}))
             }
             ControlRequest::Watch { .. } => Err("watch requires streaming".into()),
+            ControlRequest::Tasks => self.tasks().await,
             ControlRequest::Ui => Ok(
                 json!({"url":self.ui_url,"status":self.ui_url.clone().unwrap_or_else(|| "Add to kinds.toml:\n[ui]\nlisten = \"127.0.0.1:7434\"".into())}),
             ),
@@ -452,10 +504,13 @@ impl ControlApi {
                                 args.body,
                                 args.reply_to,
                                 binding.key(session, &id),
+                                args.act,
                             )
                             .await
                             .map(|v| v["status"].as_str().unwrap_or("Queued").to_owned()),
-                        Err(_) => Err("invalid send_message arguments".into()),
+                        Err(error) => {
+                            Err(format!("invalid send_message arguments: {error}").into())
+                        }
                     },
                     Some("list_agents") if args == json!({}) => {
                         self.agents().await.map(|v| v.to_string())
@@ -538,14 +593,16 @@ struct SendArgs {
     to: String,
     body: Body,
     reply_to: Option<MessageId>,
+    #[serde(default)]
+    act: Option<acts::ActArgs>,
 }
 fn rpc_error(id: Value, code: i32, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
 }
 pub fn agent_tools() -> Value {
     json!([
-        {"name":"send_message","description":"Send a message to another agent. Busy agents receive it when their current turn ends.",
-         "inputSchema":{"type":"object","properties":{"to":{"type":"string"},"body":{"type":"string","minLength":1,"maxLength":65536},"reply_to":{"type":["string","null"]}},"required":["to","body"],"additionalProperties":false}},
+        {"name":"send_message","description":"Send a message to another agent. Busy agents receive it when their current turn ends. Leave act out for an ordinary message. To hand another agent a piece of work with a budget, set act kind \"request\"; the recipient is told the new task id. When a task assigned to you ends, send exactly one act kind \"report\" with that task id and an outcome, to the address the task message names. Outcomes: done (you produced the deliverable), partial (only part is possible as specified), infeasible (it cannot be done as specified), failed (you could not do it, but it may be possible), blocked (you need something you do not have). partial and infeasible need evidence and wait for verification. Never report done for work you did not finish.",
+         "inputSchema":{"type":"object","properties":{"to":{"type":"string"},"body":{"type":"string","minLength":1,"maxLength":65536},"reply_to":{"type":["string","null"]},"act":acts::schema()},"required":["to","body"],"additionalProperties":false}},
         {"name":"list_agents","description":"List agent names, kinds, phases and queued mail.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}
     ])
 }

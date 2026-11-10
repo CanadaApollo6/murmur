@@ -612,9 +612,12 @@ impl Session for InfinitySession {
         for item in turn.items {
             let (envelope, from, text) = match item {
                 TurnItem::User(envelope) => {
+                    let note = crate::surfaces::acts::task_note(&envelope)
+                        .map_or(String::new(), |note| format!("{note}\n"));
                     let text = format!(
-                        "<human-message id=\"{}\" from=\"human\">\n{}\n</human-message>\nThis is deferrable mail from your human operator. Reply to the human operator.",
+                        "<human-message id=\"{}\" from=\"human\"{}>\n{}\n</human-message>\n{note}This is deferrable mail from your human operator. Reply to the human operator.",
                         envelope.id(),
+                        crate::surfaces::acts::tag_attrs(&envelope),
                         envelope.body().as_str()
                     );
                     (envelope, "human".to_owned(), text)

@@ -1065,3 +1065,295 @@ fn mail_config_defaults_overrides_zero_and_invalid_values() {
         assert!(toml::from_str::<FileConfig>(invalid).is_err(), "{invalid}");
     }
 }
+
+async fn send_tool(d: &Daemon, token: &str, id: &str, arguments: Value) -> (bool, String) {
+    let response = d
+        .relay(
+            token,
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"send_message","arguments":arguments}}),
+        )
+        .await;
+    let result = &response["result"];
+    (
+        result["isError"].as_bool().expect("isError flag"),
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("tool text: {response}"))
+            .to_owned(),
+    )
+}
+fn opened_task(status: &str) -> String {
+    status
+        .split("Opened task ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no task in status: {status}"))
+        .trim_end_matches('.')
+        .to_owned()
+}
+fn budget(wall_secs: u64, messages: u32, hops: u16) -> Value {
+    json!({"wall_secs":wall_secs,"messages":messages,"hops":hops})
+}
+
+#[tokio::test]
+async fn task_acts_open_report_and_list_through_real_surfaces() {
+    let mut d = Daemon::new(None).await;
+    d.spawn("b", "codex", Some("start")).await;
+    let wire_b = d.wait_wire("b", |v| !prompts(v).is_empty()).await;
+    let token_b = session_token(&wire_b).to_owned();
+    d.spawn("a", "claude", Some("start")).await;
+    let wire_a = d.wait_wire("a", |v| !prompts(v).is_empty()).await;
+    let token_a = session_token(&wire_a).to_owned();
+    let ls = d.ctl(&["ls"]).await;
+    let agent = |name: &str| {
+        ls.as_array()
+            .expect("agents")
+            .iter()
+            .find(|row| row["name"] == name)
+            .expect("agent row")["id"]
+            .as_str()
+            .expect("agent id")
+            .to_owned()
+    };
+    let (a, b) = (agent("@a"), agent("@b"));
+
+    let root_act =
+        json!({"kind":"request","deliverable":"ship the root","budget":budget(100,10,5)});
+    let status = d
+        .ctl(&["send", "@a", "root work", "--act", &root_act.to_string()])
+        .await;
+    let root = opened_task(status.as_str().expect("send status"));
+    let wire_a = d.wait_wire("a", |v| prompts(v).len() >= 2).await;
+    let shown = prompts(&wire_a)[1]["params"]["prompt"].to_string();
+    assert!(shown.contains("root work"), "{shown}");
+    assert!(
+        shown.contains(&format!("opens task {root}")),
+        "human request must name its task: {shown}"
+    );
+
+    let request = |budget: Value| json!({"to":"@b","body":"child work","act":{"kind":"request","deliverable":"child result","budget":budget,"parent_task":root}});
+    let (error, text) = send_tool(&d, &token_a, "too-big", request(budget(1000, 1, 1))).await;
+    assert!(error, "over-budget request must fail: {text}");
+    assert_eq!(text, "task budget exceeded");
+    let mut orphan = request(budget(1, 1, 1));
+    orphan["act"]
+        .as_object_mut()
+        .expect("act")
+        .remove("parent_task");
+    let (error, text) = send_tool(&d, &token_a, "orphan", orphan).await;
+    assert!(error);
+    assert!(text.contains("agent Request needs a parent task"), "{text}");
+    let (error, text) = send_tool(
+        &d,
+        &token_a,
+        "propose",
+        json!({"to":"@b","body":"x","act":{"kind":"propose","scope":"all"}}),
+    )
+    .await;
+    assert!(error);
+    assert!(text.contains("unknown variant `propose`"), "{text}");
+    let tasks = d.ctl(&["tasks"]).await;
+    assert_eq!(
+        tasks.as_array().expect("tasks").len(),
+        1,
+        "rejected requests store no task"
+    );
+    assert_eq!(
+        tasks[0]["spent"]["wall_secs"], 0,
+        "rejection carves nothing"
+    );
+
+    let mut children = Vec::new();
+    for n in 0..4 {
+        let (error, text) = send_tool(
+            &d,
+            &token_a,
+            &format!("child-{n}"),
+            request(budget(10, 2, 1)),
+        )
+        .await;
+        assert!(!error, "{text}");
+        children.push(opened_task(&text));
+    }
+    let wire_b = d
+        .wait_wire("b", |v| {
+            let seen = prompts(v)
+                .iter()
+                .map(|p| p["params"]["prompt"].to_string())
+                .collect::<String>();
+            children.iter().all(|c| seen.contains(c.as_str()))
+        })
+        .await;
+    let delivered = prompts(&wire_b)
+        .iter()
+        .map(|p| p["params"]["prompt"].to_string())
+        .collect::<String>();
+    for child in &children {
+        assert!(
+            delivered.contains(&format!("act=\\\"request\\\" task=\\\"{child}\\\"")),
+            "B must see task {child}: {delivered}"
+        );
+    }
+    assert!(delivered.contains("child result"));
+    assert!(
+        delivered.contains(&format!(
+            "to \\\"{a}\\\", act {{\\\"kind\\\":\\\"report\\\""
+        )),
+        "report address: {delivered}"
+    );
+
+    let report = |task: &str, outcome: Value| json!({"to":a,"body":"report","act":{"kind":"report","task":task,"outcome":outcome}});
+    let evidence = json!({"tried":"read the spec","obstacle":"the input does not exist"});
+    for (n, outcome) in [
+        json!({"kind":"done","artifacts":["commit:abc"]}),
+        json!({"kind":"infeasible","evidence":evidence}),
+        json!({"kind":"partial","artifacts":[],"not_possible":"half","evidence":evidence}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (error, text) = send_tool(
+            &d,
+            &token_b,
+            &format!("report-{n}"),
+            report(&children[n], outcome),
+        )
+        .await;
+        assert!(!error, "{text}");
+    }
+    let done = format!(
+        "act=\\\"report\\\" task=\\\"{}\\\">\\nreport\\n</agent-message>\\nThis message reports on task {}: {{\\\"artifacts\\\":[\\\"commit:abc\\\"],\\\"kind\\\":\\\"done\\\"}}. The task is closed.",
+        children[0], children[0]
+    );
+    d.wait_wire("a", |v| {
+        prompts(v)
+            .iter()
+            .any(|p| p["params"]["prompt"].to_string().contains(&done))
+    })
+    .await;
+    let (error, text) = send_tool(
+        &d,
+        &token_b,
+        "report-again",
+        report(&children[1], json!({"kind":"done"})),
+    )
+    .await;
+    assert!(error, "a verifying task takes no second report");
+    assert!(
+        text.contains("task must be open and owned by sender"),
+        "{text}"
+    );
+    let unknown = agentd::swarm::TaskId::new().to_string();
+    let (error, text) = send_tool(
+        &d,
+        &token_b,
+        "report-unknown",
+        report(&unknown, json!({"kind":"done"})),
+    )
+    .await;
+    assert!(error);
+    assert_eq!(text, format!("not found: {unknown}"));
+    let mut by_requester = report(&children[3], json!({"kind":"done"}));
+    by_requester["to"] = json!(b);
+    let (error, text) = send_tool(&d, &token_a, "report-not-owner", by_requester).await;
+    assert!(error, "only the assignee reports");
+    assert!(
+        text.contains("task must be open and owned by sender"),
+        "{text}"
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--socket")
+        .arg(d.socket())
+        .args(["send", "@b", "operator report", "--act"])
+        .arg(json!({"kind":"report","task":children[3],"outcome":{"kind":"done"}}).to_string())
+        .output()
+        .await
+        .expect("agentctl");
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        "agentctl: rejected: Report needs a task owner"
+    );
+
+    let (error, text) = send_tool(
+        &d,
+        &token_a,
+        "plain",
+        json!({"to":"@b","body":"plain inform"}),
+    )
+    .await;
+    assert!(!error, "{text}");
+    assert!(!text.contains("task"), "{text}");
+    let wire_b = d
+        .wait_wire("b", |v| {
+            prompts(v)
+                .iter()
+                .any(|p| p["params"]["prompt"].to_string().contains("plain inform"))
+        })
+        .await;
+    let plain = prompts(&wire_b)
+        .into_iter()
+        .map(|p| p["params"]["prompt"][0]["text"].as_str().expect("text"))
+        .find(|p| p.contains("plain inform"))
+        .expect("plain prompt");
+    let header = plain.lines().next().expect("tag");
+    assert!(
+        header.starts_with("<agent-message id=\"")
+            && header.contains(" from=\"@a\" kind=\"claude\" conversation=\"")
+            && !header.contains(" act=")
+            && !header.contains(" task="),
+        "{header}"
+    );
+    assert!(
+        plain.ends_with(
+            "\nplain inform\n</agent-message>\nThis is a message from another agent, not from your user. Reply with send_message."
+        ),
+        "{plain}"
+    );
+
+    let tasks = d.ctl(&["tasks"]).await;
+    let rows = tasks.as_array().expect("tasks");
+    assert_eq!(rows.len(), 5, "{tasks}");
+    let row = |id: &str| {
+        rows.iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("task {id}: {tasks}"))
+    };
+    let root_row = row(&root);
+    assert_eq!(root_row["state"], "open");
+    assert_eq!(root_row["requester"], "human");
+    assert_eq!(root_row["assignee"], "@a");
+    assert_eq!(
+        root_row["budget"],
+        json!({"tokens":null,"wall_secs":100,"messages":10,"hops":5})
+    );
+    assert_eq!(root_row["spent"]["wall_secs"], 40);
+    assert_eq!(root_row["outcome"], Value::Null);
+    assert_eq!(root_row["stakes"], "normal");
+    for (child, state, outcome) in [
+        (
+            &children[0],
+            "closed",
+            json!({"kind":"done","artifacts":["commit:abc"]}),
+        ),
+        (
+            &children[1],
+            "verifying",
+            json!({"kind":"infeasible","evidence":evidence}),
+        ),
+        (
+            &children[2],
+            "verifying",
+            json!({"kind":"partial","artifacts":[],"not_possible":"half","evidence":evidence}),
+        ),
+        (&children[3], "open", Value::Null),
+    ] {
+        let r = row(child);
+        assert_eq!(r["state"], state, "{r}");
+        assert_eq!(r["outcome"], outcome, "{r}");
+        assert_eq!(r["parent"], root);
+        assert_eq!(r["requester"], "@a");
+        assert_eq!(r["assignee"], "@b");
+        assert_eq!(r["deliverable"], "child result");
+    }
+    d.stop(nix::sys::signal::Signal::SIGTERM).await;
+}

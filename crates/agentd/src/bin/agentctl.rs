@@ -37,6 +37,10 @@ enum Command {
     Send {
         to: String,
         text: String,
+        /// The act as JSON, in the same shape as the send_message tool's `act`,
+        /// for example '{"kind":"request","deliverable":"...","budget":{"wall_secs":600,"messages":20,"hops":2}}'.
+        #[arg(long)]
+        act: Option<String>,
     },
     Approvals,
     Approve {
@@ -62,6 +66,8 @@ enum Command {
         nonce: Option<String>,
     },
     Ui,
+    /// List the task ledger.
+    Tasks,
 }
 #[derive(Clone, ValueEnum)]
 enum Kind {
@@ -118,10 +124,13 @@ async fn run(args: Args) -> Result<()> {
             key,
         },
         Command::Ls => ControlRequest::Ls,
-        Command::Send { to, text } => ControlRequest::Send {
+        Command::Send { to, text, act } => ControlRequest::Send {
             to,
             body: Body::new(text)?,
             key,
+            act: act
+                .map(|act| serde_json::from_str(&act).map_err(|e| format!("invalid --act: {e}")))
+                .transpose()?,
         },
         Command::Approvals => ControlRequest::Approvals,
         Command::Approve { id, option } => ControlRequest::Approve {
@@ -138,6 +147,7 @@ async fn run(args: Args) -> Result<()> {
         },
         Command::Watch { cursor, nonce } => ControlRequest::Watch { cursor, nonce },
         Command::Ui => ControlRequest::Ui,
+        Command::Tasks => ControlRequest::Tasks,
     };
     let watch = matches!(request, ControlRequest::Watch { .. });
     let held = matches!(request, ControlRequest::Held { .. });

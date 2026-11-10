@@ -398,10 +398,11 @@ async fn execute(
                 args.body,
                 args.reply_to,
                 ClientKey(format!("rap:{id}")),
+                args.act,
             )
             .await
         }
-        Err(_) => Err("invalid send_message arguments".into()),
+        Err(error) => Err(format!("invalid send_message arguments: {error}").into()),
     };
     let (text, is_error) = match result {
         Ok(value) => (
