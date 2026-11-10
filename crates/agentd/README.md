@@ -5,6 +5,10 @@ server for Claude and Codex agents. The SQLite mailroom remains the delivery aut
 
 ## Run
 
+For a first run with one Claude agent and one Codex agent, follow the
+[quickstart](../../docs/murmur/quickstart.md). It lists only commands that
+were run against a live daemon.
+
 ```sh
 cargo build -p agentd --bins
 agentd --config /path/to/kinds.toml
@@ -23,8 +27,12 @@ agentctl watch
 ```
 
 The default state directory is `~/.local/state/agentd/`. `--state-dir` overrides it.
+`agentctl` has no `--state-dir` flag. With a custom state directory, set
+`AGENTD_SOCKET` or pass `--socket` to every `agentctl` command.
 The daemon reads `kinds.toml` there when present. An explicit `--config` must exist.
 Without a config, commands default to `claude-agent-acp` and `codex-acp` on PATH.
+On Linux, that is the PATH inside the sandbox. A `command` outside the default
+binds also needs its directory in `[bwrap] ro_binds`.
 On Linux, both kinds are preflighted inside bubblewrap. Non-Linux targets default
 to `sandbox = "none"`. Install both commands or explicitly
 set `sandbox = "none"` for kinds you do not intend to sandbox. An Infinity-only
@@ -340,7 +348,7 @@ as the human and reach every agent's socket.
 
 The broker copies only `~/.claude/.credentials.json` or `~/.codex/auth.json` into
 the private home. It never mounts the human's CLI directory. Credential reads use
-no-follow directory descriptors and accept regular files up to 1 MiB. Valid JSON
+no-follow directory descriptors and accept regular files up to 256 KiB. Valid JSON
 refreshes return through compare-and-swap and propagate to unchanged live
 siblings. Conflicts and superseded values are skipped and logged. Refresh checks
 run every two seconds and once after session exit.
@@ -360,9 +368,10 @@ closed. A denial names the agent in its HTTP 403 response.
 
 ## Other V1 limitations
 
-There is no per-sender mail quota. An agent can flood another agent's queue
-because leaving out `reply_to` restarts the hop count. A per-sender cap and a
-per-turn batch limit are follow-up work.
+Agent mail is bounded by the `[mail]` limits described under Run. Leaving out
+`reply_to` restarts the hop count, so the hop limit does not stop a long
+exchange. The per-sender and per-pair caps still bound how much undelivered
+mail one agent can queue. Human sends are exempt.
 
 For unsandboxed agents, token redaction in activity output works per frame and is best-effort. A token
 split across frames may appear without redaction.
