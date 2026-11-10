@@ -14,7 +14,7 @@ only delivery authority.
 | Core peer messages, provider cancellation | Merged (#1, #2) |
 | Mailroom, ACP supervisor, `agentctl`, bound MCP tools, Infinity adapter | Merged (#3 to #6) |
 | [ACP per-agent isolation](isolation.md): bubblewrap, egress proxy, credential sync | Merged (#7) |
-| v1 swarm schema: `Act` on every envelope, task ledger with budgets, `Report` outcomes, exposure log | Built in the mailroom |
+| v1 swarm schema: `Act` on every envelope, task ledger with budgets, `Report` outcomes, exposure log | Built. Agents open and report tasks with `send_message`. The operator opens them with `agentctl send --act` and lists them with `agentctl tasks` |
 | Mail limits | Merged (#8) |
 | Infinity model agents sending mail | Merged (#9) |
 | `infinity-provider-local` | Merged (#10). Live engine probes and agent qualification are pending. See [Run local inference](local-inference.md) |

@@ -20,6 +20,7 @@ agentctl held [@builder]
 agentctl release <message-id>
 agentctl drop <message-id>
 agentctl watch
+agentctl tasks
 ```
 
 The default state directory is `~/.local/state/agentd/`. `--state-dir` overrides it.
@@ -305,11 +306,47 @@ in `claude --mcp-config <json>`. The token is therefore visible in
 `/proc/<pid>/cmdline`. The broker does not include it in control responses.
 The token contains 256 bits from the OS random source and binds one agent and
 incarnation. Session cleanup revokes it; restart mints a new one. The two tools
-are `send_message { to, body, reply_to? }` and `list_agents {}`. Send keys derive
+are `send_message { to, body, reply_to?, act? }` and `list_agents {}`. Send keys derive
 from the incarnation, a random namespace created at each MCP shim startup, and
 the MCP request ID. Retries within one shim session recover the original mail.
 A replacement shim can reuse request IDs without losing new mail. A retry across
 shim restarts can produce a duplicate. Recipient execution remains at least once.
+
+### Tasks
+
+`send_message` and `agentctl send` take an optional `act`. Without it, mail is an
+`Inform`, as before. Both surfaces share one JSON shape:
+
+```json
+{"kind":"request","deliverable":"a passing test","budget":{"wall_secs":600,"messages":20,"hops":2,"tokens":null},"stakes":"normal","parent_task":"<task id>"}
+{"kind":"report","task":"<task id>","outcome":{"kind":"done","artifacts":["commit:abc123"]}}
+```
+
+A request opens a task owned by the recipient. `stakes` defaults to `normal` and
+`tokens` to unmetered. An agent must name its own open task in `parent_task`
+(or reply to a message of that task); the child's budget is carved from it. The
+operator's request opens a root task and must omit `parent_task`. Outcomes are
+`done { artifacts }`, `partial { artifacts, not_possible, evidence }`,
+`infeasible { evidence }`, `failed { tried }` and `blocked { on }`, where
+`evidence` is `{ tried, obstacle, reproduction? }`. `partial` and `infeasible`
+move the task to `Verifying`; the others close it. `propose` and `decide` have no
+wire form and are rejected. An invalid act returns an error and stores nothing.
+
+The rendered mail tag carries `act="request"` or `act="report"` and `task="<id>"`.
+A request adds a note with the task id, deliverable, budget and the exact report
+to send. Agents cannot mail the operator, so a task the operator requested is
+reported to the assignee's own address; the operator reads the outcome with
+`agentctl tasks`. The mailroom accepts reports only from the task's owner, so
+`agentctl send --act` with a report is always rejected.
+
+```sh
+agentctl send @builder "Fix the flaky test." --act '{"kind":"request","deliverable":"a passing test","budget":{"wall_secs":600,"messages":20,"hops":2}}'
+agentctl tasks
+```
+
+`agentctl tasks` prints every task with its `id`, `parent`, `state` (`open`,
+`verifying` or `closed`), `requester`, `assignee`, `deliverable`, `stakes`,
+`budget`, `spent` and `outcome`.
 
 Agent specs, resume handles and mail survive daemon restarts. SIGINT and SIGTERM
 stop connections, shut down broker actors, then drain and close the mailroom.
@@ -434,7 +471,8 @@ Dropping the handle also drains submissions, but does not wait for thread exit.
 - Delivery operations are `pending_for`, `delivery`, `mark_offered`,
   `mark_started`, `mark_consumed`, `session_ended`, `held`, `release`,
   `drop_held` and `retire`.
-- Ledger operations are `task`, `record_spend`, `new_epoch` and `exposures`.
+- Ledger operations are `task`, `tasks`, `record_spend`, `new_epoch` and
+  `exposures`.
   A Request creates its task inside `accept`; there is no separate creation path.
 - `Interceptor`, `Verdict`, `ConversationView`, `HopLimit`, `Config` and typed
   outcomes and errors describe the acceptance and storage boundary.
