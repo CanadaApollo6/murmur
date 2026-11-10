@@ -2554,3 +2554,71 @@ async fn a_thread_that_reports_idle_ends_the_halt_warning_without_the_mail_recei
         t.broker.shutdown().await.expect("shutdown");
     }
 }
+
+#[tokio::test]
+async fn a_fresh_idle_thread_is_no_evidence_about_the_thread_it_replaced() {
+    use agentd::supervisor::Operation;
+    const WARNING: &str = "may still be running";
+    for archive in [false, true] {
+        let mut t = Test::new().await;
+        let mail = t.send(false, "work").await;
+        let offer = t.daemon.next().await;
+        offer.emit(fake::start());
+        offer.emit(fake::receipt(format!("peer-{mail}")));
+        t.consumed(mail).await;
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(3),
+            t.broker.operate(t.agent.id, Operation::Stop),
+        )
+        .await
+        .expect("the stop is bounded by the cancel deadline");
+        assert!(stopped.is_err_and(|e| e.to_string().contains(WARNING)));
+
+        // One fault: the saved thread cannot be reattached, so the next
+        // restart leaves `NeedsRecovery` on a fresh thread.
+        t.daemon.state.lock().expect("state").missing = true;
+        let lost = t.broker.operate(t.agent.id, Operation::Restart).await;
+        assert!(lost.is_err_and(|e| e.to_string().contains(WARNING)));
+        assert!(matches!(t.agent.phase(), Phase::NeedsRecovery { .. }));
+        t.daemon.state.lock().expect("state").missing = false;
+        let fresh = t.broker.operate(t.agent.id, Operation::Restart).await;
+        assert!(fresh.is_err_and(|e| e.to_string().contains(WARNING)));
+        assert_eq!(t.agent.phase(), Phase::Idle);
+        let create = loop {
+            let request = t.daemon.next().await;
+            if matches!(request.message, ClientMessage::CreateSession { .. }) {
+                break request;
+            }
+        };
+
+        if archive {
+            create.emit(DaemonMessage::SessionsUpdated {
+                sessions: std::collections::HashMap::from([(
+                    fake::root(),
+                    infinity_protocol::SessionInfo {
+                        title: None,
+                        last_updated: String::new(),
+                        total_tokens_used: 0,
+                        status: infinity_protocol::SessionStatus::Archived,
+                        threads: vec![],
+                        remote: None,
+                    },
+                )]),
+            });
+            let mut phases = t.agent.phases();
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                phases.wait_for(|p| matches!(p, Phase::NeedsRecovery { .. })),
+            )
+            .await
+            .expect("the archive is bounded")
+            .expect("phase");
+        }
+        t.broker.shutdown().await.expect("shutdown");
+        let error = t.agent.error();
+        assert!(
+            error.as_deref().is_some_and(|e| e.contains(WARNING)),
+            "archive={archive}: {error:?}"
+        );
+    }
+}

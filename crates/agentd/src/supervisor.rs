@@ -1400,8 +1400,11 @@ impl AgentActor {
             mcp.revoke(self.id).await;
         }
         if let Some(session) = self.session.take() {
-            if !session.busy() {
-                // The thread reported idle, whatever mail receipts are still missing.
+            if self.phase == Phase::Busy && !session.busy() {
+                // The thread reported idle after this session's turn began,
+                // whatever mail receipts are still missing. A session that ran
+                // no turn is no evidence: it can be a fresh thread, and the
+                // warning is about the thread before it.
                 self.turn_over();
             }
             let token = session
