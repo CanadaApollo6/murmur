@@ -1219,3 +1219,193 @@ async fn concurrent_sends_cannot_overrun_the_last_slot() {
     assert_eq!(mail.pending_for(b).await.expect("pending").len(), 1);
     mail.close().await.expect("close");
 }
+
+fn message_count(dir: &TempDir) -> u32 {
+    let db = rusqlite::Connection::open(dir.path().join("broker.db")).expect("inspect");
+    db.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .expect("messages")
+}
+
+#[tokio::test]
+async fn reports_go_to_the_requester_or_to_the_assignee_for_operator_tasks() {
+    let (dir, mail, a, b) = setup(Config::default()).await;
+    let c = mail
+        .register(AgentName::parse("carol").expect("name"))
+        .await
+        .expect("register");
+    let root = request(&mail, Sender::Human, a, None, budget(10))
+        .await
+        .expect("root")
+        .task()
+        .expect("task");
+    let child = request(&mail, Sender::Agent(a), b, Some(root), budget(2))
+        .await
+        .expect("child")
+        .task()
+        .expect("task");
+    let done = Outcome::Done { artifacts: vec![] };
+    let report = |task: TaskId, from: AgentId, to: AgentId| {
+        let mut msg = send(Sender::Agent(from), to);
+        msg.act = Act::Report {
+            task,
+            outcome: done.clone(),
+        };
+        msg
+    };
+    mail.close().await.expect("close");
+    let before = message_count(&dir);
+    let mail = Mailroom::open(dir.path().join("broker.db"), Config::default())
+        .await
+        .expect("reopen");
+    for (task, from, to) in [(child, b, c), (child, b, b), (root, a, b), (root, a, c)] {
+        assert!(
+            matches!(
+                mail.accept(report(task, from, to)).await,
+                Err(Error::Rejected(_))
+            ),
+            "report of {task} from {from} to {to}"
+        );
+        assert_eq!(mail.task(task).await.expect("task").state, TaskState::Open);
+    }
+    mail.close().await.expect("close");
+    assert_eq!(
+        message_count(&dir),
+        before,
+        "rejected reports store no mail"
+    );
+    let mail = Mailroom::open(dir.path().join("broker.db"), Config::default())
+        .await
+        .expect("reopen");
+    mail.accept(report(child, b, a))
+        .await
+        .expect("to requester");
+    mail.accept(report(root, a, a))
+        .await
+        .expect("operator task to self");
+    mail.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn act_content_and_budgets_are_bounded() {
+    let (dir, mail, a, b) = setup(Config::default()).await;
+    let root = request(&mail, Sender::Human, a, None, budget(10))
+        .await
+        .expect("root")
+        .task()
+        .expect("task");
+    let child = |deliverable: String, amount: Budget| {
+        let mut msg = send(Sender::Agent(a), b);
+        msg.task = Some(root);
+        msg.act = Act::Request {
+            deliverable,
+            budget: amount,
+            stakes: Stakes::Normal,
+        };
+        msg
+    };
+    let half = "x".repeat(MAX_BODY_BYTES / 2);
+    let mut oversized = child(half.clone(), budget(1));
+    oversized.body = Body::new(half.clone()).expect("body");
+    let mut rejected = vec![
+        child("x".repeat(1 << 20), budget(1)),
+        oversized,
+        child(
+            "x".into(),
+            Budget {
+                wall_secs: 0,
+                ..budget(1)
+            },
+        ),
+        child(
+            "x".into(),
+            Budget {
+                messages: 0,
+                ..budget(1)
+            },
+        ),
+        child(
+            "x".into(),
+            Budget {
+                tokens: Some(0),
+                ..budget(1)
+            },
+        ),
+    ];
+    let mut report = send(Sender::Agent(a), a);
+    report.act = Act::Report {
+        task: root,
+        outcome: Outcome::Failed {
+            tried: "x".repeat(MAX_BODY_BYTES),
+        },
+    };
+    rejected.push(report);
+    for msg in rejected {
+        assert!(
+            matches!(mail.accept(msg).await, Err(Error::Rejected(_))),
+            "act must be rejected"
+        );
+    }
+    let parent = mail.task(root).await.expect("root");
+    assert_eq!(parent.spent, budget(0));
+    assert_eq!(parent.state, TaskState::Open);
+    let mut fits = child(
+        half,
+        Budget {
+            hops: 0,
+            ..budget(1)
+        },
+    );
+    fits.body = Body::new("x".repeat(MAX_BODY_BYTES / 4)).expect("body");
+    mail.accept(fits).await.expect("bounded act with zero hops");
+    let mut full = send(Sender::Agent(a), b);
+    full.body = Body::new("x".repeat(MAX_BODY_BYTES)).expect("body");
+    mail.accept(full)
+        .await
+        .expect("a full-size inform is unchanged");
+    mail.close().await.expect("close");
+    assert_eq!(message_count(&dir), 3);
+}
+
+#[tokio::test]
+async fn a_client_key_reused_for_different_content_is_an_error() {
+    let (dir, mail, a, b) = setup(Config::default()).await;
+    let root = request(&mail, Sender::Human, a, None, budget(10))
+        .await
+        .expect("root")
+        .task()
+        .expect("task");
+    let keyed = |act: Act| {
+        let mut msg = send(Sender::Agent(a), a);
+        msg.client_key = ClientKey("reused".into());
+        msg.act = act;
+        msg
+    };
+    let report = Act::Report {
+        task: root,
+        outcome: Outcome::Done { artifacts: vec![] },
+    };
+    let (first, inform) = mail.accept(keyed(Act::Inform)).await.expect("inform");
+    assert!(matches!(first, SendOutcome::Queued { .. }));
+    let (again, same) = mail.accept(keyed(Act::Inform)).await.expect("retry");
+    assert_eq!(again, SendOutcome::Duplicate { id: inform.id() });
+    assert_eq!(same, inform);
+    assert!(matches!(
+        mail.accept(keyed(report.clone())).await,
+        Err(Error::Rejected(_))
+    ));
+    let mut other_body = keyed(Act::Inform);
+    other_body.body = Body::new("different").expect("body");
+    assert!(matches!(
+        mail.accept(other_body).await,
+        Err(Error::Rejected(_))
+    ));
+    let mut other_to = keyed(Act::Inform);
+    other_to.to = b;
+    assert!(matches!(
+        mail.accept(other_to).await,
+        Err(Error::Rejected(_))
+    ));
+    assert_eq!(mail.task(root).await.expect("root").state, TaskState::Open);
+    mail.close().await.expect("close");
+    assert_eq!(message_count(&dir), 2);
+}

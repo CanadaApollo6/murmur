@@ -325,6 +325,118 @@ pub(crate) fn schema() -> Value {
 mod tests {
     use super::*;
 
+    /// One table for the published schema and the parser: each case is
+    /// either accepted by both or rejected by both.
+    #[test]
+    fn schema_and_parser_agree() {
+        let task = TaskId::new();
+        let evidence = json!({"tried":"t","obstacle":"o"});
+        let request = |extra: Value| {
+            let mut act = json!({"kind":"request","deliverable":"x","budget":{"wall_secs":1,"messages":1,"hops":0}});
+            for (k, v) in extra.as_object().expect("bug: extra is an object") {
+                act[k] = v.clone();
+            }
+            act
+        };
+        let budget = |b: Value| request(json!({"budget":b}));
+        let report = |outcome: Value| json!({"kind":"report","task":task,"outcome":outcome});
+        let cases = [
+            (json!({"kind":"inform"}), true),
+            (request(json!({})), true),
+            (
+                request(
+                    json!({"stakes":"high","parent_task":task,"budget":{"wall_secs":5,"messages":2,"hops":65535,"tokens":9}}),
+                ),
+                true,
+            ),
+            (
+                request(
+                    json!({"parent_task":null,"budget":{"wall_secs":5,"messages":2,"hops":1,"tokens":null}}),
+                ),
+                true,
+            ),
+            (report(json!({"kind":"done"})), true),
+            (
+                report(json!({"kind":"done","artifacts":["commit:a"]})),
+                true,
+            ),
+            (
+                report(
+                    json!({"kind":"partial","not_possible":"n","evidence":{"tried":"t","obstacle":"o","reproduction":null}}),
+                ),
+                true,
+            ),
+            (
+                report(
+                    json!({"kind":"infeasible","evidence":{"tried":"t","obstacle":"o","reproduction":"r"}}),
+                ),
+                true,
+            ),
+            (report(json!({"kind":"failed","tried":"t"})), true),
+            (report(json!({"kind":"blocked","on":"input"})), true),
+            (json!({"kind":"inform","typo":1}), false),
+            (json!({"kind":"inform","outcome":{"kind":"done"}}), false),
+            (json!({"kind":"request"}), false),
+            (json!({}), false),
+            (json!("inform"), false),
+            (json!({"kind":"propose","scope":"x"}), false),
+            (
+                json!({"kind":"decide","proposal":"x","accepted":true}),
+                false,
+            ),
+            (request(json!({"outcome":{"kind":"done"}})), false),
+            (request(json!({"task":task})), false),
+            (request(json!({"deliverable":""})), false),
+            (request(json!({"deliverable":" \n"})), false),
+            (request(json!({"stakes":"extreme"})), false),
+            (request(json!({"stakes":null})), false),
+            (request(json!({"parent_task":"not-a-task"})), false),
+            (
+                budget(json!({"wall_secs":1,"messages":1,"hops":70000})),
+                false,
+            ),
+            (budget(json!({"wall_secs":0,"messages":1,"hops":1})), false),
+            (budget(json!({"wall_secs":1,"messages":0,"hops":1})), false),
+            (
+                budget(json!({"wall_secs":1,"messages":1,"hops":1,"tokens":0})),
+                false,
+            ),
+            (budget(json!({"wall_secs":-1,"messages":1,"hops":1})), false),
+            (budget(json!({"wall_secs":1,"messages":1})), false),
+            (
+                budget(json!({"wall_secs":1,"messages":1,"hops":1,"extra":1})),
+                false,
+            ),
+            (json!({"kind":"report","task":task}), false),
+            (json!({"kind":"report","outcome":{"kind":"done"}}), false),
+            (report(json!({"kind":"done","bogus":1})), false),
+            (report(json!({"kind":"done","artifacts":[""]})), false),
+            (report(json!({"kind":"done","on":"x"})), false),
+            (report(json!({"kind":"partial","not_possible":"n"})), false),
+            (report(json!({"kind":"partial","evidence":evidence})), false),
+            (report(json!({"kind":"infeasible"})), false),
+            (
+                report(json!({"kind":"infeasible","evidence":{"tried":"t","obstacle":""}})),
+                false,
+            ),
+            (
+                report(json!({"kind":"infeasible","evidence":{"tried":"t","obstacle":"o","x":1}})),
+                false,
+            ),
+            (report(json!({"kind":"failed"})), false),
+            (report(json!({"kind":"failed","tried":""})), false),
+            (report(json!({"kind":"blocked"})), false),
+            (report(json!({"kind":"blocked","on":""})), false),
+            (report(json!({"kind":"unknown"})), false),
+        ];
+        let schema = jsonschema::validator_for(&schema()).expect("bug: act schema compiles");
+        for (case, valid) in cases {
+            assert_eq!(schema.is_valid(&case), valid, "schema on {case}");
+            let parsed = serde_json::from_value::<ActArgs>(case.clone());
+            assert_eq!(parsed.is_ok(), valid, "parser on {case}: {parsed:?}");
+        }
+    }
+
     #[test]
     fn wire_rejects_unknown_kinds_and_fields() {
         for bad in [

@@ -60,6 +60,7 @@ infinity-provider-protocol = { path = "../infinity-provider-protocol", features 
 rap-test-servers = { path = "../rap-test-servers" }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+jsonschema = { version = "0.61.1", default-features = false }
 
 [lints]
 workspace = true
