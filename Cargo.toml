@@ -8,7 +8,6 @@ members = [
     "crates/infinity-mdtests",
     "crates/sandbox-core",
     "crates/sandbox-local",
-    "crates/sandbox-remote",
     "crates/rap-protocol",
     "crates/rap-client",
     "crates/rap-steering-server",
@@ -46,10 +45,7 @@ rhai = { version = "1", features = ["no_optimize"] }
 strkind = "0.0.1"
 
 # AWS crates
-aws-sdk-dynamodb = { version = "1", default-features = false }
 aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "credentials-process", "sso"] }
-aws-sigv4 = { version = "1", default-features = false }
-aws-credential-types = { version = "1", default-features = false }
 aws-smithy-runtime-api = { version = "1", default-features = false }
 
 # Sandbox crates
