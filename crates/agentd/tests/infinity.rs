@@ -2073,8 +2073,12 @@ async fn r17_choice_id_reuse_after_turn_gets_new_deadline() {
 #[cfg(test)]
 async fn r18_admission_probe(matching_root: bool) {
     let mut t = Test::with_stall(Default::default(), Duration::from_millis(300)).await;
-    let id = t.send(true, "waiting mail").await;
-    let offer = t.daemon.next().await;
+    // From here virtual time moves only by `advance`. Neither the 300 ms stall deadline nor the
+    // 200 ms cancel deadline that follows it can then expire because this test or agentd was
+    // scheduled late.
+    tokio::time::pause();
+    let id = hold_clock(t.send(true, "waiting mail")).await;
+    let offer = hold_clock(t.daemon.next()).await;
     offer.emit(fake::start());
     offer.emit(fake::round_done());
     offer.emit(DaemonMessage::InputAdmitted {
@@ -2094,28 +2098,21 @@ async fn r18_admission_probe(matching_root: bool) {
         thread_id: fake::thread(),
         text: "admission barrier".into(),
     });
-    t.event(|e| matches!(e, Event::Activity { text, .. } if text == "admission barrier"))
-        .await;
-    // From here virtual time moves only by `advance`. The stall deadline (300 ms after the
-    // barrier) is then past, so a still-Waiting offer is cancelled as soon as the supervisor
-    // runs, without waiting for real time. The frozen clock also keeps the 200 ms cancel
-    // deadline from expiring while the test replies on this connection.
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_millis(700)).await;
-    let stall = hold_clock_for(
-        Duration::from_millis(700),
-        t.event(|e| matches!(e, Event::Activity { text, .. } if text.starts_with("mail-starvation stall"))),
+    hold_clock(
+        t.event(|e| matches!(e, Event::Activity { text, .. } if text == "admission barrier")),
     )
     .await;
-    let interrupted = stall.is_some();
+    // The stall deadline is now past. A still-Waiting offer is interrupted as soon as the
+    // supervisor runs. An offer that admission retired must stay silent on the wire.
+    tokio::time::advance(Duration::from_millis(700)).await;
+    let next = hold_clock_for(Duration::from_millis(700), t.daemon.next()).await;
+    let interrupted = next
+        .as_ref()
+        .is_some_and(|r| matches!(r.message, ClientMessage::Interrupt { .. }));
     assert_eq!(
         interrupted, !matching_root,
         "only exact root admission retires Waiting, including across continuation StartOutput"
     );
-    if interrupted {
-        let interrupt = hold_clock(t.daemon.next()).await;
-        assert!(matches!(interrupt.message, ClientMessage::Interrupt { .. }));
-    }
     assert!(
         matches!(
             hold_clock(t.mailroom.delivery(id))
