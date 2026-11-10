@@ -20,7 +20,7 @@ The loop itself lives in one crate, with the protocol and platform pieces factor
 - **`infinity-provider-protocol`** defines the `ModelProvider` trait and the out-of-process provider transport, deliberately lightweight so provider crates can depend on it alone.
 - **`rap-protocol`** holds the RAP wire types: `RapInvocation`, toolset manifests, display segments.
 - **`rap-client`** is the client-side RAP plumbing: the `HttpClient` trait, `ToolsetLoader` for discovery, `RapNotifier` for cancellations, and a local callback server.
-- **`infinity-agent-lambda`** is the AWS binding: SQS handler, DSQL conversation store, DynamoDB state store.
+- **`infinity-agent-lambda`** is the AWS binding: SQS handler, DSQL conversation store, DynamoDB state store. murmur does not carry this crate. Its source is in [upstream Infinity](https://github.com/hydro-project/infinity/blob/1abc6fcff1f186124f924b56aa92c3a3684c90c5/crates/infinity-agent-lambda).
 - **`infinity-daemon`** is the resident-process binding used by Infinity Code: it runs one long-lived local agent system for the whole daemon, with in-memory + JSON-file stores and lazily booted per-session RAP servers.
 
 The last two are the production applications of the core. If you are writing your own, they are the reference material: `infinity-agent-lambda` is the minimal [step-mode](../agent-systems/step-mode.md) application, and `infinity-daemon` is the full interactive [local](../agent-systems/running-locally.md) one.
