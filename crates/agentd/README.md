@@ -353,8 +353,10 @@ refreshes return through compare-and-swap and propagate to unchanged live
 siblings. Conflicts and superseded values are skipped and logged. Refresh checks
 run every two seconds and once after session exit.
 
-An agent can write arbitrary valid JSON into the human's credential file. A CLI
-that caches tokens in memory may need a restart after a sibling's refresh.
+An agent can replace the values in the human's credential file. A refresh must
+be a JSON object with the same top-level keys as the copy that the agent
+started with. A CLI that caches tokens in memory may need a restart after a
+sibling's refresh.
 An unrelated host writer can still race the final comparison and rename.
 Use `credentials = []` and `CLAUDE_CODE_OAUTH_TOKEN` or `OPENAI_API_KEY` in
 `kind.env` to avoid exposing the human's refresh token.

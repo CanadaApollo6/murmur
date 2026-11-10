@@ -45,6 +45,7 @@ Write `$RUN/kinds.toml`. Replace `$ACP` with the absolute path of the npm instal
 [bwrap]
 # An explicit list replaces the default binds. The shims live under $ACP,
 # so that directory must be visible inside the sandbox.
+# Every path in the list must exist. Remove the ones that your machine lacks.
 ro_binds = ["~/.local/share/mise/installs", "~/.cargo/bin", "$ACP"]
 
 [ui]
@@ -57,6 +58,11 @@ command = ["$ACP/node_modules/.bin/claude-agent-acp"]
 command = ["$ACP/node_modules/.bin/codex-acp"]
 ```
 
+The default binds are `~/.cargo/bin`, `~/.rustup/toolchains` and
+`~/.local/share/mise/installs`, and agentd drops the ones that do not exist.
+It does not drop a missing path from an explicit list. A missing path there
+stops sandboxed agents from starting.
+
 Without `[kind.*] command`, agentd looks for `claude-agent-acp` and `codex-acp`
 on PATH inside the sandbox. If they are missing, startup fails with an empty
 reason after the final colon:
@@ -68,11 +74,14 @@ agentd: sandbox preflight failed for claude (command claude-agent-acp); check bw
 ## 3. Start agentd
 
 ```sh
-"$B/agentd" --config "$RUN/kinds.toml" --state-dir "$RUN/state" 2>> "$RUN/agentd.log" &
+RUST_LOG=info,agentd=debug "$B/agentd" --config "$RUN/kinds.toml" --state-dir "$RUN/state" 2>> "$RUN/agentd.log" &
 ```
 
 The control socket appeared in about 150 ms. agentd prints nothing on a clean
 start. Warnings and crash reasons go to stderr.
+
+Set `RUST_LOG`. Without it agentd logs errors only, and the reason for a
+crashed session is a warning.
 
 `agentctl` has no `--state-dir` flag. It looks for the socket in
 `~/.local/state/agentd`. Point it at your socket for every command:
@@ -124,10 +133,13 @@ session starts.
 
 ## 5. Watch events
 
-Start the feed in a second terminal. It prints one JSON object per line,
-starting with a snapshot.
+Start the feed in a second terminal, from the repository root. A new terminal
+has neither `B` nor `AGENTD_SOCKET`, so set both again. The feed prints one
+JSON object per line, starting with a snapshot.
 
 ```sh
+B=$PWD/target/debug
+export AGENTD_SOCKET="$PWD/.live-run/state/agentd.sock"
 "$B/agentctl" watch
 ```
 
@@ -171,9 +183,15 @@ Each option includes a ready-made command:
 }
 ```
 
+Use the ID and the option key from your own `approvals` output. Each request
+gets a new ID, and agentd rejects an old one as stale.
+
 ```sh
-"$B/agentctl" approve 01M73E04Z0MEFVRBGNQ3QDRF7B allow-once
+"$B/agentctl" approve <permission-id> allow-once
 ```
+
+The ready-made command calls `agentctl` by name. Replace that name with
+`"$B/agentctl"` when the binary is not on PATH.
 
 `allow-with-updates` approves the rest of that session's `send_message` calls.
 
@@ -199,8 +217,10 @@ The agent was `idle` about 60 ms later. The cancelled message is `consumed`.
 "$B/agentctl" drop <message-id>      # give up on it
 ```
 
-Mail that was in flight when a session died is `Uncertain`. agentd does not
-redeliver it. Release it only if a second execution is safe.
+Mail whose turn had started when its session died is `Uncertain`. agentd does
+not redeliver it. Release it only if a second execution is safe. Mail that was
+offered before a turn started returns to the queue. After the maximum number
+of attempts it is held.
 
 ## 10. Graph UI
 
