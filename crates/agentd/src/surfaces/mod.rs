@@ -14,7 +14,7 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::KindConfig;
 use crate::mailroom::{Mailroom, NewMessage, SendOutcome};
 use crate::model::*;
-use crate::supervisor::{AgentSpec, Broker, Operation, Phase};
+use crate::supervisor::{AgentSpec, Broker, Operation, Phase, phase_error};
 use crate::swarm::Act;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -272,10 +272,11 @@ impl ControlApi {
         for (id, spec, queued) in self.mailroom.observed_agents().await? {
             let handle = self.broker.handle(id).await;
             let phase = handle.as_ref().map_or(Phase::Ended, |h| h.phase());
+            let error = handle.as_ref().and_then(|h| h.error());
             let isolation = handle.as_ref().map_or("none", |h| h.isolation());
             rows.push(
                 json!({"id":format!("agent:{id}"),"name":format!("@{}",spec.name.as_str()),
-                "kind":spec.kind,"isolation":isolation,"phase":phase_name(&phase),"error":match &phase { Phase::Failed { last } => Some(last.as_str()), Phase::NeedsRecovery { reason } => Some(reason.as_str()), Phase::Stopped { detached } => detached.as_deref(), _ => None },
+                "kind":spec.kind,"isolation":isolation,"phase":phase_name(&phase),"error":error,
                 "queued":queued}),
             );
         }

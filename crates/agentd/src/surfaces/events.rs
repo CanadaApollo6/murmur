@@ -219,12 +219,16 @@ async fn agent(
     let (phase, incarnation) = h
         .as_ref()
         .map_or(fallback, |h| (h.phase(), h.incarnation()));
+    let error = h
+        .as_ref()
+        .map_or_else(|| phase_error(&phase), |h| h.error());
     let (name, kind) = cache.get(&id).cloned().unwrap_or_default();
     Ok(agent_row(
         id,
         &name,
         &kind,
         &phase,
+        error,
         Some(incarnation),
         h.as_ref().map_or("none", |h| h.isolation()),
     ))
@@ -234,17 +238,11 @@ fn agent_row(
     name: &str,
     kind: &str,
     phase: &Phase,
+    error: Option<String>,
     incarnation: Option<Incarnation>,
     isolation: &str,
 ) -> Value {
-    let error = match phase {
-        Phase::Failed { last } => Some(cut(last, 1024)),
-        Phase::NeedsRecovery { reason } => Some(cut(reason, 1024)),
-        Phase::Stopped {
-            detached: Some(note),
-        } => Some(cut(note, 1024)),
-        _ => None,
-    };
+    let error = error.map(|e| cut(&e, 1024));
     json!({"id":format!("agent:{id}"),"name":cut(name,1024),"kind":cut(kind,1024),"isolation":isolation,"phase":phase_name(phase),"incarnation":incarnation,"error":error})
 }
 type AgentCache = HashMap<AgentId, (String, String)>;
@@ -289,6 +287,7 @@ fn assemble_snapshot(input: SnapshotInput) -> Result<(Snapshot, AgentCache)> {
             &name,
             &spec.kind,
             &handle.as_ref().map_or(Phase::Ended, |h| h.phase()),
+            handle.as_ref().and_then(|h| h.error()),
             handle.as_ref().map(|h| h.incarnation()),
             handle.as_ref().map_or("none", |h| h.isolation()),
         ));
@@ -928,13 +927,15 @@ mod tests {
     #[test]
     fn a_stop_that_may_have_left_work_running_says_so() {
         let row = |detached: Option<&str>| {
+            let phase = Phase::Stopped {
+                detached: detached.map(str::to_owned),
+            };
             agent_row(
                 AgentId::new(),
                 "a",
                 "infinity",
-                &Phase::Stopped {
-                    detached: detached.map(str::to_owned),
-                },
+                &phase,
+                phase_error(&phase),
                 None,
                 "none",
             )
@@ -962,6 +963,7 @@ mod tests {
             &Phase::Failed {
                 last: "\0".repeat(1024),
             },
+            Some("\0".repeat(1024)),
             Some(Incarnation(u64::MAX)),
             "bwrap+proxy",
         );

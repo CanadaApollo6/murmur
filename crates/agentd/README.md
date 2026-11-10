@@ -39,11 +39,18 @@ the cancel timeout, `stop` still stops the agent but fails with
 still be running in the daemon`. `agentctl ls` and the event feed show the same
 note as the agent's `error` while it stays stopped. The note does not survive an
 agentd restart. Stop also interrupts a thread that is busy with work agentd did
-not submit.
+not submit. The note is reported however the session ends: when the cancel
+cannot be sent, when the daemon connection drops, or when the session ends
+before the deadline. `restart` reports the same case as `agent restarted, but
+...` and reattaches to the thread. `agentctl ls` and the feed show that note as
+the agent's `error` until a turn ends or the next stop or restart.
 
 If agentd cannot settle the ended session's mail (a storage error, or a failed
 session shutdown), the command fails, the agent waits in phase `ended`, and its
-mail keeps its state. Run the same command again to settle it.
+mail keeps its state. `agentctl ls` and the feed show the failure as the agent's
+`error`. Run the same command again to settle it. The repeated command still
+reports Infinity work that may be running, and a restart from `needs-recovery`
+or `failed` stays fresh.
 
 `agentctl restart @name` ends any current session the same way and starts a new
 one. From `stopped` or a live phase, the new session resumes the saved
@@ -420,16 +427,17 @@ diagnosed, so the twelve tests that use them are ignored there.
   CLI agents receive human mail as user input. Infinity receives deferrable
   operator mail. Peer mail carries the labelled `<agent-message>` framing.
   Idle delivery batches all queued envelopes in arrival order.
-- `AgentHandle::{cancel,pending_permissions,answer_permission,phase,phases,stop}`
-  control or observe an actor. Answers include the request's incarnation.
+- `AgentHandle::{cancel,pending_permissions,answer_permission,phase,phases,error,stop}`
+  control or observe an actor. `error` is what `agentctl ls` shows. Answers include the request's incarnation.
   Rules match an exact normalized tool name, or `*`; the first match wins.
   No rule means escalate to the caller. An optional timeout rejects once, or
   cancels if the agent provides no single-use rejection option.
 - `operate(id, Operation::Stop | Operation::Restart)` stops or restarts an agent.
   It cancels a running turn and waits at most the kind's `cancel_timeout` before
   it ends the session. The stop flag persists in `agent_specs.stopped` (schema
-  version 3). An actor that exited in `Failed` is respawned from its saved spec.
-  An actor ended by `shutdown()` or a replacement is not.
+  version 3). An actor that exited in `Failed` or panicked is respawned from its
+  saved spec. An actor ended by `shutdown()` or a replacement is not, and
+  `spawn` after `shutdown()` returns `Error::Closed`.
 - `events()` returns a bounded display-only broadcast receiver. Subscribers can
   lag; SQLite remains delivery authority. Activity never becomes agent input.
 - `shutdown()` stops and reaps sessions, settles outstanding delivery, and waits

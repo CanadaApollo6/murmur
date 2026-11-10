@@ -146,6 +146,7 @@ pub struct AgentHandle {
     phase: watch::Receiver<Phase>,
     isolation: watch::Receiver<&'static str>,
     incarnation: watch::Receiver<Incarnation>,
+    note: watch::Receiver<Option<String>>,
 }
 impl AgentHandle {
     fn nudge(&self) {
@@ -167,6 +168,11 @@ impl AgentHandle {
     }
     pub fn phases(&self) -> watch::Receiver<Phase> {
         self.phase.clone()
+    }
+    /// What `agentctl ls` and the feed show as the agent's error: the phase's
+    /// own reason, else what the last stop or restart left unresolved.
+    pub fn error(&self) -> Option<String> {
+        phase_error(&self.phase()).or_else(|| self.note.borrow().clone())
     }
     pub async fn cancel(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -323,9 +329,10 @@ impl Broker {
     pub async fn restore(&self, spec: AgentSpec) -> Result<AgentHandle> {
         self.spawn_inner(spec, true).await
     }
-    /// Stops or restarts an agent. An actor that exited in `Failed` is respawned
-    /// from its saved spec and reads the persisted stop flag, so both work from
-    /// any phase. An actor ended by shutdown or replacement is never respawned.
+    /// Stops or restarts an agent. An actor that exited in `Failed` or panicked
+    /// is respawned from its saved spec and reads the persisted stop flag, so
+    /// both work from any phase. An actor ended by shutdown or replacement
+    /// exits in `Ended` and is never respawned.
     pub async fn operate(&self, id: AgentId, op: Operation) -> Result<()> {
         if let Some(handle) = self.handle(id).await {
             match handle.operate(op).await {
@@ -342,10 +349,7 @@ impl Broker {
             drop(replacement);
             return handle.operate(op).await;
         }
-        if previous
-            .as_ref()
-            .is_some_and(|h| !matches!(h.phase(), Phase::Failed { .. }))
-        {
+        if previous.as_ref().is_some_and(|h| h.phase() == Phase::Ended) {
             return Err(Error::Closed);
         }
         let (_, spec) = self
@@ -362,13 +366,16 @@ impl Broker {
         // fails, the actor stays dead in Failed and a repeated command converges.
         self.mailroom.set_stopped(id, op == Operation::Stop).await?;
         if previous.is_some() {
-            // Either command leaves Failed with a fresh session, as in the actor.
+            // Either command leaves a dead actor with a fresh session, as in the actor.
             self.mailroom.forget_resume(id).await?;
         }
         self.spawn_locked(spec, true).await.map(drop)
     }
     async fn spawn_inner(&self, spec: AgentSpec, restore: bool) -> Result<AgentHandle> {
         let _replacement = self.replacements.lock().await;
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Closed);
+        }
         self.spawn_locked(spec, restore).await
     }
     async fn spawn_locked(&self, mut spec: AgentSpec, restore: bool) -> Result<AgentHandle> {
@@ -445,6 +452,7 @@ impl Broker {
         let (phase_tx, phase) = watch::channel(initial.clone());
         let (isolation_tx, isolation) = watch::channel("none");
         let (incarnation_tx, incarnation_rx) = watch::channel(incarnation);
+        let (note_tx, note) = watch::channel(None);
         let handle = AgentHandle {
             id,
             cwd: spec.cwd.clone(),
@@ -452,6 +460,7 @@ impl Broker {
             phase,
             isolation,
             incarnation: incarnation_rx,
+            note,
         };
         #[cfg(test)]
         let adapter = self
@@ -468,6 +477,7 @@ impl Broker {
             credentials: self.credentials.clone(),
             isolation_tx,
             incarnation_tx,
+            note_tx,
             kind: kind.clone(),
             id,
             idle_after: if model_agent {
@@ -494,6 +504,8 @@ impl Broker {
             session: None,
             cancelling: false,
             halting: None,
+            fresh: false,
+            unacknowledged: false,
             offered: Vec::new(),
             pending: HashMap::new(),
             crashes: VecDeque::new(),
@@ -590,12 +602,19 @@ struct AgentActor {
     phase_tx: watch::Sender<Phase>,
     isolation_tx: watch::Sender<&'static str>,
     incarnation_tx: watch::Sender<Incarnation>,
+    note_tx: watch::Sender<Option<String>>,
     phase: Phase,
     incarnation: Incarnation,
     resume: Option<ResumeToken>,
     session: Option<Box<dyn Session>>,
     cancelling: bool,
     halting: Option<Halting>,
+    /// The next settled stop or restart discards the resume token. Kept here,
+    /// not on `Halting`, so a settlement that fails does not forget it.
+    fresh: bool,
+    /// An Infinity turn was in flight when a halt began and has not
+    /// acknowledged the cancel. Kept until a settled halt reports it.
+    unacknowledged: bool,
     offered: Vec<MessageId>,
     pending: HashMap<PermissionId, (PermissionRequest, Option<Instant>)>,
     crashes: VecDeque<Instant>,
@@ -606,10 +625,6 @@ struct AgentActor {
 
 struct Halting {
     op: Operation,
-    /// Leaving NeedsRecovery or Failed discards the resume token.
-    fresh: bool,
-    /// The session reported that its cancel deadline expired.
-    cancel_timed_out: bool,
     replies: Vec<Reply>,
     deadline: Instant,
 }
@@ -626,6 +641,9 @@ impl AgentActor {
             incarnation: self.incarnation,
             phase,
         });
+    }
+    fn note(&mut self, note: Option<String>) {
+        self.note_tx.send_replace(note);
     }
     fn session(&mut self) -> Result<&mut Box<dyn Session>> {
         self.session.as_mut().ok_or(Error::Closed)
@@ -990,6 +1008,7 @@ impl AgentActor {
                 });
             }
             SessionEvent::CancelComplete => {
+                self.unacknowledged = false;
                 self.unavailable_attempts = 0;
                 self.interrupt_since = None;
                 self.cancelling = false;
@@ -1002,6 +1021,8 @@ impl AgentActor {
                 self.phase(Phase::Busy);
             }
             SessionEvent::TurnEnded { outcome } => {
+                self.unacknowledged = false;
+                self.note(None);
                 if !self.offered.is_empty() {
                     self.end("turn ended without receipt".into()).await?;
                 } else {
@@ -1061,11 +1082,13 @@ impl AgentActor {
                 }
             }
             SessionEvent::CancelTimedOut => {
-                if let Some(halting) = &mut self.halting {
-                    halting.cancel_timed_out = true;
-                }
                 tracing::warn!(agent=%self.id, "cancel deadline expired, waiting for session recovery");
                 self.stop_session().await?;
+                if self.halting.is_some() {
+                    // The pending stop or restart publishes the outcome.
+                    self.unacknowledged = true;
+                    return Ok(());
+                }
                 self.unavailable_attempts = self.unavailable_attempts.saturating_add(1);
                 let since = self.interrupt_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= Duration::from_secs(10 * 60) {
@@ -1204,11 +1227,12 @@ impl AgentActor {
         }
     }
     async fn operate(&mut self, op: Operation, reply: Reply) -> Result<()> {
+        self.note(None);
         if op == Operation::Stop
             && self.halting.is_none()
             && let Phase::Stopped { detached } = &self.phase
         {
-            respond(reply, stop_reply(detached.as_deref()));
+            respond(reply, halt_reply(op, detached.as_deref()));
             return Ok(());
         }
         if let Err(error) = self
@@ -1219,29 +1243,32 @@ impl AgentActor {
             respond(reply, Err(error.into()));
             return Ok(());
         }
-        let fresh = matches!(
-            self.phase,
-            Phase::NeedsRecovery { .. } | Phase::Failed { .. }
-        );
+        self.fresh |= self.needs_fresh_session();
         if let Some(halting) = &mut self.halting {
             halting.op = op;
-            halting.fresh |= fresh;
             halting.replies.push(reply);
             return Ok(());
         }
         self.halting = Some(Halting {
             op,
-            fresh,
-            cancel_timed_out: false,
             replies: vec![reply],
             deadline: Instant::now() + self.kind.cancel_timeout,
         });
-        if self.turn_in_flight()
-            && let Err(error) = self.cancel().await
-        {
-            self.end(error.to_string()).await?;
+        if self.turn_in_flight() {
+            // Suspend kills an ACP process but only detaches from an Infinity thread.
+            self.unacknowledged |= self.model_agent;
+            if let Err(error) = self.cancel().await {
+                self.end(error.to_string()).await?;
+            }
         }
         Ok(())
+    }
+    /// Leaving NeedsRecovery or Failed discards the resume token.
+    fn needs_fresh_session(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::NeedsRecovery { .. } | Phase::Failed { .. }
+        )
     }
     /// An Infinity thread can be busy with work agentd did not submit.
     fn turn_in_flight(&self) -> bool {
@@ -1258,15 +1285,8 @@ impl AgentActor {
         if in_flight && halting.deadline > Instant::now() {
             return Ok(());
         }
-        let Halting {
-            op,
-            fresh,
-            cancel_timed_out,
-            replies,
-            ..
-        } = self.halting.take().expect("bug: halting checked above");
-        // Suspend kills an ACP process but only detaches from an Infinity thread.
-        let detached = (cancel_timed_out || (self.model_agent && in_flight)).then(|| {
+        let Halting { op, replies, .. } = self.halting.take().expect("bug: halting checked above");
+        let detached = (self.unacknowledged || (self.model_agent && in_flight)).then(|| {
             format!(
                 "the Infinity turn did not acknowledge the cancel within {:?} and may still be running in the daemon",
                 self.kind.cancel_timeout
@@ -1275,23 +1295,36 @@ impl AgentActor {
         if let Err(error) = self.stop_session().await {
             // The session is gone but its mail may still be offered. A repeated
             // command settles again, so the agent waits in Ended until then.
+            let command = match op {
+                Operation::Stop => "stop",
+                Operation::Restart => "restart",
+            };
+            let reason = format!(
+                "{command} did not settle the session: {error}; repeat `agentctl {command}` to settle it"
+            );
+            self.note(Some(reason.clone()));
             self.phase(Phase::Ended);
-            let reason = format!("{op:?} did not settle the session: {error}");
             for reply in replies {
                 respond(reply, Err(Error::Rejected(reason.clone())));
             }
             return Ok(());
         }
+        let fresh = std::mem::take(&mut self.fresh) || self.needs_fresh_session();
+        self.unacknowledged = false;
         let result = match op {
-            Operation::Stop => self.stopped(fresh, detached).await,
-            Operation::Restart => self.restart(fresh).await,
-        };
-        let failure = match (&result, &self.phase) {
-            (Err(error), _) => Some(error.to_string()),
-            (Ok(()), Phase::Stopped { detached }) => {
-                stop_reply(detached.as_deref()).err().map(|e| e.to_string())
+            Operation::Stop => self.stopped(fresh, detached.clone()).await,
+            Operation::Restart => {
+                // Restart reattaches to a thread that may still run the old turn.
+                // The note stays until a turn ends or the next command.
+                self.note(detached.clone());
+                self.restart(fresh).await
             }
-            _ => None,
+        };
+        let failure = match &result {
+            Err(error) => Some(error.to_string()),
+            Ok(()) => halt_reply(op, detached.as_deref())
+                .err()
+                .map(|e| e.to_string()),
         };
         for reply in replies {
             respond(
@@ -1342,6 +1375,11 @@ impl AgentActor {
         Ok(())
     }
     async fn end(&mut self, reason: String) -> Result<()> {
+        if self.halting.is_some() {
+            // The pending stop or restart publishes the outcome. This is not a crash.
+            tracing::warn!(agent=%self.id, %reason, "agent session ended during a stop or restart");
+            return self.stop_session().await;
+        }
         let idle = self.phase == Phase::Idle;
         self.phase(Phase::Ended);
         self.stop_session().await?;
@@ -1370,6 +1408,10 @@ impl AgentActor {
         }
     }
     fn retry(&mut self, attempt: u32) {
+        if self.halting.is_some() {
+            // The pending stop or restart publishes the outcome.
+            return;
+        }
         let delay = self
             .config
             .backoff_initial
@@ -1460,10 +1502,23 @@ impl AgentActor {
     }
 }
 
-fn stop_reply(detached: Option<&str>) -> Result<()> {
+fn halt_reply(op: Operation, detached: Option<&str>) -> Result<()> {
+    let done = match op {
+        Operation::Stop => "stopped",
+        Operation::Restart => "restarted",
+    };
     detached.map_or(Ok(()), |note| {
-        Err(Error::Rejected(format!("agent stopped, but {note}")))
+        Err(Error::Rejected(format!("agent {done}, but {note}")))
     })
+}
+/// The reason a phase carries, as `agentctl ls` and the feed show it.
+pub fn phase_error(phase: &Phase) -> Option<String> {
+    match phase {
+        Phase::Failed { last } => Some(last.clone()),
+        Phase::NeedsRecovery { reason } => Some(reason.clone()),
+        Phase::Stopped { detached } => detached.clone(),
+        _ => None,
+    }
 }
 fn respond(reply: Reply, result: Result<()>) {
     if reply.send(result).is_err() {
@@ -1544,6 +1599,7 @@ mod replacement_tests {
                     phase,
                     isolation,
                     incarnation,
+                    note: watch::channel(None).1,
                 },
             );
             let (stopping, stopped) = oneshot::channel();
@@ -1638,6 +1694,7 @@ mod publication_tests {
                 phase,
                 isolation,
                 incarnation,
+                note: watch::channel(None).1,
             },
         );
         let pause = Arc::new(tokio::sync::Notify::new());
@@ -1704,6 +1761,7 @@ mod stale_phase_tests {
                 phase,
                 isolation,
                 incarnation,
+                note: watch::channel(None).1,
             },
         );
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -2501,6 +2559,12 @@ mod halt_tests {
             .to_string();
         assert!(first.contains("did not settle"), "{first}");
         assert_eq!(h.agent.phase(), Phase::Ended);
+        assert_eq!(
+            h.agent.error().as_deref(),
+            Some(first.as_str()),
+            "ls and the feed show why the agent is Ended"
+        );
+        assert!(first.contains("repeat `agentctl stop`"), "{first}");
         let result = h.operate(Operation::Stop).await;
         assert_detached(result, "agent stopped, but ", "repeat");
         assert!(matches!(
@@ -2515,8 +2579,18 @@ mod halt_tests {
         let h = harness(true).await;
         h.script.thread_busy.store(true, SeqCst);
         let result = h.operate(Operation::Restart).await;
-        assert_detached(result, "agent restarted, but ", "restart");
+        let error = assert_detached(result, "agent restarted, but ", "restart");
         assert_eq!(h.count(|s| &s.opens), 2, "restart still reattaches");
+        assert_eq!(
+            h.agent.error().as_deref(),
+            error.strip_prefix("agent restarted, but "),
+            "ls and the feed show the note"
+        );
+        h.inject(SessionEvent::TurnEnded {
+            outcome: TurnOutcome::Completed,
+        });
+        h.wait(|p| *p == Phase::Idle).await;
+        assert_eq!(h.agent.error(), None, "the note clears when the turn ends");
         h.broker.shutdown().await.expect("shutdown");
     }
 
@@ -2533,10 +2607,14 @@ mod halt_tests {
             .await;
         h.sql(REFUSE_SETTLE).await;
         assert!(matches!(h.state(mail).await, DeliveryState::Offered { .. }));
-        h.operate(Operation::Restart)
+        let failure = h
+            .operate(Operation::Restart)
             .await
-            .expect_err("settlement failed");
+            .expect_err("settlement failed")
+            .to_string();
         assert_eq!(h.agent.phase(), Phase::Ended);
+        assert!(failure.contains("repeat `agentctl restart`"), "{failure}");
+        assert_eq!(h.agent.error(), Some(failure));
         h.sql("DROP TRIGGER temp.refuse_settle").await;
         h.operate(Operation::Restart)
             .await
