@@ -50,6 +50,14 @@ enum Command {
     Cancel {
         to: String,
     },
+    /// End the agent's session and keep it stopped until `restart`.
+    Stop {
+        to: String,
+    },
+    /// Start a new session. Leaves stopped, needs-recovery and failed.
+    Restart {
+        to: String,
+    },
     Held {
         to: Option<String>,
     },
@@ -138,6 +146,8 @@ async fn run(args: Args) -> Result<()> {
             option,
         },
         Command::Cancel { to } => ControlRequest::Cancel { to },
+        Command::Stop { to } => ControlRequest::Stop { to },
+        Command::Restart { to } => ControlRequest::Restart { to },
         Command::Held { to } => ControlRequest::Held { to },
         Command::Release { id } => ControlRequest::Release {
             id: MessageId(id.parse()?),

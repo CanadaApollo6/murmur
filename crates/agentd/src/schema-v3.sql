@@ -1,0 +1,4 @@
+BEGIN;
+ALTER TABLE agent_specs ADD COLUMN stopped INTEGER NOT NULL DEFAULT 0;
+PRAGMA user_version=3;
+COMMIT;

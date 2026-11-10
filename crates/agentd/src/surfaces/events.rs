@@ -219,12 +219,16 @@ async fn agent(
     let (phase, incarnation) = h
         .as_ref()
         .map_or(fallback, |h| (h.phase(), h.incarnation()));
+    let error = h
+        .as_ref()
+        .map_or_else(|| phase_error(&phase), |h| h.error());
     let (name, kind) = cache.get(&id).cloned().unwrap_or_default();
     Ok(agent_row(
         id,
         &name,
         &kind,
         &phase,
+        error,
         Some(incarnation),
         h.as_ref().map_or("none", |h| h.isolation()),
     ))
@@ -234,14 +238,11 @@ fn agent_row(
     name: &str,
     kind: &str,
     phase: &Phase,
+    error: Option<String>,
     incarnation: Option<Incarnation>,
     isolation: &str,
 ) -> Value {
-    let error = match phase {
-        Phase::Failed { last } => Some(cut(last, 1024)),
-        Phase::NeedsRecovery { reason } => Some(cut(reason, 1024)),
-        _ => None,
-    };
+    let error = error.map(|e| cut(&e, 1024));
     json!({"id":format!("agent:{id}"),"name":cut(name,1024),"kind":cut(kind,1024),"isolation":isolation,"phase":phase_name(phase),"incarnation":incarnation,"error":error})
 }
 type AgentCache = HashMap<AgentId, (String, String)>;
@@ -286,6 +287,7 @@ fn assemble_snapshot(input: SnapshotInput) -> Result<(Snapshot, AgentCache)> {
             &name,
             &spec.kind,
             &handle.as_ref().map_or(Phase::Ended, |h| h.phase()),
+            handle.as_ref().and_then(|h| h.error()),
             handle.as_ref().map(|h| h.incarnation()),
             handle.as_ref().map_or("none", |h| h.isolation()),
         ));
@@ -371,13 +373,18 @@ fn buffer_activity(
     *buffer = tail(buffer, 2048);
 }
 
-async fn state(
+pub(crate) async fn state(
     api: &ControlApi,
     event: Event,
     cache: &mut HashMap<AgentId, (String, String)>,
 ) -> Result<Option<Value>> {
     Ok(Some(match event {
         Event::PhaseChanged {
+            agent: id,
+            incarnation,
+            phase,
+        }
+        | Event::ErrorChanged {
             agent: id,
             incarnation,
             phase,
@@ -940,6 +947,7 @@ mod tests {
             &Phase::Failed {
                 last: "\0".repeat(1024),
             },
+            Some("\0".repeat(1024)),
             Some(Incarnation(u64::MAX)),
             "bwrap+proxy",
         );
@@ -988,15 +996,21 @@ mod quiet_tests {
             }
         }
         let task = tokio::spawn(async move { feed(&api, &mut Discard, None).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let before = room.jobs_run.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(before, 3, "snapshot, specs, then initial page");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            room.jobs_run.load(std::sync::atomic::Ordering::SeqCst),
-            before,
-            "idle feed polled worker"
-        );
+        let jobs = || room.jobs_run.load(std::sync::atomic::Ordering::SeqCst);
+        // Storage jobs run on their own thread and take longer under load.
+        let started = std::time::Instant::now();
+        while jobs() < 3 {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the feed never read its snapshot: jobs={}",
+                jobs()
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(jobs(), 3, "snapshot, specs, then initial page");
+        // Idle past the 100 ms activity flush. A stray job needs real time to show.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(jobs(), 3, "idle feed polled worker");
         task.abort();
         assert!(task.await.expect_err("abort").is_cancelled());
     }

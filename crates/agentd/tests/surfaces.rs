@@ -1080,6 +1080,70 @@ fn mail_config_defaults_overrides_zero_and_invalid_values() {
     }
 }
 
+#[tokio::test]
+async fn agentctl_stop_and_restart_survive_a_daemon_restart() {
+    let mut d = Daemon::new(None).await;
+    d.spawn("b", "codex", None).await;
+    let mut watch = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--socket")
+        .arg(d.socket())
+        .arg("watch")
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("watch");
+    let mut events = BufReader::new(watch.stdout.take().expect("watch stdout")).lines();
+    assert_eq!(d.ctl(&["stop", "@b"]).await, json!({"stopped":"@b"}));
+    assert_eq!(d.ctl(&["stop", "@b"]).await, json!({"stopped":"@b"}));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let line = events
+                .next_line()
+                .await
+                .expect("watch line")
+                .expect("frame");
+            let frame: Value = serde_json::from_str(&line).expect("frame JSON");
+            if frame["event"] == "agent" && frame["phase"] == "stopped" {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("events feed reports the stopped phase");
+    watch.kill().await.expect("stop watch");
+    watch.wait().await.expect("reap watch");
+    let phase = |ls: Value| ls[0]["phase"].as_str().expect("phase").to_owned();
+    assert_eq!(phase(d.ctl(&["ls"]).await), "stopped");
+    let status = d.ctl(&["send", "@b", "while stopped"]).await;
+    assert!(
+        status.as_str().expect("status").contains("stopped"),
+        "send tells the operator the agent is stopped: {status}"
+    );
+
+    let unknown = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--socket")
+        .arg(d.socket())
+        .args(["restart", "@nobody"])
+        .output()
+        .await
+        .expect("agentctl");
+    assert!(!unknown.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&unknown.stderr).trim(),
+        "agentctl: not found: nobody"
+    );
+
+    d.stop(nix::sys::signal::Signal::SIGTERM).await;
+    d.child = Daemon::start(&d.root);
+    d.ready().await;
+    let ls = d.ctl(&["ls"]).await;
+    assert_eq!(phase(ls.clone()), "stopped", "{ls}");
+    assert_eq!(ls[0]["queued"], 1, "{ls}");
+    assert_eq!(d.ctl(&["restart", "@b"]).await, json!({"restarted":"@b"}));
+    assert_ne!(phase(d.ctl(&["ls"]).await), "stopped");
+    d.stop(nix::sys::signal::Signal::SIGTERM).await;
+}
+
 async fn send_tool(d: &Daemon, token: &str, id: &str, arguments: Value) -> (bool, String) {
     let response = d
         .relay(

@@ -2462,3 +2462,163 @@ async fn busy_delivery_drains_bounded_batches_without_new_sends_or_idle() {
     t.idle().await;
     t.finish().await;
 }
+
+/// Sends one mail and a stop, and returns the stop's `Interrupt` with the stop still pending.
+macro_rules! stop_a_busy_agent {
+    ($t:ident, $stop:ident) => {{
+        let mail = $t.send(false, "work").await;
+        let offered = $t.daemon.next().await;
+        assert!(matches!(
+            offered.message,
+            ClientMessage::DeliverPeerMessage { .. }
+        ));
+        let interrupt = tokio::select! {
+            result = &mut $stop => panic!("the stop settled before its interrupt: {result:?}"),
+            r = $t.daemon.next() => r,
+        };
+        assert!(matches!(interrupt.message, ClientMessage::Interrupt { .. }));
+        (mail, interrupt)
+    }};
+}
+
+#[tokio::test]
+async fn a_restart_that_cannot_reattach_reports_the_failure_with_the_warning() {
+    use agentd::supervisor::Operation;
+    let mut t = Test::new().await;
+    let stop = t.broker.operate(t.agent.id, Operation::Stop);
+    tokio::pin!(stop);
+    let _ = stop_a_busy_agent!(t, stop);
+    let result = tokio::time::timeout(Duration::from_secs(3), stop)
+        .await
+        .expect("the stop is bounded by the cancel deadline");
+    let stopped = result
+        .expect_err("an unacknowledged interrupt is not a clean stop")
+        .to_string();
+    assert!(stopped.contains("may still be running"), "{stopped}");
+
+    t.daemon.state.lock().expect("state").missing = true;
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        t.broker.operate(t.agent.id, Operation::Restart),
+    )
+    .await
+    .expect("the restart is bounded");
+    assert!(matches!(t.agent.phase(), Phase::NeedsRecovery { .. }));
+    let reply = result
+        .expect_err("a restart that lands in NeedsRecovery did not restart")
+        .to_string();
+    assert!(reply.contains("root thread does not exist"), "{reply}");
+    assert!(reply.contains("may still be running"), "{reply}");
+    t.broker.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn a_thread_that_reports_idle_ends_the_halt_warning_without_the_mail_receipt() {
+    use agentd::supervisor::Operation;
+    for receipt in [true, false] {
+        let mut t = Test::new().await;
+        let stop = t.broker.operate(t.agent.id, Operation::Stop);
+        tokio::pin!(stop);
+        let (mail, interrupt) = stop_a_busy_agent!(t, stop);
+        if receipt {
+            interrupt.emit(fake::receipt(format!("peer-{mail}")));
+        }
+        interrupt.emit(fake::idle());
+        if !receipt {
+            interrupt.emit(DaemonMessage::Info {
+                thread_id: fake::thread(),
+                text: "idle processed".into(),
+            });
+            let barrier = async {
+                loop {
+                    if matches!(
+                        t.events.recv().await.expect("event"),
+                        Event::Activity { text, .. } if text == "idle processed"
+                    ) {
+                        break;
+                    }
+                }
+            };
+            tokio::select! {
+                result = &mut stop => panic!("the stop settled before the idle was read: {result:?}"),
+                result = tokio::time::timeout(Duration::from_secs(2), barrier) => {
+                    result.expect("the agent reads the idle");
+                }
+            }
+        }
+        let result = tokio::time::timeout(Duration::from_secs(3), stop)
+            .await
+            .expect("the stop is bounded by the cancel deadline");
+        assert!(result.is_ok(), "receipt={receipt}: {result:?}");
+        assert_eq!(t.agent.error(), None, "receipt={receipt}");
+        t.broker.shutdown().await.expect("shutdown");
+    }
+}
+
+#[tokio::test]
+async fn a_fresh_idle_thread_is_no_evidence_about_the_thread_it_replaced() {
+    use agentd::supervisor::Operation;
+    const WARNING: &str = "may still be running";
+    for archive in [false, true] {
+        let mut t = Test::new().await;
+        let mail = t.send(false, "work").await;
+        let offer = t.daemon.next().await;
+        offer.emit(fake::start());
+        offer.emit(fake::receipt(format!("peer-{mail}")));
+        t.consumed(mail).await;
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(3),
+            t.broker.operate(t.agent.id, Operation::Stop),
+        )
+        .await
+        .expect("the stop is bounded by the cancel deadline");
+        assert!(stopped.is_err_and(|e| e.to_string().contains(WARNING)));
+
+        // One fault: the saved thread cannot be reattached, so the next
+        // restart leaves `NeedsRecovery` on a fresh thread.
+        t.daemon.state.lock().expect("state").missing = true;
+        let lost = t.broker.operate(t.agent.id, Operation::Restart).await;
+        assert!(lost.is_err_and(|e| e.to_string().contains(WARNING)));
+        assert!(matches!(t.agent.phase(), Phase::NeedsRecovery { .. }));
+        t.daemon.state.lock().expect("state").missing = false;
+        let fresh = t.broker.operate(t.agent.id, Operation::Restart).await;
+        assert!(fresh.is_err_and(|e| e.to_string().contains(WARNING)));
+        assert_eq!(t.agent.phase(), Phase::Idle);
+        let create = loop {
+            let request = t.daemon.next().await;
+            if matches!(request.message, ClientMessage::CreateSession { .. }) {
+                break request;
+            }
+        };
+
+        if archive {
+            create.emit(DaemonMessage::SessionsUpdated {
+                sessions: std::collections::HashMap::from([(
+                    fake::root(),
+                    infinity_protocol::SessionInfo {
+                        title: None,
+                        last_updated: String::new(),
+                        total_tokens_used: 0,
+                        status: infinity_protocol::SessionStatus::Archived,
+                        threads: vec![],
+                        remote: None,
+                    },
+                )]),
+            });
+            let mut phases = t.agent.phases();
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                phases.wait_for(|p| matches!(p, Phase::NeedsRecovery { .. })),
+            )
+            .await
+            .expect("the archive is bounded")
+            .expect("phase");
+        }
+        t.broker.shutdown().await.expect("shutdown");
+        let error = t.agent.error();
+        assert!(
+            error.as_deref().is_some_and(|e| e.contains(WARNING)),
+            "archive={archive}: {error:?}"
+        );
+    }
+}

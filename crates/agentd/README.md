@@ -20,12 +20,56 @@ agentctl ls
 agentctl approvals
 agentctl approve <permission-id> <option-key>
 agentctl cancel @builder
+agentctl stop @builder
+agentctl restart @builder
 agentctl held [@builder]
 agentctl release <message-id>
 agentctl drop <message-id>
 agentctl watch
 agentctl tasks
 ```
+
+`agentctl stop @name` ends the agent's session and keeps the agent stopped.
+A running turn is cancelled first. If the agent does not finish the turn within
+the kind's cancel timeout (two seconds by default), agentd ends the session anyway.
+Mail to a stopped agent stays queued under the normal mail limits. `agentctl ls`
+shows the phase `stopped`, and the agent stays stopped across an agentd restart.
+
+Ending the session kills an ACP agent's process. An Infinity agent's work runs in
+the shared Infinity daemon, and the daemon protocol has no command that ends a
+thread's work in bounded time: `Interrupt` is the only cancel, and agentd can only
+detach from the thread. If the thread does not acknowledge the interrupt within
+the cancel timeout, `stop` still stops the agent but fails with
+`agent stopped, but the Infinity turn has not acknowledged the cancel and may
+still be running in the daemon`. `restart` reports the same case as
+`agent restarted, but ...` and reattaches to the thread. Stop also interrupts a
+thread that is busy with work agentd did not submit.
+
+From the moment a stop or restart interrupts an Infinity turn, `agentctl ls` and
+the event feed show this warning in the agent's `error`, next to any other error,
+in every phase and across an actor respawn. Every reply to `stop` or `restart`
+carries it, including a reply that fails for another reason. Only evidence that
+the turn is over clears it: the thread reports the turn ended, or a session
+attached to the thread reports it idle. A new command does not clear it, and
+neither does an interrupt acknowledgement that leaves the thread running a new
+completion. The warning does not survive an agentd restart.
+
+If agentd cannot settle the ended session's mail (a storage error, or a failed
+session shutdown), the command fails, the agent waits in phase `ended`, and its
+mail keeps its state. `agentctl ls` and the feed show the failure as the agent's
+`error`. Run the same command again to settle it. The repeated command still
+reports Infinity work that may be running, and a restart from `needs-recovery`
+or `failed` stays fresh.
+
+`agentctl restart @name` ends any current session the same way and starts a new
+one. From `stopped` or a live phase, the new session resumes the saved
+conversation. From `needs-recovery` or `failed`, restart discards the saved
+conversation and starts a fresh session. A stop from `needs-recovery` or `failed`
+discards it too, so the restart that follows is fresh, as restart alone would be.
+This is the only way out of `needs-recovery`. If agentd shuts down while a stop
+or restart waits for the cancel, the command fails and nothing is started. Mail held from an uncertain turn stays held; use `agentctl held`,
+`release` and `drop` for it. Both commands are idempotent and affect only the
+named agent.
 
 The default state directory is `~/.local/state/agentd/`. `--state-dir` overrides it.
 `agentctl` has no `--state-dir` flag. With a custom state directory, set
@@ -449,18 +493,26 @@ diagnosed, so the twelve tests that use them are ignored there.
   CLI agents receive human mail as user input. Infinity receives deferrable
   operator mail. Peer mail carries the labelled `<agent-message>` framing.
   Idle delivery batches all queued envelopes in arrival order.
-- `AgentHandle::{cancel,pending_permissions,answer_permission,phase,phases,stop}`
-  control or observe an actor. Answers include the request's incarnation.
+- `AgentHandle::{cancel,pending_permissions,answer_permission,phase,phases,error,stop}`
+  control or observe an actor. `error` is what `agentctl ls` shows. Answers include the request's incarnation.
   Rules match an exact normalized tool name, or `*`; the first match wins.
   No rule means escalate to the caller. An optional timeout rejects once, or
   cancels if the agent provides no single-use rejection option.
+- `operate(id, Operation::Stop | Operation::Restart)` stops or restarts an agent.
+  It cancels a running turn and waits at most the kind's `cancel_timeout` before
+  it ends the session. The stop flag persists in `agent_specs.stopped` (schema
+  version 3). An actor that exited in `Failed` or panicked is respawned from its
+  saved spec. The respawn discards the saved session only when the dead actor's
+  last phase was `failed` or `needs-recovery`, so a busy actor that panicked
+  resumes. An actor ended by `shutdown()` or a replacement is not, and
+  `spawn` after `shutdown()` returns `Error::Closed`.
 - `events()` returns a bounded display-only broadcast receiver. Subscribers can
   lag; SQLite remains delivery authority. Activity never becomes agent input.
 - `shutdown()` stops and reaps sessions, settles outstanding delivery, and waits
   for the actors to release storage. Call it before closing the mailroom.
 
 `Phase` covers Dormant, Starting, Idle, Busy, Suspending, Ended, Crashed, Failed,
-and NeedsRecovery. Busy CLI agents wait for a turn boundary. Infinity accepts
+NeedsRecovery and Stopped. Busy CLI agents wait for a turn boundary. Infinity accepts
 deferrable mail while busy. Five crashes in ten
 minutes stop retries; backoff doubles from one second to a 60-second cap.
 A failed ACP resume or a missing Infinity root enters NeedsRecovery without

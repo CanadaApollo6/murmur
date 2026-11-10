@@ -14,7 +14,7 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::KindConfig;
 use crate::mailroom::{Mailroom, NewMessage, SendOutcome};
 use crate::model::*;
-use crate::supervisor::{AgentSpec, Broker, Phase};
+use crate::supervisor::{AgentSpec, Broker, Operation, Phase, phase_error};
 use crate::swarm::{Act, TaskState};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -240,6 +240,12 @@ pub enum ControlRequest {
     Cancel {
         to: String,
     },
+    Stop {
+        to: String,
+    },
+    Restart {
+        to: String,
+    },
     Held {
         to: Option<String>,
     },
@@ -270,10 +276,11 @@ impl ControlApi {
         for (id, spec, queued) in self.mailroom.observed_agents().await? {
             let handle = self.broker.handle(id).await;
             let phase = handle.as_ref().map_or(Phase::Ended, |h| h.phase());
+            let error = handle.as_ref().and_then(|h| h.error());
             let isolation = handle.as_ref().map_or("none", |h| h.isolation());
             rows.push(
                 json!({"id":format!("agent:{id}"),"name":format!("@{}",spec.name.as_str()),
-                "kind":spec.kind,"isolation":isolation,"phase":phase_name(&phase),"error":match &phase { Phase::Failed { last } => Some(last.as_str()), Phase::NeedsRecovery { reason } => Some(reason.as_str()), _ => None },
+                "kind":spec.kind,"isolation":isolation,"phase":phase_name(&phase),"error":error,
                 "queued":queued}),
             );
         }
@@ -316,15 +323,10 @@ impl ControlApi {
             SendOutcome::Duplicate { .. } => "Already queued".to_owned(),
             SendOutcome::Held { reason, .. } => format!("Held ({reason})"),
         };
-        let busy = self
-            .broker
-            .handle(id)
-            .await
-            .is_some_and(|h| h.phase() == Phase::Busy);
-        let suffix = if busy {
-            " (busy; it sees this when its turn ends)"
-        } else {
-            ""
+        let suffix = match self.broker.handle(id).await.map(|h| h.phase()) {
+            Some(Phase::Busy) => " (busy; it sees this when its turn ends)",
+            Some(Phase::Stopped) => " (stopped; it sees this after agentctl restart)",
+            _ => "",
         };
         let opened = match (env.act(), env.task()) {
             (Act::Request { .. }, Some(task)) => format!(" Opened task {task}."),
@@ -439,6 +441,16 @@ impl ControlApi {
                     .cancel()
                     .await?;
                 Ok(json!({"cancelled":to}))
+            }
+            ControlRequest::Stop { to } => {
+                let id = self.mailroom.resolve(Recipient::parse(&to)?).await?;
+                self.broker.operate(id, Operation::Stop).await?;
+                Ok(json!({"stopped":to}))
+            }
+            ControlRequest::Restart { to } => {
+                let id = self.mailroom.resolve(Recipient::parse(&to)?).await?;
+                self.broker.operate(id, Operation::Restart).await?;
+                Ok(json!({"restarted":to}))
             }
             ControlRequest::Held { to } => {
                 let agent = match to {
@@ -622,6 +634,7 @@ fn phase_name(phase: &Phase) -> &'static str {
         Phase::Crashed { .. } => "crashed",
         Phase::Failed { .. } => "failed",
         Phase::NeedsRecovery { .. } => "needs-recovery",
+        Phase::Stopped => "stopped",
     }
 }
 pub async fn read_frame(read: &mut (impl AsyncBufRead + Unpin)) -> Result<Option<Vec<u8>>> {

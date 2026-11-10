@@ -141,6 +141,12 @@ impl Drop for Mcp {
         self.child.wait().expect("MCP reap");
     }
 }
+/// One `write_all` per line, so a kill mid-log never leaves a partial record:
+/// `writeln!` on an unbuffered file issues one write per format fragment.
+fn log_line(log: &mut File, value: &Value) {
+    log.write_all(format!("{value}\n").as_bytes())
+        .expect("write log");
+}
 fn main() {
     let root = if std::env::var_os("FAKE_ROOT_FROM_CWD").is_some() {
         std::env::current_dir().expect("cwd")
@@ -152,13 +158,11 @@ fn main() {
         .append(true)
         .open(root.join("wire.jsonl"))
         .expect("wire log");
-    writeln!(
-        log,
-        "{}",
-        json!({"pid":std::process::id(),"cwd":std::env::current_dir().expect("cwd"),"args":std::env::args().collect::<Vec<_>>(),
-            "agentd_env":std::env::vars_os().map(|(name, _)| name.to_string_lossy().into_owned()).filter(|name| name.starts_with("AGENTD_")).collect::<Vec<_>>()})
-    )
-    .expect("log pid");
+    log_line(
+        &mut log,
+        &json!({"pid":std::process::id(),"cwd":std::env::current_dir().expect("cwd"),"args":std::env::args().collect::<Vec<_>>(),
+            "agentd_env":std::env::vars_os().map(|(name, _)| name.to_string_lossy().into_owned()).filter(|name| name.starts_with("AGENTD_")).collect::<Vec<_>>()}),
+    );
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
@@ -197,8 +201,7 @@ fn main() {
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        writeln!(log, "{msg}").expect("write log");
-        log.flush().expect("flush log");
+        log_line(&mut log, &msg);
         let id = &msg["id"];
         match msg["method"].as_str() {
             Some("initialize") => {
