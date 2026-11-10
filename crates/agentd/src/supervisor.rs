@@ -1984,6 +1984,21 @@ mod halt_tests {
         thread_busy: AtomicBool,
         accepts_busy_mail: AtomicBool,
         cancel_times_out: AtomicBool,
+        /// What a cancel does to the session besides counting.
+        on_cancel: std::sync::Mutex<OnCancel>,
+        panic_on_submit: AtomicBool,
+        latest: std::sync::Mutex<Option<mpsc::UnboundedSender<SessionEvent>>>,
+    }
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    enum OnCancel {
+        #[default]
+        Nothing,
+        /// The session reports that it ended.
+        EndSession,
+        /// The event stream closes, as when the daemon socket drops.
+        Disconnect,
+        /// The cancel cannot be sent.
+        Fail,
     }
     struct Scripted(Arc<Script>);
     struct ScriptedSession {
@@ -2002,6 +2017,7 @@ mod halt_tests {
                 self.0.resumed.fetch_add(1, SeqCst);
             }
             let (tx, events) = mpsc::unbounded_channel();
+            *self.0.latest.lock().expect("bug: script lock") = Some(tx.clone());
             Ok(Box::new(ScriptedSession {
                 script: self.0.clone(),
                 tx,
@@ -2025,6 +2041,10 @@ mod halt_tests {
         }
         async fn submit(&mut self, _: Turn) -> std::result::Result<(), AdapterError> {
             self.script.submits.fetch_add(1, SeqCst);
+            assert!(
+                !self.script.panic_on_submit.load(SeqCst),
+                "injected actor panic"
+            );
             Ok(())
         }
         async fn cancel(&mut self) -> std::result::Result<(), AdapterError> {
@@ -2033,6 +2053,17 @@ mod halt_tests {
                 self.tx
                     .send(SessionEvent::CancelTimedOut)
                     .expect("bug: session owns its receiver");
+            }
+            match *self.script.on_cancel.lock().expect("bug: script lock") {
+                OnCancel::Nothing => {}
+                OnCancel::EndSession => self
+                    .tx
+                    .send(SessionEvent::Ended {
+                        reason: "injected session end".into(),
+                    })
+                    .expect("bug: session owns its receiver"),
+                OnCancel::Disconnect => self.events.close(),
+                OnCancel::Fail => return Err(AdapterError::Spawn("injected dead socket".into())),
             }
             Ok(())
         }
@@ -2174,6 +2205,19 @@ mod halt_tests {
                 .await
                 .expect("inject SQL");
         }
+        fn inject(&self, event: SessionEvent) {
+            self.script
+                .latest
+                .lock()
+                .expect("bug: script lock")
+                .as_ref()
+                .expect("a session was opened")
+                .send(event)
+                .expect("session is listening");
+        }
+        fn on_cancel(&self, mode: OnCancel) {
+            *self.script.on_cancel.lock().expect("bug: script lock") = mode;
+        }
         fn count(&self, counter: fn(&Script) -> &AtomicUsize) -> usize {
             counter(&self.script).load(SeqCst)
         }
@@ -2290,7 +2334,9 @@ mod halt_tests {
             let h = harness(true).await;
             h.script.cancel_times_out.store(timed_out, SeqCst);
             h.script.thread_busy.store(true, SeqCst);
+            let mut events = h.broker.events();
             let result = h.operate(Operation::Stop).await;
+            assert_eq!(crashes(&mut events), vec![], "a halt is not a crash");
             assert_eq!(
                 h.count(|s| &s.cancels),
                 1,
@@ -2385,5 +2431,163 @@ mod halt_tests {
             }
             h.broker.shutdown().await.expect("shutdown");
         }
+    }
+
+    const REFUSE_SETTLE: &str = "CREATE TEMP TRIGGER refuse_settle BEFORE UPDATE OF state ON deliveries WHEN OLD.state='offered' BEGIN SELECT RAISE(ABORT,'injected settlement failure'); END;";
+
+    fn assert_detached(result: Result<()>, prefix: &str, case: &str) -> String {
+        let error = result
+            .expect_err(&format!(
+                "{case}: an unacknowledged interrupt is not a clean halt"
+            ))
+            .to_string();
+        assert!(error.starts_with(prefix), "{case}: {error}");
+        assert!(error.contains("may still be running"), "{case}: {error}");
+        error
+    }
+
+    fn crashes(events: &mut broadcast::Receiver<Event>) -> Vec<Phase> {
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::PhaseChanged {
+                phase: phase @ Phase::Crashed { .. },
+                ..
+            } = event
+            {
+                seen.push(phase);
+            }
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn stop_keeps_the_detached_note_when_the_session_goes_away_first() {
+        let mut wrong = Vec::new();
+        for mode in [OnCancel::EndSession, OnCancel::Disconnect, OnCancel::Fail] {
+            for timed_out in [false, true] {
+                let case = format!("{mode:?}, cancel times out: {timed_out}");
+                let h = harness(true).await;
+                h.script.thread_busy.store(true, SeqCst);
+                h.script.cancel_times_out.store(timed_out, SeqCst);
+                h.on_cancel(mode);
+                let mut events = h.broker.events();
+                let reply = h.operate(Operation::Stop).await.map_err(|e| e.to_string());
+                let phase = h.agent.phase();
+                let crashed = crashes(&mut events);
+                if !reply.as_ref().is_err_and(|e| {
+                    e.starts_with("agent stopped, but ") && e.contains("may still be running")
+                }) || !matches!(phase, Phase::Stopped { detached: Some(_) })
+                    || !crashed.is_empty()
+                {
+                    wrong.push(format!(
+                        "{case}: reply {reply:?}, phase {phase:?}, crashes {crashed:?}"
+                    ));
+                }
+                h.broker.shutdown().await.expect("shutdown");
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_stop_after_a_failed_settlement_keeps_the_detached_note() {
+        let h = harness(true).await;
+        h.script.thread_busy.store(true, SeqCst);
+        h.script.failing_suspends.store(1, SeqCst);
+        let first = h
+            .operate(Operation::Stop)
+            .await
+            .expect_err("settlement failed")
+            .to_string();
+        assert!(first.contains("did not settle"), "{first}");
+        assert_eq!(h.agent.phase(), Phase::Ended);
+        let result = h.operate(Operation::Stop).await;
+        assert_detached(result, "agent stopped, but ", "repeat");
+        assert!(matches!(
+            h.agent.phase(),
+            Phase::Stopped { detached: Some(_) }
+        ));
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn restart_reports_infinity_work_that_may_still_be_running() {
+        let h = harness(true).await;
+        h.script.thread_busy.store(true, SeqCst);
+        let result = h.operate(Operation::Restart).await;
+        assert_detached(result, "agent restarted, but ", "restart");
+        assert_eq!(h.count(|s| &s.opens), 2, "restart still reattaches");
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn restart_from_needs_recovery_stays_fresh_after_a_failed_settlement() {
+        let h = harness(false).await;
+        h.inject(SessionEvent::ResumeFailed {
+            reason: "injected rejected token".into(),
+        });
+        h.wait(|p| matches!(p, Phase::NeedsRecovery { .. })).await;
+        let mail = h.send("queued during recovery").await;
+        h.barrier().await;
+        h.sql("UPDATE deliveries SET state='offered', incarnation=1")
+            .await;
+        h.sql(REFUSE_SETTLE).await;
+        assert!(matches!(h.state(mail).await, DeliveryState::Offered { .. }));
+        h.operate(Operation::Restart)
+            .await
+            .expect_err("settlement failed");
+        assert_eq!(h.agent.phase(), Phase::Ended);
+        h.sql("DROP TRIGGER temp.refuse_settle").await;
+        h.operate(Operation::Restart)
+            .await
+            .expect("a repeated restart settles");
+        assert_eq!(h.count(|s| &s.opens), 2);
+        assert_eq!(
+            h.count(|s| &s.resumed),
+            0,
+            "the rejected token is not resumed again"
+        );
+        assert!(!matches!(h.agent.phase(), Phase::NeedsRecovery { .. }));
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn spawn_after_shutdown_is_refused() {
+        let h = harness(false).await;
+        h.broker.shutdown().await.expect("shutdown");
+        let late = h
+            .broker
+            .spawn(AgentSpec {
+                name: AgentName::parse("late").expect("name"),
+                kind: "claude".into(),
+                cwd: h._dir.path().into(),
+                workspace: None,
+                model: None,
+                permissions: Default::default(),
+                idle_after: None,
+            })
+            .await;
+        assert!(
+            matches!(late, Err(Error::Closed)),
+            "{:?}",
+            late.map(|h| h.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn operate_respawns_an_actor_that_panicked() {
+        let h = harness(false).await;
+        h.script.panic_on_submit.store(true, SeqCst);
+        h.send("panics the actor").await;
+        tokio::time::timeout(Duration::from_secs(5), h.agent.commands.closed())
+            .await
+            .expect("actor dies");
+        h.script.panic_on_submit.store(false, SeqCst);
+        h.operate(Operation::Restart)
+            .await
+            .expect("restart respawns a panicked actor");
+        let current = h.broker.handle(h.agent.id).await.expect("handle");
+        assert!(!current.commands.same_channel(&h.agent.commands));
+        h.broker.shutdown().await.expect("shutdown");
     }
 }
