@@ -2105,7 +2105,10 @@ async fn r18_admission_probe(matching_root: bool) {
     // The stall deadline is now past. A still-Waiting offer is interrupted as soon as the
     // supervisor runs. An offer that admission retired must stay silent on the wire.
     tokio::time::advance(Duration::from_millis(700)).await;
-    let next = hold_clock_for(Duration::from_millis(700), t.daemon.next()).await;
+    // Silence can only be watched for a bounded real time. An expected interrupt gets the long
+    // limit, so a supervisor that is scheduled late does not fail the test.
+    let window = Duration::from_millis(if matching_root { 700 } else { 5000 });
+    let next = hold_clock_for(window, t.daemon.next()).await;
     let interrupted = next
         .as_ref()
         .is_some_and(|r| matches!(r.message, ClientMessage::Interrupt { .. }));
