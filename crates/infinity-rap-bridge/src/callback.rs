@@ -1,11 +1,11 @@
 //! Conversion from RAP callback wire messages ([`RapCallback`]) into the
 //! runtime's [`InputMessage`].
 //!
-//! This is the single authoritative mapping, shared by every callback
-//! ingestion point (the Infinity Code daemon's local callback server and the
-//! AWS `rap-receiver` Lambda), so the platforms cannot drift in how tool
-//! results, subscription events, OAuth challenges, and user choices enter
-//! the input queue.
+//! This is the single authoritative mapping for every callback ingestion
+//! point, so they cannot drift in how tool results, subscription events,
+//! OAuth challenges, and user choices enter the input queue. murmur has one
+//! such point, the daemon's local callback server. Upstream Infinity also
+//! used it from its AWS `rap-receiver` Lambda.
 
 use infinity_provider_protocol::message::{
     Image, ImageMediaType, ImageSource, Text, ToolResult, ToolResultContent, UserContent,
