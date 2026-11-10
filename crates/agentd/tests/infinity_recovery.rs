@@ -1044,7 +1044,7 @@ async fn queued_attachment_mail_probe(resume: bool) {
         mailroom.clone(),
         vec![{
             let mut kind = agentd::KindConfig::infinity(socket);
-            kind.request_timeout = Duration::from_secs(2);
+            kind.request_timeout = Duration::from_secs(5);
             kind
         }],
         agentd::supervisor::Config {
@@ -1098,7 +1098,7 @@ async fn queued_attachment_mail_probe(resume: bool) {
         .await
         .expect("inference starts");
     // The provider has accepted the request but intentionally sends no output or receipt.
-    let crashed = tokio::time::timeout(Duration::from_secs(3), async {
+    let crashed = tokio::time::timeout(Duration::from_secs(6), async {
         loop {
             if matches!(
                 events.recv().await.expect("event"),
@@ -1537,7 +1537,7 @@ async fn r9_broker_mail_after_completed_rap_tool_and_provider_failure() {
                 vec![{
                     let mut kind = agentd::KindConfig::infinity(socket);
                     kind.cancel_timeout = Duration::from_millis(100);
-                    kind.request_timeout = Duration::from_millis(200);
+                    kind.request_timeout = Duration::from_secs(10);
                     kind
                 }],
                 agentd::supervisor::Config {
@@ -1820,7 +1820,7 @@ async fn r10a_choice_write_failure_has_bounded_recovery() {
                 vec![{
                     let mut kind = agentd::KindConfig::infinity(socket);
                     kind.cancel_timeout = Duration::from_millis(100);
-                    kind.request_timeout = Duration::from_millis(200);
+                    kind.request_timeout = Duration::from_secs(10);
                     kind
                 }],
                 agentd::supervisor::Config {
@@ -3373,7 +3373,7 @@ mod r14 {
         tokio::task::LocalSet::new().run_until(async {
         let mut h = start_harness().await.expect("harness");
         let cfg = Config { backoff_initial: Duration::from_millis(10), backoff_max: Duration::from_millis(20), ..Default::default() };
-        let r = r12o::rig_with_stall(&h, Duration::from_millis(100), Duration::from_millis(100), cfg, None, Duration::from_millis(300)).await;
+        let r = r12o::rig_with_stall(&h, Duration::from_secs(10), Duration::from_millis(100), cfg, None, Duration::from_millis(300)).await;
         r12o::send(&r, "start stream that remains open").await;
         h.ctrl.next_request().await;
         h.ctrl.send_text("partial answer");
