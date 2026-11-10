@@ -21,8 +21,6 @@ members = [
     "crates/infinity-provider-bedrock",
     "crates/infinity-provider-local",
     "crates/infinity-provider-rig",
-    "crates/infinity-slack-bot",
-    "crates/infinity-slack-dataflow",
 ]
 resolver = "2"
 
