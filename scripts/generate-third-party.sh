@@ -18,7 +18,7 @@ cargo about generate \
     about.hbs > "$OUTPUT"
 
 echo "Generating npm third-party notices..."
-for dir in infinity-ui agent agentd-web; do
+for dir in infinity-ui agentd-web; do
     (cd "$dir" && npm install --ignore-scripts --no-audit --no-fund &>/dev/null)
 
     # Check for disallowed licenses
