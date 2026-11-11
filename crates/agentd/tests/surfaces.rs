@@ -876,8 +876,12 @@ async fn agentctl_spawns_an_infinity_kind_and_relays_approval() {
     let mut infinity = fake_infinity::FakeDaemon::bind(&socket);
     let path = d.root.path().join("kinds.toml");
     let mut config = std::fs::read_to_string(&path).expect("config");
+    let rap = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve RAP port")
+        .local_addr()
+        .expect("RAP address");
     config.push_str(&format!(
-        "\n[kind.infinity]\nwire = 'infinity'\nsocket = {}\nmodel = 'fake/small'\n",
+        "\n[rap]\nlisten = '{rap}'\n[kind.infinity]\nwire = 'infinity'\nsocket = {}\nmodel = 'fake/small'\n",
         json!(socket)
     ));
     std::fs::write(path, config).expect("Infinity config");

@@ -906,7 +906,11 @@ async fn maximum_bounds_snapshot_crosses_real_daemon_and_both_clients() {
     d.stop().await;
     let cfg = d.root.path().join("config.toml");
     let mut config = std::fs::read_to_string(&cfg).expect("config");
-    config.push_str("FAKE_BOUND_OPTIONS='1'\n[kind.infinity]\nwire='infinity'\nsocket='/tmp/m5-unused-infinity.sock'\n");
+    let rap = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve RAP port")
+        .local_addr()
+        .expect("RAP address");
+    config.push_str(&format!("FAKE_BOUND_OPTIONS='1'\n[rap]\nlisten='{rap}'\n[kind.infinity]\nwire='infinity'\nsocket='/tmp/m5-unused-infinity.sock'\n"));
     std::fs::write(cfg, config).expect("config");
     let mut db = rusqlite::Connection::open(d.root.path().join("state/mail.db")).expect("db");
     db.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")
