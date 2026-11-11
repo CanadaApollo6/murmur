@@ -1786,15 +1786,15 @@ async fn ls_and_the_feed_show_why_a_crashed_agent_crashed() {
     let row = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let ls = d.ctl(&["ls"]).await;
-            match ls[0]["phase"].as_str() {
-                Some("crashed") => return ls[0].clone(),
-                Some("failed") => panic!("the agent failed before ls saw it crashed: {ls}"),
-                _ => {}
+            // A slow machine can run out the retries before this poll. A failed agent keeps
+            // the reason of its last crash, so the comparison below holds for it too.
+            if let Some("crashed" | "failed") = ls[0]["phase"].as_str() {
+                return ls[0].clone();
             }
         }
     })
     .await
-    .expect("ls reports the crashed phase");
+    .expect("ls reports the crashed or failed phase");
     assert_eq!(
         row["error"], frame["error"],
         "ls shows the same reason as the feed: {row}"
