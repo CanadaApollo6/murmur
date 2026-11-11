@@ -15,6 +15,7 @@ agentd --config /path/to/kinds.toml
 agentctl spawn planner --kind infinity --cwd /path/to/project
 agentctl spawn reviewer --kind claude --cwd /path/to/project
 agentctl spawn builder --kind codex --cwd /path/to/project --sandbox workspace-write "Ask @reviewer to check the plan."
+agentctl spawn tester --kind claude --cwd /path/to/project --rule send_message=allow
 agentctl send @reviewer "Focus on session expiry."
 agentctl ls
 agentctl approvals
@@ -270,6 +271,47 @@ incarnation-tagged approval under `infinity.user_choice`. Options use zero-based
 index keys and preserve the daemon's labels. Infinity does not supply tool names
 or authorization effects, so allow/deny rules cannot auto-select these choices.
 A timeout interrupts the turn instead of guessing an answer.
+
+### Permission rules
+
+Every permission request goes to the operator unless a rule answers it. Rules
+are opt-in and per agent. Give them at spawn as `TOOL=DECISION`, where the
+decision is `allow`, `deny` or `ask`:
+
+```sh
+agentctl spawn reviewer --kind claude --cwd /path/to/project --rule send_message=allow
+```
+
+The first rule that names the request's tool, or `*`, decides. `allow` and
+`deny` pick the agent's allow-once or reject-once option. ACP tool kinds give
+the names `shell` (kind `execute`), `edit`, `fetch` and the other ACP kinds.
+Rules have no effect on Infinity kinds, whose requests carry no tool name.
+
+`send_message` names only agentd's own `send_message` tool, from the MCP
+server agentd registered for that session as `agentd`. Only claude-agent-acp
+requests get this name. agentd recognizes the tool from fields that adapter
+sets, never from the title or arguments: `toolCall._meta.claudeCode.mcpServer`
+is `{"name":"agentd","source":"dynamic"}` and
+`toolCall._meta.claudeCode.toolName` is `mcp__agentd__send_message`. The
+match is confirmed against a live session with claude-agent-acp 0.90.0. In
+the CLI source, a same-named server from user, project or local configuration
+reports that scope as its `source`, and a plugin's server is renamed and
+reports `plugin`. Those cases have not been run in a live session.
+
+Before this name existed, the request carried the name `other`, like every
+MCP tool call from Claude. A rule that names `other` no longer answers it.
+
+A `send_message` tool from another MCP server, a shell command that mentions
+it, and a request without these fields keep their usual name. The
+`send_message` rule does not answer them. Another rule that names them, or
+`*`, still does. Older adapters that leave out these fields are treated the
+same way.
+
+codex-acp requests never get the name. Codex identifies an MCP call by server
+name alone, and it skips the server agentd passes in when its own
+configuration defines one named `agentd`. An approval from Codex for an MCP
+call keeps the name `shell`. In a live session, codex-acp 2.2.2 called
+`send_message` without asking for approval at all.
 
 ### Give Infinity agents `send_message`
 

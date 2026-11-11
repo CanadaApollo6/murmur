@@ -38,6 +38,10 @@ enum Command {
         sandbox: Sandbox,
         #[arg(long)]
         model: Option<String>,
+        /// A permission rule as TOOL=DECISION, for example `send_message=allow`. Repeatable;
+        /// the first rule that names the tool, or `*`, wins. Tools no rule names ask.
+        #[arg(long = "rule", value_name = "TOOL=DECISION", value_parser = parse_rule)]
+        rules: Vec<PermissionRule>,
         first_message: Option<String>,
     },
     Ls,
@@ -96,6 +100,29 @@ enum Sandbox {
     WorkspaceWrite,
     FullAccess,
 }
+fn parse_rule(rule: &str) -> std::result::Result<PermissionRule, String> {
+    let (tool, decision) = rule
+        .split_once('=')
+        .ok_or("expected TOOL=DECISION, for example send_message=allow")?;
+    // ACP tool kinds and agentd's own names are lowercase ASCII, so other names never match.
+    let named = !tool.is_empty()
+        && tool
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if tool != "*" && !named {
+        return Err("the tool is `*` or a name in lowercase letters, digits, `_` and `-`".into());
+    }
+    let decision = match decision {
+        "allow" => RuleDecision::Allow,
+        "deny" => RuleDecision::Deny,
+        "ask" => RuleDecision::Ask,
+        _ => return Err("decision must be allow, deny or ask".into()),
+    };
+    Ok(PermissionRule {
+        tool: tool.into(),
+        decision,
+    })
+}
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args = parse(std::env::args_os()).unwrap_or_else(|error| error.exit());
@@ -142,6 +169,7 @@ async fn run(args: Args) -> Result<()> {
             cwd,
             sandbox,
             model,
+            rules,
             first_message,
         } => ControlRequest::Spawn {
             spec: AgentSpec {
@@ -161,6 +189,7 @@ async fn run(args: Args) -> Result<()> {
                         Sandbox::WorkspaceWrite => SandboxLevel::WorkspaceWrite,
                         Sandbox::FullAccess => SandboxLevel::FullAccess,
                     },
+                    rules,
                     ..Default::default()
                 },
                 idle_after: None,
@@ -308,6 +337,40 @@ mod tests {
                 clap::error::ErrorKind::ArgumentConflict,
                 "{argv:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_rule_is_a_tool_name_and_a_decision() {
+        let rule = parse_rule("send_message=allow").expect("rule");
+        assert_eq!(rule.tool, "send_message");
+        assert!(matches!(rule.decision, RuleDecision::Allow));
+        let rule = parse_rule("*=deny").expect("rule");
+        assert_eq!(rule.tool, "*");
+        assert!(matches!(rule.decision, RuleDecision::Deny));
+        assert!(matches!(
+            parse_rule("shell=ask").expect("rule").decision,
+            RuleDecision::Ask
+        ));
+    }
+
+    /// A rule that can never match would leave the operator believing it applies.
+    #[test]
+    fn a_rule_that_could_never_match_is_rejected() {
+        for rule in [
+            "send_message",
+            "=allow",
+            "send_message=",
+            "send_message=Allow",
+            "send_message=allow ",
+            " send_message=allow",
+            "send message=allow",
+            "Send_Message=allow",
+            "\u{200b}send_message=allow",
+            "**=allow",
+            "a=b=allow",
+        ] {
+            assert!(parse_rule(rule).is_err(), "{rule:?}");
         }
     }
 }

@@ -83,6 +83,38 @@ fn untitled_permission(session: &str, variant: &str) {
         "options":[{"optionId":"yes","name":"Allow once","kind":"allow_once"}]}}),
     );
 }
+/// Asks approval for an MCP call in the shape a real adapter sends. `claude-own` and
+/// `codex-agentd` are a `send_message` call on a server named `agentd`, as claude-agent-acp
+/// and codex-acp report one.
+/// `shell` is a shell command that names the tool.
+fn mcp_permission(session: &str, variant: &str) {
+    let mut params = match variant {
+        v if v.starts_with("claude-own") => json!({"toolCall":{"toolCallId":"toolu_1",
+            "name":"mcp__agentd__send_message","status":"pending","kind":"other",
+            "title":"mcp__agentd__send_message","rawInput":{"to":"@b","body":"hi"},
+            "_meta":{"claudeCode":{"toolName":"mcp__agentd__send_message",
+                "mcpServer":{"name":"agentd","source":"dynamic"}}}}}),
+        v if v.starts_with("codex-agentd") => {
+            emit(
+                json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,
+                "update":{"sessionUpdate":"tool_call","toolCallId":"call-1","kind":"execute",
+                    "title":"mcp.agentd.send_message","status":"pending",
+                    "rawInput":{"server":"agentd","tool":"send_message","arguments":{"to":"@a","body":"hi"}}}}}),
+            );
+            json!({"toolCall":{"toolCallId":"call-1","kind":"execute","status":"pending"},
+                "_meta":{"is_mcp_tool_approval":true}})
+        }
+        v if v.starts_with("shell") => json!({"toolCall":{"toolCallId":"call-1","kind":"execute",
+            "title":"agentctl send_message","rawInput":{"command":"agentctl send_message"}}}),
+        _ => panic!("unknown MCP permission variant {variant}"),
+    };
+    params["sessionId"] = json!(session);
+    params["options"] = json!([{"optionId":"yes","name":"Allow once","kind":"allow_once"},
+        {"optionId":"no","name":"Reject once","kind":"reject_once"}]);
+    emit(
+        json!({"jsonrpc":"2.0","id":"permission-1","method":"session/request_permission","params":params}),
+    );
+}
 struct Mcp {
     child: std::process::Child,
     input: std::process::ChildStdin,
@@ -322,6 +354,9 @@ fn main() {
                     permission_responses_remaining = Some(2);
                     permission(session, "permission-1", false);
                     permission(session, "permission-2", false);
+                } else if let Some(variant) = text.split("mcp-permission:").nth(1) {
+                    flight = Some(id.clone());
+                    mcp_permission(session, variant);
                 } else if let Some(variant) = text.split("untitled-permission:").nth(1) {
                     flight = Some(id.clone());
                     untitled_permission(session, variant);
