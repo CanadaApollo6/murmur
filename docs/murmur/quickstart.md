@@ -195,17 +195,17 @@ The ready-made command calls `agentctl` by name. Replace that name with
 
 `allow-with-updates` approves the rest of that session's `send_message` calls.
 
-To let an agent send to its peers without asking, give it a rule when you
-spawn it. This is opt-in. Without a rule, every `send_message` call still waits
-for you.
+To let a Claude agent send to its peers without asking, give it a rule when
+you spawn it. This is opt-in. Without a rule, every `send_message` request
+from Claude still waits for you.
 
 ```sh
 "$B/agentctl" spawn reviewer --kind claude --cwd "$RUN/clone" --rule send_message=allow
 ```
 
-The rule matches only agentd's own `send_message` tool. A tool with the same
-name from another MCP server, or a shell command that mentions it, still asks.
-The rule applies to that agent only.
+The rule matches only agentd's own `send_message` tool. It does not answer a
+tool with the same name from another MCP server, or a shell command that
+mentions it. The rule applies to that agent only.
 
 This step ran in a second live session on 2026-11-11. With the rule, Claude
 sent to a peer and no request appeared. A shell command that wrote the text
@@ -213,7 +213,8 @@ sent to a peer and no request appeared. A shell command that wrote the text
 appeared as tool `send_message`.
 
 Codex did not ask before it called `send_message` in that session, with or
-without a rule. The rule changes nothing for Codex until it asks.
+without a rule. The rule never applies to Codex. agentd cannot tell from a
+Codex request whether the server named `agentd` is its own.
 
 ## 8. Cancel a turn
 

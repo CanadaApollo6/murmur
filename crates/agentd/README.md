@@ -287,24 +287,26 @@ The first rule that names the request's tool, or `*`, decides. `allow` and
 the names `shell` (kind `execute`), `edit`, `fetch` and the other ACP kinds.
 
 `send_message` names only agentd's own `send_message` tool, from the MCP
-server agentd registered for that session as `agentd`. agentd recognizes it from
-fields the ACP adapter sets, never from the title or arguments:
-
-- claude-agent-acp: `toolCall._meta.claudeCode.mcpServer` is
-  `{"name":"agentd","source":"dynamic"}` and `toolCall._meta.claudeCode.toolName`
-  is `mcp__agentd__send_message`. The CLI reports another `source` for a
-  same-named server from user, project or plugin configuration.
-- codex-acp: the request has `_meta.is_mcp_tool_approval: true`, and the
-  `tool_call` it approves was announced with
-  `rawInput: {"server":"agentd","tool":"send_message",...}`.
+server agentd registered for that session as `agentd`. Only claude-agent-acp
+requests get this name. agentd recognizes the tool from fields that adapter
+sets, never from the title or arguments: `toolCall._meta.claudeCode.mcpServer`
+is `{"name":"agentd","source":"dynamic"}` and
+`toolCall._meta.claudeCode.toolName` is `mcp__agentd__send_message`. The CLI
+reports another `source` for a same-named server from user, project or plugin
+configuration. This match is confirmed against a live session with
+claude-agent-acp 0.90.0.
 
 A `send_message` tool from another MCP server, a shell command that mentions
-it, and a request without these fields keep their usual name and still ask.
-Older adapters that leave out these fields also still ask.
+it, and a request without these fields keep their usual name. The
+`send_message` rule does not answer them. Another rule that names them, or
+`*`, still does. Older adapters that leave out these fields are treated the
+same way.
 
-The claude-agent-acp match is confirmed against a live session with version
-0.90.0. The codex-acp match is tested against the payload shape in version
-2.2.2 only. In a live session that version called the tool without asking.
+codex-acp requests never get the name. Codex identifies an MCP call by server
+name alone, and it skips the server agentd passes in when its own
+configuration defines one named `agentd`. An approval from Codex for an MCP
+call keeps the name `shell`. In a live session, codex-acp 2.2.2 called
+`send_message` without asking for approval at all.
 
 ### Give Infinity agents `send_message`
 

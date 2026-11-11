@@ -728,13 +728,24 @@ async fn send_message_rule_answers_only_agentds_own_send_message() {
     d.ctl(&["approve", id, "no"]).await;
     answered("a", 2).await;
 
-    d.spawn("b", "codex", Some("mcp-permission:codex-own"))
-        .await;
+    let cwd = d.root.path().join("b");
+    d.ctl(&[
+        "spawn",
+        "b",
+        "--kind",
+        "codex",
+        "--cwd",
+        cwd.to_str().expect("cwd"),
+        "--rule",
+        "send_message=allow",
+        "mcp-permission:codex-own",
+    ])
+    .await;
     let pending = approvals().await;
     assert_eq!(pending.as_array().expect("requests").len(), 1);
     assert_eq!(
-        pending[0]["tool"], "send_message",
-        "without a rule agentd's own send_message still asks: {pending}"
+        pending[0]["tool"], "shell",
+        "the rule does not answer a Codex MCP approval, which names the server only: {pending}"
     );
 }
 
