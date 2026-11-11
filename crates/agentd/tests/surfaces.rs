@@ -738,7 +738,7 @@ async fn send_message_rule_answers_only_agentds_own_send_message() {
         cwd.to_str().expect("cwd"),
         "--rule",
         "send_message=allow",
-        "mcp-permission:codex-own",
+        "mcp-permission:codex-agentd",
     ])
     .await;
     let pending = approvals().await;

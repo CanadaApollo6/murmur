@@ -84,8 +84,8 @@ fn untitled_permission(session: &str, variant: &str) {
     );
 }
 /// Asks approval for an MCP call in the shape a real adapter sends. `claude-own` and
-/// `codex-own` are a `send_message` call on a server named `agentd`, as claude-agent-acp and
-/// codex-acp report one.
+/// `codex-agentd` are a `send_message` call on a server named `agentd`, as claude-agent-acp
+/// and codex-acp report one.
 /// `shell` is a shell command that names the tool.
 fn mcp_permission(session: &str, variant: &str) {
     let mut params = match variant {
@@ -94,7 +94,7 @@ fn mcp_permission(session: &str, variant: &str) {
             "title":"mcp__agentd__send_message","rawInput":{"to":"@b","body":"hi"},
             "_meta":{"claudeCode":{"toolName":"mcp__agentd__send_message",
                 "mcpServer":{"name":"agentd","source":"dynamic"}}}}}),
-        v if v.starts_with("codex-own") => {
+        v if v.starts_with("codex-agentd") => {
             emit(
                 json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,
                 "update":{"sessionUpdate":"tool_call","toolCallId":"call-1","kind":"execute",

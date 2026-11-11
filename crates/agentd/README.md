@@ -294,8 +294,9 @@ sets, never from the title or arguments: `toolCall._meta.claudeCode.mcpServer`
 is `{"name":"agentd","source":"dynamic"}` and
 `toolCall._meta.claudeCode.toolName` is `mcp__agentd__send_message`. The
 match is confirmed against a live session with claude-agent-acp 0.90.0. In
-the CLI source, a same-named server from user, project or plugin configuration
-reports that scope as its `source`. That case has not been run live.
+the CLI source, a same-named server from user, project or local configuration
+reports that scope as its `source`, and a plugin's server is renamed and
+reports `plugin`. Those cases have not been run in a live session.
 
 Before this name existed, the request carried the name `other`, like every
 MCP tool call from Claude. A rule that names `other` no longer answers it.

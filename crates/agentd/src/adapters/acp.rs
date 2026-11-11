@@ -64,8 +64,9 @@ const TOOL_TITLES: usize = 64;
 /// Rule name for agentd's own `send_message` tool. No ACP tool kind may claim it.
 const SEND_MESSAGE: &str = "send_message";
 /// The Claude CLI's `mcpServer.source` for a server passed in for the session, which is how
-/// ACP `mcpServers` reach it. A server from user, project or plugin configuration carries
-/// that scope instead. Read from CLI 2.1.296; only the `dynamic` case is confirmed live.
+/// ACP `mcpServers` reach it. A server from user, project or local configuration carries
+/// that scope instead, and a plugin's server is renamed and reports `plugin`. Read from CLI
+/// 2.1.296; only the `dynamic` case is confirmed live.
 const CLAUDE_DYNAMIC_SOURCE: &str = "dynamic";
 
 /// The name of agentd's MCP server in a session. `None` when one of the kind's own servers

@@ -97,8 +97,13 @@ fn parse_rule(rule: &str) -> std::result::Result<PermissionRule, String> {
     let (tool, decision) = rule
         .split_once('=')
         .ok_or("expected TOOL=DECISION, for example send_message=allow")?;
-    if tool.is_empty() || tool.contains(char::is_whitespace) {
-        return Err("the rule needs a tool name without spaces".into());
+    // ACP tool kinds and agentd's own names are lowercase ASCII, so other names never match.
+    let named = !tool.is_empty()
+        && tool
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if tool != "*" && !named {
+        return Err("the tool is `*` or a name in lowercase letters, digits, `_` and `-`".into());
     }
     let decision = match decision {
         "allow" => RuleDecision::Allow,
@@ -254,6 +259,9 @@ mod rule_tests {
             "send_message=allow ",
             " send_message=allow",
             "send message=allow",
+            "Send_Message=allow",
+            "\u{200b}send_message=allow",
+            "**=allow",
             "a=b=allow",
         ] {
             assert!(parse_rule(rule).is_err(), "{rule:?}");
