@@ -73,8 +73,8 @@ or restart waits for the cancel, the command fails and nothing is started. Mail 
 named agent.
 
 The default state directory is `~/.local/state/agentd/`. `--state-dir` overrides it.
-`agentctl` has no `--state-dir` flag. With a custom state directory, set
-`AGENTD_SOCKET` or pass `--socket` to every `agentctl` command.
+The daemon logs warnings and errors to stderr; `RUST_LOG` replaces that filter.
+`agentctl --state-dir` takes the same directory and connects to `agentd.sock` in it.
 The daemon reads `kinds.toml` there when present. An explicit `--config` must exist.
 Without a config, commands default to `claude-agent-acp` and `codex-acp` on PATH.
 On Linux, that is the PATH inside the sandbox. A `command` outside the default
@@ -378,8 +378,10 @@ launch arguments and ACP mode. Claude's `default` mode asks permission for edits
 it is not an OS read-only sandbox. Bubblewrap confinement is described below. Shims
 must support the selected mode; a mode-setting failure prevents prompting.
 
-`agentctl --socket /absolute/path` or `AGENTD_SOCKET` selects a custom control
-socket. Responses are JSON except for the short send status. Watch emits JSON
+`agentctl --socket /absolute/path` selects a custom control socket.
+`agentctl --state-dir DIR` selects `DIR/agentd.sock`; it assumes the daemon kept the
+default socket name. Without either flag, `AGENTD_SOCKET` applies, then the default
+state directory. Passing both flags is a usage error, wherever each sits on the command line. Responses are JSON except for the short send status. Watch emits JSON
 lines, beginning with a snapshot. A `lagged` event signals dropped display events;
 the stream is not a durable audit log. Held mail streams one envelope per socket
 frame, followed by a completion frame; `agentctl held` collects these into one
@@ -557,6 +559,8 @@ diagnosed, so the twelve tests that use them are ignored there.
 NeedsRecovery and Stopped. Busy CLI agents wait for a turn boundary. Infinity accepts
 deferrable mail while busy. Five crashes in ten
 minutes stop retries; backoff doubles from one second to a 60-second cap.
+While an agent waits in Crashed, its `error` in `agentctl ls` and the event feed
+is the reason the session ended.
 A failed ACP resume or a missing Infinity root enters NeedsRecovery without
 creating a fresh conversation.
 Only resumable agents suspend on idle timeout. `None` on the spec inherits the

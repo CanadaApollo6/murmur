@@ -948,9 +948,11 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
                     "bwrap preflight failed: {e}; install bwrap >= 0.10.0 or set sandbox = \"none\""
                 )
             })?;
+        if !out.status.success() {
+            return Err(bwrap_help_failure(&cfg.path, out.status, &out.stderr).into());
+        }
         let help = String::from_utf8_lossy(&out.stdout);
-        if !out.status.success() || !help.contains("--bind-fd ") || !help.contains("--ro-bind-fd ")
-        {
+        if !help.contains("--bind-fd ") || !help.contains("--ro-bind-fd ") {
             return Err("bwrap preflight requires --bind-fd and --ro-bind-fd (bubblewrap >= 0.10.0); configure [bwrap] path = \"<bwrap >= 0.10.0>\" or sandbox = \"none\"".into());
         }
         if !help.contains("--add-seccomp-fd ") {
@@ -1003,7 +1005,9 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
             launch.args.extend([
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
-                OsString::from("command -v -- \"$1\""),
+                OsString::from(
+                    "command -v -- \"$1\" || { echo 'command not found or not executable inside the sandbox' >&2; exit 127; }",
+                ),
                 OsString::from("preflight"),
                 kind.command.clone().into(),
             ]);
@@ -1020,11 +1024,37 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
                 )
             })?;
             if !out.status.success() {
-                return Err(format!("sandbox preflight failed for {} (command {}); check bwrap, user namespaces and ro_binds, or set sandbox = \"none\": {}",kind.name,kind.command,String::from_utf8_lossy(&out.stderr)).into());
+                return Err(preflight_failure(kind, out.status, &out.stderr).into());
             }
         }
     }
     Ok(())
+}
+
+/// A `bwrap --help` that fails says nothing about which options bwrap supports, so report
+/// what it printed instead of a missing option.
+fn bwrap_help_failure(path: &Path, status: std::process::ExitStatus, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let reason = match stderr.trim() {
+        "" => "no stderr",
+        text => text,
+    };
+    format!(
+        "bwrap preflight failed: `{} --help` ended with {status}: {reason}; check [bwrap] path or set sandbox = \"none\"",
+        path.display()
+    )
+}
+
+fn preflight_failure(kind: &KindConfig, status: std::process::ExitStatus, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let reason = match stderr.trim() {
+        "" => format!("probe {status} with no stderr"),
+        text => text.to_owned(),
+    };
+    format!(
+        "sandbox preflight failed for {} (command {}); check bwrap, user namespaces and ro_binds, or set sandbox = \"none\": {reason}",
+        kind.name, kind.command
+    )
 }
 
 async fn relay(listener: tokio::net::TcpListener) -> Result<()> {
@@ -1094,6 +1124,25 @@ mod tests {
             egress: vec![],
         });
         vec![kind]
+    }
+    #[test]
+    fn preflight_failure_gives_exit_status_when_stderr_is_empty() {
+        use std::os::unix::process::ExitStatusExt;
+        let kind = &sandbox_kinds()[0];
+        let error = preflight_failure(kind, std::process::ExitStatus::from_raw(9), b"");
+        assert!(
+            error.ends_with("set sandbox = \"none\": probe signal: 9 (SIGKILL) with no stderr"),
+            "{error}"
+        );
+        let error = preflight_failure(
+            kind,
+            std::process::ExitStatus::from_raw(1 << 8),
+            b"bwrap: No permissions to create new namespace\n",
+        );
+        assert!(
+            error.ends_with(": bwrap: No permissions to create new namespace"),
+            "{error}"
+        );
     }
     #[test]
     fn fsid_identity_ignores_device_changes_and_falls_back_only_for_zero() {
