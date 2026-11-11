@@ -72,6 +72,7 @@ or restart waits for the cancel, the command fails and nothing is started. Mail 
 named agent.
 
 The default state directory is `~/.local/state/agentd/`. `--state-dir` overrides it.
+The daemon logs warnings and errors to stderr; `RUST_LOG` replaces that filter.
 `agentctl --state-dir` takes the same directory and connects to `agentd.sock` in it.
 The daemon reads `kinds.toml` there when present. An explicit `--config` must exist.
 Without a config, commands default to `claude-agent-acp` and `codex-acp` on PATH.

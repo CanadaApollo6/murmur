@@ -79,8 +79,9 @@ RUST_LOG=info,agentd=debug "$B/agentd" --config "$RUN/kinds.toml" --state-dir "$
 The control socket appeared in about 150 ms. agentd prints nothing on a clean
 start. Warnings and crash reasons go to stderr.
 
-Set `RUST_LOG`. Without it agentd logs errors only, and the reason for a
-crashed session is a warning.
+Without `RUST_LOG`, agentd logs warnings and errors, which includes the reason
+for a crashed session. `RUST_LOG` replaces that default, so the command above
+adds info and debug output.
 
 By default `agentctl` looks for the socket in `~/.local/state/agentd`. Pass
 `--state-dir "$RUN/state"` to any command, or set the socket once for this
