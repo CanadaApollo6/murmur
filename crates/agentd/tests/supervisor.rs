@@ -383,7 +383,9 @@ async fn crash_backoff_and_five_crashes_fail() {
     let mut previous = None;
     for expected in 1..=4 {
         let Event::PhaseChanged {
-            phase: Phase::Crashed { attempt, retry_at },
+            phase: Phase::Crashed {
+                attempt, retry_at, ..
+            },
             ..
         } = t
             .event(|e| {

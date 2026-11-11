@@ -1746,3 +1746,57 @@ async fn a_report_to_a_retired_requester_tells_the_assignee_what_to_do() {
     assert_eq!(row["state"], "closed", "{row}");
     d.stop(nix::sys::signal::Signal::SIGTERM).await;
 }
+
+#[tokio::test]
+async fn ls_and_the_feed_show_why_a_crashed_agent_crashed() {
+    let d = Daemon::new(None).await;
+    std::fs::write(d.root.path().join("a/crash-open"), "").expect("crash on open");
+    let mut watch = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--socket")
+        .arg(d.socket())
+        .arg("watch")
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("watch");
+    let mut events = BufReader::new(watch.stdout.take().expect("watch stdout")).lines();
+    d.spawn("a", "claude", Some("hello")).await;
+    let frame = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let line = events
+                .next_line()
+                .await
+                .expect("watch line")
+                .expect("frame");
+            let frame: Value = serde_json::from_str(&line).expect("frame JSON");
+            if frame["event"] == "agent" && frame["phase"] == "crashed" {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("events feed reports the crashed phase");
+    watch.kill().await.expect("stop watch");
+    watch.wait().await.expect("reap watch");
+    assert_eq!(
+        frame["error"], "session ended",
+        "the feed names the crash reason: {frame}"
+    );
+
+    let row = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let ls = d.ctl(&["ls"]).await;
+            match ls[0]["phase"].as_str() {
+                Some("crashed") => return ls[0].clone(),
+                Some("failed") => panic!("the agent failed before ls saw it crashed: {ls}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("ls reports the crashed phase");
+    assert_eq!(
+        row["error"], frame["error"],
+        "ls shows the same reason as the feed: {row}"
+    );
+}

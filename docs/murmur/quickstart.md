@@ -276,8 +276,3 @@ mail limit: per_pair cap 2 reached with 2 undelivered messages to 01M73DZGN0EGNR
 
 The defaults are `per_sender = 64` and `per_pair = 16`. Sends from `agentctl`
 are exempt.
-
-## Known problems in this run
-
-- `agentctl ls` shows `"error": null` after a crash. The reason is only in the
-  daemon log.
