@@ -302,6 +302,10 @@ A `send_message` tool from another MCP server, a shell command that mentions
 it, and a request without these fields keep their usual name and still ask.
 Older adapters that leave out these fields also still ask.
 
+The claude-agent-acp match is confirmed against a live session with version
+0.90.0. The codex-acp match is tested against the payload shape in version
+2.2.2 only. In a live session that version called the tool without asking.
+
 ### Give Infinity agents `send_message`
 
 When an Infinity kind is configured, agentd starts a RAP server. Set its fixed

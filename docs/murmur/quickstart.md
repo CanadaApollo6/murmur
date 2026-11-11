@@ -207,6 +207,14 @@ The rule matches only agentd's own `send_message` tool. A tool with the same
 name from another MCP server, or a shell command that mentions it, still asks.
 The rule applies to that agent only.
 
+This step ran in a second live session on 2026-11-11. With the rule, Claude
+sent to a peer and no request appeared. A shell command that wrote the text
+`send_message` still asked, as tool `shell`. Without the rule, the request
+appeared as tool `send_message`.
+
+Codex did not ask before it called `send_message` in that session, with or
+without a rule. The rule changes nothing for Codex until it asks.
+
 ## 8. Cancel a turn
 
 ```sh

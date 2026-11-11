@@ -69,6 +69,15 @@ const SEND_MESSAGE: &str = "send_message";
 /// same-named server from user, project or plugin configuration reports another source.
 const CLAUDE_DYNAMIC_SOURCE: &str = "dynamic";
 
+/// The name of agentd's MCP server in a session. `None` when one of the kind's own servers
+/// has the same name, because the adapter's reports could then mean either server.
+fn own_server(launch: Option<&Value>, kind_servers: &[Value]) -> Option<String> {
+    launch
+        .and_then(|server| server["name"].as_str())
+        .filter(|name| !kind_servers.iter().any(|s| s["name"] == *name))
+        .map(str::to_owned)
+}
+
 fn protocol(e: impl std::fmt::Display) -> AdapterError {
     AdapterError::Protocol(e.to_string())
 }
@@ -82,13 +91,7 @@ impl Adapter for AcpAdapter {
             .as_ref()
             .and_then(|v| v["env"][0]["value"].as_str())
             .map(str::to_owned);
-        let own_server = req
-            .launch
-            .mcp_server
-            .as_ref()
-            .and_then(|v| v["name"].as_str())
-            .filter(|name| !self.0.mcp_servers.iter().any(|s| s["name"] == *name))
-            .map(str::to_owned);
+        let own_server = own_server(req.launch.mcp_server.as_ref(), &self.0.mcp_servers);
         let mut cmd = Command::new(&req.launch.program);
         req.launch.inherit_mount_fds(&mut cmd);
         cmd.args(&req.launch.args)
@@ -850,7 +853,14 @@ mod tests {
 
     #[tokio::test]
     async fn other_mcp_servers_send_message_does_not_get_the_rule_name() {
+        let mut other_server = claude_call("agentd", "dynamic", "send_message");
+        other_server["toolCall"]["_meta"]["claudeCode"]["mcpServer"]["name"] = json!("mail");
         let cases = [
+            (
+                "claude, tool name says agentd but the server is another",
+                vec![],
+                other_server,
+            ),
             (
                 "claude, other server",
                 vec![],
@@ -971,6 +981,50 @@ mod tests {
             rule_tool(&mut session, &updates, codex_approval()).await,
             "send_message"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_announcement_does_not_outlive_its_turn() {
+        let mut session = turn_session();
+        let started = codex_started("agentd", "send_message");
+        session
+            .receive(json!({"jsonrpc":"2.0","method":"session/update",
+                "params":{"sessionId":"session","update":started}}))
+            .await
+            .expect("tool call update");
+        session
+            .receive(json!({"jsonrpc":"2.0","id":PROMPT,"result":{"stopReason":"end_turn"}}))
+            .await
+            .expect("turn end");
+        session.flight = Some(Flight {
+            request: PROMPT + 1,
+            ids: Vec::new(),
+            started: true,
+            cancel_deadline: None,
+        });
+        assert_ne!(
+            rule_tool(&mut session, &[], codex_approval()).await,
+            "send_message"
+        );
+    }
+
+    #[test]
+    fn a_kind_server_with_agentds_name_leaves_no_own_server() {
+        let launch = json!({"name":"agentd","command":"agentd"});
+        assert_eq!(own_server(Some(&launch), &[]), Some("agentd".into()));
+        assert_eq!(
+            own_server(Some(&launch), &[json!({"name":"mail"})]),
+            Some("agentd".into())
+        );
+        assert_eq!(
+            own_server(
+                Some(&launch),
+                &[json!({"name":"mail"}), json!({"name":"agentd"})]
+            ),
+            None
+        );
+        assert_eq!(own_server(None, &[]), None);
+        assert_eq!(own_server(Some(&json!({"command":"agentd"})), &[]), None);
     }
 
     #[tokio::test]
