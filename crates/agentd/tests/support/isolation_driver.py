@@ -41,10 +41,13 @@ for kind, name, model in [('claude', 'a', 'default'), ('codex', 'b', 'read-only'
         config += f'egress = ["localhost", "example.com"]\n'
     config += f'[kind.{kind}.env]\nFAKE_ROOT = {json.dumps(str(root / name))}\nFAKE_MODE = {json.dumps(model)}\nFAKE_ROOT_FROM_CWD = "1"\n'
 if not baseline:
-    with socket.socket() as reserve:
-        reserve.bind(('127.0.0.1', 0))
-        ui_port = reserve.getsockname()[1]
+    with socket.socket() as ui_reserve, socket.socket() as rap_reserve:
+        ui_reserve.bind(('127.0.0.1', 0))
+        rap_reserve.bind(('127.0.0.1', 0))
+        ui_port = ui_reserve.getsockname()[1]
+        rap_port = rap_reserve.getsockname()[1]
     config += f'[ui]\nlisten = \"127.0.0.1:{ui_port}\"\n'
+    config += f'[rap]\nlisten = \"127.0.0.1:{rap_port}\"\n'
     config += '[kind.infinity]\nwire = "infinity"\nsocket = "/nonexistent/infinity.sock"\n'
 (root / 'config.toml').write_text(config)
 # Old main does not understand isolation configuration.
