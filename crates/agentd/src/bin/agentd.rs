@@ -53,6 +53,7 @@ fn log_filter(rust_log: Option<&str>) -> EnvFilter {
         _ => EnvFilter::new("warn"),
     }
 }
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     tracing_subscriber::fmt()

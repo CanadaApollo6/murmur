@@ -112,6 +112,7 @@ fn socket_path(
         .or_else(|| env_socket.map(PathBuf::from))
         .unwrap_or_else(|| default_state_dir().join("agentd.sock"))
 }
+
 async fn run(args: Args) -> Result<()> {
     let key = ClientKey(ulid::Ulid::new().to_string());
     let request = match args.command {
