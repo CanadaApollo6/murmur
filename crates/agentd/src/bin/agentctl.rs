@@ -97,8 +97,8 @@ fn parse_rule(rule: &str) -> std::result::Result<PermissionRule, String> {
     let (tool, decision) = rule
         .split_once('=')
         .ok_or("expected TOOL=DECISION, for example send_message=allow")?;
-    if tool.is_empty() {
-        return Err("the rule needs a tool name".into());
+    if tool.is_empty() || tool.contains(char::is_whitespace) {
+        return Err("the rule needs a tool name without spaces".into());
     }
     let decision = match decision {
         "allow" => RuleDecision::Allow,
@@ -222,5 +222,41 @@ async fn run(args: Args) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(result)?);
         }
         return Ok(());
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+
+    #[test]
+    fn a_rule_is_a_tool_name_and_a_decision() {
+        let rule = parse_rule("send_message=allow").expect("rule");
+        assert_eq!(rule.tool, "send_message");
+        assert!(matches!(rule.decision, RuleDecision::Allow));
+        let rule = parse_rule("*=deny").expect("rule");
+        assert_eq!(rule.tool, "*");
+        assert!(matches!(rule.decision, RuleDecision::Deny));
+        assert!(matches!(
+            parse_rule("shell=ask").expect("rule").decision,
+            RuleDecision::Ask
+        ));
+    }
+
+    /// A rule that can never match would leave the operator believing it applies.
+    #[test]
+    fn a_rule_that_could_never_match_is_rejected() {
+        for rule in [
+            "send_message",
+            "=allow",
+            "send_message=",
+            "send_message=Allow",
+            "send_message=allow ",
+            " send_message=allow",
+            "send message=allow",
+            "a=b=allow",
+        ] {
+            assert!(parse_rule(rule).is_err(), "{rule:?}");
+        }
     }
 }

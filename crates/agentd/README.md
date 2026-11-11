@@ -285,16 +285,20 @@ agentctl spawn reviewer --kind claude --cwd /path/to/project --rule send_message
 The first rule that names the request's tool, or `*`, decides. `allow` and
 `deny` pick the agent's allow-once or reject-once option. ACP tool kinds give
 the names `shell` (kind `execute`), `edit`, `fetch` and the other ACP kinds.
+Rules have no effect on Infinity kinds, whose requests carry no tool name.
 
 `send_message` names only agentd's own `send_message` tool, from the MCP
 server agentd registered for that session as `agentd`. Only claude-agent-acp
 requests get this name. agentd recognizes the tool from fields that adapter
 sets, never from the title or arguments: `toolCall._meta.claudeCode.mcpServer`
 is `{"name":"agentd","source":"dynamic"}` and
-`toolCall._meta.claudeCode.toolName` is `mcp__agentd__send_message`. The CLI
-reports another `source` for a same-named server from user, project or plugin
-configuration. This match is confirmed against a live session with
-claude-agent-acp 0.90.0.
+`toolCall._meta.claudeCode.toolName` is `mcp__agentd__send_message`. The
+match is confirmed against a live session with claude-agent-acp 0.90.0. In
+the CLI source, a same-named server from user, project or plugin configuration
+reports that scope as its `source`. That case has not been run live.
+
+Before this name existed, the request carried the name `other`, like every
+MCP tool call from Claude. A rule that names `other` no longer answers it.
 
 A `send_message` tool from another MCP server, a shell command that mentions
 it, and a request without these fields keep their usual name. The
