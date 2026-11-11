@@ -517,6 +517,8 @@ diagnosed, so the twelve tests that use them are ignored there.
 NeedsRecovery and Stopped. Busy CLI agents wait for a turn boundary. Infinity accepts
 deferrable mail while busy. Five crashes in ten
 minutes stop retries; backoff doubles from one second to a 60-second cap.
+While an agent waits in Crashed, its `error` in `agentctl ls` and the event feed
+is the reason the session ended.
 A failed ACP resume or a missing Infinity root enters NeedsRecovery without
 creating a fresh conversation.
 Only resumable agents suspend on idle timeout. `None` on the spec inherits the
