@@ -34,9 +34,17 @@ pub enum Phase {
     Busy,
     Suspending,
     Ended,
-    Crashed { attempt: u32, retry_at: Instant },
-    Failed { last: String },
-    NeedsRecovery { reason: String },
+    Crashed {
+        attempt: u32,
+        retry_at: Instant,
+        reason: String,
+    },
+    Failed {
+        last: String,
+    },
+    NeedsRecovery {
+        reason: String,
+    },
     Stopped,
 }
 
@@ -942,7 +950,7 @@ impl AgentActor {
             Err(AdapterError::Unavailable(reason)) if self.model_agent => {
                 tracing::warn!(agent=%self.id, %reason, "waiting for Infinity daemon");
                 self.unavailable_attempts = self.unavailable_attempts.saturating_add(1);
-                self.retry(self.unavailable_attempts);
+                self.retry(self.unavailable_attempts, reason);
             }
             Err(error) => self.crash(error.to_string()),
         }
@@ -1160,7 +1168,10 @@ impl AgentActor {
                                 .into(),
                     });
                 } else {
-                    self.retry(self.unavailable_attempts);
+                    self.retry(
+                        self.unavailable_attempts,
+                        "cancel deadline expired, waiting for session recovery".into(),
+                    );
                 }
             }
             SessionEvent::Ended { reason } => self.end(reason).await?,
@@ -1172,7 +1183,7 @@ impl AgentActor {
                 tracing::warn!(agent=%self.id, %reason, "waiting for session recovery");
                 self.stop_session().await?;
                 self.unavailable_attempts = self.unavailable_attempts.saturating_add(1);
-                self.retry(self.unavailable_attempts);
+                self.retry(self.unavailable_attempts, reason);
             }
         }
         Ok(())
@@ -1455,10 +1466,10 @@ impl AgentActor {
         if self.crashes.len() >= self.config.crash_limit {
             self.phase(Phase::Failed { last: reason });
         } else {
-            self.retry(self.crashes.len() as u32);
+            self.retry(self.crashes.len() as u32, reason);
         }
     }
-    fn retry(&mut self, attempt: u32) {
+    fn retry(&mut self, attempt: u32, reason: String) {
         if self.halting.is_some() {
             // The pending stop or restart publishes the outcome.
             return;
@@ -1476,6 +1487,7 @@ impl AgentActor {
         self.phase(Phase::Crashed {
             attempt,
             retry_at: Instant::now() + delay,
+            reason,
         });
     }
     fn stall_deadline(&self) -> Option<Instant> {
@@ -1573,7 +1585,7 @@ fn halt_reply(op: Operation, result: Result<()>, warning: Option<&str>) -> Resul
 pub fn phase_error(phase: &Phase) -> Option<String> {
     match phase {
         Phase::Failed { last } => Some(last.clone()),
-        Phase::NeedsRecovery { reason } => Some(reason.clone()),
+        Phase::Crashed { reason, .. } | Phase::NeedsRecovery { reason } => Some(reason.clone()),
         _ => None,
     }
 }
