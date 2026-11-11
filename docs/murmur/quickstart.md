@@ -64,11 +64,10 @@ It does not drop a missing path from an explicit list. A missing path there
 stops sandboxed agents from starting.
 
 Without `[kind.*] command`, agentd looks for `claude-agent-acp` and `codex-acp`
-on PATH inside the sandbox. If they are missing, startup fails with an empty
-reason after the final colon:
+on PATH inside the sandbox. If they are missing, startup fails:
 
 ```text
-agentd: sandbox preflight failed for claude (command claude-agent-acp); check bwrap, user namespaces and ro_binds, or set sandbox = "none":
+agentd: sandbox preflight failed for claude (command claude-agent-acp); check bwrap, user namespaces and ro_binds, or set sandbox = "none": command not found on PATH inside the sandbox
 ```
 
 ## 3. Start agentd

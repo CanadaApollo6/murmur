@@ -162,6 +162,35 @@ fn preflight_rejects_bwrap_without_fd_binds() {
 }
 
 #[test]
+fn real_preflight_names_command_missing_from_sandbox_path() {
+    if !supported() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("root");
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[bwrap]\nro_binds = []\n[kind.claude]\ncommand = ['agentd-test-missing-command']\ncredentials = []\n[kind.codex]\ncommand = ['/bin/true']\ncredentials = []\n",
+    )
+    .expect("config");
+    let output = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .arg("--config")
+        .arg(config)
+        .arg("--state-dir")
+        .arg(root.path().join("state"))
+        .env("HOME", root.path())
+        .output()
+        .expect("preflight");
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("(command agentd-test-missing-command)")
+            && error.contains("command not found on PATH inside the sandbox"),
+        "{error}"
+    );
+}
+
+#[test]
 fn real_daemon_availability_and_explicit_pin_recovery() {
     if !supported() {
         return;
