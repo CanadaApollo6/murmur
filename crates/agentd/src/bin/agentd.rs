@@ -15,6 +15,7 @@ use agentd::surfaces::{
     mcp_stdio, private_dir,
 };
 use clap::{Parser, Subcommand};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(about = "Local ACP agent broker")]
@@ -46,11 +47,18 @@ enum Command {
         socket: PathBuf,
     },
 }
+fn log_filter(rust_log: Option<&str>) -> EnvFilter {
+    match rust_log {
+        Some(directives) if !directives.trim().is_empty() => EnvFilter::new(directives),
+        _ => EnvFilter::new("warn"),
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
         .init();
     if let Err(error) = run(Args::parse()).await {
         eprintln!("agentd: {error}");
@@ -321,4 +329,31 @@ async fn serve_agent(api: Arc<ControlApi>, bound: BoundListener) -> Result<()> {
     }
     connections.shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::filter::LevelFilter;
+
+    #[test]
+    fn log_filter_defaults_to_warn_without_rust_log() {
+        assert_eq!(log_filter(None).max_level_hint(), Some(LevelFilter::WARN));
+        assert_eq!(
+            log_filter(Some("")).max_level_hint(),
+            Some(LevelFilter::WARN)
+        );
+    }
+
+    #[test]
+    fn rust_log_overrides_the_default_in_both_directions() {
+        assert_eq!(
+            log_filter(Some("error")).max_level_hint(),
+            Some(LevelFilter::ERROR)
+        );
+        assert_eq!(
+            log_filter(Some("info,agentd=debug")).max_level_hint(),
+            Some(LevelFilter::DEBUG)
+        );
+    }
 }

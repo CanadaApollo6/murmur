@@ -162,6 +162,65 @@ fn preflight_rejects_bwrap_without_fd_binds() {
 }
 
 #[test]
+fn preflight_reports_why_bwrap_help_failed() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().expect("root");
+    let stub = root.path().join("denied-bwrap");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\necho 'bwrap: denied by policy' >&2\nexit 1\n",
+    )
+    .expect("stub");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700)).expect("mode");
+    let config = root.path().join("config.toml");
+    std::fs::write(&config, format!("[bwrap]\npath = {}\nro_binds = []\n[kind.claude]\ncommand = ['/bin/true']\ncredentials = []\n[kind.codex]\ncommand = ['/bin/true']\ncredentials = []\n", serde_json::to_string(&stub).expect("path"))).expect("config");
+    let output = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .arg("--config")
+        .arg(config)
+        .arg("--state-dir")
+        .arg(root.path().join("state"))
+        .env("HOME", root.path())
+        .output()
+        .expect("preflight");
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("--help` ended with exit status: 1: bwrap: denied by policy")
+            && !error.contains("--bind-fd"),
+        "{error}"
+    );
+}
+
+#[test]
+fn real_preflight_names_command_missing_from_sandbox_path() {
+    if !supported() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("root");
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[bwrap]\nro_binds = []\n[kind.claude]\ncommand = ['agentd-test-missing-command']\ncredentials = []\n[kind.codex]\ncommand = ['/bin/true']\ncredentials = []\n",
+    )
+    .expect("config");
+    let output = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .arg("--config")
+        .arg(config)
+        .arg("--state-dir")
+        .arg(root.path().join("state"))
+        .env("HOME", root.path())
+        .output()
+        .expect("preflight");
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("(command agentd-test-missing-command)")
+            && error.contains("command not found or not executable inside the sandbox"),
+        "{error}"
+    );
+}
+
+#[test]
 fn real_daemon_availability_and_explicit_pin_recovery() {
     if !supported() {
         return;

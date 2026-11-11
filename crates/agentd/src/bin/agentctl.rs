@@ -1,4 +1,5 @@
 #![deny(clippy::unwrap_used)]
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use agentd::model::*;
@@ -6,16 +7,22 @@ use agentd::supervisor::AgentSpec;
 use agentd::surfaces::{
     ControlRequest, Result, Socket, default_state_dir, read_frame_limit, write_frame,
 };
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 
 #[derive(Parser)]
-#[command(about = "Control the local agentd broker")]
+#[command(name = "agentctl", about = "Control the local agentd broker")]
 struct Args {
+    /// Control socket path. Overrides `AGENTD_SOCKET`. Cannot be combined with `--state-dir`.
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
+    /// The daemon's state directory. Selects `<DIR>/agentd.sock`, so it assumes the
+    /// daemon uses the default socket name. Overrides `AGENTD_SOCKET`. Cannot be combined
+    /// with `--socket`.
+    #[arg(long, global = true, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -91,11 +98,41 @@ enum Sandbox {
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    if let Err(error) = run(Args::parse()).await {
+    let args = parse(std::env::args_os()).unwrap_or_else(|error| error.exit());
+    if let Err(error) = run(args).await {
         eprintln!("agentctl: {error}");
         std::process::exit(1);
     }
 }
+/// Parses the command line and rejects `--socket` with `--state-dir`. clap's own
+/// `conflicts_with` misses the pair when one flag is before the subcommand and the other
+/// after it, and the command would then run against a socket the operator did not mean.
+fn parse<I, T>(argv: I) -> std::result::Result<Args, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let args = Args::try_parse_from(argv)?;
+    if args.socket.is_some() && args.state_dir.is_some() {
+        return Err(Args::command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "the argument '--socket <SOCKET>' cannot be used with '--state-dir <DIR>'",
+        ));
+    }
+    Ok(args)
+}
+
+fn socket_path(
+    socket: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    env_socket: Option<OsString>,
+) -> PathBuf {
+    socket
+        .or_else(|| state_dir.map(|dir| dir.join("agentd.sock")))
+        .or_else(|| env_socket.map(PathBuf::from))
+        .unwrap_or_else(|| default_state_dir().join("agentd.sock"))
+}
+
 async fn run(args: Args) -> Result<()> {
     let key = ClientKey(ulid::Ulid::new().to_string());
     let request = match args.command {
@@ -162,10 +199,11 @@ async fn run(args: Args) -> Result<()> {
     let watch = matches!(request, ControlRequest::Watch { .. });
     let held = matches!(request, ControlRequest::Held { .. });
     let mut held_mail = Vec::new();
-    let socket = args
-        .socket
-        .or_else(|| std::env::var_os("AGENTD_SOCKET").map(PathBuf::from))
-        .unwrap_or_else(|| default_state_dir().join("agentd.sock"));
+    let socket = socket_path(
+        args.socket,
+        args.state_dir,
+        std::env::var_os("AGENTD_SOCKET"),
+    );
     let stream = UnixStream::connect(socket).await?;
     Socket::check_peer(&stream)?;
     let (read, mut write) = stream.into_split();
@@ -201,5 +239,75 @@ async fn run(args: Args) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(result)?);
         }
         return Ok(());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolve(argv: &[&str], env: Option<&str>) -> PathBuf {
+        let args = parse(argv).expect("bug: test argv must parse");
+        socket_path(args.socket, args.state_dir, env.map(OsString::from))
+    }
+
+    #[test]
+    fn socket_flag_wins_over_env() {
+        assert_eq!(
+            resolve(
+                &["agentctl", "--socket", "/s/a.sock", "ls"],
+                Some("/env.sock")
+            ),
+            PathBuf::from("/s/a.sock")
+        );
+    }
+
+    #[test]
+    fn state_dir_selects_default_socket_name_over_env() {
+        assert_eq!(
+            resolve(
+                &["agentctl", "ls", "--state-dir", "/run/state"],
+                Some("/env.sock")
+            ),
+            PathBuf::from("/run/state/agentd.sock")
+        );
+    }
+
+    #[test]
+    fn env_socket_used_without_flags() {
+        assert_eq!(
+            resolve(&["agentctl", "ls"], Some("/env.sock")),
+            PathBuf::from("/env.sock")
+        );
+    }
+
+    #[test]
+    fn default_state_dir_used_without_flags_or_env() {
+        assert_eq!(
+            resolve(&["agentctl", "ls"], None),
+            default_state_dir().join("agentd.sock")
+        );
+    }
+
+    #[test]
+    fn socket_and_state_dir_together_are_a_usage_error_wherever_they_sit() {
+        let (socket, dir) = (["--socket", "/s/a.sock"], ["--state-dir", "/run/state"]);
+        let placements = [
+            [&socket[..], &dir[..], &["ls"][..]].concat(),
+            [&socket[..], &["ls"][..], &dir[..]].concat(),
+            [&dir[..], &["ls"][..], &socket[..]].concat(),
+            [&["ls"][..], &dir[..], &socket[..]].concat(),
+        ];
+        for placement in placements {
+            let argv = [&["agentctl"][..], &placement[..]].concat();
+            let error = parse(&argv)
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} must be rejected"));
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{argv:?}"
+            );
+        }
     }
 }

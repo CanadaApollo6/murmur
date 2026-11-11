@@ -64,11 +64,10 @@ It does not drop a missing path from an explicit list. A missing path there
 stops sandboxed agents from starting.
 
 Without `[kind.*] command`, agentd looks for `claude-agent-acp` and `codex-acp`
-on PATH inside the sandbox. If they are missing, startup fails with an empty
-reason after the final colon:
+on PATH inside the sandbox. If they are missing, startup fails:
 
 ```text
-agentd: sandbox preflight failed for claude (command claude-agent-acp); check bwrap, user namespaces and ro_binds, or set sandbox = "none":
+agentd: sandbox preflight failed for claude (command claude-agent-acp); check bwrap, user namespaces and ro_binds, or set sandbox = "none": command not found or not executable inside the sandbox
 ```
 
 ## 3. Start agentd
@@ -80,11 +79,13 @@ RUST_LOG=info,agentd=debug "$B/agentd" --config "$RUN/kinds.toml" --state-dir "$
 The control socket appeared in about 150 ms. agentd prints nothing on a clean
 start. Warnings and crash reasons go to stderr.
 
-Set `RUST_LOG`. Without it agentd logs errors only, and the reason for a
-crashed session is a warning.
+Without `RUST_LOG`, agentd logs warnings and errors, which includes the reason
+for a crashed session. `RUST_LOG` replaces that default, so the command above
+adds info and debug output.
 
-`agentctl` has no `--state-dir` flag. It looks for the socket in
-`~/.local/state/agentd`. Point it at your socket for every command:
+By default `agentctl` looks for the socket in `~/.local/state/agentd`. Pass
+`--state-dir "$RUN/state"` to any command, or set the socket once for this
+shell. The rest of this guide assumes the variable:
 
 ```sh
 export AGENTD_SOCKET="$RUN/state/agentd.sock"
