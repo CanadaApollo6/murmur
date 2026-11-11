@@ -676,6 +676,69 @@ async fn binary_cli_mcp_delivery_security_retry_and_restart() {
 }
 
 #[tokio::test]
+async fn send_message_rule_answers_only_agentds_own_send_message() {
+    let d = Daemon::new(None).await;
+    let answered = |name: &'static str, n: usize| {
+        d.wait_wire(name, move |v| {
+            v.iter()
+                .filter(|m| m["id"] == "permission-1" && m.get("result").is_some())
+                .count()
+                >= n
+        })
+    };
+    let approvals = || async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let requests = d.ctl(&["approvals"]).await;
+                if !requests.as_array().expect("requests").is_empty() {
+                    break requests;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pending approval deadline")
+    };
+    let cwd = d.root.path().join("a");
+    d.ctl(&[
+        "spawn",
+        "a",
+        "--kind",
+        "claude",
+        "--cwd",
+        cwd.to_str().expect("cwd"),
+        "--rule",
+        "send_message=allow",
+        "mcp-permission:claude-own",
+    ])
+    .await;
+    let wire = answered("a", 1).await;
+    assert!(
+        wire.iter()
+            .any(|m| m["id"] == "permission-1" && m["result"]["outcome"]["optionId"] == "yes"),
+        "the rule did not allow agentd's own send_message"
+    );
+    assert_eq!(d.ctl(&["approvals"]).await, json!([]));
+
+    d.ctl(&["send", "@a", "mcp-permission:shell"]).await;
+    let pending = approvals().await;
+    assert_eq!(pending.as_array().expect("requests").len(), 1);
+    assert_eq!(pending[0]["tool"], "shell", "{pending}");
+    let id = pending[0]["id"].as_str().expect("permission id");
+    d.ctl(&["approve", id, "no"]).await;
+    answered("a", 2).await;
+
+    d.spawn("b", "codex", Some("mcp-permission:codex-own"))
+        .await;
+    let pending = approvals().await;
+    assert_eq!(pending.as_array().expect("requests").len(), 1);
+    assert_eq!(
+        pending[0]["tool"], "send_message",
+        "without a rule agentd's own send_message still asks: {pending}"
+    );
+}
+
+#[tokio::test]
 async fn operator_approvals_cancel_held_release_and_drop() {
     let mut d = Daemon::new(None).await;
     d.spawn("b", "codex", Some("permission")).await;

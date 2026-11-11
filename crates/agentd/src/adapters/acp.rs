@@ -53,11 +53,21 @@ struct AcpSession {
     pending: HashMap<PermissionId, Pending>,
     /// Titles of this turn's tool calls, newest last, for permission requests that omit one.
     tool_titles: VecDeque<(String, String)>,
+    /// Name of agentd's own MCP server in this session, unless a kind server shares it.
+    own_server: Option<String>,
+    /// This turn's tool calls that codex-acp announced as agentd's own `send_message`.
+    own_sends: VecDeque<String>,
     ended: bool,
 }
 
 /// Enough recent tool calls to cover one whose approval is pending.
 const TOOL_TITLES: usize = 64;
+
+/// Rule name for agentd's own `send_message` tool. No ACP tool kind may claim it.
+const SEND_MESSAGE: &str = "send_message";
+/// The Claude CLI's `mcpServer.source` for servers passed in through ACP `mcpServers`; a
+/// same-named server from user, project or plugin configuration reports another source.
+const CLAUDE_DYNAMIC_SOURCE: &str = "dynamic";
 
 fn protocol(e: impl std::fmt::Display) -> AdapterError {
     AdapterError::Protocol(e.to_string())
@@ -71,6 +81,13 @@ impl Adapter for AcpAdapter {
             .mcp_server
             .as_ref()
             .and_then(|v| v["env"][0]["value"].as_str())
+            .map(str::to_owned);
+        let own_server = req
+            .launch
+            .mcp_server
+            .as_ref()
+            .and_then(|v| v["name"].as_str())
+            .filter(|name| !self.0.mcp_servers.iter().any(|s| s["name"] == *name))
             .map(str::to_owned);
         let mut cmd = Command::new(&req.launch.program);
         req.launch.inherit_mount_fds(&mut cmd);
@@ -180,6 +197,8 @@ impl Adapter for AcpAdapter {
             flight: None,
             pending: HashMap::new(),
             tool_titles: VecDeque::new(),
+            own_server,
+            own_sends: VecDeque::new(),
             ended: false,
         });
         let result = session.initialize(&req).await;
@@ -345,6 +364,7 @@ impl AcpSession {
                         }
                         Some("tool_call" | "tool_call_update") => {
                             self.remember_title(update);
+                            self.remember_own_send(update);
                             Some(update["title"].as_str().unwrap_or("tool activity"))
                         }
                         Some("plan") => Some("plan updated"),
@@ -388,14 +408,7 @@ impl AcpSession {
                     }
                     let id = PermissionId::new();
                     let title = self.permission_title(&params["toolCall"]);
-                    let tool = match params["toolCall"]["kind"].as_str() {
-                        Some("execute") => "shell",
-                        Some("edit") => "edit",
-                        Some("fetch") => "fetch",
-                        Some(other) => other,
-                        None => "unknown",
-                    }
-                    .into();
+                    let tool = self.permission_tool(params).into();
                     self.pending.insert(
                         id,
                         Pending {
@@ -442,6 +455,7 @@ impl AcpSession {
             let flight = self.flight.take().ok_or(AdapterError::Ended)?;
             self.pending.clear();
             self.tool_titles.clear();
+            self.own_sends.clear();
             self.events
                 .push_back(SessionEvent::Committed { ids: flight.ids });
             self.events.push_back(SessionEvent::TurnEnded { outcome });
@@ -461,6 +475,51 @@ impl AcpSession {
             self.tool_titles.pop_front();
         }
         self.tool_titles.push_back((id.into(), title.into()));
+    }
+
+    /// codex-acp announces an MCP call as `rawInput: {server, tool, arguments}`.
+    fn remember_own_send(&mut self, update: &Value) {
+        let (Some(id), Some(input)) = (update["toolCallId"].as_str(), update.get("rawInput"))
+        else {
+            return;
+        };
+        self.own_sends.retain(|known| known != id);
+        let own = self
+            .own_server
+            .as_deref()
+            .is_some_and(|server| input["server"] == server && input["tool"] == SEND_MESSAGE);
+        if own {
+            if self.own_sends.len() == TOOL_TITLES {
+                self.own_sends.pop_front();
+            }
+            self.own_sends.push_back(id.into());
+        }
+    }
+
+    /// Only fields each adapter sets itself identify agentd's own `send_message`, never the
+    /// title or arguments, which the model or another MCP server controls.
+    fn permission_tool<'a>(&self, params: &'a Value) -> &'a str {
+        let call = &params["toolCall"];
+        if let Some(server) = self.own_server.as_deref() {
+            let claude = &call["_meta"]["claudeCode"];
+            let claude_own = claude["mcpServer"]["name"] == server
+                && claude["mcpServer"]["source"] == CLAUDE_DYNAMIC_SOURCE
+                && claude["toolName"] == format!("mcp__{server}__{SEND_MESSAGE}");
+            let codex_own = params["_meta"]["is_mcp_tool_approval"] == true
+                && call["kind"] == "execute"
+                && call["toolCallId"]
+                    .as_str()
+                    .is_some_and(|id| self.own_sends.iter().any(|known| known == id));
+            if claude_own || codex_own {
+                return SEND_MESSAGE;
+            }
+        }
+        match call["kind"].as_str() {
+            Some("execute") => "shell",
+            Some(SEND_MESSAGE) => "other",
+            Some(other) => other,
+            None => "unknown",
+        }
     }
 
     /// ACP makes `title` optional here, and codex-acp omits it when it approves an MCP call it
@@ -705,10 +764,228 @@ mod tests {
             }),
             pending: HashMap::new(),
             tool_titles: VecDeque::new(),
+            own_server: None,
+            own_sends: VecDeque::new(),
             ended: false,
             kind,
         };
         (session, incoming)
+    }
+
+    /// A session mid-turn whose agentd MCP server is registered as `agentd`.
+    fn turn_session() -> AcpSession {
+        let (mut session, _incoming) = cancelling_session();
+        session.own_server = Some("agentd".into());
+        if let Some(flight) = &mut session.flight {
+            flight.cancel_deadline = None;
+        }
+        session
+    }
+
+    /// The rule name agentd gives a permission request after the agent sent `updates` first.
+    async fn rule_tool(session: &mut AcpSession, updates: &[Value], params: Value) -> String {
+        for update in updates {
+            session
+                .receive(json!({"jsonrpc":"2.0","method":"session/update",
+                    "params":{"sessionId":"session","update":update}}))
+                .await
+                .expect("tool call update");
+        }
+        let mut params = params;
+        params["sessionId"] = json!("session");
+        params["options"] = json!([{"optionId":"yes","name":"Allow once","kind":"allow_once"}]);
+        session
+            .receive(json!({"jsonrpc":"2.0","id":"permission-1",
+                "method":"session/request_permission","params":params}))
+            .await
+            .expect("permission request");
+        session
+            .events
+            .drain(..)
+            .find_map(|event| match event {
+                SessionEvent::PermissionRequested(request) => Some(request.tool),
+                _ => None,
+            })
+            .expect("permission event")
+    }
+
+    /// The `toolCall` claude-agent-acp sends for an MCP tool: `presentation.js` plus the
+    /// `_meta.claudeCode` that `acp-agent.js` adds when the CLI names the tool's server.
+    fn claude_call(server: &str, source: &str, tool: &str) -> Value {
+        let name = format!("mcp__{server}__{tool}");
+        json!({"toolCall":{"toolCallId":"toolu_1","name":name,"status":"pending",
+            "rawInput":{"to":"@b","body":"hi"},"title":name,"kind":"other","content":[],
+            "_meta":{"claudeCode":{"toolName":name,"mcpServer":{"name":server,"source":source}}}}})
+    }
+
+    /// The `tool_call` codex-acp announces for an MCP call (`McpToolReporter.started`).
+    fn codex_started(server: &str, tool: &str) -> Value {
+        json!({"sessionUpdate":"tool_call","toolCallId":"call-1","kind":"execute",
+            "title":format!("mcp.{server}.{tool}"),"status":"pending",
+            "rawInput":{"server":server,"tool":tool,"arguments":{"to":"@b","body":"hi"}}})
+    }
+
+    /// codex-acp's approval of an announced MCP call (`buildMcpPermissionRequest`).
+    fn codex_approval() -> Value {
+        json!({"toolCall":{"toolCallId":"call-1","kind":"execute","status":"pending"},
+            "_meta":{"is_mcp_tool_approval":true}})
+    }
+
+    #[tokio::test]
+    async fn claude_own_send_message_gets_the_send_message_rule_name() {
+        let mut session = turn_session();
+        let call = claude_call("agentd", "dynamic", "send_message");
+        assert_eq!(rule_tool(&mut session, &[], call).await, "send_message");
+    }
+
+    #[tokio::test]
+    async fn codex_own_send_message_gets_the_send_message_rule_name() {
+        let mut session = turn_session();
+        let started = codex_started("agentd", "send_message");
+        assert_eq!(
+            rule_tool(&mut session, &[started], codex_approval()).await,
+            "send_message"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_mcp_servers_send_message_does_not_get_the_rule_name() {
+        let cases = [
+            (
+                "claude, other server",
+                vec![],
+                claude_call("mail", "dynamic", "send_message"),
+            ),
+            (
+                "claude, agentd from project config",
+                vec![],
+                claude_call("agentd", "project", "send_message"),
+            ),
+            (
+                "claude, agentd from a plugin",
+                vec![],
+                claude_call("agentd", "plugin", "send_message"),
+            ),
+            (
+                "claude, other agentd tool",
+                vec![],
+                claude_call("agentd", "dynamic", "list_agents"),
+            ),
+            (
+                "codex, other server",
+                vec![codex_started("mail", "send_message")],
+                codex_approval(),
+            ),
+            (
+                "codex, other agentd tool",
+                vec![codex_started("agentd", "list_agents")],
+                codex_approval(),
+            ),
+        ];
+        for (case, updates, params) in cases {
+            let mut session = turn_session();
+            let tool = rule_tool(&mut session, &updates, params).await;
+            assert_ne!(tool, "send_message", "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn text_that_mentions_send_message_does_not_get_the_rule_name() {
+        let shell = json!({"toolCall":{"toolCallId":"call-1","kind":"execute",
+            "title":"mcp__agentd__send_message","name":"send_message",
+            "rawInput":{"command":"echo mcp.agentd.send_message","server":"agentd","tool":"send_message"}},
+            "_meta":{"is_mcp_tool_approval":true}});
+        let spoofed_args = json!({"sessionUpdate":"tool_call","toolCallId":"toolu_1",
+            "title":"mcp.agentd.send_message","kind":"other",
+            "rawInput":{"server":"agentd","tool":"send_message","arguments":{}}});
+        let other_tool = json!({"toolCall":{"toolCallId":"toolu_1","kind":"other",
+            "name":"mcp__mail__relay","title":"mcp.agentd.send_message",
+            "_meta":{"claudeCode":{"toolName":"mcp__mail__relay","mcpServer":{"name":"mail","source":"dynamic"}}}}});
+        let cases = [
+            ("shell command", vec![], shell),
+            (
+                "another server's tool with agentd-shaped arguments",
+                vec![spoofed_args],
+                other_tool,
+            ),
+            (
+                "kind named send_message",
+                vec![],
+                json!({"toolCall":{"toolCallId":"x","kind":"send_message"}}),
+            ),
+        ];
+        for (case, updates, params) in cases {
+            let mut session = turn_session();
+            let tool = rule_tool(&mut session, &updates, params).await;
+            assert_ne!(tool, "send_message", "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_or_malformed_tool_calls_do_not_get_the_rule_name() {
+        let mut no_server = claude_call("agentd", "dynamic", "send_message");
+        no_server["toolCall"]["_meta"]["claudeCode"]["mcpServer"] = json!(null);
+        let mut no_tool_name = claude_call("agentd", "dynamic", "send_message");
+        no_tool_name["toolCall"]["_meta"]["claudeCode"]["toolName"] = json!(null);
+        let mut string_meta = claude_call("agentd", "dynamic", "send_message");
+        string_meta["toolCall"]["_meta"] = json!("mcp__agentd__send_message");
+        let mut string_approval = codex_approval();
+        string_approval["_meta"]["is_mcp_tool_approval"] = json!("true");
+        let cases = [
+            ("claude without mcpServer", vec![], no_server),
+            ("claude without toolName", vec![], no_tool_name),
+            ("claude with string _meta", vec![], string_meta),
+            (
+                "codex approval of an unannounced call",
+                vec![],
+                codex_approval(),
+            ),
+            (
+                "codex approval flag not a boolean",
+                vec![codex_started("agentd", "send_message")],
+                string_approval,
+            ),
+            (
+                "bare tool call",
+                vec![],
+                json!({"toolCall":{"toolCallId":"call-1"}}),
+            ),
+            ("empty tool call", vec![], json!({"toolCall":{}})),
+        ];
+        for (case, updates, params) in cases {
+            let mut session = turn_session();
+            let tool = rule_tool(&mut session, &updates, params).await;
+            assert_ne!(tool, "send_message", "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_call_reannounced_with_another_tool_loses_the_rule_name() {
+        let mut session = turn_session();
+        let updates = [
+            codex_started("agentd", "send_message"),
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"call-1",
+                "rawInput":{"server":"mail","tool":"send_message","arguments":{}}}),
+        ];
+        assert_ne!(
+            rule_tool(&mut session, &updates, codex_approval()).await,
+            "send_message"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_unambiguous_agentd_server_nothing_gets_the_rule_name() {
+        let mut session = turn_session();
+        session.own_server = None;
+        let call = claude_call("agentd", "dynamic", "send_message");
+        assert_ne!(rule_tool(&mut session, &[], call).await, "send_message");
+        let mut session = turn_session();
+        session.own_server = None;
+        let started = codex_started("agentd", "send_message");
+        assert_ne!(
+            rule_tool(&mut session, &[started], codex_approval()).await,
+            "send_message"
+        );
     }
 
     fn cancelled() -> Result<Value, String> {

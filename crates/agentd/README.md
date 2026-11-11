@@ -15,6 +15,7 @@ agentd --config /path/to/kinds.toml
 agentctl spawn planner --kind infinity --cwd /path/to/project
 agentctl spawn reviewer --kind claude --cwd /path/to/project
 agentctl spawn builder --kind codex --cwd /path/to/project --sandbox workspace-write "Ask @reviewer to check the plan."
+agentctl spawn tester --kind claude --cwd /path/to/project --rule send_message=allow
 agentctl send @reviewer "Focus on session expiry."
 agentctl ls
 agentctl approvals
@@ -270,6 +271,36 @@ incarnation-tagged approval under `infinity.user_choice`. Options use zero-based
 index keys and preserve the daemon's labels. Infinity does not supply tool names
 or authorization effects, so allow/deny rules cannot auto-select these choices.
 A timeout interrupts the turn instead of guessing an answer.
+
+### Permission rules
+
+Every permission request goes to the operator unless a rule answers it. Rules
+are opt-in and per agent. Give them at spawn as `TOOL=DECISION`, where the
+decision is `allow`, `deny` or `ask`:
+
+```sh
+agentctl spawn reviewer --kind claude --cwd /path/to/project --rule send_message=allow
+```
+
+The first rule that names the request's tool, or `*`, decides. `allow` and
+`deny` pick the agent's allow-once or reject-once option. ACP tool kinds give
+the names `shell` (kind `execute`), `edit`, `fetch` and the other ACP kinds.
+
+`send_message` names only agentd's own `send_message` tool, from the MCP
+server agentd registered for that session as `agentd`. agentd recognizes it from
+fields the ACP adapter sets, never from the title or arguments:
+
+- claude-agent-acp: `toolCall._meta.claudeCode.mcpServer` is
+  `{"name":"agentd","source":"dynamic"}` and `toolCall._meta.claudeCode.toolName`
+  is `mcp__agentd__send_message`. The CLI reports another `source` for a
+  same-named server from user, project or plugin configuration.
+- codex-acp: the request has `_meta.is_mcp_tool_approval: true`, and the
+  `tool_call` it approves was announced with
+  `rawInput: {"server":"agentd","tool":"send_message",...}`.
+
+A `send_message` tool from another MCP server, a shell command that mentions
+it, and a request without these fields keep their usual name and still ask.
+Older adapters that leave out these fields also still ask.
 
 ### Give Infinity agents `send_message`
 

@@ -31,6 +31,10 @@ enum Command {
         sandbox: Sandbox,
         #[arg(long)]
         model: Option<String>,
+        /// A permission rule as TOOL=DECISION, for example `send_message=allow`. Repeatable;
+        /// the first rule that names the tool, or `*`, wins. Tools no rule names ask.
+        #[arg(long = "rule", value_name = "TOOL=DECISION", value_parser = parse_rule)]
+        rules: Vec<PermissionRule>,
         first_message: Option<String>,
     },
     Ls,
@@ -89,6 +93,24 @@ enum Sandbox {
     WorkspaceWrite,
     FullAccess,
 }
+fn parse_rule(rule: &str) -> std::result::Result<PermissionRule, String> {
+    let (tool, decision) = rule
+        .split_once('=')
+        .ok_or("expected TOOL=DECISION, for example send_message=allow")?;
+    if tool.is_empty() {
+        return Err("the rule needs a tool name".into());
+    }
+    let decision = match decision {
+        "allow" => RuleDecision::Allow,
+        "deny" => RuleDecision::Deny,
+        "ask" => RuleDecision::Ask,
+        _ => return Err("decision must be allow, deny or ask".into()),
+    };
+    Ok(PermissionRule {
+        tool: tool.into(),
+        decision,
+    })
+}
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(error) = run(Args::parse()).await {
@@ -105,6 +127,7 @@ async fn run(args: Args) -> Result<()> {
             cwd,
             sandbox,
             model,
+            rules,
             first_message,
         } => ControlRequest::Spawn {
             spec: AgentSpec {
@@ -124,6 +147,7 @@ async fn run(args: Args) -> Result<()> {
                         Sandbox::WorkspaceWrite => SandboxLevel::WorkspaceWrite,
                         Sandbox::FullAccess => SandboxLevel::FullAccess,
                     },
+                    rules,
                     ..Default::default()
                 },
                 idle_after: None,
