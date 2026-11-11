@@ -83,8 +83,9 @@ start. Warnings and crash reasons go to stderr.
 Set `RUST_LOG`. Without it agentd logs errors only, and the reason for a
 crashed session is a warning.
 
-`agentctl` has no `--state-dir` flag. It looks for the socket in
-`~/.local/state/agentd`. Point it at your socket for every command:
+By default `agentctl` looks for the socket in `~/.local/state/agentd`. Pass
+`--state-dir "$RUN/state"` to any command, or set the socket once for this
+shell. The rest of this guide assumes the variable:
 
 ```sh
 export AGENTD_SOCKET="$RUN/state/agentd.sock"
