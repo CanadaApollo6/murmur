@@ -176,7 +176,10 @@ async fn run(args: Args) -> Result<()> {
             .await?
             .ok_or("broker closed connection")?;
         let value: Value = serde_json::from_slice(&line)?;
-        if let Some(e) = value["error"].as_str() {
+        // A feed event's own `error` field is data, not a failed request.
+        if value.get("event").is_none()
+            && let Some(e) = value["error"].as_str()
+        {
             return Err(e.to_owned().into());
         }
         if watch {

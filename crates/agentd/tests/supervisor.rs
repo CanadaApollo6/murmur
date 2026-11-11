@@ -376,6 +376,51 @@ async fn death_before_start_requeues_and_after_start_is_uncertain() {
 }
 
 #[tokio::test]
+async fn a_restart_whose_new_session_crashes_replies_with_the_crash_reason() {
+    let mut t = Test::new(Default::default()).await;
+    let mut phases = t.agent.phases();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        phases.wait_for(|p| *p == Phase::Idle),
+    )
+    .await
+    .expect("the first session opens")
+    .expect("phase");
+    std::fs::write(t.root.path().join("crash-open"), "").expect("flag");
+    // The first restart cannot resume and lands in `NeedsRecovery`. The second
+    // one opens a fresh session, which crashes.
+    let restart = agentd::supervisor::Operation::Restart;
+    let lost = t.broker.operate(t.agent.id, restart).await;
+    assert!(lost.is_err_and(|e| e.to_string().starts_with("resume failed")));
+    let reply = t
+        .broker
+        .operate(t.agent.id, restart)
+        .await
+        .expect_err("a restart whose session crashed did not restart")
+        .to_string();
+    let Event::PhaseChanged {
+        phase: Phase::Crashed { reason, .. },
+        ..
+    } = t
+        .event(|e| {
+            matches!(
+                e,
+                Event::PhaseChanged {
+                    phase: Phase::Crashed { .. },
+                    ..
+                }
+            )
+        })
+        .await
+    else {
+        panic!("crash")
+    };
+    assert!(!reason.is_empty());
+    assert_eq!(reply, reason);
+    t.finish().await;
+}
+
+#[tokio::test]
 async fn crash_backoff_and_five_crashes_fail() {
     let root = tempfile::tempdir().expect("tempdir");
     std::fs::write(root.path().join("crash-open"), "").expect("flag");
@@ -383,7 +428,9 @@ async fn crash_backoff_and_five_crashes_fail() {
     let mut previous = None;
     for expected in 1..=4 {
         let Event::PhaseChanged {
-            phase: Phase::Crashed { attempt, retry_at },
+            phase: Phase::Crashed {
+                attempt, retry_at, ..
+            },
             ..
         } = t
             .event(|e| {
