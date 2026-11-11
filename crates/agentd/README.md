@@ -339,7 +339,7 @@ must support the selected mode; a mode-setting failure prevents prompting.
 `agentctl --socket /absolute/path` selects a custom control socket.
 `agentctl --state-dir DIR` selects `DIR/agentd.sock`; it assumes the daemon kept the
 default socket name. Without either flag, `AGENTD_SOCKET` applies, then the default
-state directory. Passing both flags is a usage error. Responses are JSON except for the short send status. Watch emits JSON
+state directory. Passing both flags is a usage error, wherever each sits on the command line. Responses are JSON except for the short send status. Watch emits JSON
 lines, beginning with a snapshot. A `lagged` event signals dropped display events;
 the stream is not a durable audit log. Held mail streams one envelope per socket
 frame, followed by a completion frame; `agentctl held` collects these into one

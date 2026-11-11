@@ -948,9 +948,11 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
                     "bwrap preflight failed: {e}; install bwrap >= 0.10.0 or set sandbox = \"none\""
                 )
             })?;
+        if !out.status.success() {
+            return Err(bwrap_help_failure(&cfg.path, out.status, &out.stderr).into());
+        }
         let help = String::from_utf8_lossy(&out.stdout);
-        if !out.status.success() || !help.contains("--bind-fd ") || !help.contains("--ro-bind-fd ")
-        {
+        if !help.contains("--bind-fd ") || !help.contains("--ro-bind-fd ") {
             return Err("bwrap preflight requires --bind-fd and --ro-bind-fd (bubblewrap >= 0.10.0); configure [bwrap] path = \"<bwrap >= 0.10.0>\" or sandbox = \"none\"".into());
         }
         if !help.contains("--add-seccomp-fd ") {
@@ -1004,7 +1006,7 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
                 OsString::from(
-                    "command -v -- \"$1\" || { echo 'command not found on PATH inside the sandbox' >&2; exit 127; }",
+                    "command -v -- \"$1\" || { echo 'command not found or not executable inside the sandbox' >&2; exit 127; }",
                 ),
                 OsString::from("preflight"),
                 kind.command.clone().into(),
@@ -1027,6 +1029,20 @@ pub async fn preflight(cfg: &SandboxConfig, kinds: &[KindConfig], state: &Path) 
         }
     }
     Ok(())
+}
+
+/// A `bwrap --help` that fails says nothing about which options bwrap supports, so report
+/// what it printed instead of a missing option.
+fn bwrap_help_failure(path: &Path, status: std::process::ExitStatus, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let reason = match stderr.trim() {
+        "" => "no stderr",
+        text => text,
+    };
+    format!(
+        "bwrap preflight failed: `{} --help` ended with {status}: {reason}; check [bwrap] path or set sandbox = \"none\"",
+        path.display()
+    )
 }
 
 fn preflight_failure(kind: &KindConfig, status: std::process::ExitStatus, stderr: &[u8]) -> String {

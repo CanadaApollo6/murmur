@@ -67,7 +67,7 @@ Without `[kind.*] command`, agentd looks for `claude-agent-acp` and `codex-acp`
 on PATH inside the sandbox. If they are missing, startup fails:
 
 ```text
-agentd: sandbox preflight failed for claude (command claude-agent-acp); check bwrap, user namespaces and ro_binds, or set sandbox = "none": command not found on PATH inside the sandbox
+agentd: sandbox preflight failed for claude (command claude-agent-acp); check bwrap, user namespaces and ro_binds, or set sandbox = "none": command not found or not executable inside the sandbox
 ```
 
 ## 3. Start agentd

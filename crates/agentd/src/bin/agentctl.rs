@@ -7,20 +7,21 @@ use agentd::supervisor::AgentSpec;
 use agentd::surfaces::{
     ControlRequest, Result, Socket, default_state_dir, read_frame_limit, write_frame,
 };
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 
 #[derive(Parser)]
-#[command(about = "Control the local agentd broker")]
+#[command(name = "agentctl", about = "Control the local agentd broker")]
 struct Args {
-    /// Control socket path. Overrides `--state-dir` and `AGENTD_SOCKET`.
+    /// Control socket path. Overrides `AGENTD_SOCKET`. Cannot be combined with `--state-dir`.
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
     /// The daemon's state directory. Selects `<DIR>/agentd.sock`, so it assumes the
-    /// daemon uses the default socket name. Overrides `AGENTD_SOCKET`.
-    #[arg(long, global = true, value_name = "DIR", conflicts_with = "socket")]
+    /// daemon uses the default socket name. Overrides `AGENTD_SOCKET`. Cannot be combined
+    /// with `--socket`.
+    #[arg(long, global = true, value_name = "DIR")]
     state_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
@@ -97,11 +98,30 @@ enum Sandbox {
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    if let Err(error) = run(Args::parse()).await {
+    let args = parse(std::env::args_os()).unwrap_or_else(|error| error.exit());
+    if let Err(error) = run(args).await {
         eprintln!("agentctl: {error}");
         std::process::exit(1);
     }
 }
+/// Parses the command line and rejects `--socket` with `--state-dir`. clap's own
+/// `conflicts_with` misses the pair when one flag is before the subcommand and the other
+/// after it, and the command would then run against a socket the operator did not mean.
+fn parse<I, T>(argv: I) -> std::result::Result<Args, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let args = Args::try_parse_from(argv)?;
+    if args.socket.is_some() && args.state_dir.is_some() {
+        return Err(Args::command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "the argument '--socket <SOCKET>' cannot be used with '--state-dir <DIR>'",
+        ));
+    }
+    Ok(args)
+}
+
 fn socket_path(
     socket: Option<PathBuf>,
     state_dir: Option<PathBuf>,
@@ -224,7 +244,7 @@ mod tests {
     use super::*;
 
     fn resolve(argv: &[&str], env: Option<&str>) -> PathBuf {
-        let args = Args::try_parse_from(argv).expect("bug: test argv must parse");
+        let args = parse(argv).expect("bug: test argv must parse");
         socket_path(args.socket, args.state_dir, env.map(OsString::from))
     }
 
@@ -267,17 +287,24 @@ mod tests {
     }
 
     #[test]
-    fn socket_and_state_dir_together_are_a_usage_error() {
-        let error = Args::try_parse_from([
-            "agentctl",
-            "--socket",
-            "/s/a.sock",
-            "--state-dir",
-            "/run/state",
-            "ls",
-        ])
-        .err()
-        .expect("--socket with --state-dir must be rejected");
-        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    fn socket_and_state_dir_together_are_a_usage_error_wherever_they_sit() {
+        let (socket, dir) = (["--socket", "/s/a.sock"], ["--state-dir", "/run/state"]);
+        let placements = [
+            [&socket[..], &dir[..], &["ls"][..]].concat(),
+            [&socket[..], &["ls"][..], &dir[..]].concat(),
+            [&dir[..], &["ls"][..], &socket[..]].concat(),
+            [&["ls"][..], &dir[..], &socket[..]].concat(),
+        ];
+        for placement in placements {
+            let argv = [&["agentctl"][..], &placement[..]].concat();
+            let error = parse(&argv)
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} must be rejected"));
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{argv:?}"
+            );
+        }
     }
 }
