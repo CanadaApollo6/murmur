@@ -246,6 +246,9 @@ pub enum ControlRequest {
     Restart {
         to: String,
     },
+    Retire {
+        to: String,
+    },
     Held {
         to: Option<String>,
     },
@@ -451,6 +454,11 @@ impl ControlApi {
                 let id = self.mailroom.resolve(Recipient::parse(&to)?).await?;
                 self.broker.operate(id, Operation::Restart).await?;
                 Ok(json!({"restarted":to}))
+            }
+            ControlRequest::Retire { to } => {
+                let id = self.mailroom.resolve(Recipient::parse(&to)?).await?;
+                self.broker.retire(id).await?;
+                Ok(json!({"retired":to}))
             }
             ControlRequest::Held { to } => {
                 let agent = match to {
