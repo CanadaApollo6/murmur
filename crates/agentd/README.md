@@ -622,6 +622,14 @@ The seed replaces the operator, so a seeded task never waits in `review`:
 The note on the claimant's report is the same on a seeded task. It still says
 that a claim waits for a verifier or the operator.
 
+The secrecy has one limit. Up to and including its report, an agent sees the
+same thing on a seeded task and on an ordinary one. Later it can learn that a
+task was ordinary: only an ordinary task can be reopened by `resolve refute`,
+and the owner gets a notice. No notice proves nothing, so an agent never learns
+that a task was seeded. The operator's surfaces do show a difference. In
+`agentctl tasks` and the feed, an ordinary claim waits in `review` and a seeded
+claim is closed.
+
 #### Calibration
 
 The `calibration_events` table records whether a claimant or a verifier was
