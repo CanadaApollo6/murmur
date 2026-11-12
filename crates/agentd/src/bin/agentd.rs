@@ -102,10 +102,11 @@ async fn run(args: Args) -> Result<()> {
         .unwrap_or_else(|| state.join("mcp.sock"));
     let mut sandbox = cfg.bwrap.clone();
     sandbox.repin_binds = args.repin_binds;
-    let mail_config = agentd::mailroom::Config {
+    let mut mail_config = agentd::mailroom::Config {
         limits: cfg.mail.clone(),
         ..Default::default()
     };
+    let verify_file = cfg.verify.clone();
     let rap_config = cfg.rap.clone();
     let ui_config = cfg.ui.clone();
     let ui = agentd::surfaces::ui::UiServer::bind(ui_config.clone(), &state).await?;
@@ -133,6 +134,8 @@ async fn run(args: Args) -> Result<()> {
         Some(agentd::surfaces::rap::RapServer::bind(&rap_config, infinity_sockets).await?)
     };
     sandbox.validate(&state, &control_path, &mcp_path, &mut kinds)?;
+    let verify = agentd::verify::Settings::from_file(verify_file.as_ref(), &kinds)?;
+    mail_config.verifier_available = verify.is_some();
     if kinds
         .iter()
         .any(|k| matches!(k.isolation, agentd::sandbox::Isolation::Bwrap(_)))
@@ -164,13 +167,15 @@ async fn run(args: Args) -> Result<()> {
         std::env::current_exe()?,
         bound_tx,
     ));
-    let broker = Arc::new(
-        Broker::new(Arc::clone(&mailroom), kinds, Default::default())?.with_mcp(
-            Arc::clone(&bindings),
-            state.clone(),
-            sandbox,
-        ),
+    let mut broker = Broker::new(Arc::clone(&mailroom), kinds, Default::default())?.with_mcp(
+        Arc::clone(&bindings),
+        state.clone(),
+        sandbox,
     );
+    if let Some(settings) = verify {
+        broker = broker.with_verifier(agentd::verify::Runner::new(settings, &state)?);
+    }
+    let broker = Arc::new(broker);
     let result = serve(
         &control_path,
         &mcp_path,
@@ -216,6 +221,12 @@ async fn serve(
         async move { broker.expire_tasks().await }
     };
     tokio::pin!(expiry);
+    let verifications = {
+        let broker = Arc::clone(&broker);
+        async move { broker.run_verifications().await }
+    };
+    tokio::pin!(verifications);
+    let mut verifications_done = false;
     let api = Arc::new(ControlApi {
         broker,
         mailroom,
@@ -252,6 +263,11 @@ async fn serve(
         let accepted = tokio::select! {
             result = &mut rap_server => break result,
             () = &mut expiry => break Err("task expiry stopped: the mailroom closed".into()),
+            () = &mut verifications, if !verifications_done => {
+                // Without a runner this returns at once.
+                verifications_done = true;
+                continue;
+            }
             result = &mut ui_server => {ui_done=true;break result?;},
             Some(listener) = bound.recv() => {
                 let api = Arc::clone(&api);

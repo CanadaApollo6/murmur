@@ -47,6 +47,9 @@ pub struct FileConfig {
     pub rap: rap::RapConfig,
     #[serde(default)]
     pub ui: ui::UiConfig,
+    /// Verifiers for `partial` and `infeasible` claims. Without it, every
+    /// claim goes to the operator.
+    pub verify: Option<crate::verify::VerifyFile>,
     #[serde(default)]
     kind: BTreeMap<String, KindFile>,
 }
@@ -59,6 +62,7 @@ pub struct ListenConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KindFile {
+    family: Option<String>,
     sandbox: Option<crate::sandbox::SandboxMode>,
     home: Option<Vec<String>>,
     credentials: Option<Vec<PathBuf>>,
@@ -171,6 +175,13 @@ impl FileConfig {
                 );
             }
             kind.name = name.clone();
+            kind.family = match entry.family {
+                Some(family) if family.trim().is_empty() => {
+                    return Err(format!("kind {name}: family must not be empty").into());
+                }
+                Some(family) => Some(family.trim().to_ascii_lowercase()),
+                None => None,
+            };
             kind.model = entry.model;
             kind.env = entry.env;
             if let Some(mode) = entry.mode {

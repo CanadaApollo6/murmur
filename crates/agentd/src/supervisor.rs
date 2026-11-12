@@ -277,6 +277,7 @@ pub struct Broker {
     mcp: Option<Arc<crate::surfaces::Bindings>>,
     isolation: Option<(PathBuf, crate::sandbox::SandboxConfig)>,
     credentials: Arc<std::sync::Mutex<crate::credentials::Credentials>>,
+    verify: Option<Arc<crate::verify::Runner>>,
 }
 impl Broker {
     pub fn new(mailroom: Arc<Mailroom>, kinds: Vec<KindConfig>, config: Config) -> Result<Self> {
@@ -324,7 +325,21 @@ impl Broker {
             mcp: None,
             isolation: None,
             credentials: Default::default(),
+            verify: None,
         })
+    }
+    /// Starts verifiers for pending claims. Run `run_verifications` too.
+    /// The mailroom needs `verifier_available` set.
+    pub fn with_verifier(mut self, runner: crate::verify::Runner) -> Self {
+        self.verify = Some(Arc::new(runner));
+        self
+    }
+    /// The reconcile loop of the verifier runner. Returns at once without a
+    /// runner, and otherwise when the mailroom closes.
+    pub async fn run_verifications(&self) {
+        if let Some(runner) = self.verify.clone() {
+            crate::verify::run(&runner, self).await;
+        }
     }
     pub fn with_mcp(
         mut self,
@@ -518,6 +533,16 @@ impl Broker {
                 return Err(Error::Rejected("agent already supervised".into()));
             }
         }
+        let verifier = self.mailroom.role(id).await? == Some(crate::swarm::AgentRole::Verifier);
+        let kind = if verifier {
+            // A verifier gets no MCP server but the broker's.
+            KindConfig {
+                mcp_servers: Vec::new(),
+                ..kind
+            }
+        } else {
+            kind
+        };
         let (lease, incarnation, resume) = self.mailroom.claim_actor(id, spec.kind.clone()).await?;
         self.mailroom.save_spec(id, spec.clone()).await?;
         let initial = if self.mailroom.stopped(id).await? {
@@ -556,6 +581,7 @@ impl Broker {
             mcp: self.mcp.clone(),
             isolation: self.isolation.clone(),
             credentials: self.credentials.clone(),
+            verifier,
             isolation_tx,
             incarnation_tx,
             hint_tx,
@@ -621,9 +647,43 @@ impl Broker {
         let agents = Arc::clone(&self.agents);
         let to = message.to;
         let mailroom = Arc::clone(&self.mailroom);
+        let runner = self.verify.clone().filter(|_| {
+            matches!(
+                &message.act,
+                crate::swarm::Act::Report {
+                    outcome: crate::swarm::Outcome::Partial { .. }
+                        | crate::swarm::Outcome::Infeasible { .. },
+                    ..
+                }
+            )
+        });
         // A dropped caller must not separate a durable accept from its wakeup.
         tokio::spawn(async move {
+            // A claim's snapshot is taken here, before the claimant's send
+            // returns, so the claimant cannot change its workspace first.
+            let gate = match &runner {
+                Some(runner) => Some(runner.gate.read().await),
+                None => None,
+            };
             let outcome = mailroom.accept(message).await;
+            let claimed = match (&runner, &outcome) {
+                (
+                    Some(runner),
+                    Ok((SendOutcome::Queued { id } | SendOutcome::Held { id, .. }, _)),
+                ) if runner
+                    .inflight
+                    .lock()
+                    .expect("bug: inflight set poisoned")
+                    .insert(*id) =>
+                {
+                    Some((runner, *id))
+                }
+                _ => None,
+            };
+            drop(gate);
+            if let Some((runner, id)) = claimed {
+                runner.snapshot_accepted(&mailroom, id).await;
+            }
             let wake = match &outcome {
                 Ok(_) => vec![to],
                 Err(crate::mailroom::Error::TaskExpired { notified, .. }) => notified.clone(),
@@ -717,6 +777,52 @@ impl Broker {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::verify::Host for Broker {
+    fn mailroom(&self) -> &Mailroom {
+        &self.mailroom
+    }
+    async fn verifier_down(&self, id: AgentId) -> bool {
+        self.handle(id)
+            .await
+            .is_none_or(|h| h.commands.is_closed() || matches!(h.phase(), Phase::Failed { .. }))
+    }
+    async fn start_verifier(&self, spec: AgentSpec) -> std::result::Result<(), String> {
+        self.restore(spec)
+            .await
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }
+    async fn restart_verifier(&self, id: AgentId) -> std::result::Result<(), String> {
+        self.operate(id, Operation::Restart)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    async fn retire_verifier(&self, id: AgentId) -> std::result::Result<(), String> {
+        self.retire(id).await.map_err(|e| e.to_string())
+    }
+    fn pin_snapshot(
+        &self,
+        kind: &str,
+        workspace: &std::path::Path,
+    ) -> std::result::Result<Option<crate::sandbox::PinnedPath>, String> {
+        let kind = self
+            .kinds
+            .get(kind)
+            .ok_or_else(|| format!("verifier kind {kind} is not configured"))?;
+        if !matches!(kind.isolation, crate::sandbox::Isolation::Bwrap(_)) {
+            return Ok(None);
+        }
+        let (state, cfg) = self
+            .isolation
+            .as_ref()
+            .ok_or("bwrap requires an MCP isolation context")?;
+        crate::sandbox::PinnedPath::capture_snapshot(workspace, cfg, state)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+}
+
 struct AgentActor {
     agents: Arc<Mutex<HashMap<AgentId, AgentHandle>>>,
     retired: bool,
@@ -725,6 +831,8 @@ struct AgentActor {
     isolation: Option<(PathBuf, crate::sandbox::SandboxConfig)>,
     credentials: Arc<std::sync::Mutex<crate::credentials::Credentials>>,
     kind: KindConfig,
+    /// A verifier's workspace is its snapshot, and it gets no writable bind.
+    verifier: bool,
     mcp: Option<Arc<crate::surfaces::Bindings>>,
     _lease: crate::mailroom::ActorLease,
     permissions_guard: crate::event_hub::PermissionGuard,
@@ -993,6 +1101,7 @@ impl AgentActor {
                     let mounts = cfg.launch_mounts(
                         self.spec.workspace.as_ref().expect("workspace captured"),
                         state,
+                        self.verifier,
                     )?;
                     let paths = crate::sandbox::AgentPaths::new(state, self.id);
                     crate::sandbox::seed(sb, &paths.home)?;

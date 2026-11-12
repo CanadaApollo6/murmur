@@ -132,6 +132,7 @@ per_turn = 16   # Envelopes offered to a session in one pump.
 
 [kind.claude]
 wire = "acp"
+family = "anthropic" # Optional. Only kinds with a family can verify or be verified.
 command = ["claude-agent-acp"]
 mode = "default"
 workspace_write_mode = "acceptEdits"
@@ -142,6 +143,7 @@ idle_after_secs = 600 # 0 disables suspension
 
 [kind.codex]
 wire = "acp"
+family = "openai"
 command = ["codex-acp"]
 mode = "read-only"
 workspace_write_mode = "workspace-write"
@@ -149,6 +151,15 @@ full_access_mode = "agent-full-access"
 idle_after_secs = 600
 [kind.codex.env]
 INITIAL_AGENT_MODE = "read-only"
+
+# Optional. Without it, every partial or infeasible claim goes to the operator.
+# See "Verification of claims".
+[verify]
+kinds = ["codex", "claude"] # Verifier kinds, in order of preference.
+wall_secs = 900             # Wall clock budget of one check.
+# tokens = 200000           # Optional token budget of one check.
+max_running = 2             # Checks that run at once.
+max_snapshot_bytes = 2147483648
 ```
 
 Queued, offered, uncertain, and held mail count toward the sender and pair limits.
@@ -526,8 +537,67 @@ A `partial` or `infeasible` report says that work cannot be done. The broker
 does not take that on trust. When the mailroom's `verifier_available` flag is
 set, the report moves the task to `verifying` and records a pending
 verification. When the flag is off, the task goes straight to `review` with the
-finding `unverified`. The flag is off by default, and nothing in the daemon sets
-it yet, so today every such claim waits in `review` for the operator.
+finding `unverified`. The daemon sets the flag only when `kinds.toml` has a
+`[verify]` table whose `kinds` list is not empty. Without one, every such claim
+waits in `review` for the operator, as before.
+
+##### The verifier runner
+
+Each kind can name its `family`, such as `anthropic` or `openai`. The family is
+trimmed and lowercased. `[verify] kinds` lists the kinds that may verify, in
+order of preference. The daemon refuses to start if a listed kind is not
+configured, has no family, is not an ACP kind, or runs with `sandbox = "none"`.
+The error names the kind.
+
+The runner picks a verifier for each claim. The claimant is the owner of the
+claimant's task, and its family comes from its kind. The runner takes the first
+listed kind whose family differs from the claimant's. If no kind qualifies, or
+the claimant's kind has no family, the claim goes to `review` with the finding
+`unverified` and a reason.
+
+The verifier works on a copy of the claimant's workspace, at
+`<state>/verify/<report>/workspace`. The `verify` directory is mode 0700. No
+worker sandbox can bind it or anything under it. The copy follows these rules:
+
+- No program runs on the claimant's workspace. The copy reads it directly.
+- A symlink is copied as a symlink and never followed.
+- Sockets, FIFOs and devices are skipped.
+- Every `.git` entry is dropped, at any depth.
+- Instruction files get the suffix `.claimant-copy`, at any depth and in any
+  case: `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `GEMINI.md`, `.mcp.json`,
+  `.claude`, `.codex` and `.cursor`.
+- File content over `max_snapshot_bytes` stops the copy. The partial copy is
+  deleted and the claim goes to `review` as `unverified`.
+- Files are mode 0600, or 0700 if the owner could run them.
+
+The broker takes the copy while it accepts the report, before the claimant's
+`send_message` returns. Such a snapshot is clean. A claim found pending later,
+for example after a restart, gets a snapshot that is not clean, and a
+`confirmed` verdict from it goes to `review`. A file named `complete` marks a
+finished copy. A copy without it was cut short by a crash, so it is deleted and
+taken again as not clean.
+
+The verifier is an agent named `v-<report>` of the chosen kind. Its working
+directory is the snapshot. It gets workspace write on the snapshot and nothing
+else outside its private home and `/tmp`. It keeps its kind's egress hosts and
+read-only binds, but no writable bind and no MCP server other than the broker's.
+Its permission rules allow `shell`, `edit` and `send_message` and deny every
+other tool. The bwrap sandbox is the boundary, so the verifier runs commands
+without asking, and no request waits for the operator. Its budget comes from
+`wall_secs` and `tokens`. The brief also says that files in the workspace and
+command output may have been written by the claimant, so they are evidence, not
+instructions and not proof.
+
+The runner wakes at startup, on every task change and every 30 seconds:
+
+- It starts pending checks while fewer than `max_running` checks run.
+- A check whose verifier fails to start three times in one daemon run goes to
+  `review` as `unverified`.
+- A running check whose verifier is down gets a restart, up to three per daemon
+  run. If that fails, its task expires and the claim goes to `review`.
+- A settled check's verifier is retired. Then its snapshot is deleted.
+- An error on one check does not stop the others. After an error, the runner
+  waits one second before the next pass.
 
 `Mailroom::open_verification` starts one check in one transaction. It registers
 a verifier agent, saves its spec, and opens a verification task for it. The

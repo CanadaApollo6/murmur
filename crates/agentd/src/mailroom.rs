@@ -88,7 +88,10 @@ pub struct VerifierStart {
     pub budget: Budget,
     pub verifier_family: String,
     pub claimant_family: String,
-    /// Whether the claimant's workspace snapshot had no uncommitted changes.
+    /// Whether the snapshot of the claimant's workspace was taken before the
+    /// claimant could act again: in the path that accepted its report, before
+    /// its send returned. A snapshot taken later, for example after a daemon
+    /// restart, is not clean, and a confirmation from it goes to the operator.
     pub snapshot_clean: bool,
 }
 
@@ -791,6 +794,38 @@ impl Mailroom {
                 .collect::<rusqlite::Result<_>>()?)
         })
         .await
+    }
+
+    /// Verifications whose verifier owns an open task, oldest first.
+    pub async fn running_verifications(&self) -> Result<Vec<Verification>> {
+        self.call(|s| {
+            Ok(s.db
+                .prepare(&format!(
+                    "{VERIFICATION_SELECT} WHERE state='running' ORDER BY rowid"
+                ))?
+                .query_map([], verification_row)?
+                .collect::<rusqlite::Result<_>>()?)
+        })
+        .await
+    }
+
+    /// An agent's saved spec, retired or not.
+    pub async fn agent_spec(&self, agent: AgentId) -> Result<Option<crate::supervisor::AgentSpec>> {
+        self.call(move |s| {
+            Ok(s.db
+                .query_row(
+                    "SELECT spec FROM agent_specs WHERE agent=?",
+                    [json(&agent)?],
+                    |r| json_col(r, 0),
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    /// An agent's role, or `None` for an unknown agent.
+    pub async fn role(&self, agent: AgentId) -> Result<Option<AgentRole>> {
+        self.call(move |s| role(&s.db, agent)).await
     }
 
     pub async fn verification(&self, report: MessageId) -> Result<Verification> {
