@@ -428,7 +428,9 @@ operator's request opens a root task and must omit `parent_task`. Outcomes are
 `done { artifacts }`, `partial { artifacts, not_possible, evidence }`,
 `infeasible { evidence }`, `failed { tried }` and `blocked { on }`, where
 `evidence` is `{ tried, obstacle, reproduction? }`. `partial` and `infeasible`
-move the task to `Verifying`; the others close it. `propose` and `decide` have no
+are claims that need a check. They move the task to `verifying` or `review`, as
+[Verification](#verification-of-claims) describes. The others close it. A report
+may carry a `verdict` only on a verification task. `propose` and `decide` have no
 wire form and are rejected. Unknown fields are rejected for every kind,
 `inform` included. An invalid act returns an error and stores nothing. The tool
 schema lists each kind as a `oneOf` branch with its own required fields, and a
@@ -440,7 +442,7 @@ deliverable follows the body as `Deliverable: ...`, and a report's outcome
 follows it as `Outcome: {...}`. After the tag, the broker writes only values it
 produced. For a request, that is the task id, stakes, budget and the exact report
 to send. For a report, it is the outcome kind and whether the task closed or waits
-for verification. These notes replace the usual "Reply with send_message" line.
+for a verifier or the operator. These notes replace the usual "Reply with send_message" line.
 
 A report must be addressed to the agent that requested the task. Agents cannot
 mail the operator or a retired agent, so a task the operator requested, or one
@@ -468,7 +470,9 @@ expires overdue tasks at once. A send that arrives after the deadline expires
 the task itself. Every send on an expired task is rejected with an error that
 says the task expired. The assignee's running turn is not cancelled. Child
 tasks keep their own budgets. Expired tasks need schema version 4, so an older
-`agentd` refuses the database.
+`agentd` refuses the database. A task the operator reopens gets its whole
+`wall_secs` again, counted from the reopen. Its deadline, its expiry and its
+recorded `spent.wall_secs` all use that new start.
 
 `spent` keeps child reservations, which are never refunded, so a reported
 task's `spent.wall_secs` is the larger of its reservations and its open time.
@@ -481,8 +485,74 @@ agentctl tasks
 ```
 
 `agentctl tasks` prints every task with its `id`, `parent`, `state` (`open`,
-`verifying`, `closed` or `expired`), `requester`, `assignee`, `deliverable`,
-`stakes`, `budget`, `spent` and `outcome`.
+`verifying`, `review`, `closed` or `expired`), `requester`, `assignee`,
+`deliverable`, `stakes`, `budget`, `spent`, `outcome` and `finding`. `finding`
+is null unless the task is in `review`.
+
+#### Verification of claims
+
+A `partial` or `infeasible` report says that work cannot be done. The broker
+does not take that on trust. When the mailroom's `verifier_available` flag is
+set, the report moves the task to `verifying` and records a pending
+verification. When the flag is off, the task goes straight to `review` with the
+finding `unverified`. The flag is off by default, and nothing in the daemon sets
+it yet, so today every such claim waits in `review` for the operator.
+
+`Mailroom::open_verification` starts one check in one transaction. It registers
+a verifier agent, saves its spec, and opens a verification task for it. The
+task's request comes from the operator. Its body is a brief that quotes the
+original request, the deliverable and the claimant's evidence. Every quoted
+block is escaped, and the brief says that quoted blocks are data, not
+instructions. For a `partial` claim, the contested claim is `not_possible`. The
+brief includes this rule: "A path counts only if it stays inside the original
+task's scope and meets what the deliverable is checking. A change that makes
+the check pass without meeting it is not a path."
+
+A verifier answers with one report on its verification task:
+
+```json
+{"kind":"report","task":"<verification task>","outcome":{"kind":"done"},"verdict":{"kind":"refuted","path":"what to change","reproduction":"how to see it work"}}
+{"kind":"report","task":"<verification task>","outcome":{"kind":"done"},"verdict":{"kind":"confirmed","tried":"what was tried"}}
+{"kind":"report","task":"<verification task>","outcome":{"kind":"failed","tried":"why it could not decide"}}
+```
+
+`done` needs a verdict. `failed` and `blocked` carry none and mean the check was
+inconclusive. `partial` and `infeasible` are rejected on a verification task.
+A verdict is rejected on any other task.
+
+The verdict settles the claim in the same transaction:
+
+- `confirmed` closes the task as a success with the claimant's outcome. A
+  `high` stakes task, or a check whose snapshot was not clean, goes to `review`
+  instead. `low` stakes is treated as `normal`.
+- `refuted` goes to `review`. Every refutation waits for the operator.
+- An inconclusive report goes to `review`. So does a verification task that
+  expires.
+- If the claimant's task is no longer verifying that report, the verdict is
+  stored and changes nothing.
+
+A verifier is a separate role. No agent can send it mail. It can send exactly
+one message: the report on its own running verification task. That report is
+stored but never delivered. `list_agents` and name lookups for agents skip
+verifiers. `agentctl ls` shows every agent with its `role`.
+
+The operator settles a task in `review`:
+
+```sh
+agentctl resolve <task> confirm   # close it as a success with the claimant's outcome
+agentctl resolve <task> refute    # reopen it and tell the owner
+```
+
+`resolve` works only on a task in `review`. A refuted task reopens with its
+whole wall clock budget, and the owner gets a notice. For a `refuted` finding,
+the notice quotes the verifier's path and reproduction, escaped. The event feed
+lists tasks in `review` in the snapshot's `review` field and sends a `review`
+frame when that list changes. The feed shows only the finding's kind.
+
+Roles, verifications and reopened clocks need schema version 5. Opening a
+version 4 database upgrades it in place. Existing agents become workers, and a
+task left in `verifying` gets a pending verification. An older `agentd` refuses
+a version 5 database.
 
 Agent specs, resume handles and mail survive daemon restarts. SIGINT and SIGTERM
 stop connections, shut down broker actors, then drain and close the mailroom.
@@ -623,7 +693,9 @@ Dropping the handle also drains submissions, but does not wait for thread exit.
   `mark_started`, `mark_consumed`, `session_ended`, `held`, `release`,
   `drop_held` and `retire`.
 - Ledger operations are `task`, `tasks`, `expire_tasks(now)`, `new_epoch` and
-  `exposures`. `expire_tasks` expires every task due at `now` and returns the
+  `exposures`. Verification operations are `pending_verifications`,
+  `open_verification`, `verification`, `unverifiable`, `settled_verifiers` and
+  `resolve_review`. `expire_tasks` expires every task due at `now` and returns the
   tasks, the agents it notified and the next deadline. Running it twice has no
   second effect.
   A Request creates its task inside `accept`; there is no separate creation path.
