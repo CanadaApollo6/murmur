@@ -39,6 +39,15 @@ pub enum Error {
     Transition(DeliveryState),
     #[error("task budget exceeded")]
     BudgetExceeded,
+    #[error(
+        "rejected: task {task} expired when its wall clock budget of {wall_secs}s ran out; it can no longer be reported"
+    )]
+    TaskExpired {
+        task: TaskId,
+        wall_secs: u64,
+        /// Agents whose expiry notices this call queued.
+        notified: Vec<AgentId>,
+    },
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -58,6 +67,15 @@ pub enum SendOutcome {
     Queued { id: MessageId },
     Held { id: MessageId, reason: String },
     Duplicate { id: MessageId },
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Sweep {
+    pub expired: Vec<TaskId>,
+    /// Agents whose expiry notices this sweep queued.
+    pub notified: Vec<AgentId>,
+    /// The earliest deadline among tasks still open.
+    pub next: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -569,6 +587,30 @@ impl Mailroom {
         self.call(move |s| s.accept(msg)).await
     }
 
+    /// Expires every open task whose deadline is at or before `now` and
+    /// queues its notices in the same transaction.
+    pub async fn expire_tasks(&self, now: OffsetDateTime) -> Result<Sweep> {
+        self.call(move |s| {
+            let tx = s.db.transaction()?;
+            let open = tx
+                .prepare(&format!("{TASK_SELECT} WHERE t.state=?"))?
+                .query_map([json(&TaskState::Open)?], task_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut sweep = Sweep::default();
+            for mut t in open {
+                if due(&t, now) {
+                    sweep.notified.extend(expire(&tx, &mut t, now)?);
+                    sweep.expired.push(t.id);
+                } else if let Some(deadline) = t.deadline() {
+                    sweep.next = Some(sweep.next.map_or(deadline, |n| n.min(deadline)));
+                }
+            }
+            tx.commit()?;
+            Ok(sweep)
+        })
+        .await
+    }
+
     pub async fn message(&self, id: MessageId) -> Result<Envelope> {
         self.call(move |s| message(&s.db, id)).await
     }
@@ -841,7 +883,7 @@ impl Store {
             ));
         }
         let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 3 {
+        if version > 4 {
             return Err(Error::Rejected(format!(
                 "unsupported schema version {version}"
             )));
@@ -852,6 +894,9 @@ impl Store {
         }
         if version < 3 {
             db.execute_batch(include_str!("schema-v3.sql"))?;
+        }
+        if version < 4 {
+            db.execute_batch(include_str!("schema-v4.sql"))?;
         }
         let last_prune = feed::head(&db)?;
         Ok(Self {
@@ -915,6 +960,21 @@ impl Store {
         }
         let parent = msg.reply_to.map(|id| message(&tx, id)).transpose()?;
         let current_task = msg.task.or_else(|| parent.as_ref().and_then(|p| p.task));
+        let context = match msg.act {
+            Act::Report { task, .. } => Some(task),
+            _ => current_task,
+        };
+        if let Some(id) = context {
+            let mut t = task(&tx, id)?;
+            if due(&t, now) {
+                let notified = expire(&tx, &mut t, now)?;
+                tx.commit()?;
+                return Err(expired(&t, notified));
+            }
+            if t.state == TaskState::Expired {
+                return Err(expired(&t, Vec::new()));
+            }
+        }
         // A report's recipient is checked against the task below.
         if !matches!(msg.act, Act::Report { .. }) {
             active(&tx, msg.to)?;
@@ -1364,6 +1424,13 @@ fn owned_task(db: &Connection, id: TaskId, owner: AgentId) -> Result<Task> {
 fn not_open() -> Error {
     Error::Rejected("task must be open and owned by sender".into())
 }
+fn expired(t: &Task, notified: Vec<AgentId>) -> Error {
+    Error::TaskExpired {
+        task: t.id,
+        wall_secs: t.budget.wall_secs,
+        notified,
+    }
+}
 
 /// Everything that changes a task's state or spend.
 enum TaskEvent<'a> {
@@ -1376,13 +1443,20 @@ enum TaskEvent<'a> {
         outcome: &'a Outcome,
         at: OffsetDateTime,
     },
+    /// Only for a task that is `due`.
+    Expire,
 }
 
-/// The task lifecycle: `Open` moves to `Verifying` or `Closed`, and only an
-/// `Open` task is charged.
+fn due(t: &Task, now: OffsetDateTime) -> bool {
+    t.state == TaskState::Open && t.deadline().is_some_and(|deadline| now >= deadline)
+}
+
+/// The task lifecycle: `Open` moves to `Verifying`, `Closed` or `Expired`, and
+/// only an `Open` task is charged. Callers apply expiry with `due` first.
 fn advance(t: &mut Task, event: TaskEvent<'_>) -> Result<()> {
     match t.state {
         TaskState::Open => {}
+        TaskState::Expired => return Err(expired(t, Vec::new())),
         TaskState::Verifying { .. } | TaskState::Closed { .. } => return Err(not_open()),
     }
     match event {
@@ -1421,10 +1495,66 @@ fn advance(t: &mut Task, event: TaskEvent<'_>) -> Result<()> {
                 },
             };
         }
+        TaskEvent::Expire => {
+            t.spent.wall_secs = t.budget.wall_secs;
+            t.state = TaskState::Expired;
+        }
     }
     Ok(())
 }
 
+/// Expires `t` and queues its notices in the caller's transaction. Returns
+/// the agents notified.
+fn expire(tx: &Connection, t: &mut Task, now: OffsetDateTime) -> Result<Vec<AgentId>> {
+    advance(t, TaskEvent::Expire)?;
+    save_task(tx, t)?;
+    let request = message(tx, t.request)?;
+    let owner: String = tx.query_row(
+        "SELECT name FROM agents WHERE id=?",
+        [json(&t.owner)?],
+        |r| r.get(0),
+    )?;
+    let mut notices = vec![(
+        t.owner,
+        format!(
+            "Task {} expired: its wall clock budget of {}s ran out. It can no longer be reported.",
+            t.id, t.budget.wall_secs
+        ),
+    )];
+    if let Sender::Agent(requester) = t.requested_by
+        && requester != t.owner
+    {
+        notices.push((
+            requester,
+            format!(
+                "Task {} assigned to @{owner} expired: its wall clock budget of {}s ran out.",
+                t.id, t.budget.wall_secs
+            ),
+        ));
+    }
+    let mut notified = Vec::new();
+    for (to, body) in notices {
+        if retired(tx, to)? {
+            continue;
+        }
+        let env = Envelope {
+            id: MessageId::new(),
+            from: Sender::Human,
+            to,
+            conversation: request.conversation,
+            in_reply_to: Some(t.request),
+            hop: 0,
+            act: Act::Inform,
+            task: Some(t.id),
+            exposure: None,
+            body: Body::new(body).expect("bug: an expiry notice is a short nonempty body"),
+            sent_at: now,
+        };
+        insert_message(tx, &env, &format!("task-expired:{}:{to}", t.id), None)?;
+        notified.push(to);
+    }
+    Ok(notified)
+}
 fn save_task(db: &Connection, t: &Task) -> Result<()> {
     db.execute(
         "UPDATE tasks SET spent=?,state=? WHERE id=?",
@@ -1629,6 +1759,85 @@ mod budget_tests {
             30,
             "a child's reservation is never refunded"
         );
+        r.room.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_send_after_the_deadline_expires_the_task_before_any_sweep() {
+        let r = Room::new().await;
+        let root = r
+            .request(Sender::Human, r.a, None, 60, Duration::ZERO)
+            .await;
+        r.send(
+            mail(Sender::Agent(r.a), r.b, Some(root)),
+            Duration::seconds(59),
+        )
+        .await
+        .expect("before the deadline");
+        let late = r
+            .send(
+                mail(Sender::Agent(r.a), r.b, Some(root)),
+                Duration::seconds(60),
+            )
+            .await
+            .expect_err("at the deadline");
+        assert!(
+            matches!(&late, Error::TaskExpired { task, notified, .. } if *task == root && *notified == vec![r.a]),
+            "{late:?}"
+        );
+        let t = r.room.task(root).await.expect("root");
+        assert_eq!(t.state, TaskState::Expired);
+        assert_eq!(t.spent.messages, 1);
+        assert_eq!(t.spent.wall_secs, 60);
+        let notice = r.room.pending_for(r.a).await.expect("pending");
+        assert_eq!(notice.len(), 2, "the request and one notice");
+        let again = r
+            .send(report(r.a, r.a, root), Duration::seconds(61))
+            .await
+            .expect_err("no report after expiry");
+        assert!(
+            matches!(&again, Error::TaskExpired { notified, .. } if notified.is_empty()),
+            "{again:?}"
+        );
+        let sweep = r
+            .room
+            .expire_tasks(r.t0 + Duration::seconds(120))
+            .await
+            .expect("sweep");
+        assert!(sweep.expired.is_empty() && sweep.notified.is_empty());
+        assert_eq!(r.room.pending_for(r.a).await.expect("pending").len(), 2);
+        r.room.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn children_of_an_expired_task_keep_their_own_budgets() {
+        let r = Room::new().await;
+        let root = r
+            .request(Sender::Human, r.a, None, 100, Duration::ZERO)
+            .await;
+        let child = r
+            .request(
+                Sender::Agent(r.a),
+                r.b,
+                Some(root),
+                90,
+                Duration::seconds(50),
+            )
+            .await;
+        let sweep = r
+            .room
+            .expire_tasks(r.t0 + Duration::seconds(100))
+            .await
+            .expect("sweep");
+        assert_eq!(sweep.expired, vec![root]);
+        assert_eq!(sweep.next, Some(r.t0 + Duration::seconds(140)));
+        assert_eq!(
+            r.room.task(child).await.expect("child").state,
+            TaskState::Open
+        );
+        r.send(report(r.b, r.a, child), Duration::seconds(120))
+            .await
+            .expect("the child still reports to its requester");
         r.room.close().await.expect("close");
     }
 }

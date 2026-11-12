@@ -73,15 +73,30 @@ pub struct Task {
     /// task leaves `Open`, `wall_secs` is at least the time it was open.
     pub spent: Budget,
     pub state: TaskState,
-    /// The request's `sent_at`. The wall clock runs from here.
+    /// The request's `sent_at`. The wall clock budget runs from here.
     pub opened: OffsetDateTime,
+}
+
+impl Task {
+    /// `None` when the deadline is past what `OffsetDateTime` can hold.
+    pub fn deadline(&self) -> Option<OffsetDateTime> {
+        let secs = i64::try_from(self.budget.wall_secs).ok()?;
+        self.opened.checked_add(time::Duration::seconds(secs))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskState {
     Open,
-    Verifying { report: MessageId },
-    Closed { outcome: Outcome, success: bool },
+    Verifying {
+        report: MessageId,
+    },
+    Closed {
+        outcome: Outcome,
+        success: bool,
+    },
+    /// The wall clock budget ran out while the task was open.
+    Expired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

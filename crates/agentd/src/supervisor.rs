@@ -589,18 +589,66 @@ impl Broker {
         // A dropped caller must not separate a durable accept from its wakeup.
         tokio::spawn(async move {
             let outcome = mailroom.accept(message).await;
-            match &outcome {
-                Ok(_) => {
-                    if let Some(handle) = agents.lock().await.get(&to) {
-                        handle.nudge();
-                    }
+            let wake = match &outcome {
+                Ok(_) => vec![to],
+                Err(crate::mailroom::Error::TaskExpired { notified, .. }) => notified.clone(),
+                Err(error) => {
+                    tracing::debug!(%error, "broker send failed");
+                    Vec::new()
                 }
-                Err(error) => tracing::debug!(%error, "broker send failed"),
+            };
+            let agents = agents.lock().await;
+            for id in wake {
+                if let Some(handle) = agents.get(&id) {
+                    handle.nudge();
+                }
             }
             outcome.map_err(Error::from)
         })
         .await
         .map_err(crate::mailroom::Error::from)?
+    }
+    /// Expires tasks at their deadlines and wakes the agents told about it.
+    /// Sleeps until the earliest deadline or the next mailroom change, so a
+    /// newly opened task with an earlier deadline is seen. Returns when the
+    /// mailroom closes.
+    pub async fn expire_tasks(&self) {
+        let mut changes = self.mailroom.changes();
+        loop {
+            changes.borrow_and_update();
+            let next = match self
+                .mailroom
+                .expire_tasks(time::OffsetDateTime::now_utc())
+                .await
+            {
+                Ok(sweep) => {
+                    for agent in sweep.notified {
+                        self.nudge(agent).await;
+                    }
+                    sweep.next
+                }
+                Err(crate::mailroom::Error::Closed) => return,
+                Err(error) => {
+                    tracing::error!(%error, "task expiry failed; retrying in one second");
+                    Some(time::OffsetDateTime::now_utc() + Duration::from_secs(1))
+                }
+            };
+            let wait = async {
+                match next {
+                    Some(at) => {
+                        let left = (at - time::OffsetDateTime::now_utc())
+                            .try_into()
+                            .unwrap_or(Duration::ZERO);
+                        tokio::time::sleep(left).await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                () = wait => {}
+                changed = changes.changed() => if changed.is_err() { return; },
+            }
+        }
     }
     pub async fn shutdown(&self) -> Result<()> {
         self.closing
@@ -3122,5 +3170,81 @@ mod halt_tests {
             "{cleared:?}"
         );
         h.broker.shutdown().await.expect("shutdown");
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    use super::*;
+    use crate::swarm::{Act, Budget, Stakes, TaskState};
+
+    #[tokio::test]
+    async fn the_expiry_loop_wakes_for_an_earlier_deadline_opened_while_it_sleeps() {
+        let dir = tempfile::tempdir().expect("dir");
+        let room = Arc::new(
+            Mailroom::open(dir.path().join("mail.db"), Default::default())
+                .await
+                .expect("mailroom"),
+        );
+        let broker =
+            Arc::new(Broker::new(room.clone(), vec![], Default::default()).expect("broker"));
+        let a = room
+            .register(AgentName::parse("a").expect("name"))
+            .await
+            .expect("register");
+        let request = |wall_secs| NewMessage {
+            from: Sender::Human,
+            to: a,
+            body: Body::new("work").expect("body"),
+            reply_to: None,
+            client_key: ClientKey(MessageId::new().to_string()),
+            act: Act::Request {
+                deliverable: "work".into(),
+                budget: Budget {
+                    tokens: None,
+                    wall_secs,
+                    messages: 1,
+                    hops: 1,
+                },
+                stakes: Stakes::Normal,
+            },
+            task: None,
+        };
+        let (_, late) = room.accept(request(3600)).await.expect("late task");
+        let before = room.jobs_run.load(SeqCst);
+        let sweeper = tokio::spawn({
+            let broker = broker.clone();
+            async move { broker.expire_tasks().await }
+        });
+        // The first sweep has started, so it sees only the late task and
+        // would sleep for an hour unless the next accept wakes it.
+        while room.jobs_run.load(SeqCst) == before {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let (_, early) = room.accept(request(1)).await.expect("early task");
+        let early = early.task().expect("task");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while room.task(early).await.expect("task").state != TaskState::Expired {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the early task expires within its one second budget");
+        let late = room.task(late.task().expect("task")).await.expect("late");
+        assert_eq!(late.state, TaskState::Open);
+        sweeper.abort();
+        match sweeper.await {
+            Err(error) if error.is_cancelled() => {}
+            other => panic!("expiry loop ended unexpectedly: {other:?}"),
+        }
+        drop(broker);
+        Arc::try_unwrap(room)
+            .map_err(|_| "mailroom still shared")
+            .expect("sole owner")
+            .close()
+            .await
+            .expect("close");
     }
 }

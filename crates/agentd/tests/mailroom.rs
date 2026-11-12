@@ -890,7 +890,7 @@ async fn schema_version_and_attempt_configuration_are_checked() {
     let dir = tempfile::tempdir().expect("dir");
     let path = dir.path().join("future.db");
     let db = rusqlite::Connection::open(&path).expect("db");
-    db.execute_batch("PRAGMA user_version=4").expect("version");
+    db.execute_batch("PRAGMA user_version=5").expect("version");
     db.close().expect("close");
     assert!(Mailroom::open(&path, Config::default()).await.is_err());
     assert!(
@@ -941,7 +941,7 @@ async fn version_two_database_upgrades_with_agents_running() {
     let version: u32 = db
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .expect("version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }
 
 #[tokio::test]
@@ -1663,6 +1663,10 @@ fn report(from: AgentId, to: AgentId, task: TaskId) -> NewMessage {
     msg
 }
 
+fn seconds(n: i64) -> time::Duration {
+    time::Duration::seconds(n)
+}
+
 #[tokio::test]
 async fn the_message_cap_rejects_the_next_send_and_still_accepts_the_report() {
     let (dir, mail, a, b) = setup(Config::default()).await;
@@ -1731,4 +1735,205 @@ async fn a_replayed_send_is_charged_once() {
     assert!(matches!(again, SendOutcome::Duplicate { .. }));
     assert_eq!(mail.task(root).await.expect("root").spent.messages, 1);
     mail.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn expiry_at_the_deadline_queues_each_notice_once() {
+    let (_dir, mail, a, b) = setup(Config::default()).await;
+    let root = request(&mail, Sender::Human, a, None, budget(100))
+        .await
+        .expect("root")
+        .task()
+        .expect("task");
+    let child = request(
+        &mail,
+        Sender::Agent(a),
+        b,
+        Some(root),
+        Budget {
+            wall_secs: 60,
+            ..budget(5)
+        },
+    )
+    .await
+    .expect("child")
+    .task()
+    .expect("task");
+    let opened = mail.task(child).await.expect("child").opened;
+    let deadline = opened + seconds(60);
+    let early = mail
+        .expire_tasks(deadline - seconds(1))
+        .await
+        .expect("early sweep");
+    assert!(early.expired.is_empty());
+    assert_eq!(early.next, Some(deadline));
+    let pending_before = (
+        mail.pending_for(a).await.expect("a").len(),
+        mail.pending_for(b).await.expect("b").len(),
+    );
+    let sweep = mail.expire_tasks(deadline).await.expect("sweep");
+    assert_eq!(sweep.expired, vec![child]);
+    assert_eq!(sweep.notified, vec![b, a]);
+    let expired = mail.task(child).await.expect("child");
+    assert_eq!(expired.state, TaskState::Expired);
+    assert_eq!(expired.spent.wall_secs, 60);
+    assert_eq!(mail.task(root).await.expect("root").state, TaskState::Open);
+    let again = mail
+        .expire_tasks(deadline + seconds(1))
+        .await
+        .expect("again");
+    assert!(again.expired.is_empty() && again.notified.is_empty());
+    let notices = |agent: AgentId, before: usize| {
+        let mail = &mail;
+        async move {
+            let pending = mail.pending_for(agent).await.expect("pending");
+            assert_eq!(pending.len(), before + 1, "exactly one notice");
+            pending.last().expect("notice").clone()
+        }
+    };
+    let to_owner = notices(b, pending_before.1).await;
+    assert_eq!(to_owner.from(), &Sender::Human);
+    assert_eq!(to_owner.task(), Some(child));
+    assert_eq!(*to_owner.act(), Act::Inform);
+    let body = to_owner.body().as_str();
+    assert!(
+        body.contains(&child.to_string())
+            && body.contains("wall clock budget of 60s")
+            && body.contains("can no longer be reported"),
+        "{body}"
+    );
+    let to_requester = notices(a, pending_before.0).await;
+    let body = to_requester.body().as_str();
+    assert!(
+        body.contains(&child.to_string()) && body.contains("@bob"),
+        "{body}"
+    );
+    mail.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn sends_on_an_expired_task_are_rejected_with_the_expiry() {
+    let (dir, mail, a, b) = setup(Config::default()).await;
+    let root = request(
+        &mail,
+        Sender::Human,
+        a,
+        None,
+        Budget {
+            wall_secs: 60,
+            ..budget(10)
+        },
+    )
+    .await
+    .expect("root")
+    .task()
+    .expect("task");
+    let opened = mail.task(root).await.expect("root").opened;
+    mail.expire_tasks(opened + seconds(60))
+        .await
+        .expect("sweep");
+    let error = mail
+        .accept(report(a, a, root))
+        .await
+        .expect_err("expired tasks take no report");
+    assert!(
+        matches!(&error, Error::TaskExpired { task, wall_secs: 60, notified } if *task == root && notified.is_empty()),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("expired"), "{error}");
+    for msg in [in_task(a, b, root), {
+        let mut child = in_task(a, b, root);
+        child.act = Act::Request {
+            deliverable: "more".into(),
+            budget: budget(1),
+            stakes: Stakes::Low,
+        };
+        child
+    }] {
+        assert!(matches!(
+            mail.accept(msg).await,
+            Err(Error::TaskExpired { .. })
+        ));
+    }
+    mail.close().await.expect("close");
+    assert_eq!(message_count(&dir), 2, "the request and one notice");
+}
+
+#[tokio::test]
+async fn an_overdue_task_expires_after_the_database_is_reopened() {
+    let (dir, mail, a, _) = setup(Config::default()).await;
+    let root = request(
+        &mail,
+        Sender::Human,
+        a,
+        None,
+        Budget {
+            wall_secs: 60,
+            ..budget(10)
+        },
+    )
+    .await
+    .expect("root")
+    .task()
+    .expect("task");
+    let opened = mail.task(root).await.expect("root").opened;
+    mail.close().await.expect("close");
+    let mail = Mailroom::open(dir.path().join("broker.db"), Config::default())
+        .await
+        .expect("reopen");
+    let sweep = mail
+        .expire_tasks(opened + seconds(3600))
+        .await
+        .expect("sweep");
+    assert_eq!(sweep.expired, vec![root]);
+    assert_eq!(sweep.notified, vec![a]);
+    assert_eq!(sweep.next, None);
+    mail.close().await.expect("close");
+}
+
+/// Version 4 adds no columns, so a version 3 file differs only in
+/// `user_version`. The rows below are the ones the version 3 code wrote.
+#[tokio::test]
+async fn a_version_three_database_opens_and_its_open_tasks_expire() {
+    let (dir, mail, a, _) = setup(Config::default()).await;
+    let root = request(
+        &mail,
+        Sender::Human,
+        a,
+        None,
+        Budget {
+            wall_secs: 60,
+            ..budget(10)
+        },
+    )
+    .await
+    .expect("root")
+    .task()
+    .expect("task");
+    mail.close().await.expect("close");
+    let path = dir.path().join("broker.db");
+    let db = rusqlite::Connection::open(&path).expect("db");
+    db.execute_batch("PRAGMA user_version=3")
+        .expect("version 3");
+    let state: String = db
+        .query_row("SELECT state FROM tasks", [], |r| r.get(0))
+        .expect("state");
+    assert_eq!(state, "\"Open\"");
+    db.close().expect("close");
+    let mail = Mailroom::open(&path, Config::default())
+        .await
+        .expect("upgrade");
+    let task = mail.task(root).await.expect("old task");
+    assert_eq!(task.state, TaskState::Open);
+    let sweep = mail
+        .expire_tasks(task.opened + seconds(60))
+        .await
+        .expect("sweep");
+    assert_eq!(sweep.expired, vec![root]);
+    mail.close().await.expect("close");
+    let db = rusqlite::Connection::open(&path).expect("db");
+    let version: u32 = db
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("version");
+    assert_eq!(version, 4);
 }
