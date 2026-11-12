@@ -678,19 +678,18 @@ impl Broker {
                 (
                     Some(runner),
                     Ok((SendOutcome::Queued { id } | SendOutcome::Held { id, .. }, _)),
-                ) if runner
-                    .inflight
-                    .lock()
-                    .expect("bug: inflight set poisoned")
-                    .insert(*id) =>
-                {
-                    Some((runner, *id))
-                }
+                ) if runner.claim(*id) => Some((runner, *id)),
                 _ => None,
             };
             drop(gate);
             if let Some((runner, id)) = claimed {
                 runner.snapshot_accepted(&mailroom, id).await;
+            } else if let (Some(runner), Ok((SendOutcome::Duplicate { id }, _))) =
+                (&runner, &outcome)
+            {
+                // A retry of the report. It returns no sooner than the send
+                // that was accepted, which may still be taking the snapshot.
+                runner.snapshot_settled(*id).await;
             }
             let wake = match &outcome {
                 Ok(_) => vec![to],
@@ -1473,19 +1472,35 @@ impl AgentActor {
             .iter()
             .find(|r| r.tool == "*" || r.tool == request.tool)
             .map_or(RuleDecision::Ask, |r| r.decision);
-        let effect = match decision {
-            RuleDecision::Allow => Some(PermissionEffect::AllowOnce),
-            RuleDecision::Deny => Some(PermissionEffect::RejectOnce),
-            RuleDecision::Ask => None,
+        let wanted: &[PermissionEffect] = match decision {
+            RuleDecision::Allow => &[PermissionEffect::AllowOnce],
+            RuleDecision::Deny => &[PermissionEffect::RejectOnce, PermissionEffect::RejectAlways],
+            RuleDecision::Ask => &[],
         };
-        if let Some(option) =
-            effect.and_then(|effect| request.options.iter().find(|o| o.effect == effect))
+        if let Some(option) = wanted
+            .iter()
+            .find_map(|effect| request.options.iter().find(|o| o.effect == *effect))
         {
             if let Err(error) = self
                 .session()?
                 .answer_permission(request.id, &option.key)
                 .await
             {
+                self.end(error.to_string()).await?;
+            }
+        } else if matches!(decision, RuleDecision::Deny)
+            && request.options.iter().any(|o| {
+                matches!(
+                    o.effect,
+                    PermissionEffect::AllowOnce | PermissionEffect::AllowAlways
+                )
+            })
+        {
+            // A tool call that can be allowed and not refused. A deny rule
+            // never hands it to the operator, so the turn ends instead. A
+            // request with no allow option is a question, not a tool call,
+            // and still goes to the operator.
+            if let Err(error) = self.cancel().await {
                 self.end(error.to_string()).await?;
             }
         } else {

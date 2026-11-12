@@ -43,9 +43,10 @@ fn a_verify_table_parses_with_defaults() {
     );
     assert_eq!(settings.max_running, 2);
     assert_eq!(settings.max_snapshot_bytes, 2 * 1024 * 1024 * 1024);
+    assert_eq!(settings.max_snapshot_entries, 500_000);
 
     let settings = parse(&format!(
-        "{KINDS}[verify]\nkinds = [\"codex\"]\nwall_secs = 60\ntokens = 5000\nmax_running = 4\nmax_snapshot_bytes = 1024\n"
+        "{KINDS}[verify]\nkinds = [\"codex\"]\nwall_secs = 60\ntokens = 5000\nmax_running = 4\nmax_snapshot_bytes = 1024\nmax_snapshot_entries = 7\n"
     ))
     .expect("valid")
     .expect("settings");
@@ -53,6 +54,7 @@ fn a_verify_table_parses_with_defaults() {
     assert_eq!(settings.budget.tokens, Some(5000));
     assert_eq!(settings.max_running, 4);
     assert_eq!(settings.max_snapshot_bytes, 1024);
+    assert_eq!(settings.max_snapshot_entries, 7);
 }
 
 #[test]
@@ -94,6 +96,10 @@ fn each_bad_verifier_kind_is_rejected_by_name() {
             "[verify] wall_secs must be at least 1",
         ),
         (
+            format!("{KINDS}[verify]\nkinds = [\"codex\"]\nwall_secs = 604801\n"),
+            "[verify] wall_secs must be at most 604800 (one week)",
+        ),
+        (
             format!("{KINDS}[verify]\nkinds = [\"codex\"]\ntokens = 0\n"),
             "[verify] tokens must be at least 1 or left out",
         ),
@@ -104,6 +110,10 @@ fn each_bad_verifier_kind_is_rejected_by_name() {
         (
             format!("{KINDS}[verify]\nkinds = [\"codex\"]\nmax_snapshot_bytes = 0\n"),
             "[verify] max_snapshot_bytes must be at least 1",
+        ),
+        (
+            format!("{KINDS}[verify]\nkinds = [\"codex\"]\nmax_snapshot_entries = 0\n"),
+            "[verify] max_snapshot_entries must be at least 1",
         ),
     ];
     for (text, expected) in cases {
@@ -222,7 +232,12 @@ fn the_verifier_name_is_deterministic_and_the_policy_asks_nobody() {
         matches!(decide("web_fetch"), Some(RuleDecision::Deny)),
         "web_fetch"
     );
-    assert_eq!(policy.timeout, None);
+    assert!(
+        matches!(decide("fetch"), Some(RuleDecision::Deny)),
+        "any other tool"
+    );
+    // A request no rule can answer at once must not wait for the operator.
+    assert!(policy.timeout.is_some_and(|t| t <= Duration::from_secs(30)));
 }
 
 // ---------------------------------------------------------------- snapshot
@@ -253,6 +268,15 @@ fn workspace(t: &Tree) -> PathBuf {
     t.dir.join(WORKSPACE_DIR)
 }
 
+/// Limits that only `n` bytes of content can reach.
+fn bytes(n: u64) -> Limits {
+    Limits {
+        bytes: n,
+        entries: 100_000,
+        time: Duration::from_secs(60),
+    }
+}
+
 #[test]
 fn git_is_dropped_at_every_depth() {
     let t = tree();
@@ -264,7 +288,7 @@ fn git_is_dropped_at_every_depth() {
     std::fs::create_dir_all(t.source.join("wt")).expect("wt");
     std::fs::write(t.source.join("wt/.git"), "gitdir: /elsewhere").expect("git file");
     std::fs::write(t.source.join("a/.gitignore"), "target").expect("gitignore");
-    assert!(take_snapshot(&t.source, &t.dir, 1 << 20, true).expect("snapshot"));
+    assert!(take_snapshot(&t.source, &t.dir, bytes(1 << 20), true).expect("snapshot"));
     let ws = workspace(&t);
     for gone in [".git", "a/.git", "a/b/.GIT", "wt/.git"] {
         assert!(std::fs::symlink_metadata(ws.join(gone)).is_err(), "{gone}");
@@ -280,7 +304,22 @@ fn git_is_dropped_at_every_depth() {
 fn every_instruction_name_is_renamed_at_any_depth() {
     let t = tree();
     let mut renamed = Vec::new();
-    for (i, name) in INSTRUCTION_NAMES.iter().enumerate() {
+    // Written out, so a name dropped from `INSTRUCTION_NAMES` fails here.
+    let names = [
+        "CLAUDE.md",
+        "CLAUDE.local.md",
+        "AGENTS.md",
+        "AGENTS.override.md",
+        "GEMINI.md",
+        ".mcp.json",
+        ".claude",
+        ".codex",
+        ".agents",
+        ".gemini",
+        ".cursor",
+    ];
+    assert_eq!(names, INSTRUCTION_NAMES);
+    for (i, name) in names.iter().enumerate() {
         // Alternate case and depth.
         let name = if i % 2 == 0 {
             name.to_ascii_uppercase()
@@ -297,7 +336,7 @@ fn every_instruction_name_is_renamed_at_any_depth() {
         }
         renamed.push(Path::new(parent).join(name));
     }
-    take_snapshot(&t.source, &t.dir, 1 << 20, true).expect("snapshot");
+    take_snapshot(&t.source, &t.dir, bytes(1 << 20), true).expect("snapshot");
     let ws = workspace(&t);
     for path in renamed {
         assert!(
@@ -315,7 +354,7 @@ fn a_renamed_instruction_file_does_not_overwrite_another_entry() {
     let t = tree();
     std::fs::write(t.source.join("AGENTS.md"), "instructions").expect("file");
     std::fs::write(t.source.join("AGENTS.md.claimant-copy"), "other").expect("file");
-    take_snapshot(&t.source, &t.dir, 1 << 20, true).expect("snapshot");
+    take_snapshot(&t.source, &t.dir, bytes(1 << 20), true).expect("snapshot");
     let ws = workspace(&t);
     assert_eq!(
         std::fs::read_to_string(ws.join("AGENTS.md.claimant-copy")).expect("kept"),
@@ -334,7 +373,7 @@ fn symlinks_are_copied_as_links_and_never_followed() {
     std::os::unix::fs::symlink(&t.outside, t.source.join("a/leak")).expect("file link");
     std::os::unix::fs::symlink(t.outside.parent().expect("parent"), t.source.join("up"))
         .expect("dir link");
-    take_snapshot(&t.source, &t.dir, 1 << 20, true).expect("snapshot");
+    take_snapshot(&t.source, &t.dir, bytes(1 << 20), true).expect("snapshot");
     let ws = workspace(&t);
     let link = std::fs::symlink_metadata(ws.join("a/leak")).expect("link");
     assert!(link.file_type().is_symlink());
@@ -377,7 +416,7 @@ fn sockets_and_fifos_are_skipped() {
             .file_type()
             .is_socket()
     );
-    take_snapshot(&t.source, &t.dir, 1 << 20, true).expect("snapshot");
+    take_snapshot(&t.source, &t.dir, bytes(1 << 20), true).expect("snapshot");
     let ws = workspace(&t);
     assert!(std::fs::symlink_metadata(ws.join("a/pipe")).is_err());
     assert!(std::fs::symlink_metadata(ws.join("a/sock")).is_err());
@@ -388,12 +427,110 @@ fn sockets_and_fifos_are_skipped() {
 fn a_workspace_over_the_cap_is_refused_and_its_copy_deleted() {
     let t = tree();
     std::fs::write(t.source.join("big"), vec![0u8; 4096]).expect("big");
-    let error = take_snapshot(&t.source, &t.dir, 4096, true).expect_err("too large");
+    let error = take_snapshot(&t.source, &t.dir, bytes(4096), true).expect_err("too large");
     assert!(matches!(error, SnapshotError::TooLarge { limit: 4096 }));
     assert!(!t.dir.exists());
     // At the cap exactly, it fits.
-    let error = take_snapshot(&t.source, &t.dir, 4096 + 9, true);
+    let error = take_snapshot(&t.source, &t.dir, bytes(4096 + 9), true);
     assert!(error.is_ok(), "{error:?}");
+}
+
+#[test]
+fn a_file_larger_than_one_piece_is_copied_whole_and_held_to_the_cap() {
+    let t = tree();
+    let size = COPY_PIECE + 5;
+    std::fs::File::create(t.source.join("sparse"))
+        .and_then(|f| f.set_len(size))
+        .expect("sparse");
+    // `code.rs` in the tree holds nine bytes.
+    let error = take_snapshot(&t.source, &t.dir, bytes(size + 8), true).expect_err("too large");
+    assert!(matches!(error, SnapshotError::TooLarge { .. }), "{error}");
+    take_snapshot(&t.source, &t.dir, bytes(size + 9), true).expect("fits");
+    let copied = std::fs::metadata(workspace(&t).join("sparse")).expect("copy");
+    assert_eq!(copied.len(), size);
+}
+
+#[test]
+fn a_workspace_with_too_many_entries_is_refused_and_its_copy_deleted() {
+    let t = tree();
+    std::fs::create_dir(t.source.join("many")).expect("many");
+    for n in 0..20 {
+        std::fs::write(t.source.join("many").join(n.to_string()), "").expect("empty");
+    }
+    // Dropped entries count too: the copy has to read their names.
+    std::fs::create_dir(t.source.join(".git")).expect("git");
+    // `a`, `a/b`, `a/b/code.rs`, `many`, its twenty files and `.git`.
+    let limits = |entries| Limits {
+        entries,
+        ..bytes(1 << 20)
+    };
+    let error = take_snapshot(&t.source, &t.dir, limits(24), true).expect_err("too many");
+    assert!(
+        matches!(error, SnapshotError::TooMany { limit: 24 }),
+        "{error}"
+    );
+    assert!(error.over_limit());
+    assert!(!t.dir.exists());
+    take_snapshot(&t.source, &t.dir, limits(25), true).expect("fits");
+}
+
+#[test]
+fn a_copy_past_its_deadline_is_refused_and_deleted() {
+    let t = tree();
+    let limits = Limits {
+        time: Duration::ZERO,
+        ..bytes(1 << 20)
+    };
+    let error = take_snapshot(&t.source, &t.dir, limits, true).expect_err("too slow");
+    assert!(matches!(error, SnapshotError::TooSlow { .. }), "{error}");
+    assert!(error.over_limit());
+    assert!(!t.dir.exists());
+}
+
+#[test]
+fn a_workspace_nested_past_the_depth_limit_is_refused() {
+    let t = tree();
+    let nest = |levels: usize| vec!["d"; levels].join("/");
+    std::fs::create_dir_all(t.source.join(nest(MAX_DEPTH))).expect("deep");
+    take_snapshot(&t.source, &t.dir, bytes(1 << 20), true).expect("at the limit");
+    assert!(workspace(&t).join(nest(MAX_DEPTH)).is_dir());
+    remove_snapshot(&t.dir).expect("remove");
+    std::fs::create_dir(t.source.join(nest(MAX_DEPTH + 1))).expect("deeper");
+    let error = take_snapshot(&t.source, &t.dir, bytes(1 << 20), true).expect_err("too deep");
+    assert!(matches!(error, SnapshotError::TooDeep { .. }), "{error}");
+    assert!(!t.dir.exists());
+}
+
+#[test]
+fn a_directory_with_many_subdirectories_is_copied() {
+    let t = tree();
+    for n in 0..2000 {
+        std::fs::create_dir_all(t.source.join(format!("wide/{n}/leaf"))).expect("dir");
+    }
+    take_snapshot(&t.source, &t.dir, bytes(1 << 20), true).expect("snapshot");
+    assert!(workspace(&t).join("wide/1999/leaf").is_dir());
+}
+
+#[test]
+fn a_snapshot_with_a_locked_directory_is_still_deleted() {
+    let t = tree();
+    take_snapshot(&t.source, &t.dir, bytes(1 << 20), true).expect("snapshot");
+    // What a verifier can leave behind in its workspace.
+    let locked = workspace(&t).join("locked");
+    std::fs::create_dir_all(locked.join("inner")).expect("locked");
+    std::fs::write(locked.join("inner/file"), "x").expect("file");
+    let kept = t.source.join("kept");
+    std::fs::create_dir(&kept).expect("kept");
+    std::os::unix::fs::symlink(&kept, workspace(&t).join("link")).expect("link");
+    let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
+    for dir in [&locked.join("inner"), &locked, &kept] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).expect("lock");
+    }
+    remove_snapshot(&t.dir).expect("remove");
+    assert!(!t.dir.exists());
+    // The delete follows no symlink out of the snapshot.
+    assert_eq!(mode(&kept), 0o000);
+    std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o700)).expect("unlock");
 }
 
 #[test]
@@ -402,7 +539,7 @@ fn a_partial_copy_from_a_crash_is_redone_as_not_clean() {
     // A copy that stopped before its marker.
     std::fs::create_dir_all(workspace(&t).join("a")).expect("partial");
     std::fs::write(workspace(&t).join("a/stale"), "half").expect("stale");
-    assert!(!take_snapshot(&t.source, &t.dir, 1 << 20, true).expect("snapshot"));
+    assert!(!take_snapshot(&t.source, &t.dir, bytes(1 << 20), true).expect("snapshot"));
     assert_eq!(read_marker(&t.dir).expect("marker"), Some(false));
     assert!(!workspace(&t).join("a/stale").exists());
     assert!(workspace(&t).join("a/b/code.rs").exists());
@@ -411,10 +548,10 @@ fn a_partial_copy_from_a_crash_is_redone_as_not_clean() {
 #[test]
 fn a_complete_snapshot_is_reused_with_its_recorded_cleanliness() {
     let t = tree();
-    assert!(take_snapshot(&t.source, &t.dir, 1 << 20, true).expect("first"));
+    assert!(take_snapshot(&t.source, &t.dir, bytes(1 << 20), true).expect("first"));
     std::fs::write(t.source.join("later"), "changed after the claim").expect("later");
     // A later pass asks for a snapshot that is not clean; the first one stands.
-    assert!(take_snapshot(&t.source, &t.dir, 1 << 20, false).expect("reuse"));
+    assert!(take_snapshot(&t.source, &t.dir, bytes(1 << 20), false).expect("reuse"));
     assert!(!workspace(&t).join("later").exists());
 }
 
@@ -424,7 +561,7 @@ fn snapshot_directories_are_private_and_files_keep_only_the_owner_exec_bit() {
     let script = t.source.join("run.sh");
     std::fs::write(&script, "#!/bin/sh").expect("script");
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o4777)).expect("mode");
-    take_snapshot(&t.source, &t.dir, 1 << 20, true).expect("snapshot");
+    take_snapshot(&t.source, &t.dir, bytes(1 << 20), true).expect("snapshot");
     let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o7777;
     assert_eq!(mode(&t.dir), 0o700);
     assert_eq!(mode(&workspace(&t).join("a")), 0o700);

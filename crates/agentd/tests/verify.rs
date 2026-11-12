@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentd::KindConfig;
-use agentd::mailroom::{Mailroom, NewMessage, Verification, VerificationState};
+use agentd::mailroom::{Mailroom, NewMessage, SendOutcome, Verification, VerificationState};
 use agentd::model::*;
 use agentd::supervisor::{AgentSpec, Broker, Config};
 use agentd::swarm::{Act, Budget, Evidence, Finding, Outcome, Stakes, TaskId, TaskState};
@@ -61,6 +61,7 @@ fn settings(verifiers: &[&str], max_running: usize) -> Settings {
         },
         max_running,
         max_snapshot_bytes: 1 << 20,
+        max_snapshot_entries: 100_000,
     }
 }
 
@@ -319,7 +320,15 @@ async fn a_confirmed_claim_closes_and_the_verifier_is_cleaned_up() {
             rig.verifier_processes().into_iter().next()
         })
         .await;
-    assert_eq!(process["cwd"], snapshot.display().to_string());
+    // The process reports its directory with symlinks resolved.
+    assert_eq!(
+        process["cwd"],
+        snapshot
+            .canonicalize()
+            .expect("snapshot")
+            .display()
+            .to_string()
+    );
     assert!(snapshot.join("src/lib.rs").exists());
     assert!(snapshot.join("CLAUDE.md.claimant-copy").exists());
     assert!(!snapshot.join("CLAUDE.md").exists());
@@ -587,6 +596,88 @@ async fn a_claim_left_pending_by_a_restart_gets_a_snapshot_that_is_not_clean() {
         .then_some(())
     })
     .await;
+    rig.close().await;
+}
+
+#[tokio::test]
+async fn a_retried_report_returns_only_after_the_snapshot_is_complete() {
+    let root = tempfile::tempdir().expect("root");
+    std::fs::create_dir(root.path().join("state")).expect("state");
+    // No reconcile loop: only the path that accepts the report copies.
+    let rig = Rig::open(root, &["codex"], 2, false).await;
+    let a = rig.claimant("a").await;
+    // Enough entries that the copy outlasts one more send.
+    let many = rig.root.path().join("a/many");
+    std::fs::create_dir(&many).expect("many");
+    for n in 0..20_000 {
+        std::fs::write(many.join(n.to_string()), "").expect("empty");
+    }
+    let request = rig
+        .send(
+            Sender::Human,
+            a,
+            Act::Request {
+                deliverable: "a passing test".into(),
+                budget: Budget {
+                    tokens: None,
+                    wall_secs: 600,
+                    messages: 5,
+                    hops: 1,
+                },
+                stakes: Stakes::Normal,
+            },
+        )
+        .await;
+    let task = request.task().expect("task");
+    let report = || NewMessage {
+        from: Sender::Agent(a),
+        to: a,
+        body: Body::new("text").expect("body"),
+        reply_to: None,
+        client_key: ClientKey("claim".into()),
+        act: Act::Report {
+            task,
+            outcome: Outcome::Infeasible {
+                evidence: Evidence {
+                    tried: "everything".into(),
+                    obstacle: "a wall".into(),
+                    reproduction: None,
+                },
+            },
+            verdict: None,
+        },
+        task: None,
+    };
+    let first = tokio::spawn({
+        let broker = Arc::clone(&rig.broker);
+        let message = report();
+        async move { broker.send(message).await }
+    });
+    let id = loop {
+        if let Some(v) = rig
+            .mailroom
+            .pending_verifications()
+            .await
+            .expect("pending")
+            .first()
+        {
+            break v.report;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    let (outcome, _) = rig.broker.send(report()).await.expect("retry");
+    assert!(matches!(outcome, SendOutcome::Duplicate { id: again } if again == id));
+    let dir = agentd::verify::snapshot_dir(&rig.state(), id);
+    assert_eq!(
+        agentd::verify::read_marker(&dir).expect("marker"),
+        Some(true),
+        "the retry returned while the snapshot was still being copied"
+    );
+    let (outcome, _) = first.await.expect("join").expect("first send");
+    assert!(matches!(
+        outcome,
+        SendOutcome::Queued { .. } | SendOutcome::Held { .. }
+    ));
     rig.close().await;
 }
 

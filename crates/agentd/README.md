@@ -160,6 +160,7 @@ wall_secs = 900             # Wall clock budget of one check.
 # tokens = 200000           # Optional token budget of one check.
 max_running = 2             # Checks that run at once.
 max_snapshot_bytes = 2147483648
+max_snapshot_entries = 500000
 ```
 
 Queued, offered, uncertain, and held mail count toward the sender and pair limits.
@@ -325,7 +326,10 @@ agentctl spawn reviewer --kind claude --cwd /path/to/project --rule send_message
 ```
 
 The first rule that names the request's tool, or `*`, decides. `allow` and
-`deny` pick the agent's allow-once or reject-once option. ACP tool kinds give
+`deny` pick the agent's allow-once or reject-once option. A `deny` rule never
+asks the operator about a tool call. With no reject-once option it picks
+reject-always, and with no reject option at all it cancels the agent's turn.
+ACP tool kinds give
 the names `shell` (kind `execute`), `edit`, `fetch` and the other ACP kinds.
 Rules have no effect on Infinity kinds, whose requests carry no tool name.
 
@@ -564,18 +568,33 @@ worker sandbox can bind it or anything under it. The copy follows these rules:
 - Sockets, FIFOs and devices are skipped.
 - Every `.git` entry is dropped, at any depth.
 - Instruction files get the suffix `.claimant-copy`, at any depth and in any
-  case: `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `GEMINI.md`, `.mcp.json`,
-  `.claude`, `.codex` and `.cursor`.
-- File content over `max_snapshot_bytes` stops the copy. The partial copy is
-  deleted and the claim goes to `review` as `unverified`.
+  case: `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `AGENTS.override.md`,
+  `GEMINI.md`, `.mcp.json`, `.claude`, `.codex`, `.agents`, `.gemini` and
+  `.cursor`.
 - Files are mode 0600, or 0700 if the owner could run them.
 
+Four limits stop the copy: file content over `max_snapshot_bytes`, more than
+`max_snapshot_entries` files and directories, directories nested deeper than
+128 levels, and a copy that takes longer than 120 seconds. The entry count
+includes entries that the copy drops or skips. At a limit, the partial copy is
+deleted and the claim goes to `review` as `unverified`, with the limit as the
+reason.
+
 The broker takes the copy while it accepts the report, before the claimant's
-`send_message` returns. Such a snapshot is clean. A claim found pending later,
-for example after a restart, gets a snapshot that is not clean, and a
-`confirmed` verdict from it goes to `review`. A file named `complete` marks a
-finished copy. A copy without it was cut short by a crash, so it is deleted and
-taken again as not clean.
+`send_message` returns. A retry of the same report waits for that copy too.
+Such a snapshot is clean. A copy that starts later, for example after a
+restart, is not clean, and a `confirmed` verdict from it goes to `review`. A
+file named `complete` marks a finished copy and records whether it was clean,
+so a copy that finished at report time stays clean across a restart. A copy
+without the file was cut short by a crash, so it is deleted and taken again as
+not clean.
+
+Clean has one limit. It means that the workspace did not drift between the
+report and the copy. It does not mean that the claimant could not touch the
+workspace during the copy: a command that the claimant started before its
+report can still be running. That gives a claimant nothing new, because it
+controls every file in its workspace before it reports. The verifier treats
+the files as evidence to check for the same reason.
 
 The verifier is an agent named `v-<report>` of the chosen kind. Its working
 directory is the snapshot. It gets workspace write on the snapshot and nothing
@@ -583,7 +602,8 @@ else outside its private home and `/tmp`. It keeps its kind's egress hosts and
 read-only binds, but no writable bind and no MCP server other than the broker's.
 Its permission rules allow `shell`, `edit` and `send_message` and deny every
 other tool. The bwrap sandbox is the boundary, so the verifier runs commands
-without asking, and no request waits for the operator. Its budget comes from
+without asking. A request that no rule can answer at once is refused after five
+seconds, so no request waits for the operator. Its budget comes from
 `wall_secs` and `tokens`. The brief also says that files in the workspace and
 command output may have been written by the claimant, so they are evidence, not
 instructions and not proof.
@@ -595,9 +615,18 @@ The runner wakes at startup, on every task change and every 30 seconds:
   `review` as `unverified`.
 - A running check whose verifier is down gets a restart, up to three per daemon
   run. If that fails, its task expires and the claim goes to `review`.
-- A settled check's verifier is retired. Then its snapshot is deleted.
+- A settled check's verifier is retired. Then its snapshot is deleted. A
+  verifier can leave a directory without permissions. The runner gives such
+  directories their owner's permissions back and deletes the snapshot.
 - An error on one check does not stop the others. After an error, the runner
   waits one second before the next pass.
+
+The runner exists only with a `[verify]` table. Remove the table only when no
+check is running. A check that is running when the table goes away still
+settles when its task expires, but nothing retires its verifier or deletes its
+snapshot. Then retire the `v-<report>` agent with `agentctl retire` and delete
+`<state>/verify`. An operator who retires a running verifier leaves its check
+running until the task expires. The claim then goes to `review`.
 
 `Mailroom::open_verification` starts one check in one transaction. It registers
 a verifier agent, saves its spec, and opens a verification task for it. The

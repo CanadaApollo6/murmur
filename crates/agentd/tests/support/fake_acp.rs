@@ -471,6 +471,9 @@ fn main() {
                     reply(id, json!({"stopReason":"end_turn"}));
                     std::thread::sleep(Duration::from_millis(5));
                     std::process::exit(0);
+                } else if text.contains("allow-only-permission") {
+                    flight = Some(id.clone());
+                    permission(session, "permission-1", false);
                 } else if text.contains("permission") {
                     flight = Some(id.clone());
                     permission(session, "permission-1", true);
