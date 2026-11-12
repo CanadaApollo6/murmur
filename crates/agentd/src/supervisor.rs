@@ -2395,7 +2395,7 @@ mod halt_tests {
                     "agentd".into(),
                     bound,
                 )),
-                dir.path().join("state"),
+                state_root(&dir),
                 Default::default(),
             );
         }
@@ -2425,6 +2425,14 @@ mod halt_tests {
         };
         h.wait(|p| *p == ready).await;
         h
+    }
+    /// The state directory of a sandboxed harness. Credential paths are never
+    /// followed through a link, and a macOS temp directory sits behind one.
+    fn state_root(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path()
+            .canonicalize()
+            .expect("canonical temp directory")
+            .join("state")
     }
     fn spec(kind: &str, cwd: &std::path::Path, name: &str) -> AgentSpec {
         AgentSpec {
@@ -2949,10 +2957,11 @@ mod halt_tests {
     #[tokio::test]
     async fn retire_deletes_the_credential_copy_before_it_commits() {
         let h = harness_built(false, CANCEL, true).await;
-        let home = crate::sandbox::AgentPaths::new(&h._dir.path().join("state"), h.agent.id).home;
+        let state = state_root(&h._dir);
+        let home = crate::sandbox::AgentPaths::new(&state, h.agent.id).home;
         let copy = home.join(CREDENTIAL);
         let cli = copy.parent().expect("CLI dir");
-        let outside = h._dir.path().join("outside");
+        let outside = state.with_file_name("outside");
         std::fs::create_dir_all(&home).expect("home");
         std::fs::create_dir(&outside).expect("outside");
         std::fs::write(outside.join("auth.json"), b"{}").expect("target");
@@ -2984,9 +2993,10 @@ mod halt_tests {
     #[tokio::test]
     async fn retire_keeps_a_credential_refresh_the_host_never_received() {
         let h = harness_built(false, CANCEL, true).await;
-        let home = crate::sandbox::AgentPaths::new(&h._dir.path().join("state"), h.agent.id).home;
+        let state = state_root(&h._dir);
+        let home = crate::sandbox::AgentPaths::new(&state, h.agent.id).home;
         let copy = home.join(CREDENTIAL);
-        let human = h._dir.path().join("human");
+        let human = state.with_file_name("human");
         let host = human.join(CREDENTIAL);
         let cli = host.parent().expect("CLI dir");
         std::fs::create_dir_all(&home).expect("home");
