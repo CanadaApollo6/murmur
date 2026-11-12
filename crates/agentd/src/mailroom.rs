@@ -307,7 +307,8 @@ impl Mailroom {
         // A task can move with no mail: an expiry whose recipients are all
         // retired, or an operator resolve. Watching the table itself means no
         // caller has to remember to announce a move. The hook also fires for
-        // a write that is rolled back, which only wakes a watcher early.
+        // a write that is rolled back, so a watcher must not treat a wake as
+        // proof that anything changed.
         let task_written = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = task_written.clone();
         store.db.update_hook(Some(
@@ -651,7 +652,19 @@ impl Mailroom {
         }).await
     }
 
+    /// The id of the active worker with this name, or of a new worker. A
+    /// name that a verifier holds is rejected.
     pub async fn register(&self, name: AgentName) -> Result<AgentId> {
+        self.register_as(name, false).await
+    }
+
+    /// `register` for a spec this mailroom saved, so it also returns a
+    /// verifier's id. The caller runs the saved spec, not one of its own.
+    pub(crate) async fn register_saved(&self, name: AgentName) -> Result<AgentId> {
+        self.register_as(name, true).await
+    }
+
+    async fn register_as(&self, name: AgentName, saved: bool) -> Result<AgentId> {
         self.call(move |s| {
             if let Some((id, role)) =
                 s.db.query_row(
@@ -663,7 +676,7 @@ impl Mailroom {
             {
                 // A caller that got a verifier's id back could run its own
                 // agent under it and send the verdict.
-                if role != "worker" {
+                if role != "worker" && !saved {
                     return Err(Error::Rejected(format!(
                         "the name @{} belongs to a verifier; choose another name",
                         name.as_str()

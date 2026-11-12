@@ -490,7 +490,11 @@ impl Broker {
         if spec.model.is_none() {
             spec.model = kind.model.clone();
         }
-        let id = self.mailroom.register(spec.name.clone()).await?;
+        let id = if restore {
+            self.mailroom.register_saved(spec.name.clone()).await?
+        } else {
+            self.mailroom.register(spec.name.clone()).await?
+        };
         let previous = self.agents.lock().await.get(&id).cloned();
         let warning = previous
             .as_ref()
@@ -661,7 +665,11 @@ impl Broker {
                 Err(crate::mailroom::Error::Closed) => return,
                 Err(error) => {
                     tracing::error!(%error, "task expiry failed; retrying in one second");
-                    Some(time::OffsetDateTime::now_utc() + Duration::from_secs(1))
+                    // The failed sweep's own rolled-back writes announce a
+                    // task change. Waiting on that channel here would retry
+                    // at once, without end.
+                    tokio::time::sleep(EXPIRY_RETRY).await;
+                    continue;
                 }
             };
             let wait = async {
@@ -1727,6 +1735,7 @@ impl AgentActor {
 
 /// The longest the expiry loop sleeps before it reads the wall clock again.
 const EXPIRY_RECHECK: Duration = Duration::from_secs(30);
+const EXPIRY_RETRY: Duration = Duration::from_secs(1);
 const UNACKNOWLEDGED: &str =
     "the Infinity turn has not acknowledged the cancel and may still be running in the daemon";
 
@@ -3088,6 +3097,117 @@ mod halt_tests {
     }
 
     #[tokio::test]
+    async fn a_saved_verifier_restores_and_retires_but_its_name_cannot_be_spawned() {
+        let dir = tempfile::tempdir().expect("dir");
+        let room = Arc::new(
+            Mailroom::open(
+                dir.path().join("mail.db"),
+                crate::mailroom::Config {
+                    verifier_available: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("room"),
+        );
+        let mut kind = KindConfig::claude("unused-fixture");
+        kind.isolation = crate::sandbox::Isolation::None;
+        kind.idle_after = None;
+        let broker =
+            Broker::new(room.clone(), vec![kind.clone()], Default::default()).expect("broker");
+        let a = room
+            .register(AgentName::parse("a").expect("name"))
+            .await
+            .expect("register");
+        let message = |from, act| NewMessage {
+            from,
+            to: a,
+            body: Body::new("work").expect("body"),
+            reply_to: None,
+            client_key: ClientKey(ulid::Ulid::new().to_string()),
+            act,
+            task: None,
+        };
+        let budget = crate::swarm::Budget {
+            tokens: None,
+            wall_secs: 600,
+            messages: 5,
+            hops: 1,
+        };
+        let (_, request) = room
+            .accept(message(
+                Sender::Human,
+                crate::swarm::Act::Request {
+                    deliverable: "work".into(),
+                    budget,
+                    stakes: crate::swarm::Stakes::Normal,
+                },
+            ))
+            .await
+            .expect("task");
+        let (_, claim) = room
+            .accept(message(
+                Sender::Agent(a),
+                crate::swarm::Act::Report {
+                    task: request.task().expect("task"),
+                    outcome: crate::swarm::Outcome::Infeasible {
+                        evidence: crate::swarm::Evidence {
+                            tried: "every mirror".into(),
+                            obstacle: "the archive is gone".into(),
+                            reproduction: None,
+                        },
+                    },
+                    verdict: None,
+                },
+            ))
+            .await
+            .expect("claim");
+        let verifier = room
+            .open_verification(
+                claim.id(),
+                crate::mailroom::VerifierStart {
+                    spec: spec(&kind.name, dir.path(), "checker"),
+                    budget,
+                    verifier_family: "gpt".into(),
+                    claimant_family: "claude".into(),
+                    snapshot_clean: true,
+                },
+            )
+            .await
+            .expect("open verification")
+            .verifier
+            .expect("verifier");
+        room.set_stopped(verifier, true).await.expect("stop flag");
+
+        let taken = broker.spawn(spec(&kind.name, dir.path(), "checker")).await;
+        assert!(
+            matches!(taken, Err(ref e) if e.to_string().contains("belongs to a verifier")),
+            "{:?}",
+            taken.map(|h| h.id)
+        );
+
+        // A daemon start restores every saved spec, the verifier's included.
+        let saved = room.specs().await.expect("specs");
+        let (_, saved) = saved
+            .into_iter()
+            .find(|(id, _)| *id == verifier)
+            .expect("the verifier's spec is saved");
+        let handle = broker.restore(saved).await.expect("restore");
+        assert_eq!(handle.id, verifier);
+        let mut phases = handle.phases();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            phases.wait_for(|p| *p == Phase::Stopped),
+        )
+        .await
+        .expect("phase timeout")
+        .expect("phase channel");
+        broker.retire(verifier).await.expect("retire");
+        assert!(room.retired(verifier).await.expect("retired"));
+        broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
     async fn a_retired_agent_stays_retired_and_its_name_is_free() {
         let h = harness(false).await;
         h.operate(Operation::Retire).await.expect("retire");
@@ -3664,6 +3784,76 @@ mod expiry_tests {
         .expect("the early task expires within its one second budget");
         let late = room.task(late.task().expect("task")).await.expect("late");
         assert_eq!(late.state, TaskState::Open);
+        sweeper.abort();
+        match sweeper.await {
+            Err(error) if error.is_cancelled() => {}
+            other => panic!("expiry loop ended unexpectedly: {other:?}"),
+        }
+        drop(broker);
+        Arc::try_unwrap(room)
+            .map_err(|_| "mailroom still shared")
+            .expect("sole owner")
+            .close()
+            .await
+            .expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_failing_expiry_is_retried_once_a_second() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("mail.db");
+        let room = Mailroom::open(&path, Default::default())
+            .await
+            .expect("mailroom");
+        let a = room
+            .register(AgentName::parse("a").expect("name"))
+            .await
+            .expect("register");
+        room.accept(NewMessage {
+            from: Sender::Human,
+            to: a,
+            body: Body::new("work").expect("body"),
+            reply_to: None,
+            client_key: ClientKey(MessageId::new().to_string()),
+            act: Act::Request {
+                deliverable: "work".into(),
+                budget: Budget {
+                    tokens: None,
+                    wall_secs: 1,
+                    messages: 1,
+                    hops: 1,
+                },
+                stakes: Stakes::Normal,
+            },
+            task: None,
+        })
+        .await
+        .expect("task");
+        room.close().await.expect("close");
+        // Every expiry now updates its task and then fails on the notice.
+        rusqlite::Connection::open(&path)
+            .expect("db")
+            .execute_batch(
+                "CREATE TRIGGER no_mail BEFORE INSERT ON messages \
+                 BEGIN SELECT RAISE(ABORT,'injected'); END;",
+            )
+            .expect("trigger");
+        let room = Arc::new(
+            Mailroom::open(&path, Default::default())
+                .await
+                .expect("mailroom"),
+        );
+        let broker =
+            Arc::new(Broker::new(room.clone(), vec![], Default::default()).expect("broker"));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let before = room.jobs_run.load(SeqCst);
+        let sweeper = tokio::spawn({
+            let broker = broker.clone();
+            async move { broker.expire_tasks().await }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let sweeps = room.jobs_run.load(SeqCst) - before;
+        assert_eq!(sweeps, 1, "one failed sweep, then a wait");
         sweeper.abort();
         match sweeper.await {
             Err(error) if error.is_cancelled() => {}
