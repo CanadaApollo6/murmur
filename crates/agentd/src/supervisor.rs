@@ -636,10 +636,13 @@ impl Broker {
             let wait = async {
                 match next {
                     Some(at) => {
-                        let left = (at - time::OffsetDateTime::now_utc())
+                        let left: Duration = (at - time::OffsetDateTime::now_utc())
                             .try_into()
                             .unwrap_or(Duration::ZERO);
-                        tokio::time::sleep(left).await;
+                        // The deadline is wall time and this sleep is not. A
+                        // suspend or a clock step moves only one of them, so a
+                        // long sleep is cut short and the deadline read again.
+                        tokio::time::sleep(left.min(EXPIRY_RECHECK)).await;
                     }
                     None => std::future::pending().await,
                 }
@@ -1613,6 +1616,8 @@ impl AgentActor {
     }
 }
 
+/// The longest the expiry loop sleeps before it reads the wall clock again.
+const EXPIRY_RECHECK: Duration = Duration::from_secs(30);
 const UNACKNOWLEDGED: &str =
     "the Infinity turn has not acknowledged the cancel and may still be running in the daemon";
 

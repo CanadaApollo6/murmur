@@ -1937,3 +1937,46 @@ async fn a_version_three_database_opens_and_its_open_tasks_expire() {
         .expect("version");
     assert_eq!(version, 4);
 }
+
+#[tokio::test]
+async fn a_caller_cannot_block_expiry_by_taking_a_notice_key() {
+    let (_dir, mail, a, _b) = setup(Config::default()).await;
+    let budget = Budget {
+        wall_secs: 60,
+        ..budget(5)
+    };
+    let stuck = request(&mail, Sender::Human, a, None, budget)
+        .await
+        .expect("request")
+        .task()
+        .expect("task");
+    let other = request(&mail, Sender::Human, a, None, budget)
+        .await
+        .expect("request")
+        .task()
+        .expect("task");
+    for key in [
+        format!("task-expired:{stuck}:{a}"),
+        format!("task-expired:{stuck}"),
+    ] {
+        mail.accept(NewMessage {
+            client_key: ClientKey(key),
+            ..send(Sender::Human, a)
+        })
+        .await
+        .expect("a human send with a notice-shaped key");
+    }
+    let opened = mail.task(other).await.expect("task").opened;
+    let sweep = mail
+        .expire_tasks(opened + seconds(60))
+        .await
+        .expect("the sweep is not rolled back");
+    assert_eq!(sweep.expired.len(), 2, "both tasks expire");
+    assert_eq!(sweep.notified, vec![a, a], "each owner notice is queued");
+    for task in [stuck, other] {
+        assert_eq!(
+            mail.task(task).await.expect("task").state,
+            TaskState::Expired
+        );
+    }
+}

@@ -1550,7 +1550,10 @@ fn expire(tx: &Connection, t: &mut Task, now: OffsetDateTime) -> Result<Vec<Agen
             body: Body::new(body).expect("bug: an expiry notice is a short nonempty body"),
             sent_at: now,
         };
-        insert_message(tx, &env, &format!("task-expired:{}:{to}", t.id), None)?;
+        // The state change above makes expiry happen once, so this key only
+        // has to be unused. A key a caller could predict would let one earlier
+        // send fail this insert and with it the whole sweep.
+        insert_message(tx, &env, &format!("task-expired:{}", env.id), None)?;
         notified.push(to);
     }
     Ok(notified)
