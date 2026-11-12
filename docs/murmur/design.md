@@ -250,7 +250,7 @@ Free text gives the broker nothing to attach budgets, outcomes or screening to. 
 | `Inform` | State facts. Lists the environmental claims it makes. | Claims are recorded on the board. |
 | `Propose` | Offer a plan that needs a decision, in a named `Scope`. | The recipient holds the decision right for that scope. |
 | `Decide` | Settle a proposal. | The sender holds the decision right. |
-| `Report` | Close a task with an `Outcome`. | The sender owns the task. |
+| `Report` | Close a task with an `Outcome`. | The sender owns the task. An expired task takes no report. |
 
 The set is fixed. Agents cannot add acts, roles or approval steps. `send_message` gains an `act` argument that defaults to `Inform`, so an agent that ignores it still works.
 
@@ -310,7 +310,7 @@ The weak point is a content-blind team behind classifiers that missed something.
 
 Swarms build approval chains, status meetings and paperwork when nothing stops them. The broker enforces four rules at `accept`:
 
-- **Budgets.** Every task has a `Budget`: tokens (where the wire reports usage), wall time, messages and hops. A `Request` carves its child's budget out of the sender's remainder, so a delegation tree never spends more than its root. A task that runs out reports `Blocked` to its owner.
+- **Budgets.** Every task has a `Budget`: tokens (where the wire reports usage), wall time, messages and hops. A `Request` carves its child's budget out of the sender's remainder, so a delegation tree never spends more than its root. Each message the owner sends in the task costs one of its messages, and the send past the cap is rejected. A `Report` is never rejected for budget. A task still open when its wall time runs out moves to `Expired`, a state with no outcome, and the broker tells the owner and the requester. No adapter reports token use yet, so tokens stay unmetered.
 - **Decision rights.** Only the human's swarm spec creates a `DecisionRight { scope, holder }`. Outside every declared scope, the agent doing the work decides and reports after. An agent cannot create an approval step: `accept` rejects a `Propose` sent to someone who holds no right for its scope, and the rejection names the holder or says the sender decides.
 - **Status is read from the board.** Task state, claims and outcomes live on the board. No act asks for status, and a `Request` must name a deliverable.
 - **Talk versus output.** Per task, the broker counts messages against output: artifacts and closed child tasks. The `Bureaucracy` interceptor holds a conversation whose ratio crosses a threshold with no output, and the graph UI shows the ratio per team.

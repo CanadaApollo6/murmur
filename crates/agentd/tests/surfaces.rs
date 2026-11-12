@@ -1273,7 +1273,7 @@ async fn task_acts_open_report_and_list_through_real_surfaces() {
     let (a, b) = (agent("@a"), agent("@b"));
 
     let root_act =
-        json!({"kind":"request","deliverable":"ship the root","budget":budget(100,10,5)});
+        json!({"kind":"request","deliverable":"ship the root","budget":budget(100,20,5)});
     let status = d
         .ctl(&["send", "@a", "root work", "--act", &root_act.to_string()])
         .await;
@@ -1480,9 +1480,13 @@ async fn task_acts_open_report_and_list_through_real_surfaces() {
     assert_eq!(root_row["assignee"], "@a");
     assert_eq!(
         root_row["budget"],
-        json!({"tokens":null,"wall_secs":100,"messages":10,"hops":5})
+        json!({"tokens":null,"wall_secs":100,"messages":20,"hops":5})
     );
     assert_eq!(root_row["spent"]["wall_secs"], 40);
+    assert_eq!(
+        root_row["spent"]["messages"], 12,
+        "each request costs one message plus the child's two"
+    );
     assert_eq!(root_row["outcome"], Value::Null);
     assert_eq!(root_row["stakes"], "normal");
     for (child, state, outcome) in [
@@ -2067,5 +2071,81 @@ async fn agentctl_retire_mid_turn_kills_its_inbound_mail_and_keeps_what_it_sent(
             .any(|p| p.to_string().contains("peer payload"))
     })
     .await;
+    d.stop(nix::sys::signal::Signal::SIGTERM).await;
+}
+
+#[tokio::test]
+async fn an_expired_task_lists_as_expired_with_its_real_spend() {
+    let mut d = Daemon::new(None).await;
+    d.spawn("b", "codex", Some("start")).await;
+    let wire_b = d.wait_wire("b", |v| !prompts(v).is_empty()).await;
+    let token_b = session_token(&wire_b).to_owned();
+    d.spawn("a", "claude", Some("start")).await;
+    let wire_a = d.wait_wire("a", |v| !prompts(v).is_empty()).await;
+    let token_a = session_token(&wire_a).to_owned();
+    let root_act =
+        json!({"kind":"request","deliverable":"ship the root","budget":budget(100,10,2)});
+    let status = d
+        .ctl(&["send", "@a", "root work", "--act", &root_act.to_string()])
+        .await;
+    let root = opened_task(status.as_str().expect("send status"));
+    let (error, text) = send_tool(
+        &d,
+        &token_a,
+        "child",
+        json!({"to":"@b","body":"child work","act":{"kind":"request","deliverable":"child result","budget":budget(1,3,1),"parent_task":root}}),
+    )
+    .await;
+    assert!(!error, "{text}");
+    let child = opened_task(&text);
+    let request = text.split_whitespace().nth(1).expect("request id");
+    let (error, text) = send_tool(
+        &d,
+        &token_b,
+        "progress",
+        json!({"to":"@a","body":"working on it","reply_to":request}),
+    )
+    .await;
+    assert!(!error, "{text}");
+
+    let notice = wait_text(&d, "b", "can no longer be reported").await;
+    assert!(notice.contains(&child), "{notice}");
+    let notice = wait_text(&d, "a", "assigned to @b expired").await;
+    assert!(notice.contains(&child), "{notice}");
+    let (error, text) = send_tool(
+        &d,
+        &token_b,
+        "late-report",
+        json!({"to":"@a","body":"done","act":{"kind":"report","task":child,"outcome":{"kind":"done"}}}),
+    )
+    .await;
+    assert!(error, "a report after expiry is rejected");
+    assert!(text.contains(&format!("task {child} expired")), "{text}");
+
+    let tasks = d.ctl(&["tasks"]).await;
+    let row = |id: &str| {
+        tasks
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("task {id}: {tasks}"))
+            .clone()
+    };
+    let child_row = row(&child);
+    assert_eq!(child_row["state"], "expired", "{child_row}");
+    assert_eq!(child_row["outcome"], Value::Null);
+    assert_eq!(
+        child_row["spent"],
+        json!({"tokens":null,"wall_secs":1,"messages":1,"hops":0}),
+        "one reply in the task and the whole wall clock budget"
+    );
+    let root_row = row(&root);
+    assert_eq!(root_row["state"], "open", "children never expire parents");
+    assert_eq!(
+        root_row["spent"],
+        json!({"tokens":null,"wall_secs":1,"messages":4,"hops":1}),
+        "the request message plus the child's reservation"
+    );
     d.stop(nix::sys::signal::Signal::SIGTERM).await;
 }

@@ -39,6 +39,15 @@ pub enum Error {
     Transition(DeliveryState),
     #[error("task budget exceeded")]
     BudgetExceeded,
+    #[error(
+        "rejected: task {task} expired when its wall clock budget of {wall_secs}s ran out; it can no longer be reported"
+    )]
+    TaskExpired {
+        task: TaskId,
+        wall_secs: u64,
+        /// Agents whose expiry notices this call queued.
+        notified: Vec<AgentId>,
+    },
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -58,6 +67,15 @@ pub enum SendOutcome {
     Queued { id: MessageId },
     Held { id: MessageId, reason: String },
     Duplicate { id: MessageId },
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Sweep {
+    pub expired: Vec<TaskId>,
+    /// Agents whose expiry notices this sweep queued.
+    pub notified: Vec<AgentId>,
+    /// The earliest deadline among tasks still open.
+    pub next: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -569,6 +587,30 @@ impl Mailroom {
         self.call(move |s| s.accept(msg)).await
     }
 
+    /// Expires every open task whose deadline is at or before `now` and
+    /// queues its notices in the same transaction.
+    pub async fn expire_tasks(&self, now: OffsetDateTime) -> Result<Sweep> {
+        self.call(move |s| {
+            let tx = s.db.transaction()?;
+            let open = tx
+                .prepare(&format!("{TASK_SELECT} WHERE t.state=?"))?
+                .query_map([json(&TaskState::Open)?], task_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut sweep = Sweep::default();
+            for mut t in open {
+                if due(&t, now) {
+                    sweep.notified.extend(expire(&tx, &mut t, now)?);
+                    sweep.expired.push(t.id);
+                } else if let Some(deadline) = t.deadline() {
+                    sweep.next = Some(sweep.next.map_or(deadline, |n| n.min(deadline)));
+                }
+            }
+            tx.commit()?;
+            Ok(sweep)
+        })
+        .await
+    }
+
     pub async fn message(&self, id: MessageId) -> Result<Envelope> {
         self.call(move |s| message(&s.db, id)).await
     }
@@ -776,21 +818,9 @@ impl Mailroom {
     pub async fn tasks(&self) -> Result<Vec<Task>> {
         self.call(|s| {
             Ok(s.db
-                .prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY rowid"))?
+                .prepare(&format!("{TASK_SELECT} ORDER BY t.rowid"))?
                 .query_map([], task_row)?
                 .collect::<rusqlite::Result<_>>()?)
-        })
-        .await
-    }
-
-    pub async fn record_spend(&self, id: TaskId, spend: Budget) -> Result<()> {
-        self.call(move |s| {
-            let tx = s.db.transaction()?;
-            let mut t = task(&tx, id)?;
-            charge(&mut t, spend)?;
-            save_task(&tx, &t)?;
-            tx.commit()?;
-            Ok(())
         })
         .await
     }
@@ -857,7 +887,7 @@ impl Store {
             ));
         }
         let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 3 {
+        if version > 4 {
             return Err(Error::Rejected(format!(
                 "unsupported schema version {version}"
             )));
@@ -868,6 +898,9 @@ impl Store {
         }
         if version < 3 {
             db.execute_batch(include_str!("schema-v3.sql"))?;
+        }
+        if version < 4 {
+            db.execute_batch(include_str!("schema-v4.sql"))?;
         }
         let last_prune = feed::head(&db)?;
         Ok(Self {
@@ -881,6 +914,14 @@ impl Store {
     }
 
     fn accept(&mut self, msg: NewMessage) -> Result<(SendOutcome, Envelope)> {
+        self.accept_at(msg, OffsetDateTime::now_utc())
+    }
+
+    fn accept_at(
+        &mut self,
+        msg: NewMessage,
+        now: OffsetDateTime,
+    ) -> Result<(SendOutcome, Envelope)> {
         let tx = self.db.transaction()?;
         let sender = json(&msg.from)?;
         if let Some(id) = tx
@@ -921,6 +962,23 @@ impl Store {
             }
             return Ok((SendOutcome::Duplicate { id }, stored));
         }
+        let parent = msg.reply_to.map(|id| message(&tx, id)).transpose()?;
+        let current_task = msg.task.or_else(|| parent.as_ref().and_then(|p| p.task));
+        let context = match msg.act {
+            Act::Report { task, .. } => Some(task),
+            _ => current_task,
+        };
+        if let Some(id) = context {
+            let mut t = task(&tx, id)?;
+            if due(&t, now) {
+                let notified = expire(&tx, &mut t, now)?;
+                tx.commit()?;
+                return Err(expired(&t, notified));
+            }
+            if t.state == TaskState::Expired {
+                return Err(expired(&t, Vec::new()));
+            }
+        }
         // A report's recipient is checked against the task below.
         if !matches!(msg.act, Act::Report { .. }) {
             active(&tx, msg.to)?;
@@ -951,7 +1009,6 @@ impl Store {
                 }
             }
         }
-        let parent = msg.reply_to.map(|id| message(&tx, id)).transpose()?;
         if let Some(parent) = &parent {
             let involved = match msg.from {
                 Sender::Human => true,
@@ -968,7 +1025,6 @@ impl Store {
                 .map_or(Some(1), |p| p.hop.checked_add(1))
                 .ok_or_else(|| Error::Rejected("hop overflow".into()))?,
         };
-        let current_task = msg.task.or_else(|| parent.as_ref().and_then(|p| p.task));
         let mut env = Envelope {
             id: MessageId::new(),
             from: msg.from.clone(),
@@ -985,7 +1041,7 @@ impl Store {
                 Sender::Agent(a) => Some(exposure_ref(&tx, a)?),
             },
             body: msg.body,
-            sent_at: OffsetDateTime::now_utc(),
+            sent_at: now,
         };
         if env.act != Act::Inform
             && env.body.as_str().len() + json(&env.act)?.len() > MAX_BODY_BYTES
@@ -1026,7 +1082,8 @@ impl Store {
                             Error::Rejected("agent Request needs a parent task".into())
                         })?;
                         let mut t = owned_task(&tx, id, owner)?;
-                        charge(&mut t, *budget)?;
+                        advance(&mut t, TaskEvent::Message)?;
+                        advance(&mut t, TaskEvent::Carve(*budget))?;
                         updated_task = Some(t);
                         Some(id)
                     }
@@ -1047,6 +1104,7 @@ impl Store {
                         ..Budget::default()
                     },
                     state: TaskState::Open,
+                    opened: env.sent_at,
                 });
             }
             Act::Report { task: id, outcome } => {
@@ -1074,15 +1132,14 @@ impl Store {
                     )));
                 }
                 validate_outcome(outcome)?;
-                t.state = match outcome {
-                    Outcome::Partial { .. } | Outcome::Infeasible { .. } => {
-                        TaskState::Verifying { report: env.id }
-                    }
-                    _ => TaskState::Closed {
-                        outcome: outcome.clone(),
-                        success: matches!(outcome, Outcome::Done { .. }),
+                advance(
+                    &mut t,
+                    TaskEvent::Report {
+                        report: env.id,
+                        outcome,
+                        at: now,
                     },
-                };
+                )?;
                 env.task = Some(*id);
                 updated_task = Some(t);
             }
@@ -1093,12 +1150,16 @@ impl Store {
             }
             Act::Inform => {
                 if let Some(id) = current_task {
-                    let t = task(&tx, id)?;
+                    let mut t = task(&tx, id)?;
                     if env.from != Sender::Human
                         && env.from != Sender::Agent(t.owner)
                         && env.from != t.requested_by
                     {
                         return Err(Error::Rejected("sender is unrelated to task".into()));
+                    }
+                    if env.from == Sender::Agent(t.owner) && t.state == TaskState::Open {
+                        advance(&mut t, TaskEvent::Message)?;
+                        updated_task = Some(t);
                     }
                 }
             }
@@ -1116,21 +1177,7 @@ impl Store {
                 Verdict::Reject { reason } => return Err(Error::Rejected(reason)),
             }
         }
-        tx.execute("INSERT INTO messages(id,sender,client_key,recipient,conversation,in_reply_to,hop,act,task,exposure,body,sent_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", params![json(&env.id)?, sender, msg.client_key.0, json(&env.to)?, json(&env.conversation)?, env.in_reply_to.map(|v| json(&v)).transpose()?, env.hop, json(&env.act)?, env.task.map(|v| json(&v)).transpose()?, env.exposure.map(|v| json(&v)).transpose()?, env.body.as_str(), json(&env.sent_at)?])?;
-        let msg_seq = tx.last_insert_rowid();
-        tx.execute(
-            "INSERT INTO deliveries(message_id,state,reason,msg_seq) VALUES (?,?,?,?)",
-            params![
-                json(&env.id)?,
-                if held_reason.is_some() {
-                    "held"
-                } else {
-                    "queued"
-                },
-                held_reason,
-                msg_seq
-            ],
-        )?;
+        insert_message(&tx, &env, &msg.client_key.0, held_reason.as_deref())?;
         if let Some(t) = updated_task {
             save_task(&tx, &t)?;
         }
@@ -1146,6 +1193,29 @@ impl Store {
     }
 }
 
+fn insert_message(
+    tx: &Connection,
+    env: &Envelope,
+    client_key: &str,
+    held_reason: Option<&str>,
+) -> Result<()> {
+    tx.execute("INSERT INTO messages(id,sender,client_key,recipient,conversation,in_reply_to,hop,act,task,exposure,body,sent_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", params![json(&env.id)?, json(&env.from)?, client_key, json(&env.to)?, json(&env.conversation)?, env.in_reply_to.map(|v| json(&v)).transpose()?, env.hop, json(&env.act)?, env.task.map(|v| json(&v)).transpose()?, env.exposure.map(|v| json(&v)).transpose()?, env.body.as_str(), json(&env.sent_at)?])?;
+    let msg_seq = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO deliveries(message_id,state,reason,msg_seq) VALUES (?,?,?,?)",
+        params![
+            json(&env.id)?,
+            if held_reason.is_some() {
+                "held"
+            } else {
+                "queued"
+            },
+            held_reason,
+            msg_seq
+        ],
+    )?;
+    Ok(())
+}
 fn json(value: &impl Serialize) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
@@ -1323,8 +1393,7 @@ fn exposure_ref(db: &Connection, agent: AgentId) -> Result<ExposureRef> {
         seq,
     })
 }
-const TASK_COLUMNS: &str =
-    "id,parent,owner,requested_by,request_msg,deliverable,stakes,budget,spent,state";
+const TASK_SELECT: &str = "SELECT t.id,t.parent,t.owner,t.requested_by,t.request_msg,t.deliverable,t.stakes,t.budget,t.spent,t.state,m.sent_at FROM tasks t JOIN messages m ON m.id=t.request_msg";
 fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
         id: json_col(r, 0)?,
@@ -1337,11 +1406,12 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         budget: json_col(r, 7)?,
         spent: json_col(r, 8)?,
         state: json_col(r, 9)?,
+        opened: json_col(r, 10)?,
     })
 }
 fn task(db: &Connection, id: TaskId) -> Result<Task> {
     db.query_row(
-        &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id=?"),
+        &format!("{TASK_SELECT} WHERE t.id=?"),
         [json(&id)?],
         task_row,
     )
@@ -1350,19 +1420,147 @@ fn task(db: &Connection, id: TaskId) -> Result<Task> {
 }
 fn owned_task(db: &Connection, id: TaskId, owner: AgentId) -> Result<Task> {
     let t = task(db, id)?;
-    if t.owner != owner || t.state != TaskState::Open {
-        return Err(Error::Rejected(
-            "task must be open and owned by sender".into(),
-        ));
+    if t.owner != owner {
+        return Err(not_open());
     }
     Ok(t)
 }
-fn charge(t: &mut Task, spend: Budget) -> Result<()> {
-    if t.state != TaskState::Open {
-        return Err(Error::Rejected("task is not open".into()));
+fn not_open() -> Error {
+    Error::Rejected("task must be open and owned by sender".into())
+}
+fn expired(t: &Task, notified: Vec<AgentId>) -> Error {
+    Error::TaskExpired {
+        task: t.id,
+        wall_secs: t.budget.wall_secs,
+        notified,
     }
-    t.spent = t.spent.add(spend, t.budget).ok_or(Error::BudgetExceeded)?;
+}
+
+/// Everything that changes a task's state or spend.
+enum TaskEvent<'a> {
+    /// The owner sent one message in the task's context.
+    Message,
+    /// The owner opened a child task with this budget.
+    Carve(Budget),
+    Report {
+        report: MessageId,
+        outcome: &'a Outcome,
+        at: OffsetDateTime,
+    },
+    /// Only for a task that is `due`.
+    Expire,
+}
+
+fn due(t: &Task, now: OffsetDateTime) -> bool {
+    t.state == TaskState::Open && t.deadline().is_some_and(|deadline| now >= deadline)
+}
+
+/// The task lifecycle: `Open` moves to `Verifying`, `Closed` or `Expired`, and
+/// only an `Open` task is charged. Callers apply expiry with `due` first.
+fn advance(t: &mut Task, event: TaskEvent<'_>) -> Result<()> {
+    match t.state {
+        TaskState::Open => {}
+        TaskState::Expired => return Err(expired(t, Vec::new())),
+        TaskState::Verifying { .. } | TaskState::Closed { .. } => return Err(not_open()),
+    }
+    match event {
+        TaskEvent::Message => {
+            // A message adds no tokens. `add` reads a `None` charge as unknown usage.
+            let one = Budget {
+                tokens: Some(0),
+                messages: 1,
+                ..Budget::default()
+            };
+            t.spent = t.spent.add(one, t.budget).ok_or_else(|| {
+                Error::Rejected(format!(
+                    "task {} has used all {} messages in its budget; a Report is still accepted",
+                    t.id, t.budget.messages
+                ))
+            })?;
+        }
+        TaskEvent::Carve(budget) => {
+            t.spent = t.spent.add(budget, t.budget).ok_or(Error::BudgetExceeded)?;
+        }
+        TaskEvent::Report {
+            report,
+            outcome,
+            at,
+        } => {
+            // A clock that stepped back reads as no time spent.
+            let open_for = u64::try_from((at - t.opened).whole_seconds()).unwrap_or(0);
+            t.spent.wall_secs = t.spent.wall_secs.max(open_for);
+            t.state = match outcome {
+                Outcome::Partial { .. } | Outcome::Infeasible { .. } => {
+                    TaskState::Verifying { report }
+                }
+                _ => TaskState::Closed {
+                    outcome: outcome.clone(),
+                    success: matches!(outcome, Outcome::Done { .. }),
+                },
+            };
+        }
+        TaskEvent::Expire => {
+            t.spent.wall_secs = t.budget.wall_secs;
+            t.state = TaskState::Expired;
+        }
+    }
     Ok(())
+}
+
+/// Expires `t` and queues its notices in the caller's transaction. Returns
+/// the agents notified.
+fn expire(tx: &Connection, t: &mut Task, now: OffsetDateTime) -> Result<Vec<AgentId>> {
+    advance(t, TaskEvent::Expire)?;
+    save_task(tx, t)?;
+    let request = message(tx, t.request)?;
+    let owner: String = tx.query_row(
+        "SELECT name FROM agents WHERE id=?",
+        [json(&t.owner)?],
+        |r| r.get(0),
+    )?;
+    let mut notices = vec![(
+        t.owner,
+        format!(
+            "Task {} expired: its wall clock budget of {}s ran out. It can no longer be reported.",
+            t.id, t.budget.wall_secs
+        ),
+    )];
+    if let Sender::Agent(requester) = t.requested_by
+        && requester != t.owner
+    {
+        notices.push((
+            requester,
+            format!(
+                "Task {} assigned to @{owner} expired: its wall clock budget of {}s ran out.",
+                t.id, t.budget.wall_secs
+            ),
+        ));
+    }
+    let mut notified = Vec::new();
+    for (to, body) in notices {
+        if retired(tx, to)? {
+            continue;
+        }
+        let env = Envelope {
+            id: MessageId::new(),
+            from: Sender::Human,
+            to,
+            conversation: request.conversation,
+            in_reply_to: Some(t.request),
+            hop: 0,
+            act: Act::Inform,
+            task: Some(t.id),
+            exposure: None,
+            body: Body::new(body).expect("bug: an expiry notice is a short nonempty body"),
+            sent_at: now,
+        };
+        // The state change above makes expiry happen once, so this key only
+        // has to be unused. A key a caller could predict would let one earlier
+        // send fail this insert and with it the whole sweep.
+        insert_message(tx, &env, &format!("task-expired:{}", env.id), None)?;
+        notified.push(to);
+    }
+    Ok(notified)
 }
 fn save_task(db: &Connection, t: &Task) -> Result<()> {
     db.execute(
@@ -1443,5 +1641,210 @@ mod actor_tests {
         assert_eq!(incarnation, Incarnation(3));
         drop(lease);
         room.close().await.expect("close");
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use time::Duration;
+
+    use super::*;
+
+    struct Room {
+        _dir: tempfile::TempDir,
+        room: Mailroom,
+        a: AgentId,
+        b: AgentId,
+        t0: OffsetDateTime,
+    }
+
+    impl Room {
+        async fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let room = Mailroom::open(dir.path().join("mail.db"), Config::default())
+                .await
+                .expect("mailroom");
+            let a = room
+                .register(AgentName::parse("alice").expect("name"))
+                .await
+                .expect("register");
+            let b = room
+                .register(AgentName::parse("bob").expect("name"))
+                .await
+                .expect("register");
+            let t0 = OffsetDateTime::now_utc();
+            Self {
+                _dir: dir,
+                room,
+                a,
+                b,
+                t0,
+            }
+        }
+        async fn send(&self, msg: NewMessage, after: Duration) -> Result<Envelope> {
+            let now = self.t0 + after;
+            Ok(self.room.call(move |s| s.accept_at(msg, now)).await?.1)
+        }
+        async fn request(
+            &self,
+            from: Sender,
+            to: AgentId,
+            parent: Option<TaskId>,
+            wall_secs: u64,
+            after: Duration,
+        ) -> TaskId {
+            let mut msg = mail(from, to, parent);
+            msg.act = Act::Request {
+                deliverable: "work".into(),
+                budget: Budget {
+                    tokens: None,
+                    wall_secs,
+                    messages: if parent.is_some() { 3 } else { 10 },
+                    hops: 1,
+                },
+                stakes: Stakes::Normal,
+            };
+            self.send(msg, after)
+                .await
+                .expect("request")
+                .task()
+                .expect("task")
+        }
+    }
+
+    fn mail(from: Sender, to: AgentId, task: Option<TaskId>) -> NewMessage {
+        NewMessage {
+            from,
+            to,
+            body: Body::new("note").expect("body"),
+            reply_to: None,
+            client_key: ClientKey(MessageId::new().to_string()),
+            act: Act::Inform,
+            task,
+        }
+    }
+
+    fn report(from: AgentId, to: AgentId, task: TaskId) -> NewMessage {
+        NewMessage {
+            act: Act::Report {
+                task,
+                outcome: Outcome::Done { artifacts: vec![] },
+            },
+            ..mail(Sender::Agent(from), to, None)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_report_records_the_whole_seconds_the_task_was_open() {
+        let r = Room::new().await;
+        let leaf = r
+            .request(Sender::Human, r.a, None, 100, Duration::ZERO)
+            .await;
+        r.send(report(r.a, r.a, leaf), Duration::milliseconds(5_900))
+            .await
+            .expect("report");
+        let t = r.room.task(leaf).await.expect("leaf");
+        assert_eq!(t.spent.wall_secs, 5);
+        assert!(matches!(t.state, TaskState::Closed { success: true, .. }));
+
+        let parent = r
+            .request(Sender::Human, r.a, None, 100, Duration::ZERO)
+            .await;
+        r.request(
+            Sender::Agent(r.a),
+            r.b,
+            Some(parent),
+            30,
+            Duration::seconds(1),
+        )
+        .await;
+        r.send(report(r.a, r.a, parent), Duration::seconds(10))
+            .await
+            .expect("report");
+        assert_eq!(
+            r.room.task(parent).await.expect("parent").spent.wall_secs,
+            30,
+            "a child's reservation is never refunded"
+        );
+        r.room.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_send_after_the_deadline_expires_the_task_before_any_sweep() {
+        let r = Room::new().await;
+        let root = r
+            .request(Sender::Human, r.a, None, 60, Duration::ZERO)
+            .await;
+        r.send(
+            mail(Sender::Agent(r.a), r.b, Some(root)),
+            Duration::seconds(59),
+        )
+        .await
+        .expect("before the deadline");
+        let late = r
+            .send(
+                mail(Sender::Agent(r.a), r.b, Some(root)),
+                Duration::seconds(60),
+            )
+            .await
+            .expect_err("at the deadline");
+        assert!(
+            matches!(&late, Error::TaskExpired { task, notified, .. } if *task == root && *notified == vec![r.a]),
+            "{late:?}"
+        );
+        let t = r.room.task(root).await.expect("root");
+        assert_eq!(t.state, TaskState::Expired);
+        assert_eq!(t.spent.messages, 1);
+        assert_eq!(t.spent.wall_secs, 60);
+        let notice = r.room.pending_for(r.a).await.expect("pending");
+        assert_eq!(notice.len(), 2, "the request and one notice");
+        let again = r
+            .send(report(r.a, r.a, root), Duration::seconds(61))
+            .await
+            .expect_err("no report after expiry");
+        assert!(
+            matches!(&again, Error::TaskExpired { notified, .. } if notified.is_empty()),
+            "{again:?}"
+        );
+        let sweep = r
+            .room
+            .expire_tasks(r.t0 + Duration::seconds(120))
+            .await
+            .expect("sweep");
+        assert!(sweep.expired.is_empty() && sweep.notified.is_empty());
+        assert_eq!(r.room.pending_for(r.a).await.expect("pending").len(), 2);
+        r.room.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn children_of_an_expired_task_keep_their_own_budgets() {
+        let r = Room::new().await;
+        let root = r
+            .request(Sender::Human, r.a, None, 100, Duration::ZERO)
+            .await;
+        let child = r
+            .request(
+                Sender::Agent(r.a),
+                r.b,
+                Some(root),
+                90,
+                Duration::seconds(50),
+            )
+            .await;
+        let sweep = r
+            .room
+            .expire_tasks(r.t0 + Duration::seconds(100))
+            .await
+            .expect("sweep");
+        assert_eq!(sweep.expired, vec![root]);
+        assert_eq!(sweep.next, Some(r.t0 + Duration::seconds(140)));
+        assert_eq!(
+            r.room.task(child).await.expect("child").state,
+            TaskState::Open
+        );
+        r.send(report(r.b, r.a, child), Duration::seconds(120))
+            .await
+            .expect("the child still reports to its requester");
+        r.room.close().await.expect("close");
     }
 }
