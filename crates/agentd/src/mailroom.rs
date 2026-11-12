@@ -653,14 +653,22 @@ impl Mailroom {
 
     pub async fn register(&self, name: AgentName) -> Result<AgentId> {
         self.call(move |s| {
-            if let Some(id) =
+            if let Some((id, role)) =
                 s.db.query_row(
-                    "SELECT id FROM agents WHERE name=? AND retired=0",
+                    "SELECT id,role FROM agents WHERE name=? AND retired=0",
                     [name.as_str()],
-                    |r| json_col(r, 0),
+                    |r| Ok((json_col(r, 0)?, r.get::<_, String>(1)?)),
                 )
                 .optional()?
             {
+                // A caller that got a verifier's id back could run its own
+                // agent under it and send the verdict.
+                if role != "worker" {
+                    return Err(Error::Rejected(format!(
+                        "the name @{} belongs to a verifier; choose another name",
+                        name.as_str()
+                    )));
+                }
                 return Ok(id);
             }
             let id = AgentId::new();
@@ -1576,7 +1584,7 @@ impl Store {
             },
         )?;
         tx.execute(
-            "UPDATE verifications SET state='running',verifier=?,task=?,verifier_family=?,claimant_family=?,snapshot_clean=? WHERE report_msg=?",
+            "UPDATE verifications SET state='running',verifier=?,task=?,verifier_family=?,claimant_family=?,snapshot_clean=? WHERE report_msg=? AND state='pending'",
             params![
                 json(&verifier)?,
                 json(&id)?,
@@ -1925,14 +1933,20 @@ fn settle(
         save_task(tx, &claim)?;
         settlement
     };
-    tx.execute(
-        "UPDATE verifications SET state='settled',result=?,verdict_msg=? WHERE report_msg=?",
+    let settled = tx.execute(
+        "UPDATE verifications SET state='settled',result=?,verdict_msg=? WHERE report_msg=? AND state<>'settled'",
         params![
             json(&settlement)?,
             verdict.map(|m| json(&m)).transpose()?,
             json(&v.report)?
         ],
     )?;
+    if settled != 1 {
+        return Err(Error::Rejected(format!(
+            "bug: verification of report {} was already settled",
+            v.report
+        )));
+    }
     Ok(settlement)
 }
 fn json(value: &impl Serialize) -> Result<String> {
@@ -3404,6 +3418,113 @@ mod verification_tests {
                 .is_empty()
         );
         r.room.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_verifier_name_cannot_be_taken_or_adopted() {
+        let r = Room::new(true).await;
+        let (task, claim) = r.claim(Stakes::Normal, infeasible()).await;
+        // A worker holds this name, so no verifier is registered under it.
+        let taken = r
+            .room
+            .call(move |s| {
+                s.open_verification_at(claim, start("alice", true), OffsetDateTime::now_utc())
+            })
+            .await;
+        assert!(
+            matches!(taken, Err(Error::Rejected(ref reason)) if reason.contains("already exists")),
+            "{taken:?}"
+        );
+        assert_eq!(
+            r.room.verification(claim).await.expect("row").state,
+            VerificationState::Pending
+        );
+        assert_eq!(
+            r.room.register(spec("alice").name).await.expect("alice"),
+            r.a
+        );
+
+        // A spawn under the verifier's name would run as the verifier.
+        r.open(claim, start("checker", true), Duration::seconds(6))
+            .await;
+        let adopted = r.room.register(spec("checker").name).await;
+        assert!(
+            matches!(adopted, Err(Error::Rejected(ref reason)) if reason.contains("belongs to a verifier")),
+            "{adopted:?}"
+        );
+        assert_eq!(r.state(task).await, TaskState::Verifying { report: claim });
+    }
+
+    #[tokio::test]
+    async fn a_reopened_task_is_verified_again_on_its_next_claim() {
+        let r = Room::new(true).await;
+        let (task, first) = r.claim(Stakes::Normal, infeasible()).await;
+        let v = r
+            .open(first, start("checker", true), Duration::seconds(6))
+            .await;
+        r.send(
+            report(
+                v.verifier.expect("verifier"),
+                v.task.expect("task"),
+                Outcome::Done { artifacts: vec![] },
+                Some(refuted()),
+            ),
+            Duration::seconds(7),
+        )
+        .await
+        .expect("refuted");
+        r.resolve(task, ReviewDecision::Refute, Duration::seconds(8))
+            .await
+            .expect("refute");
+        assert_eq!(r.state(task).await, TaskState::Open);
+
+        let (_, second) = r
+            .send(report(r.a, task, infeasible(), None), Duration::seconds(9))
+            .await
+            .expect("second claim");
+        let second = second.id();
+        assert_eq!(r.state(task).await, TaskState::Verifying { report: second });
+        let pending = r.room.pending_verifications().await.expect("pending");
+        assert_eq!(
+            pending.iter().map(|v| v.report).collect::<Vec<_>>(),
+            [second]
+        );
+        // The first verifier is done. Its verdict cannot settle the new claim.
+        let again = r
+            .send(
+                report(
+                    v.verifier.expect("verifier"),
+                    v.task.expect("task"),
+                    Outcome::Done { artifacts: vec![] },
+                    Some(confirmed()),
+                ),
+                Duration::seconds(10),
+            )
+            .await;
+        assert!(again.is_err(), "{again:?}");
+        assert_eq!(r.state(task).await, TaskState::Verifying { report: second });
+
+        let v = r
+            .open(second, start("checker-2", true), Duration::seconds(11))
+            .await;
+        r.send(
+            report(
+                v.verifier.expect("verifier"),
+                v.task.expect("task"),
+                Outcome::Done { artifacts: vec![] },
+                Some(confirmed()),
+            ),
+            Duration::seconds(12),
+        )
+        .await
+        .expect("confirmed");
+        assert_eq!(
+            r.state(task).await,
+            TaskState::Closed {
+                outcome: infeasible(),
+                success: true
+            }
+        );
     }
 
     #[tokio::test]
