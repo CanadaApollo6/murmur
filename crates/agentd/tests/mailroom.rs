@@ -901,7 +901,7 @@ async fn schema_version_and_attempt_configuration_are_checked() {
     let dir = tempfile::tempdir().expect("dir");
     let path = dir.path().join("future.db");
     let db = rusqlite::Connection::open(&path).expect("db");
-    db.execute_batch("PRAGMA user_version=6").expect("version");
+    db.execute_batch("PRAGMA user_version=7").expect("version");
     db.close().expect("close");
     assert!(Mailroom::open(&path, Config::default()).await.is_err());
     assert!(
@@ -952,7 +952,7 @@ async fn version_two_database_upgrades_with_agents_running() {
     let version: u32 = db
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .expect("version");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 }
 
 #[tokio::test]
@@ -1921,13 +1921,15 @@ async fn an_overdue_task_expires_after_the_database_is_reopened() {
 /// built from the SQL scripts up to `version`, so the copy is the file an
 /// older build would have written. The current build writes these rows in the
 /// old shape: the new columns are left out, and a report without a verdict
-/// serializes as it did before.
+/// serializes as it did before. Version 5 also keeps roles, reopened clocks
+/// and verifications.
 fn old_copy(from: &std::path::Path, to: &std::path::Path, version: usize) {
     let scripts = [
         include_str!("../src/schema.sql"),
         include_str!("../src/schema-v2.sql"),
         include_str!("../src/schema-v3.sql"),
         include_str!("../src/schema-v4.sql"),
+        include_str!("../src/schema-v5.sql"),
     ];
     let db = rusqlite::Connection::open(to).expect("db");
     db.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
@@ -1945,10 +1947,20 @@ fn old_copy(from: &std::path::Path, to: &std::path::Path, version: usize) {
             SELECT id,parent,owner,requested_by,request_msg,deliverable,stakes,budget,spent,state FROM new.tasks;
         INSERT INTO deliveries(message_id,state,incarnation,turn_started,attempts,reason,msg_seq)
             SELECT message_id,state,incarnation,turn_started,attempts,reason,msg_seq FROM new.deliveries;
-        COMMIT;
-        DETACH new;",
+        COMMIT;",
     )
     .expect("copy rows");
+    if version >= 5 {
+        db.execute_batch(
+            "BEGIN;
+            UPDATE agents SET role=(SELECT role FROM new.agents n WHERE n.id=agents.id);
+            UPDATE tasks SET clock_start=(SELECT clock_start FROM new.tasks n WHERE n.id=tasks.id);
+            INSERT INTO verifications SELECT * FROM new.verifications;
+            COMMIT;",
+        )
+        .expect("copy version 5 rows");
+    }
+    db.execute_batch("DETACH new;").expect("detach");
     let user_version: usize = db
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .expect("version");
@@ -1994,7 +2006,7 @@ async fn a_version_three_database_opens_and_its_open_tasks_expire() {
         .expect("sweep");
     assert_eq!(sweep.expired, vec![root]);
     mail.close().await.expect("close");
-    assert_eq!(user_version(&path), 5);
+    assert_eq!(user_version(&path), 6);
 }
 
 fn verifying() -> Config {
@@ -2191,7 +2203,7 @@ async fn a_version_four_database_keeps_its_rows_and_its_verifying_tasks() {
         .expect("brief");
     assert!(brief[0].body().as_str().contains("the archive is gone"));
     mail.close().await.expect("close");
-    assert_eq!(user_version(&path), 5);
+    assert_eq!(user_version(&path), 6);
     let db = rusqlite::Connection::open(&path).expect("db");
     let mut roles = db
         .prepare("SELECT name,role FROM agents ORDER BY name")
@@ -2253,4 +2265,98 @@ async fn a_caller_cannot_block_expiry_by_taking_a_notice_key() {
             TaskState::Expired
         );
     }
+}
+
+#[tokio::test]
+async fn a_version_five_database_upgrades_and_scores_its_review() {
+    let (dir, mail, a, _) = setup(verifying()).await;
+    let root = request(&mail, Sender::Human, a, None, budget(10))
+        .await
+        .expect("root")
+        .task()
+        .expect("task");
+    let mut claim = send(Sender::Agent(a), a);
+    claim.act = Act::Report {
+        task: root,
+        outcome: Outcome::Infeasible {
+            evidence: Evidence {
+                tried: "every mirror".into(),
+                obstacle: "the archive is gone".into(),
+                reproduction: None,
+            },
+        },
+        verdict: None,
+    };
+    let (_, claim) = mail.accept(claim).await.expect("claim");
+    let v = mail
+        .open_verification(claim.id(), checker())
+        .await
+        .expect("open verification");
+    let verifier = v.verifier.expect("verifier");
+    let mut verdict = send(Sender::Agent(verifier), verifier);
+    verdict.act = Act::Report {
+        task: v.task.expect("verification task"),
+        outcome: Outcome::Done { artifacts: vec![] },
+        verdict: Some(VerifierVerdict::Refuted {
+            path: "the second mirror".into(),
+            reproduction: "fetch it".into(),
+        }),
+    };
+    mail.accept(verdict).await.expect("verdict");
+    mail.close().await.expect("close");
+    let path = dir.path().join("v5.db");
+    old_copy(&dir.path().join("broker.db"), &path, 5);
+
+    let mail = Mailroom::open(&path, verifying()).await.expect("upgrade");
+    assert!(matches!(
+        mail.task(root).await.expect("task").state,
+        TaskState::Review {
+            finding: Finding::Refuted { .. },
+            ..
+        }
+    ));
+    assert_eq!(mail.calibration().await.expect("calibration"), []);
+    mail.resolve_review(root, ReviewDecision::Refute)
+        .await
+        .expect("refute");
+    let wrong = Counts {
+        wrong: 1,
+        ..Counts::default()
+    };
+    let correct = Counts {
+        correct: 1,
+        ..Counts::default()
+    };
+    assert_eq!(
+        mail.calibration().await.expect("calibration"),
+        [
+            Calibration {
+                subject: CalibrationSubject::Claimant {
+                    agent: a,
+                    name: "alice".into()
+                },
+                seed: Counts::default(),
+                operator: wrong,
+            },
+            Calibration {
+                subject: CalibrationSubject::Verifier {
+                    family: "gpt".into()
+                },
+                seed: Counts::default(),
+                operator: correct,
+            },
+        ]
+    );
+    // The upgraded file takes seeded tasks.
+    let mut seeded = send(Sender::Human, a);
+    seeded.act = Act::Request {
+        deliverable: "a tested change".into(),
+        budget: budget(10),
+        stakes: Stakes::Normal,
+    };
+    mail.accept_seeded(seeded, Some(Expectation::Feasible))
+        .await
+        .expect("seeded request");
+    mail.close().await.expect("close");
+    assert_eq!(user_version(&path), 6);
 }

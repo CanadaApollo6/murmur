@@ -618,12 +618,20 @@ impl Broker {
     }
     /// Trusted in-process API. External callers are authenticated by surfaces.
     pub async fn send(&self, message: NewMessage) -> Result<(SendOutcome, Envelope)> {
+        self.send_seeded(message, None).await
+    }
+    /// `send` for the operator's request, with the true answer of its task.
+    pub async fn send_seeded(
+        &self,
+        message: NewMessage,
+        seed: Option<crate::swarm::Expectation>,
+    ) -> Result<(SendOutcome, Envelope)> {
         let agents = Arc::clone(&self.agents);
         let to = message.to;
         let mailroom = Arc::clone(&self.mailroom);
         // A dropped caller must not separate a durable accept from its wakeup.
         tokio::spawn(async move {
-            let outcome = mailroom.accept(message).await;
+            let outcome = mailroom.accept_seeded(message, seed).await;
             let wake = match &outcome {
                 Ok(_) => vec![to],
                 Err(crate::mailroom::Error::TaskExpired { notified, .. }) => notified.clone(),
