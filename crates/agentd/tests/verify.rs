@@ -49,6 +49,7 @@ fn kind(root: &Path, name: &str, family: &str) -> KindConfig {
 fn settings(verifiers: &[&str], max_running: usize) -> Settings {
     Settings {
         kinds: verifiers.iter().map(|k| (*k).to_owned()).collect(),
+        check_done: Some(Stakes::Normal),
         families: BTreeMap::from([
             ("claude".into(), Some("anthropic".into())),
             ("codex".into(), Some("openai".into())),
@@ -85,6 +86,7 @@ impl Rig {
                 root.path().join("state/mail.db"),
                 agentd::mailroom::Config {
                     verifier_available: !verifiers.is_empty(),
+                    check_done: Some(Stakes::Normal),
                     ..Default::default()
                 },
             )
@@ -201,6 +203,25 @@ impl Rig {
     }
     /// The operator asks `agent` for something; it answers `infeasible`.
     async fn claim(&self, agent: AgentId) -> (TaskId, MessageId) {
+        self.report(
+            agent,
+            Stakes::Normal,
+            Outcome::Infeasible {
+                evidence: Evidence {
+                    tried: "everything".into(),
+                    obstacle: "a wall".into(),
+                    reproduction: None,
+                },
+            },
+        )
+        .await
+    }
+    async fn report(
+        &self,
+        agent: AgentId,
+        stakes: Stakes,
+        outcome: Outcome,
+    ) -> (TaskId, MessageId) {
         let request = self
             .send(
                 Sender::Human,
@@ -213,7 +234,7 @@ impl Rig {
                         messages: 5,
                         hops: 1,
                     },
-                    stakes: Stakes::Normal,
+                    stakes,
                 },
             )
             .await;
@@ -224,13 +245,7 @@ impl Rig {
                 agent,
                 Act::Report {
                     task,
-                    outcome: Outcome::Infeasible {
-                        evidence: Evidence {
-                            tried: "everything".into(),
-                            obstacle: "a wall".into(),
-                            reproduction: None,
-                        },
-                    },
+                    outcome,
                     verdict: None,
                 },
             )
@@ -398,6 +413,89 @@ async fn a_confirmed_claim_closes_and_the_verifier_is_cleaned_up() {
     ));
     rig.retired_and_gone(v.verifier.expect("verifier"), report)
         .await;
+    rig.close().await;
+}
+
+#[tokio::test]
+async fn done_checks_use_a_clean_snapshot_and_skip_low_stakes() {
+    let rig = Rig::new(&["claude", "codex"], 2).await;
+    let a = rig.claimant("a").await;
+    let (task, report) = rig
+        .report(a, Stakes::Normal, Outcome::Done { artifacts: vec![] })
+        .await;
+    let v = rig.running(report).await;
+    assert_eq!(rig.task_state(task).await, TaskState::Verifying { report });
+    assert_eq!(v.verifier_family.as_deref(), Some("openai"));
+    assert_eq!(v.claimant_family.as_deref(), Some("anthropic"));
+    assert_eq!(v.snapshot_clean, Some(true));
+    let snapshot = rig
+        .state()
+        .join("verify")
+        .join(report.to_string())
+        .join("workspace");
+    assert!(snapshot.join("src/lib.rs").exists());
+    assert!(!snapshot.join(".git").exists());
+    let process = rig
+        .until("the verifier in the snapshot", async || {
+            rig.verifier_processes().into_iter().next()
+        })
+        .await;
+    assert_eq!(
+        process["cwd"],
+        snapshot
+            .canonicalize()
+            .expect("snapshot")
+            .display()
+            .to_string()
+    );
+    rig.verdict(&v).await;
+    assert_eq!(
+        rig.task_state(task).await,
+        TaskState::Closed {
+            outcome: Outcome::Done { artifacts: vec![] },
+            success: true
+        }
+    );
+    let vtask = v.task.expect("verification task");
+    assert_eq!(
+        rig.task_state(vtask).await,
+        TaskState::Closed {
+            outcome: Outcome::Done { artifacts: vec![] },
+            success: true
+        }
+    );
+    assert_eq!(rig.row(report).await.state, VerificationState::Settled);
+    rig.retired_and_gone(v.verifier.expect("verifier"), report)
+        .await;
+
+    let (low, low_report) = rig
+        .report(a, Stakes::Low, Outcome::Done { artifacts: vec![] })
+        .await;
+    assert_eq!(
+        rig.task_state(low).await,
+        TaskState::Closed {
+            outcome: Outcome::Done { artifacts: vec![] },
+            success: true
+        }
+    );
+    assert!(matches!(
+        rig.mailroom.verification(low_report).await,
+        Err(agentd::mailroom::Error::NotFound(_))
+    ));
+    assert!(
+        !rig.state()
+            .join("verify")
+            .join(low_report.to_string())
+            .exists()
+    );
+    assert!(
+        rig.mailroom
+            .pending_verifications()
+            .await
+            .expect("pending")
+            .is_empty()
+    );
+    assert_eq!(rig.verifier_processes().len(), 1);
     rig.close().await;
 }
 

@@ -136,6 +136,7 @@ async fn run(args: Args) -> Result<()> {
     sandbox.validate(&state, &control_path, &mcp_path, &mut kinds)?;
     let verify = agentd::verify::Settings::from_file(verify_file.as_ref(), &kinds)?;
     mail_config.verifier_available = verify.is_some();
+    mail_config.check_done = verify.as_ref().and_then(|settings| settings.check_done);
     if kinds
         .iter()
         .any(|k| matches!(k.isolation, agentd::sandbox::Isolation::Bwrap(_)))

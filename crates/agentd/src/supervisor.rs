@@ -655,15 +655,14 @@ impl Broker {
         let agents = Arc::clone(&self.agents);
         let to = message.to;
         let mailroom = Arc::clone(&self.mailroom);
-        let runner = self.verify.clone().filter(|_| {
-            matches!(
-                &message.act,
-                crate::swarm::Act::Report {
-                    outcome: crate::swarm::Outcome::Partial { .. }
-                        | crate::swarm::Outcome::Infeasible { .. },
-                    ..
-                }
-            )
+        let runner = self.verify.clone().filter(|runner| match &message.act {
+            crate::swarm::Act::Report { outcome, .. } => match outcome {
+                crate::swarm::Outcome::Partial { .. }
+                | crate::swarm::Outcome::Infeasible { .. } => true,
+                crate::swarm::Outcome::Done { .. } => runner.settings().check_done.is_some(),
+                _ => false,
+            },
+            _ => false,
         });
         // A dropped caller must not separate a durable accept from its wakeup.
         tokio::spawn(async move {

@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::KindConfig;
 use crate::mailroom::{Error as MailError, Mailroom, Verification, VerifierStart};
 use crate::model::*;
-use crate::swarm::Budget;
+use crate::swarm::{Budget, Stakes};
 
 /// The directory under the state directory that holds every snapshot.
 pub const VERIFY_DIR: &str = "verify";
@@ -78,6 +78,8 @@ pub struct VerifyFile {
     /// Verifier kinds, in order of preference.
     #[serde(default)]
     pub kinds: Vec<String>,
+    #[serde(default = "default_check_done")]
+    pub check_done: String,
     #[serde(default = "default_wall_secs")]
     pub wall_secs: u64,
     pub tokens: Option<u64>,
@@ -87,6 +89,9 @@ pub struct VerifyFile {
     pub max_snapshot_bytes: u64,
     #[serde(default = "default_max_snapshot_entries")]
     pub max_snapshot_entries: u64,
+}
+fn default_check_done() -> String {
+    "normal".into()
 }
 fn default_wall_secs() -> u64 {
     DEFAULT_WALL_SECS
@@ -106,6 +111,7 @@ fn default_max_snapshot_entries() -> u64 {
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub kinds: Vec<String>,
+    pub check_done: Option<Stakes>,
     /// The family of every configured kind, `None` for a kind without one.
     pub families: BTreeMap<String, Option<String>>,
     pub budget: Budget,
@@ -121,9 +127,19 @@ impl Settings {
         file: Option<&VerifyFile>,
         kinds: &[KindConfig],
     ) -> Result<Option<Self>, String> {
-        let Some(file) = file.filter(|f| !f.kinds.is_empty()) else {
+        let Some(file) = file else {
             return Ok(None);
         };
+        let check_done = match file.check_done.as_str() {
+            "never" => None,
+            "low" => Some(Stakes::Low),
+            "normal" => Some(Stakes::Normal),
+            "high" => Some(Stakes::High),
+            _ => return Err("[verify] check_done must be never, low, normal or high".into()),
+        };
+        if file.kinds.is_empty() {
+            return Ok(None);
+        }
         if file.wall_secs == 0 {
             return Err("[verify] wall_secs must be at least 1".into());
         }
@@ -168,6 +184,7 @@ impl Settings {
         }
         Ok(Some(Self {
             kinds: file.kinds.clone(),
+            check_done,
             families: kinds
                 .iter()
                 .map(|k| (k.name.clone(), k.family.clone()))
@@ -899,10 +916,11 @@ impl Runner {
         mailroom: &Mailroom,
         report: MessageId,
     ) -> Result<(), String> {
-        let v = mailroom
-            .verification(report)
-            .await
-            .map_err(|e| e.to_string())?;
+        let v = match mailroom.verification(report).await {
+            Ok(v) => v,
+            Err(MailError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
         if v.state != crate::mailroom::VerificationState::Pending {
             tracing::debug!(%report, state=?v.state, "no snapshot at report time: the claim is not pending");
             return Ok(());

@@ -19,7 +19,7 @@ only delivery authority.
 | Infinity model agents sending mail | Merged (#9) |
 | `infinity-provider-local` | Merged (#10). Live engine probes and agent qualification are pending. See [Run local inference](local-inference.md) |
 | Event bus and graph UI | Merged (#13, #14). See the [agentd README](../../crates/agentd/README.md#graph-ui) |
-| Verifier and calibration | Built. With a `[verify]` table, a verifier of another family checks each `Partial` and `Infeasible` claim in a sandboxed snapshot of the claimant's workspace. Without one, those claims go to `review` for the operator. Seeded tasks (`agentctl send --expect`) settle by their known answer. Calibration events score claimants and verifier families against seeds and operator decisions, and `agentctl calibration` prints them. Nothing acts on the scores yet. Checking `Done` claims and two verifiers for high stakes are not built |
+| Verifier and calibration | Built. With a `[verify]` table, a verifier of another family checks each `Partial` and `Infeasible` claim and `Done` claims at or above `[verify] check_done` (default `normal`) in a sandboxed snapshot of the claimant's workspace. Without one, `Partial` and `Infeasible` go to `review` for the operator and `Done` closes at once. Seeded tasks (`agentctl send --expect`) settle by their known answer. Calibration events score claimants and verifier families against seeds and operator decisions, and `agentctl calibration` prints them. Nothing acts on the scores yet. Two verifiers for high stakes are not built |
 | Pi, Prime and Muse adapters | Not built |
 | Infinity sandbox | Not built. Infinity agents run on the host (isolation risk R6) |
 
