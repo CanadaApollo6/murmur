@@ -23,6 +23,7 @@ agentctl approve <permission-id> <option-key>
 agentctl cancel @builder
 agentctl stop @builder
 agentctl restart @builder
+agentctl retire @builder
 agentctl held [@builder]
 agentctl release <message-id>
 agentctl drop <message-id>
@@ -43,13 +44,14 @@ detach from the thread. If the thread does not acknowledge the interrupt within
 the cancel timeout, `stop` still stops the agent but fails with
 `agent stopped, but the Infinity turn has not acknowledged the cancel and may
 still be running in the daemon`. `restart` reports the same case as
-`agent restarted, but ...` and reattaches to the thread. Stop also interrupts a
+`agent restarted, but ...` and reattaches to the thread. `retire` reports it as
+`agent retired, but ...`. Stop also interrupts a
 thread that is busy with work agentd did not submit.
 
 From the moment a stop or restart interrupts an Infinity turn, `agentctl ls` and
 the event feed show this warning in the agent's `error`, next to any other error,
 in every phase and across an actor respawn. Every reply to `stop` or `restart`
-carries it, including a reply that fails for another reason. Only evidence that
+carries it, including a reply that fails for another reason. The same holds for `retire`. Only evidence that
 the turn is over clears it: the thread reports the turn ended, or a session
 attached to the thread reports it idle. A new command does not clear it, and
 neither does an interrupt acknowledgement that leaves the thread running a new
@@ -71,6 +73,23 @@ This is the only way out of `needs-recovery`. If agentd shuts down while a stop
 or restart waits for the cancel, the command fails and nothing is started. Mail held from an uncertain turn stays held; use `agentctl held`,
 `release` and `drop` for it. Both commands are idempotent and affect only the
 named agent.
+
+`agentctl retire @name` removes the agent for good. It works from every phase.
+It ends the session the way `stop` does, with the same cancel and the same
+settlement of pending approvals. Then agentd marks the agent retired and drops
+its actor. The process exits, the sandbox, credential copy and MCP binding are
+released, and `agentctl ls` no longer lists the agent. Mail to it is rejected,
+and its undelivered inbound mail goes dead. Mail it already sent stays
+deliverable. Its name is free, and a new agent with that name gets a new id. An
+agentd restart does not bring it back. The feed sends
+`{"event":"agent_retired","agent":"agent:<id>"}`, and later snapshots omit the
+agent. The agent's state directory stays on disk. Retiring an unknown or
+already retired agent fails. Retire does not touch tasks. A retired assignee
+strands its open tasks. This is a known gap.
+
+If agentd stops during a retire, the agent comes back stopped, or stays retired
+if the retire had finished. If a retire fails, the agent is not retired. Run the
+same command again to finish it.
 
 The default state directory is `~/.local/state/agentd/`. `--state-dir` overrides it.
 The daemon logs warnings and errors to stderr; `RUST_LOG` replaces that filter.
