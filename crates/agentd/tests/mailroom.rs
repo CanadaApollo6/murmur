@@ -629,7 +629,11 @@ async fn rejected_request_rolls_back_carving_and_duplicate_request_creates_one_t
 
 #[tokio::test]
 async fn reports_record_all_outcomes_and_enforce_ownership_and_evidence() {
-    let (dir, mail, a, b) = setup(Config::default()).await;
+    let (dir, mail, a, b) = setup(Config {
+        verifier_available: true,
+        ..Config::default()
+    })
+    .await;
     let evidence = Evidence {
         tried: "ran tests".into(),
         obstacle: "missing input".into(),
@@ -662,12 +666,14 @@ async fn reports_record_all_outcomes_and_enforce_ownership_and_evidence() {
         invalid.act = Act::Report {
             task: id,
             outcome: outcome.clone(),
+            verdict: None,
         };
         assert!(mail.accept(invalid).await.is_err());
         let mut report = send(Sender::Agent(a), a);
         report.act = Act::Report {
             task: id,
             outcome: outcome.clone(),
+            verdict: None,
         };
         let (_, report) = mail.accept(report).await.expect("report");
         let state = mail.task(id).await.expect("task").state;
@@ -692,7 +698,11 @@ async fn reports_record_all_outcomes_and_enforce_ownership_and_evidence() {
                 .is_err()
         );
         let mut repeat = send(Sender::Agent(a), a);
-        repeat.act = Act::Report { task: id, outcome };
+        repeat.act = Act::Report {
+            task: id,
+            outcome,
+            verdict: None,
+        };
         assert!(mail.accept(repeat).await.is_err());
         reports.push(report);
     }
@@ -710,6 +720,7 @@ async fn reports_record_all_outcomes_and_enforce_ownership_and_evidence() {
                 reproduction: None,
             },
         },
+        verdict: None,
     };
     assert!(mail.accept(report).await.is_err());
     assert_eq!(mail.task(id).await.expect("task").state, TaskState::Open);
@@ -890,7 +901,7 @@ async fn schema_version_and_attempt_configuration_are_checked() {
     let dir = tempfile::tempdir().expect("dir");
     let path = dir.path().join("future.db");
     let db = rusqlite::Connection::open(&path).expect("db");
-    db.execute_batch("PRAGMA user_version=5").expect("version");
+    db.execute_batch("PRAGMA user_version=6").expect("version");
     db.close().expect("close");
     assert!(Mailroom::open(&path, Config::default()).await.is_err());
     assert!(
@@ -941,7 +952,7 @@ async fn version_two_database_upgrades_with_agents_running() {
     let version: u32 = db
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .expect("version");
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 }
 
 #[tokio::test]
@@ -1320,6 +1331,7 @@ async fn reports_go_to_the_requester_or_to_the_assignee_for_operator_tasks() {
         msg.act = Act::Report {
             task,
             outcome: done.clone(),
+            verdict: None,
         };
         msg
     };
@@ -1408,6 +1420,7 @@ async fn act_content_and_budgets_are_bounded() {
         outcome: Outcome::Failed {
             tried: "x".repeat(MAX_BODY_BYTES),
         },
+        verdict: None,
     };
     rejected.push(report);
     for msg in rejected {
@@ -1454,6 +1467,7 @@ async fn a_client_key_reused_for_different_content_is_an_error() {
     let report = Act::Report {
         task: root,
         outcome: Outcome::Done { artifacts: vec![] },
+        verdict: None,
     };
     let (first, inform) = mail.accept(keyed(Act::Inform)).await.expect("inform");
     assert!(matches!(first, SendOutcome::Queued { .. }));
@@ -1542,6 +1556,7 @@ async fn a_client_key_retry_must_name_the_same_parent_task() {
     close.act = Act::Report {
         task: root,
         outcome: Outcome::Done { artifacts: vec![] },
+        verdict: None,
     };
     mail.accept(close).await.expect("close root");
     for (msg, id) in honest_retries() {
@@ -1586,15 +1601,25 @@ async fn the_assignee_reports_to_itself_when_the_requester_is_retired() {
     mail.retire(a).await.expect("retire requester");
     let report = |task: TaskId, to: AgentId, outcome: Outcome| {
         let mut msg = send(Sender::Agent(b), to);
-        msg.act = Act::Report { task, outcome };
+        msg.act = Act::Report {
+            task,
+            outcome,
+            verdict: None,
+        };
         msg
     };
     let done = Outcome::Done { artifacts: vec![] };
     mail.close().await.expect("close");
     let before = message_count(&dir);
-    let mail = Mailroom::open(dir.path().join("broker.db"), Config::default())
-        .await
-        .expect("reopen");
+    let mail = Mailroom::open(
+        dir.path().join("broker.db"),
+        Config {
+            verifier_available: true,
+            ..Config::default()
+        },
+    )
+    .await
+    .expect("reopen");
     match mail.accept(report(children[0], a, done.clone())).await {
         Err(Error::Rejected(reason)) => assert!(
             reason.contains("is retired") && reason.contains("address the report to yourself"),
@@ -1659,6 +1684,7 @@ fn report(from: AgentId, to: AgentId, task: TaskId) -> NewMessage {
     msg.act = Act::Report {
         task,
         outcome: Outcome::Done { artifacts: vec![] },
+        verdict: None,
     };
     msg
 }
@@ -1891,8 +1917,52 @@ async fn an_overdue_task_expires_after_the_database_is_reopened() {
     mail.close().await.expect("close");
 }
 
-/// Version 4 adds no columns, so a version 3 file differs only in
-/// `user_version`. The rows below are the ones the version 3 code wrote.
+/// Copies the rows of a database the current build wrote into a new file
+/// built from the SQL scripts up to `version`, so the copy is the file an
+/// older build would have written. The current build writes these rows in the
+/// old shape: the new columns are left out, and a report without a verdict
+/// serializes as it did before.
+fn old_copy(from: &std::path::Path, to: &std::path::Path, version: usize) {
+    let scripts = [
+        include_str!("../src/schema.sql"),
+        include_str!("../src/schema-v2.sql"),
+        include_str!("../src/schema-v3.sql"),
+        include_str!("../src/schema-v4.sql"),
+    ];
+    let db = rusqlite::Connection::open(to).expect("db");
+    db.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
+    for script in &scripts[..version] {
+        db.execute_batch(script).expect("old schema");
+    }
+    db.execute("ATTACH ?1 AS new", [from.to_str().expect("path")])
+        .expect("attach");
+    db.execute_batch(
+        "BEGIN;
+        INSERT INTO agents(id,name,retired,epoch) SELECT id,name,retired,epoch FROM new.agents;
+        INSERT INTO agent_specs(agent,spec,stopped) SELECT agent,spec,stopped FROM new.agent_specs;
+        INSERT INTO messages SELECT * FROM new.messages;
+        INSERT INTO tasks(id,parent,owner,requested_by,request_msg,deliverable,stakes,budget,spent,state)
+            SELECT id,parent,owner,requested_by,request_msg,deliverable,stakes,budget,spent,state FROM new.tasks;
+        INSERT INTO deliveries(message_id,state,incarnation,turn_started,attempts,reason,msg_seq)
+            SELECT message_id,state,incarnation,turn_started,attempts,reason,msg_seq FROM new.deliveries;
+        COMMIT;
+        DETACH new;",
+    )
+    .expect("copy rows");
+    let user_version: usize = db
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("version");
+    assert_eq!(user_version, version.max(2));
+    db.close().expect("close");
+}
+
+fn user_version(path: &std::path::Path) -> u32 {
+    rusqlite::Connection::open(path)
+        .expect("db")
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("version")
+}
+
 #[tokio::test]
 async fn a_version_three_database_opens_and_its_open_tasks_expire() {
     let (dir, mail, a, _) = setup(Config::default()).await;
@@ -1911,15 +1981,8 @@ async fn a_version_three_database_opens_and_its_open_tasks_expire() {
     .task()
     .expect("task");
     mail.close().await.expect("close");
-    let path = dir.path().join("broker.db");
-    let db = rusqlite::Connection::open(&path).expect("db");
-    db.execute_batch("PRAGMA user_version=3")
-        .expect("version 3");
-    let state: String = db
-        .query_row("SELECT state FROM tasks", [], |r| r.get(0))
-        .expect("state");
-    assert_eq!(state, "\"Open\"");
-    db.close().expect("close");
+    let path = dir.path().join("v3.db");
+    old_copy(&dir.path().join("broker.db"), &path, 3);
     let mail = Mailroom::open(&path, Config::default())
         .await
         .expect("upgrade");
@@ -1931,11 +1994,104 @@ async fn a_version_three_database_opens_and_its_open_tasks_expire() {
         .expect("sweep");
     assert_eq!(sweep.expired, vec![root]);
     mail.close().await.expect("close");
+    assert_eq!(user_version(&path), 5);
+}
+
+#[tokio::test]
+async fn a_version_four_database_keeps_its_rows_and_its_verifying_tasks() {
+    let config = || Config {
+        verifier_available: true,
+        ..Config::default()
+    };
+    let (dir, mail, a, _) = setup(config()).await;
+    let root = request(&mail, Sender::Human, a, None, budget(10))
+        .await
+        .expect("root")
+        .task()
+        .expect("task");
+    let mut claim = send(Sender::Agent(a), a);
+    claim.act = Act::Report {
+        task: root,
+        outcome: Outcome::Infeasible {
+            evidence: Evidence {
+                tried: "every mirror".into(),
+                obstacle: "the archive is gone".into(),
+                reproduction: None,
+            },
+        },
+        verdict: None,
+    };
+    let (_, claim) = mail.accept(claim).await.expect("claim");
+    let claim = claim.id();
+    mail.close().await.expect("close");
+    let path = dir.path().join("v4.db");
+    old_copy(&dir.path().join("broker.db"), &path, 4);
+    let act: String = rusqlite::Connection::open(&path)
+        .expect("db")
+        .query_row(
+            "SELECT act FROM messages WHERE act LIKE '{\"Report\":%'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("stored report");
+    assert!(!act.contains("verdict"), "{act}");
+
+    let mail = Mailroom::open(&path, config()).await.expect("upgrade");
+    assert_eq!(
+        mail.task(root).await.expect("task").state,
+        TaskState::Verifying { report: claim }
+    );
+    let pending = mail.pending_verifications().await.expect("pending");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].report, claim);
+    assert_eq!(pending[0].claimant_task, root);
+    // Opening the verification reads the stored report back.
+    let v = mail
+        .open_verification(
+            claim,
+            VerifierStart {
+                spec: agentd::supervisor::AgentSpec {
+                    name: AgentName::parse("checker").expect("name"),
+                    kind: "claude".into(),
+                    cwd: "/".into(),
+                    workspace: None,
+                    model: None,
+                    permissions: Default::default(),
+                    idle_after: None,
+                },
+                budget: budget(5),
+                verifier_family: "gpt".into(),
+                claimant_family: "claude".into(),
+                snapshot_clean: true,
+            },
+        )
+        .await
+        .expect("open verification");
+    let brief = mail
+        .pending_for(v.verifier.expect("verifier"))
+        .await
+        .expect("brief");
+    assert!(brief[0].body().as_str().contains("the archive is gone"));
+    mail.close().await.expect("close");
+    assert_eq!(user_version(&path), 5);
     let db = rusqlite::Connection::open(&path).expect("db");
-    let version: u32 = db
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .expect("version");
-    assert_eq!(version, 4);
+    let mut roles = db
+        .prepare("SELECT name,role FROM agents ORDER BY name")
+        .expect("roles");
+    let roles: Vec<(String, String)> = roles
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("roles")
+        .collect::<std::result::Result<_, _>>()
+        .expect("roles");
+    assert_eq!(
+        roles,
+        [
+            ("alice", "worker"),
+            ("bob", "worker"),
+            ("checker", "verifier")
+        ]
+        .map(|(n, r)| (n.to_owned(), r.to_owned()))
+    );
 }
 
 #[tokio::test]

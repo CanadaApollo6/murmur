@@ -15,7 +15,7 @@ use crate::KindConfig;
 use crate::mailroom::{Mailroom, NewMessage, SendOutcome};
 use crate::model::*;
 use crate::supervisor::{AgentSpec, Broker, Operation, Phase, phase_error};
-use crate::swarm::{Act, TaskState};
+use crate::swarm::{Act, AgentRole, TaskId, TaskState};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -261,6 +261,11 @@ pub enum ControlRequest {
     },
     Ui,
     Tasks,
+    /// The operator's answer for a task in review.
+    Resolve {
+        task: TaskId,
+        decision: crate::mailroom::ReviewDecision,
+    },
 }
 
 pub struct ControlApi {
@@ -271,16 +276,21 @@ pub struct ControlApi {
     pub ui_url: Option<String>,
 }
 impl ControlApi {
-    async fn agents(&self) -> Result<Value> {
+    /// Every agent for the operator. Agents calling `list_agents` do not see
+    /// verifiers, which they cannot mail.
+    async fn agents(&self, verifiers: bool) -> Result<Value> {
         let mut rows = Vec::new();
-        for (id, spec, queued) in self.mailroom.observed_agents().await? {
+        for (id, spec, queued, role) in self.mailroom.observed_agents().await? {
+            if role == AgentRole::Verifier && !verifiers {
+                continue;
+            }
             let handle = self.broker.handle(id).await;
             let phase = handle.as_ref().map_or(Phase::Ended, |h| h.phase());
             let error = handle.as_ref().and_then(|h| h.error());
             let isolation = handle.as_ref().map_or("none", |h| h.isolation());
             rows.push(
                 json!({"id":format!("agent:{id}"),"name":format!("@{}",spec.name.as_str()),
-                "kind":spec.kind,"isolation":isolation,"phase":phase_name(&phase),"error":error,
+                "kind":spec.kind,"role":role,"isolation":isolation,"phase":phase_name(&phase),"error":error,
                 "queued":queued}),
             );
         }
@@ -303,7 +313,7 @@ impl ControlApi {
             // The mailroom checks a report's recipient against the task, so a
             // report to a retired requester gets its guidance.
             (Some(acts::ActArgs::Report { .. }), Recipient::Id(id)) => id,
-            (_, recipient) => self.mailroom.resolve(recipient).await?,
+            (_, recipient) => self.mailroom.resolve_for(from.sender(), recipient).await?,
         };
         let (act, task) = act.map_or((Act::Inform, None), acts::ActArgs::into_act);
         let (outcome, env) = self
@@ -322,6 +332,7 @@ impl ControlApi {
             SendOutcome::Queued { .. } => "Queued".to_owned(),
             SendOutcome::Duplicate { .. } => "Already queued".to_owned(),
             SendOutcome::Held { reason, .. } => format!("Held ({reason})"),
+            SendOutcome::Recorded { .. } => "Recorded verdict".to_owned(),
         };
         let suffix = match self.broker.handle(id).await.map(|h| h.phase()) {
             Some(Phase::Busy) => " (busy; it sees this when its turn ends)",
@@ -345,31 +356,33 @@ impl ControlApi {
     async fn tasks(&self) -> Result<Value> {
         let mut rows = Vec::new();
         for t in self.mailroom.tasks().await? {
-            let (state, outcome) = match &t.state {
-                TaskState::Open => ("open", None),
-                TaskState::Verifying { report } => {
-                    match self.mailroom.message(*report).await?.act() {
-                        Act::Report { outcome, .. } => {
-                            ("verifying", Some(acts::outcome_json(outcome)))
-                        }
-                        _ => {
-                            return Err(format!(
-                                "bug: task {} report {report} is not a report",
-                                t.id
-                            )
-                            .into());
-                        }
-                    }
+            let claim = |report: MessageId| async move {
+                match self.mailroom.message(report).await?.act() {
+                    Act::Report { outcome, .. } => Ok(acts::outcome_json(outcome)),
+                    _ => Err::<Value, Error>(
+                        format!("bug: task {} report {report} is not a report", t.id).into(),
+                    ),
                 }
-                TaskState::Closed { outcome, .. } => ("closed", Some(acts::outcome_json(outcome))),
-                TaskState::Expired => ("expired", None),
+            };
+            let (state, outcome, finding) = match &t.state {
+                TaskState::Open => ("open", None, None),
+                TaskState::Verifying { report } => ("verifying", Some(claim(*report).await?), None),
+                TaskState::Review { report, finding } => (
+                    "review",
+                    Some(claim(*report).await?),
+                    Some(acts::finding_json(finding)),
+                ),
+                TaskState::Closed { outcome, .. } => {
+                    ("closed", Some(acts::outcome_json(outcome)), None)
+                }
+                TaskState::Expired => ("expired", None, None),
             };
             rows.push(json!({
                 "id":t.id,"parent":t.parent,"state":state,
                 "requester":self.label(&t.requested_by).await?,
                 "assignee":self.label(&Sender::Agent(t.owner)).await?,
                 "deliverable":t.deliverable,"stakes":acts::StakesArgs::from(t.stakes),
-                "budget":t.budget,"spent":t.spent,"outcome":outcome,
+                "budget":t.budget,"spent":t.spent,"outcome":outcome,"finding":finding,
             }));
         }
         Ok(json!(rows))
@@ -392,7 +405,7 @@ impl ControlApi {
                 }
                 Ok(json!({"id":format!("agent:{}",handle.id),"name":to,"cwd":handle.cwd}))
             }
-            ControlRequest::Ls => self.agents().await,
+            ControlRequest::Ls => self.agents(true).await,
             ControlRequest::Send { to, body, key, act } => {
                 self.send(Bindings::human(), &to, body, None, key, act)
                     .await
@@ -471,6 +484,17 @@ impl ControlApi {
             }
             ControlRequest::Watch { .. } => Err("watch requires streaming".into()),
             ControlRequest::Tasks => self.tasks().await,
+            ControlRequest::Resolve { task, decision } => {
+                let notified = self.mailroom.resolve_review(task, decision).await?;
+                if let Some(owner) = notified {
+                    self.broker.nudge(owner).await;
+                }
+                let state = match decision {
+                    crate::mailroom::ReviewDecision::Confirm => "closed",
+                    crate::mailroom::ReviewDecision::Refute => "open",
+                };
+                Ok(json!({"task":task,"state":state}))
+            }
             ControlRequest::Ui => Ok(
                 json!({"url":self.ui_url,"status":self.ui_url.clone().unwrap_or_else(|| "Add to kinds.toml:\n[ui]\nlisten = \"127.0.0.1:7434\"".into())}),
             ),
@@ -531,7 +555,7 @@ impl ControlApi {
                         }
                     },
                     Some("list_agents") if args == json!({}) => {
-                        self.agents().await.map(|v| v.to_string())
+                        self.agents(false).await.map(|v| v.to_string())
                     }
                     _ => Err("unknown tool or invalid arguments".into()),
                 };

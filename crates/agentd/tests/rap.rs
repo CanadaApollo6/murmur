@@ -1180,7 +1180,11 @@ async fn rap_send_message_opens_and_reports_tasks() {
     let tasks = t.ctl(json!({"command":"tasks"})).await["result"].clone();
     assert_eq!(tasks.as_array().expect("tasks").len(), 2, "{tasks}");
     assert_eq!(tasks[0]["id"], root);
-    assert_eq!(tasks[0]["state"], "verifying");
+    assert_eq!(tasks[0]["state"], "review");
+    assert_eq!(
+        tasks[0]["finding"],
+        json!({"kind":"unverified","reason":"no verifier is available"})
+    );
     assert_eq!(tasks[0]["requester"], "human");
     assert_eq!(tasks[0]["assignee"], "@sender");
     assert_eq!(tasks[0]["outcome"]["kind"], "infeasible");
