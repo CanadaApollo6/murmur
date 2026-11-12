@@ -547,6 +547,7 @@ impl Broker {
             permissions_guard: self.events.owner(),
             agents: self.agents.clone(),
             retired: false,
+            kept_credentials: None,
             _lease: lease,
             mcp: self.mcp.clone(),
             isolation: self.isolation.clone(),
@@ -660,6 +661,8 @@ impl Broker {
 struct AgentActor {
     agents: Arc<Mutex<HashMap<AgentId, AgentHandle>>>,
     retired: bool,
+    /// What a retire tells the operator when it had to keep a credential copy.
+    kept_credentials: Option<String>,
     isolation: Option<(PathBuf, crate::sandbox::SandboxConfig)>,
     credentials: Arc<std::sync::Mutex<crate::credentials::Credentials>>,
     kind: KindConfig,
@@ -796,7 +799,6 @@ impl AgentActor {
             });
         }
         if self.retired {
-            self.discard_credentials();
             self.agents.lock().await.remove(&self.id);
             self.emit(Event::Retired { agent: self.id });
         }
@@ -859,22 +861,46 @@ impl AgentActor {
         }
     }
     /// A retired agent never launches again, so its credential copies go.
-    fn discard_credentials(&self) {
+    /// Returns a note for the operator when a copy had to stay.
+    fn discard_credentials(&self) -> Result<Option<String>> {
         let (crate::sandbox::Isolation::Bwrap(sb), Some((state, _))) =
             (&self.kind.isolation, &self.isolation)
         else {
-            return;
+            return Ok(None);
         };
         let home = crate::sandbox::AgentPaths::new(state, self.id).home;
-        for path in &sb.credentials {
-            let removed = match path.strip_prefix(crate::sandbox::host_home()) {
-                Ok(relative) => crate::credentials::discard(&home, relative),
-                Err(error) => Err(std::io::Error::other(error)),
-            };
-            if let Err(error) = removed {
-                tracing::warn!(id=%self.id, path=%path.display(), %error, "credential copy not removed on retire");
-            }
+        let relatives = sb
+            .credentials
+            .iter()
+            .map(|path| {
+                path.strip_prefix(crate::sandbox::host_home())
+                    .map(std::path::Path::to_path_buf)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| Error::Rejected(format!("credential path: {error}")))?;
+        let kept = self
+            .credentials
+            .lock()
+            .expect("bug: credential lock poisoned")
+            .discard(self.id, &home, &relatives)
+            .map_err(|error| {
+                Error::Rejected(format!(
+                    "retire could not delete the credential copy under {}: {error}; repeat `agentctl retire` to finish",
+                    home.display()
+                ))
+            })?;
+        if kept.is_empty() {
+            return Ok(None);
         }
+        let kept = kept
+            .iter()
+            .map(|relative| home.join(relative).display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::warn!(agent=%self.id, %kept, "credential copy kept on retire");
+        Ok(Some(format!(
+            "agent retired, but its last credential refresh did not reach the host, so the copy was kept: {kept}"
+        )))
     }
     fn finish_credentials(&self) {
         self.credentials
@@ -1453,7 +1479,9 @@ impl AgentActor {
         for reply in replies {
             let shown = match &result {
                 // A restart that could not open its session did not restart.
-                Ok(()) => phase_error(&self.phase).map_or(Ok(()), |e| Err(Error::Rejected(e))),
+                Ok(()) => phase_error(&self.phase)
+                    .or_else(|| self.kept_credentials.clone())
+                    .map_or(Ok(()), |e| Err(Error::Rejected(e))),
                 Err(error) => Err(Error::Rejected(error.to_string())),
             };
             respond(reply, self.reply(op, shown));
@@ -1470,7 +1498,9 @@ impl AgentActor {
     }
     /// The stop flag is already persisted, so a failure here leaves a stopped
     /// agent after a daemon restart, and the actor exits only once the row is retired.
+    /// The credential copies go first, so a retired agent never keeps one by accident.
     async fn retire(&mut self) -> Result<()> {
+        self.kept_credentials = self.discard_credentials()?;
         self.mailroom.retire(self.id).await?;
         self.retired = true;
         self.phase(Phase::Ended);
@@ -2318,6 +2348,13 @@ mod halt_tests {
         harness_with(infinity, CANCEL).await
     }
     async fn harness_with(infinity: bool, cancel_timeout: Duration) -> Harness {
+        harness_built(infinity, cancel_timeout, false).await
+    }
+    /// The credential path a sandboxed harness agent is configured with.
+    const CREDENTIAL: &str = ".agentd-retire-test/auth.json";
+    /// `sandboxed` gives the kind a credential copy under `<dir>/state` and
+    /// restores the agent stopped, so no sandbox is ever launched.
+    async fn harness_built(infinity: bool, cancel_timeout: Duration, sandboxed: bool) -> Harness {
         let dir = tempfile::tempdir().expect("dir");
         let room = Arc::new(
             Mailroom::open(dir.path().join("mail.db"), Default::default())
@@ -2329,7 +2366,15 @@ mod halt_tests {
         } else {
             KindConfig::claude("unused-fixture")
         };
-        kind.isolation = crate::sandbox::Isolation::None;
+        kind.isolation = if sandboxed {
+            crate::sandbox::Isolation::Bwrap(crate::sandbox::KindSandbox {
+                home: vec![],
+                credentials: vec![crate::sandbox::host_home().join(CREDENTIAL)],
+                egress: vec![],
+            })
+        } else {
+            crate::sandbox::Isolation::None
+        };
         kind.idle_after = None;
         kind.cancel_timeout = cancel_timeout;
         let mut broker = Broker::new(
@@ -2342,13 +2387,30 @@ mod halt_tests {
             },
         )
         .expect("broker");
+        if sandboxed {
+            let (bound, _) = mpsc::unbounded_channel();
+            broker = broker.with_mcp(
+                Arc::new(crate::surfaces::Bindings::new(
+                    dir.path().join("mcp"),
+                    "agentd".into(),
+                    bound,
+                )),
+                dir.path().join("state"),
+                Default::default(),
+            );
+        }
         let script = Arc::new(Script::default());
         broker.test_adapter = Some(Arc::new(Scripted(script.clone())));
         let broker = Arc::new(broker);
-        let agent = broker
-            .spawn(spec(&kind.name, dir.path(), "a"))
-            .await
-            .expect("spawn");
+        let spec = spec(&kind.name, dir.path(), "a");
+        let agent = if sandboxed {
+            let id = room.register(spec.name.clone()).await.expect("register");
+            room.save_spec(id, spec.clone()).await.expect("saved spec");
+            room.set_stopped(id, true).await.expect("stop flag");
+            broker.restore(spec).await.expect("restore")
+        } else {
+            broker.spawn(spec).await.expect("spawn")
+        };
         let h = Harness {
             _dir: dir,
             room,
@@ -2356,7 +2418,12 @@ mod halt_tests {
             script,
             agent,
         };
-        h.wait(|p| *p == Phase::Idle).await;
+        let ready = if sandboxed {
+            Phase::Stopped
+        } else {
+            Phase::Idle
+        };
+        h.wait(|p| *p == ready).await;
         h
     }
     fn spec(kind: &str, cwd: &std::path::Path, name: &str) -> AgentSpec {
@@ -2877,6 +2944,84 @@ mod halt_tests {
             assert!(retired, "{from}: the feed hears the removal");
             h.broker.shutdown().await.expect("shutdown");
         }
+    }
+
+    #[tokio::test]
+    async fn retire_deletes_the_credential_copy_before_it_commits() {
+        let h = harness_built(false, CANCEL, true).await;
+        let home = crate::sandbox::AgentPaths::new(&h._dir.path().join("state"), h.agent.id).home;
+        let copy = home.join(CREDENTIAL);
+        let cli = copy.parent().expect("CLI dir");
+        let outside = h._dir.path().join("outside");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir(&outside).expect("outside");
+        std::fs::write(outside.join("auth.json"), b"{}").expect("target");
+        // The agent could have linked its CLI directory elsewhere. Nothing is
+        // deleted through a link, so the retire fails before it commits.
+        std::os::unix::fs::symlink(&outside, cli).expect("link");
+        let error = h
+            .operate(Operation::Retire)
+            .await
+            .expect_err("a removal that is refused");
+        assert!(
+            error.to_string().contains("repeat `agentctl retire`"),
+            "{error}"
+        );
+        assert!(
+            !h.room.retired(h.agent.id).await.expect("retired"),
+            "a failed removal leaves the agent unretired"
+        );
+        assert!(outside.join("auth.json").exists(), "the target survives");
+        std::fs::remove_file(cli).expect("unlink");
+        std::fs::create_dir(cli).expect("CLI dir");
+        std::fs::write(&copy, b"{\"token\":1}").expect("copy");
+        h.operate(Operation::Retire).await.expect("repeated retire");
+        assert!(!copy.exists(), "the copy is gone");
+        h.assert_retired(None, "credentials").await;
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn retire_keeps_a_credential_refresh_the_host_never_received() {
+        let h = harness_built(false, CANCEL, true).await;
+        let home = crate::sandbox::AgentPaths::new(&h._dir.path().join("state"), h.agent.id).home;
+        let copy = home.join(CREDENTIAL);
+        let human = h._dir.path().join("human");
+        let host = human.join(CREDENTIAL);
+        let cli = host.parent().expect("CLI dir");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(cli).expect("host CLI dir");
+        std::fs::write(&host, b"{\"token\":0}").expect("host credential");
+        h.broker
+            .credentials
+            .lock()
+            .expect("credential lock")
+            .launch(
+                h.agent.id,
+                "claude",
+                &[(host.clone(), CREDENTIAL.into())],
+                &home,
+            )
+            .expect("launch");
+        std::fs::write(&copy, b"{\"token\":1}").expect("refresh");
+        let moved = human.join("moved");
+        std::fs::rename(cli, &moved).expect("unavailable host");
+        let error = h
+            .operate(Operation::Retire)
+            .await
+            .expect_err("a retire that kept a copy says so");
+        assert!(error.to_string().contains("agent retired, but "), "{error}");
+        assert!(
+            error.to_string().contains(&copy.display().to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&copy).expect("kept copy"),
+            b"{\"token\":1}",
+            "the only refreshed credential survives"
+        );
+        h.assert_retired(None, "kept credential").await;
+        h.broker.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]

@@ -84,7 +84,18 @@ deliverable. Its name is free, and a new agent with that name gets a new id. An
 agentd restart does not bring it back. The feed sends
 `{"event":"agent_retired","agent":"agent:<id>"}`, and later snapshots omit the
 agent. The rest of the agent's state directory stays on disk, including its
-CLI session history. Retiring an unknown or
+CLI session history.
+
+The credential copy is deleted before the agent is marked retired. If agentd
+cannot delete it, the retire fails and the agent is not retired. One copy is
+kept on purpose. If the agent refreshed its credential and agentd could not
+copy that refresh back to your home directory, deleting the copy would destroy
+the only working credential. The retire then finishes, reports
+`agent retired, but ...` with the path of the kept copy, and leaves the file
+for you to copy back or delete. agentd tracks refreshes in memory, so a
+refresh made just before an agentd crash is not protected this way.
+
+Retiring an unknown or
 already retired agent fails. Retire does not touch tasks. A retired assignee
 strands its open tasks. This is a known gap.
 
