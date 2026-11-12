@@ -362,6 +362,7 @@ impl ControlApi {
                     }
                 }
                 TaskState::Closed { outcome, .. } => ("closed", Some(acts::outcome_json(outcome))),
+                TaskState::Expired => ("expired", None),
             };
             rows.push(json!({
                 "id":t.id,"parent":t.parent,"state":state,

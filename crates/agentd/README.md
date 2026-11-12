@@ -449,14 +449,40 @@ operator reads the outcome with `agentctl tasks`. The mailroom
 accepts reports only from the task's owner, so `agentctl send --act` with a
 report is always rejected.
 
+Budgets limit real use. Each message the owner sends in an open task's context
+costs one of the task's `messages`. That covers an `inform` and a `request`, and
+a `request` also reserves the child's whole budget. A report costs nothing and
+is never rejected for budget, so a task can always be closed. The send that
+would pass the cap is rejected and stores nothing. A retry with the same client
+key is charged once.
+
+The wall clock runs from the request's `sent_at` until the task leaves `open`.
+A report records the whole seconds the task was open in `spent.wall_secs`. A
+task still open when its `wall_secs` pass moves to `expired`. It has no outcome
+and cannot be reported. Its `spent.wall_secs` equals its budget. The broker
+queues an `inform` from the operator, in the task's context, to the assignee
+and to a requesting agent. Retired agents get no notice. The expiry and these
+notices commit together. A background loop sleeps until the next deadline or
+the next mailroom change. It sweeps once when the daemon starts, so a restart
+expires overdue tasks at once. A send that arrives after the deadline expires
+the task itself. Every send on an expired task is rejected with an error that
+says the task expired. The assignee's running turn is not cancelled. Child
+tasks keep their own budgets. Expired tasks need schema version 4, so an older
+`agentd` refuses the database.
+
+`spent` keeps child reservations, which are never refunded, so a reported
+task's `spent.wall_secs` is the larger of its reservations and its open time.
+No adapter reports token use, so `tokens` stays unmetered: a task's
+`spent.tokens` grows only by child reservations.
+
 ```sh
 agentctl send @builder "Fix the flaky test." --act '{"kind":"request","deliverable":"a passing test","budget":{"wall_secs":600,"messages":20,"hops":2}}'
 agentctl tasks
 ```
 
 `agentctl tasks` prints every task with its `id`, `parent`, `state` (`open`,
-`verifying` or `closed`), `requester`, `assignee`, `deliverable`, `stakes`,
-`budget`, `spent` and `outcome`.
+`verifying`, `closed` or `expired`), `requester`, `assignee`, `deliverable`,
+`stakes`, `budget`, `spent` and `outcome`.
 
 Agent specs, resume handles and mail survive daemon restarts. SIGINT and SIGTERM
 stop connections, shut down broker actors, then drain and close the mailroom.
@@ -596,8 +622,10 @@ Dropping the handle also drains submissions, but does not wait for thread exit.
 - Delivery operations are `pending_for`, `delivery`, `mark_offered`,
   `mark_started`, `mark_consumed`, `session_ended`, `held`, `release`,
   `drop_held` and `retire`.
-- Ledger operations are `task`, `tasks`, `record_spend`, `new_epoch` and
-  `exposures`.
+- Ledger operations are `task`, `tasks`, `expire_tasks(now)`, `new_epoch` and
+  `exposures`. `expire_tasks` expires every task due at `now` and returns the
+  tasks, the agents it notified and the next deadline. Running it twice has no
+  second effect.
   A Request creates its task inside `accept`; there is no separate creation path.
 - `Interceptor`, `Verdict`, `ConversationView`, `HopLimit`, `Config` and typed
   outcomes and errors describe the acceptance and storage boundary.

@@ -211,6 +211,11 @@ async fn serve(
     for (_, spec) in mailroom.specs().await? {
         broker.restore(spec).await?;
     }
+    let expiry = {
+        let broker = Arc::clone(&broker);
+        async move { broker.expire_tasks().await }
+    };
+    tokio::pin!(expiry);
     let api = Arc::new(ControlApi {
         broker,
         mailroom,
@@ -246,6 +251,7 @@ async fn serve(
     let result = loop {
         let accepted = tokio::select! {
             result = &mut rap_server => break result,
+            () = &mut expiry => break Err("task expiry stopped: the mailroom closed".into()),
             result = &mut ui_server => {ui_done=true;break result?;},
             Some(listener) = bound.recv() => {
                 let api = Arc::clone(&api);
