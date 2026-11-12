@@ -796,6 +796,7 @@ impl AgentActor {
             });
         }
         if self.retired {
+            self.discard_credentials();
             self.agents.lock().await.remove(&self.id);
             self.emit(Event::Retired { agent: self.id });
         }
@@ -854,6 +855,24 @@ impl AgentActor {
                     self.on_event(event.unwrap_or(SessionEvent::Ended { reason: "session event stream closed".into() })).await?;
                 },
                 () = async { match deadline { Some(d) => tokio::time::sleep_until(d).await, None => std::future::pending().await } } => self.timer().await?,
+            }
+        }
+    }
+    /// A retired agent never launches again, so its credential copies go.
+    fn discard_credentials(&self) {
+        let (crate::sandbox::Isolation::Bwrap(sb), Some((state, _))) =
+            (&self.kind.isolation, &self.isolation)
+        else {
+            return;
+        };
+        let home = crate::sandbox::AgentPaths::new(state, self.id).home;
+        for path in &sb.credentials {
+            let removed = match path.strip_prefix(crate::sandbox::host_home()) {
+                Ok(relative) => crate::credentials::discard(&home, relative),
+                Err(error) => Err(std::io::Error::other(error)),
+            };
+            if let Err(error) = removed {
+                tracing::warn!(id=%self.id, path=%path.display(), %error, "credential copy not removed on retire");
             }
         }
     }

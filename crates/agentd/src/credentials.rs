@@ -41,6 +41,24 @@ fn host_file(path: &Path) -> Result<(Dir, OsString)> {
         path.file_name().ok_or("credential needs name")?.into(),
     ))
 }
+/// Deletes one credential copy from a private home. Its agent could write that
+/// home, so no path component is followed through a link.
+pub(crate) fn discard(home: &Path, relative: &Path) -> std::io::Result<()> {
+    let removed = Dir::open(home, false)
+        .and_then(|home| home.parent(relative, false))
+        .and_then(|(dir, name)| {
+            let old = dir.read(&name)?;
+            dir.replace(&name, old.as_deref(), None)
+        });
+    match removed {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(std::io::Error::other(
+            "credential copy changed during removal",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
 impl Credentials {
     pub fn launch(
         &mut self,
@@ -231,6 +249,20 @@ mod tests {
         let home = path.join("private");
         std::fs::create_dir(&home).expect("home");
         (root, human, host, home)
+    }
+    #[test]
+    fn discard_removes_the_copy_and_never_follows_a_link() {
+        let (_root, human, host, home) = fixture();
+        let relative = Path::new(".codex/auth.json");
+        discard(&home, relative).expect("a home that never held a copy");
+        std::fs::create_dir(home.join(".codex")).expect("CLI dir");
+        std::fs::write(home.join(relative), b"{\"token\":1}").expect("copy");
+        discard(&home, relative).expect("discard");
+        assert!(!home.join(relative).exists(), "the copy is gone");
+        std::fs::remove_dir(home.join(".codex")).expect("remove CLI dir");
+        std::os::unix::fs::symlink(human.join(".codex"), home.join(".codex")).expect("link");
+        discard(&home, relative).expect_err("a linked CLI dir is refused");
+        assert!(host.exists(), "the human's credential survives");
     }
     #[test]
     fn host_io_and_cas_failures_retry_identical_valid_refresh_bytes() {

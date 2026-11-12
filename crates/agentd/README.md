@@ -77,13 +77,14 @@ named agent.
 `agentctl retire @name` removes the agent for good. It works from every phase.
 It ends the session the way `stop` does, with the same cancel and the same
 settlement of pending approvals. Then agentd marks the agent retired and drops
-its actor. The process exits, the sandbox, credential copy and MCP binding are
-released, and `agentctl ls` no longer lists the agent. Mail to it is rejected,
+its actor. The process exits, the sandbox and MCP binding are released, the
+credential copy is deleted, and `agentctl ls` no longer lists the agent. Mail to it is rejected,
 and its undelivered inbound mail goes dead. Mail it already sent stays
 deliverable. Its name is free, and a new agent with that name gets a new id. An
 agentd restart does not bring it back. The feed sends
 `{"event":"agent_retired","agent":"agent:<id>"}`, and later snapshots omit the
-agent. The agent's state directory stays on disk. Retiring an unknown or
+agent. The rest of the agent's state directory stays on disk, including its
+CLI session history. Retiring an unknown or
 already retired agent fails. Retire does not touch tasks. A retired assignee
 strands its open tasks. This is a known gap.
 
