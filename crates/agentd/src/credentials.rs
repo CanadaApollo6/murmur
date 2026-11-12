@@ -67,8 +67,6 @@ impl Credentials {
         home: &Path,
     ) -> Result<()> {
         self.finish(id);
-        // Launch overwrites every copy, so nothing is left to keep.
-        self.unsynced.remove(&id);
         let private = Dir::open(home, false)?;
         let mut copies = vec![];
         for (host, relative) in paths {
@@ -89,6 +87,14 @@ impl Credentials {
             let old = dir.read(&name)?;
             if !dir.replace(&name, old.as_deref(), bytes.as_deref())? {
                 return Err("private credential changed during launch".into());
+            }
+            // Only a copy this launch replaced has nothing left to keep. A
+            // launch that fails earlier leaves the record for a later retire.
+            if let Some(unsynced) = self.unsynced.get_mut(&id) {
+                unsynced.remove(relative);
+                if unsynced.is_empty() {
+                    self.unsynced.remove(&id);
+                }
             }
             copies.push(Copy {
                 host: host.clone(),
@@ -341,6 +347,15 @@ mod tests {
         let moved = human.join("moved");
         std::fs::rename(parent, &moved).expect("unavailable host parent");
         c.finish(id);
+        // A restart that cannot read the host replaces nothing, so the
+        // refresh is still the only copy and stays protected.
+        std::fs::create_dir(parent).expect("host parent");
+        std::fs::create_dir(&host).expect("unreadable host credential");
+        c.launch(id, "codex", &sources(&host, &human), &home)
+            .expect_err("launch with an unreadable host credential");
+        c.finish(id);
+        std::fs::remove_dir(&host).expect("remove unreadable credential");
+        std::fs::remove_dir(parent).expect("remove host parent");
         std::fs::rename(&moved, parent).expect("restore parent");
         assert_eq!(c.discard(id, &home, &paths).expect("discard"), paths);
         assert_eq!(
