@@ -242,7 +242,10 @@ async fn run(args: Args) -> Result<()> {
         Command::Ui => ControlRequest::Ui,
         Command::Tasks => ControlRequest::Tasks,
         Command::Resolve { task, decision } => ControlRequest::Resolve {
-            task: TaskId(task.parse()?),
+            task: TaskId(
+                task.parse()
+                    .map_err(|e| format!("{task:?} is not a task id: {e}"))?,
+            ),
             decision: match decision {
                 Decision::Confirm => agentd::mailroom::ReviewDecision::Confirm,
                 Decision::Refute => agentd::mailroom::ReviewDecision::Refute,

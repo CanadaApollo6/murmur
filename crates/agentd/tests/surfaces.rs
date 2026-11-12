@@ -1537,6 +1537,19 @@ async fn task_acts_open_report_and_list_through_real_surfaces() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let unknown = agentd::swarm::TaskId::new().to_string();
+    for (task, reason) in [
+        ("not-a-task", "\"not-a-task\" is not a task id"),
+        (unknown.as_str(), "not found"),
+    ] {
+        let output = resolve(task, "confirm").await.expect("agentctl");
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(reason),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     assert_eq!(
         d.ctl(&["resolve", &children[1], "confirm"]).await,
         json!({"task":children[1],"state":"closed"})
