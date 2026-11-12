@@ -19,6 +19,8 @@ pub mod surfaces;
 pub mod egress;
 pub mod sandbox;
 mod seccomp;
+#[cfg(unix)]
+pub mod verify;
 
 mod credentials;
 mod private_fs;

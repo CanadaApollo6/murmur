@@ -240,6 +240,21 @@ impl SandboxConfig {
             Ok(())
         })
     }
+    /// Accepts only a verifier workspace: `<state>/verify/<report>/workspace`.
+    pub fn check_snapshot(&self, path: &Path, state: &Path) -> Result<()> {
+        let path = resolved(path)?;
+        let root = resolved(state)?.join(crate::verify::VERIFY_DIR);
+        let parts = path
+            .strip_prefix(&root)
+            .map(|rest| rest.components().collect::<Vec<_>>())
+            .unwrap_or_default();
+        match parts.as_slice() {
+            [Component::Normal(_), Component::Normal(w)] if *w == crate::verify::WORKSPACE_DIR => {
+                Ok(())
+            }
+            _ => Err(format!("not a verifier snapshot: {}", path.display()).into()),
+        }
+    }
     pub fn check_bind(&self, path: &Path, state: &Path) -> Result<()> {
         if path.starts_with("/run") {
             return Err(format!("sandbox bind exposes runtime paths: {}", path.display()).into());
@@ -269,10 +284,13 @@ impl SandboxConfig {
         kinds: &mut [KindConfig],
     ) -> Result<()> {
         self.credential_paths.clear();
+        let snapshots = state.join(crate::verify::VERIFY_DIR);
         self.protected = [
             control,
             control.parent().ok_or("control socket needs parent")?,
             shared,
+            // Verifier snapshots. Only a verifier gets one, as its workspace.
+            &snapshots,
         ]
         .into_iter()
         .map(resolved)
@@ -418,12 +436,20 @@ impl SandboxConfig {
         let parent = resolved(parent).map_err(|e| format!("credential {}: {e}", path.display()))?;
         Ok(parent.join(path.file_name().ok_or("credential needs name")?))
     }
-    pub fn launch_mounts(&self, workspace: &PinnedPath, state: &Path) -> Result<Vec<PinnedMount>> {
+    /// A verifier gets the read-only binds, none of the writable ones, and
+    /// its snapshot as the workspace.
+    pub fn launch_mounts(
+        &self,
+        workspace: &PinnedPath,
+        state: &Path,
+        verifier: bool,
+    ) -> Result<Vec<PinnedMount>> {
         if let Some(error) = &self.bind_error {
             return Err(error.clone().into());
         }
         self.binds
             .iter()
+            .filter(|(_, _, readonly)| *readonly || !verifier)
             .map(|(pin, target, readonly)| {
                 Ok(PinnedMount {
                     fd: Arc::new(
@@ -437,9 +463,12 @@ impl SandboxConfig {
             .chain(std::iter::once_with(|| {
                 Ok(PinnedMount {
                     fd: Arc::new(
-                        workspace
-                            .open(self, state, true)
-                            .map_err(|e| workspace.failure(e))?,
+                        if verifier {
+                            workspace.open_snapshot(self, state)
+                        } else {
+                            workspace.open(self, state, true)
+                        }
+                        .map_err(|e| workspace.failure(e))?,
                     ),
                     target: workspace.path.clone(),
                     readonly: false,
@@ -540,6 +569,35 @@ impl PinnedPath {
     }
     fn capture_bind(path: &Path, cfg: &SandboxConfig, state: &Path) -> Result<Self> {
         Self::capture_source(path, cfg, state, false)
+    }
+    /// Pins a verifier's snapshot. Nothing else under the state directory
+    /// can be pinned.
+    pub fn capture_snapshot(path: &Path, cfg: &SandboxConfig, state: &Path) -> Result<Self> {
+        cfg.check_snapshot(path, state)?;
+        let fd = Self::descriptor(path, true)
+            .map_err(|e| format!("sandbox source {}: {e}", path.display()))?;
+        let path = Self::resolved_fd(&fd, path)?;
+        cfg.check_snapshot(&path, state)?;
+        use std::os::unix::fs::MetadataExt;
+        let stat = std::fs::File::from(fd.try_clone()?).metadata()?;
+        Ok(Self {
+            path,
+            identity: Some(FilesystemIdentity::read(&fd, stat.dev())?),
+            ino: stat.ino(),
+        })
+    }
+    fn open_snapshot(&self, cfg: &SandboxConfig, state: &Path) -> Result<OwnedFd> {
+        let fd = Self::descriptor(&self.path, true)
+            .map_err(|e| format!("sandbox source {}: {e}", self.path.display()))?;
+        use std::os::unix::fs::MetadataExt;
+        let stat = std::fs::File::from(fd.try_clone()?).metadata()?;
+        if self.identity.as_ref() != Some(&FilesystemIdentity::read(&fd, stat.dev())?)
+            || stat.ino() != self.ino
+        {
+            return Err(format!("sandbox source identity changed: {}", self.path.display()).into());
+        }
+        cfg.check_snapshot(&Self::resolved_fd(&fd, &self.path)?, state)?;
+        Ok(fd)
     }
     /// Whether `path` is this pinned object, reached by any path (including bind-mount aliases).
     fn identifies(&self, path: &Path) -> bool {
@@ -1647,7 +1705,7 @@ mod tests {
             &mut sandbox_kinds(),
         )
         .expect("daemon remains available");
-        assert!(cfg.launch_mounts(&restored, &state).is_err());
+        assert!(cfg.launch_mounts(&restored, &state, false).is_err());
     }
     #[test]
     fn provider_tokens_never_enter_argv() {

@@ -12,6 +12,9 @@ pub struct KindConfig {
     pub isolation: crate::sandbox::Isolation,
     pub model: Option<String>,
     pub name: String,
+    /// The model family, such as `anthropic` or `openai`. A claim is checked
+    /// by a verifier from another family.
+    pub family: Option<String>,
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
@@ -61,6 +64,7 @@ impl KindConfig {
             },
             model: None,
             name: name.into(),
+            family: None,
             command,
             args: Vec::new(),
             env: BTreeMap::new(),

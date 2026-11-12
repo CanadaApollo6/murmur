@@ -179,9 +179,54 @@ fn log_line(log: &mut File, value: &Value) {
     log.write_all(format!("{value}\n").as_bytes())
         .expect("write log");
 }
+/// The id after `marker` in a task note, such as `opens task ` or `to "agent:`.
+fn note_id(text: &str, marker: &str) -> String {
+    let start = text.find(marker).expect("task note marker") + marker.len();
+    text[start..]
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect()
+}
+/// Every path under `dir`, relative, with `-> target` for a symlink.
+fn listing(dir: &std::path::Path, prefix: &std::path::Path, out: &mut Vec<String>) {
+    let mut entries = std::fs::read_dir(dir)
+        .expect("list workspace")
+        .map(|e| e.expect("entry"))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = prefix.join(entry.file_name());
+        let kind = entry.file_type().expect("file type");
+        if kind.is_symlink() {
+            let target = std::fs::read_link(entry.path()).expect("link");
+            out.push(format!("{} -> {}", path.display(), target.display()));
+        } else if kind.is_dir() {
+            out.push(format!("{}/", path.display()));
+            listing(&entry.path(), &path, out);
+        } else {
+            out.push(path.display().to_string());
+        }
+    }
+}
+/// Sends a report through the broker's MCP server. The note in `text` names
+/// the task and the address.
+fn report(mcp: &mut Mcp, text: &str, outcome: Value, verdict: Option<Value>) -> Value {
+    let task = note_id(text, "opens task ");
+    let to = note_id(text, "to \"agent:");
+    let mut act = json!({"kind":"report","task":task,"outcome":outcome});
+    if let Some(verdict) = verdict {
+        act["verdict"] = verdict;
+    }
+    mcp.call(
+        json!({"jsonrpc":"2.0","id":"report","method":"tools/call","params":{"name":"send_message",
+        "arguments":{"to":format!("agent:{to}"),"body":"report","act":act}}}),
+    )
+}
 fn main() {
     let root = if std::env::var_os("FAKE_ROOT_FROM_CWD").is_some() {
         std::env::current_dir().expect("cwd")
+    } else if std::env::var_os("FAKE_ROOT_FROM_HOME").is_some() {
+        PathBuf::from(std::env::var_os("HOME").expect("HOME"))
     } else {
         PathBuf::from(std::env::var_os("FAKE_ROOT").expect("FAKE_ROOT"))
     };
@@ -317,6 +362,66 @@ fn main() {
                     std::fs::write(root.join("mcp-result.json"), first.to_string())
                         .expect("MCP result");
                 }
+                let said = msg["params"]["prompt"]
+                    .as_array()
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|p| p["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                // A verifier's brief quotes the claim, so check for it first.
+                let verifier = said.contains("You are a verifier");
+                if !verifier
+                    && said.contains("fake-claim:infeasible")
+                    && let Some(mcp) = mcp.as_mut()
+                {
+                    let result = report(
+                        mcp,
+                        &said,
+                        json!({"kind":"infeasible","evidence":{"tried":"everything","obstacle":"a wall"}}),
+                        None,
+                    );
+                    std::fs::write(root.join("claim-result.json"), result.to_string())
+                        .expect("claim result");
+                    // Acts only after its send returned; the snapshot must not see this.
+                    std::fs::write(
+                        std::env::current_dir()
+                            .expect("cwd")
+                            .join("after-report.txt"),
+                        "written after the report",
+                    )
+                    .expect("after report");
+                    if let Some(probe) = std::env::var_os("FAKE_PROBE") {
+                        let seen = match std::fs::read_dir(&probe) {
+                            Ok(entries) => format!("listed {} entries", entries.count()),
+                            Err(error) => format!("error: {error}"),
+                        };
+                        std::fs::write(root.join("probe.txt"), seen).expect("probe result");
+                    }
+                }
+                if verifier {
+                    let cwd = std::env::current_dir().expect("cwd");
+                    let mut seen = Vec::new();
+                    listing(&cwd, std::path::Path::new(""), &mut seen);
+                    std::fs::write(
+                        root.join("verifier-seen.json"),
+                        json!({"cwd":cwd,"files":seen,"brief":said}).to_string(),
+                    )
+                    .expect("verifier listing");
+                    if let Some(mcp) = mcp.as_mut() {
+                        let result = report(
+                            mcp,
+                            &said,
+                            json!({"kind":"done"}),
+                            Some(json!({"kind":"confirmed","tried":"the same wall"})),
+                        );
+                        std::fs::write(root.join("verdict-result.json"), result.to_string())
+                            .expect("verdict result");
+                    }
+                }
                 if text.contains("echo-token") {
                     update(session, &broker_token);
                     eprintln!("fixture secret {broker_token}");
@@ -366,6 +471,9 @@ fn main() {
                     reply(id, json!({"stopReason":"end_turn"}));
                     std::thread::sleep(Duration::from_millis(5));
                     std::process::exit(0);
+                } else if text.contains("allow-only-permission") {
+                    flight = Some(id.clone());
+                    permission(session, "permission-1", false);
                 } else if text.contains("permission") {
                     flight = Some(id.clone());
                     permission(session, "permission-1", true);

@@ -662,6 +662,36 @@ async fn permission_timeout_and_per_agent_rules() {
 }
 
 #[tokio::test]
+async fn a_denied_request_with_no_reject_option_ends_the_turn_and_asks_nobody() {
+    let policy = PermissionPolicy {
+        // No timeout: a request that reaches the operator would wait forever.
+        timeout: None,
+        rules: vec![PermissionRule {
+            tool: "edit".into(),
+            decision: RuleDecision::Deny,
+        }],
+        ..Default::default()
+    };
+    let mut t = Test::new(policy).await;
+    let id = t.send("allow-only-permission").await;
+    t.consumed(id).await;
+    let wire = t.wire();
+    assert!(
+        wire.iter().any(|m| m["id"] == "permission-1"
+            && m["result"]["outcome"] == serde_json::json!({"outcome":"cancelled"})),
+        "{wire:?}"
+    );
+    assert!(
+        t.agent
+            .pending_permissions()
+            .await
+            .expect("list")
+            .is_empty()
+    );
+    t.finish().await;
+}
+
+#[tokio::test]
 async fn cancel_is_a_notification_and_turn_completes() {
     let mut t = Test::new(Default::default()).await;
     let id = t.send("hold").await;
