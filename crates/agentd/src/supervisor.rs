@@ -3204,6 +3204,11 @@ mod halt_tests {
         .expect("phase channel");
         broker.retire(verifier).await.expect("retire");
         assert!(room.retired(verifier).await.expect("retired"));
+        let reused = room
+            .register(AgentName::parse("checker").expect("name"))
+            .await
+            .expect("a retired verifier frees its name");
+        assert_ne!(reused, verifier);
         broker.shutdown().await.expect("shutdown");
     }
 

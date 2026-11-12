@@ -1141,9 +1141,10 @@ impl Store {
         }
         let mut db = db;
         if !config.verifier_available {
-            // No runner will take these, so they go to the operator. This
-            // covers a task an older build left verifying and a daemon
-            // restarted without its verifier.
+            // No runner will take these, so they go to the operator. One is
+            // a task that an older build left verifying. A running
+            // verification is left alone. Its verifier is restored with the
+            // other saved specs, and its task has a deadline.
             let tx = db.transaction()?;
             let pending = tx
                 .prepare(&format!(
@@ -1596,7 +1597,7 @@ impl Store {
                 opened: now,
             },
         )?;
-        tx.execute(
+        let opened = tx.execute(
             "UPDATE verifications SET state='running',verifier=?,task=?,verifier_family=?,claimant_family=?,snapshot_clean=? WHERE report_msg=? AND state='pending'",
             params![
                 json(&verifier)?,
@@ -1607,6 +1608,11 @@ impl Store {
                 json(&report)?
             ],
         )?;
+        if opened != 1 {
+            return Err(Error::Rejected(format!(
+                "bug: verification of report {report} was not pending"
+            )));
+        }
         let v = verification_by(&tx, "report_msg", &json(&report)?)?
             .expect("bug: the verification row was just updated");
         tx.commit()?;
