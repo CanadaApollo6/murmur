@@ -494,11 +494,20 @@ async fn child_carving_and_spend_cannot_exceed_any_remaining_budget() {
         .await
         .expect("root");
     let root_id = root.task().expect("task");
-    mail.record_spend(root_id, budget(2)).await.expect("spend");
+    for _ in 0..2 {
+        let mut note = send(Sender::Agent(a), b);
+        note.task = Some(root_id);
+        mail.accept(note).await.expect("owner inform");
+    }
     let child = request(&mail, Sender::Agent(a), b, Some(root_id), budget(3))
         .await
         .expect("child");
-    assert_eq!(mail.task(root_id).await.expect("root").spent, budget(5));
+    // Two informs, the request itself and the child's three messages.
+    let spent = Budget {
+        messages: 6,
+        ..budget(3)
+    };
+    assert_eq!(mail.task(root_id).await.expect("root").spent, spent);
     assert_eq!(
         mail.task(child.task().expect("task"))
             .await
@@ -508,19 +517,19 @@ async fn child_carving_and_spend_cannot_exceed_any_remaining_budget() {
     );
     for excess in [
         Budget {
-            tokens: Some(6),
+            tokens: Some(8),
             ..budget(1)
         },
         Budget {
-            wall_secs: 6,
+            wall_secs: 8,
             ..budget(1)
         },
         Budget {
-            messages: 6,
+            messages: 4,
             ..budget(1)
         },
         Budget {
-            hops: 6,
+            hops: 8,
             ..budget(1)
         },
         Budget {
@@ -532,14 +541,7 @@ async fn child_carving_and_spend_cannot_exceed_any_remaining_budget() {
             request(&mail, Sender::Agent(a), b, Some(root_id), excess).await,
             Err(Error::BudgetExceeded)
         ));
-        assert!(matches!(
-            mail.record_spend(root_id, excess).await,
-            Err(Error::BudgetExceeded)
-        ));
-        assert_eq!(
-            mail.task(root_id).await.expect("unchanged").spent,
-            budget(5)
-        );
+        assert_eq!(mail.task(root_id).await.expect("unchanged").spent, spent);
     }
     assert!(
         request(&mail, Sender::Agent(b), a, Some(root_id), budget(1))
@@ -551,9 +553,18 @@ async fn child_carving_and_spend_cannot_exceed_any_remaining_budget() {
             .await
             .is_err()
     );
-    request(&mail, Sender::Agent(a), b, Some(root_id), budget(5))
-        .await
-        .expect("exact remainder");
+    request(
+        &mail,
+        Sender::Agent(a),
+        b,
+        Some(root_id),
+        Budget {
+            messages: 3,
+            ..budget(7)
+        },
+    )
+    .await
+    .expect("exact remainder");
     assert_eq!(mail.task(root_id).await.expect("spent").spent, budget(10));
     mail.close().await.expect("close");
     let mail = Mailroom::open(dir.path().join("broker.db"), Config::default())
@@ -573,7 +584,7 @@ async fn child_carving_and_spend_cannot_exceed_any_remaining_budget() {
     assert_eq!(
         db.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, u32>(0))
             .expect("messages"),
-        3
+        5
     );
 }
 
@@ -605,7 +616,13 @@ async fn rejected_request_rolls_back_carving_and_duplicate_request_creates_one_t
         };
         mail.accept(msg).await.expect("idempotent request");
     }
-    assert_eq!(mail.task(id).await.expect("parent").spent, budget(3));
+    assert_eq!(
+        mail.task(id).await.expect("parent").spent,
+        Budget {
+            messages: 4,
+            ..budget(3)
+        }
+    );
     assert_eq!(mail.pending_for(b).await.expect("pending").len(), 1);
     mail.close().await.expect("close");
 }
@@ -669,7 +686,11 @@ async fn reports_record_all_outcomes_and_enforce_ownership_and_evidence() {
                 }
             ),
         }
-        assert!(mail.record_spend(id, budget(1)).await.is_err());
+        assert!(
+            request(&mail, Sender::Agent(a), b, Some(id), budget(1))
+                .await
+                .is_err()
+        );
         let mut repeat = send(Sender::Agent(a), a);
         repeat.act = Act::Report { task: id, outcome };
         assert!(mail.accept(repeat).await.is_err());
@@ -936,7 +957,13 @@ async fn concurrent_children_cannot_double_allocate_the_parent_remainder() {
     );
     assert!(left.is_ok());
     assert!(matches!(right, Err(Error::BudgetExceeded)));
-    assert_eq!(mail.task(id).await.expect("parent").spent, budget(6));
+    assert_eq!(
+        mail.task(id).await.expect("parent").spent,
+        Budget {
+            messages: 7,
+            ..budget(6)
+        }
+    );
     assert_eq!(mail.pending_for(b).await.expect("one child").len(), 1);
     mail.close().await.expect("close");
 }
@@ -1619,4 +1646,89 @@ async fn the_assignee_reports_to_itself_when_the_requester_is_retired() {
     );
     mail.close().await.expect("close");
     assert_eq!(message_count(&dir), before + 2);
+}
+
+fn in_task(from: AgentId, to: AgentId, task: TaskId) -> NewMessage {
+    let mut msg = send(Sender::Agent(from), to);
+    msg.task = Some(task);
+    msg
+}
+
+fn report(from: AgentId, to: AgentId, task: TaskId) -> NewMessage {
+    let mut msg = send(Sender::Agent(from), to);
+    msg.act = Act::Report {
+        task,
+        outcome: Outcome::Done { artifacts: vec![] },
+    };
+    msg
+}
+
+#[tokio::test]
+async fn the_message_cap_rejects_the_next_send_and_still_accepts_the_report() {
+    let (dir, mail, a, b) = setup(Config::default()).await;
+    let root = request(
+        &mail,
+        Sender::Human,
+        a,
+        None,
+        Budget {
+            messages: 2,
+            ..budget(10)
+        },
+    )
+    .await
+    .expect("root")
+    .task()
+    .expect("task");
+    for _ in 0..2 {
+        mail.accept(in_task(a, b, root)).await.expect("within cap");
+    }
+    let error = mail
+        .accept(in_task(a, b, root))
+        .await
+        .expect_err("third message exceeds the cap");
+    let text = error.to_string();
+    assert!(
+        text.contains(&root.to_string())
+            && text.contains("all 2 messages")
+            && text.contains("a Report is still accepted"),
+        "{text}"
+    );
+    assert!(
+        request(&mail, Sender::Agent(a), b, Some(root), budget(1))
+            .await
+            .is_err(),
+        "a request is a message too"
+    );
+    assert_eq!(mail.task(root).await.expect("root").spent.messages, 2);
+    mail.accept(report(a, a, root))
+        .await
+        .expect("a report is never rejected for budget");
+    assert!(matches!(
+        mail.task(root).await.expect("root").state,
+        TaskState::Closed { success: true, .. }
+    ));
+    mail.close().await.expect("close");
+    assert_eq!(message_count(&dir), 4, "rejected sends store nothing");
+}
+
+#[tokio::test]
+async fn a_replayed_send_is_charged_once() {
+    let (_dir, mail, a, b) = setup(Config::default()).await;
+    let root = request(&mail, Sender::Human, a, None, budget(10))
+        .await
+        .expect("root")
+        .task()
+        .expect("task");
+    let keyed = || {
+        let mut msg = in_task(a, b, root);
+        msg.client_key = ClientKey("once".into());
+        msg
+    };
+    let (first, _) = mail.accept(keyed()).await.expect("first");
+    assert!(matches!(first, SendOutcome::Queued { .. }));
+    let (again, _) = mail.accept(keyed()).await.expect("replay");
+    assert!(matches!(again, SendOutcome::Duplicate { .. }));
+    assert_eq!(mail.task(root).await.expect("root").spent.messages, 1);
+    mail.close().await.expect("close");
 }

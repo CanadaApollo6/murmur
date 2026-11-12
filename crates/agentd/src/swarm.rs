@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::model::{AgentId, MessageId, id};
 id!(TaskId);
@@ -68,9 +69,12 @@ pub struct Task {
     pub deliverable: String,
     pub stakes: Stakes,
     pub budget: Budget,
-    /// Includes child reservations, which are never refunded in v1.
+    /// Includes child reservations, which are never refunded in v1. Once the
+    /// task leaves `Open`, `wall_secs` is at least the time it was open.
     pub spent: Budget,
     pub state: TaskState,
+    /// The request's `sent_at`. The wall clock runs from here.
+    pub opened: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

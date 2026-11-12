@@ -1273,7 +1273,7 @@ async fn task_acts_open_report_and_list_through_real_surfaces() {
     let (a, b) = (agent("@a"), agent("@b"));
 
     let root_act =
-        json!({"kind":"request","deliverable":"ship the root","budget":budget(100,10,5)});
+        json!({"kind":"request","deliverable":"ship the root","budget":budget(100,20,5)});
     let status = d
         .ctl(&["send", "@a", "root work", "--act", &root_act.to_string()])
         .await;
@@ -1480,9 +1480,13 @@ async fn task_acts_open_report_and_list_through_real_surfaces() {
     assert_eq!(root_row["assignee"], "@a");
     assert_eq!(
         root_row["budget"],
-        json!({"tokens":null,"wall_secs":100,"messages":10,"hops":5})
+        json!({"tokens":null,"wall_secs":100,"messages":20,"hops":5})
     );
     assert_eq!(root_row["spent"]["wall_secs"], 40);
+    assert_eq!(
+        root_row["spent"]["messages"], 12,
+        "each request costs one message plus the child's two"
+    );
     assert_eq!(root_row["outcome"], Value::Null);
     assert_eq!(root_row["stakes"], "normal");
     for (child, state, outcome) in [
