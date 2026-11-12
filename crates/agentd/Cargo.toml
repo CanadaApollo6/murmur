@@ -27,7 +27,7 @@ base64 = "0.22"
 url = "2"
 toml = "0.9"
 async-trait = { workspace = true }
-rusqlite = { version = "0.32.1", features = ["bundled"] }
+rusqlite = { version = "0.32.1", features = ["bundled", "hooks"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

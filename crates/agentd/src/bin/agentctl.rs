@@ -91,6 +91,18 @@ enum Command {
     Ui,
     /// List the task ledger.
     Tasks,
+    /// Settle a task in review: `confirm` closes it as a success, `refute`
+    /// reopens it with its whole wall clock budget and tells its assignee.
+    Resolve {
+        task: String,
+        #[arg(value_enum)]
+        decision: Decision,
+    },
+}
+#[derive(Clone, ValueEnum)]
+enum Decision {
+    Confirm,
+    Refute,
 }
 #[derive(Clone, ValueEnum)]
 enum Kind {
@@ -229,6 +241,16 @@ async fn run(args: Args) -> Result<()> {
         Command::Watch { cursor, nonce } => ControlRequest::Watch { cursor, nonce },
         Command::Ui => ControlRequest::Ui,
         Command::Tasks => ControlRequest::Tasks,
+        Command::Resolve { task, decision } => ControlRequest::Resolve {
+            task: TaskId(
+                task.parse()
+                    .map_err(|e| format!("{task:?} is not a task id: {e}"))?,
+            ),
+            decision: match decision {
+                Decision::Confirm => agentd::mailroom::ReviewDecision::Confirm,
+                Decision::Refute => agentd::mailroom::ReviewDecision::Refute,
+            },
+        },
     };
     let watch = matches!(request, ControlRequest::Watch { .. });
     let held = matches!(request, ControlRequest::Held { .. });

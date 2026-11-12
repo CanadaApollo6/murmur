@@ -206,12 +206,12 @@ async fn agent(
     cache: &mut HashMap<AgentId, (String, String)>,
 ) -> Result<Value> {
     if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(id)
-        && let Some((_, spec, _)) = api
+        && let Some((_, spec, _, _)) = api
             .mailroom
             .observed_agents()
             .await?
             .into_iter()
-            .find(|(a, _, _)| *a == id)
+            .find(|(a, _, _, _)| *a == id)
     {
         entry.insert((format!("@{}", spec.name.as_str()), spec.kind));
     }
@@ -246,15 +246,32 @@ fn agent_row(
     json!({"id":format!("agent:{id}"),"name":cut(name,1024),"kind":cut(kind,1024),"isolation":isolation,"phase":phase_name(phase),"incarnation":incarnation,"error":error})
 }
 type AgentCache = HashMap<AgentId, (String, String)>;
+/// Tasks waiting for the operator, as the feed shows them. Findings carry
+/// only their kind; a refuted path is agent text and stays out of the feed.
+fn review_list(rows: Vec<crate::mailroom::Review>) -> Value {
+    let truncated = rows.len() > 1000;
+    let tasks = rows
+        .into_iter()
+        .take(1000)
+        .map(|(task, owner, finding)| {
+            let kind = acts::finding_json(&finding)["kind"].clone();
+            json!({"task":task,"assignee":format!("agent:{owner}"),"state":"review","finding":kind})
+        })
+        .collect::<Vec<_>>();
+    json!({"tasks":tasks,"truncated":truncated})
+}
 pub(crate) struct Snapshot {
     pub cursor: i64,
+    /// The `review` value inside `json`.
+    pub review: Value,
     pub json: String,
     pub full_mail: bool,
 }
 struct SnapshotInput {
     cursor: i64,
+    review: Value,
     mail_state: Value,
-    specs: Vec<(AgentId, AgentSpec, i64)>,
+    specs: Vec<crate::mailroom::ObservedAgent>,
     handles: Vec<Option<crate::supervisor::AgentHandle>>,
     hub: crate::event_hub::EventHub,
     control_path: PathBuf,
@@ -263,6 +280,7 @@ struct SnapshotInput {
 fn assemble_snapshot(input: SnapshotInput) -> Result<(Snapshot, AgentCache)> {
     let SnapshotInput {
         cursor,
+        review,
         mut mail_state,
         specs,
         handles,
@@ -279,7 +297,7 @@ fn assemble_snapshot(input: SnapshotInput) -> Result<(Snapshot, AgentCache)> {
     }
     let truncated = specs.len() > 1024;
     let mut agents = Vec::new();
-    for ((id, spec, _), handle) in specs.into_iter().take(1024).zip(handles) {
+    for ((id, spec, _, _), handle) in specs.into_iter().take(1024).zip(handles) {
         let name = format!("@{}", spec.name.as_str());
         cache.insert(id, (name.clone(), spec.kind.clone()));
         agents.push(agent_row(
@@ -294,12 +312,13 @@ fn assemble_snapshot(input: SnapshotInput) -> Result<(Snapshot, AgentCache)> {
     }
     let approvals = hub.permissions();
     let full_mail = !mail_state.is_null();
-    let value = json!({"event":"snapshot","mail_cursor":cursor,"mail":mail_state,"agents":agents,"agents_truncated":truncated,"approvals_truncated":approvals.len()>64,"approvals":approvals.into_iter().take(64).map(|r|permission(r,&control_path)).collect::<Vec<_>>()});
+    let value = json!({"event":"snapshot","mail_cursor":cursor,"mail":mail_state,"review":review,"agents":agents,"agents_truncated":truncated,"approvals_truncated":approvals.len()>64,"approvals":approvals.into_iter().take(64).map(|r|permission(r,&control_path)).collect::<Vec<_>>()});
     Ok((
         Snapshot {
             cursor,
             json: serde_json::to_string(&value)?,
             full_mail,
+            review: value["review"].clone(),
         },
         cache,
     ))
@@ -326,14 +345,16 @@ pub(crate) async fn snapshot(
     } else {
         api.mailroom.mail_snapshot(resume).await?
     };
-    let specs = api.mailroom.observed_agents().await?;
+    let (specs, review) = api.mailroom.observed_roster().await?;
+    let review = review_list(review);
     let mut handles = Vec::with_capacity(specs.len().min(1024));
-    for (id, _, _) in specs.iter().take(1024) {
+    for (id, _, _, _) in specs.iter().take(1024) {
         handles.push(api.broker.handle(*id).await);
     }
     let (frame, updated) = encode_snapshot(
         SnapshotInput {
             cursor,
+            review,
             mail_state,
             specs,
             handles,
@@ -417,7 +438,8 @@ pub async fn feed(api: &ControlApi, sink: &mut impl Sink, resume: Option<Anchor>
     let states = api.broker.event_hub().state();
     let activity = api.broker.event_hub().activity();
     let changes = api.mailroom.changes();
-    run(api, sink, resume, states, activity, changes).await
+    let review = api.mailroom.task_changes();
+    run(api, sink, resume, states, activity, changes, review).await
 }
 async fn run(
     api: &ControlApi,
@@ -426,9 +448,14 @@ async fn run(
     mut states: tokio::sync::broadcast::Receiver<Event>,
     mut activity: tokio::sync::broadcast::Receiver<Event>,
     mut changes: tokio::sync::watch::Receiver<i64>,
+    mut review: tokio::sync::watch::Receiver<u64>,
 ) -> Result<()> {
     let mut cache = HashMap::new();
+    review.mark_unchanged();
     let first = snapshot(api, resume, None, &mut cache).await?;
+    // The review list the subscriber holds. Every snapshot carries it.
+    let mut shown = first.review.clone();
+    let mut review_due = false;
     let mut cursor = first.cursor;
     send_snapshot(sink, first).await?;
     let mut pending = true;
@@ -443,8 +470,9 @@ async fn run(
                     }
                 }
                 Err(TryRecvError::Lagged(_)) => {
-                    send_snapshot(sink, snapshot(api, None, Some(cursor), &mut cache).await?)
-                        .await?
+                    let snap = snapshot(api, None, Some(cursor), &mut cache).await?;
+                    shown = snap.review.clone();
+                    send_snapshot(sink, snap).await?
                 }
                 Err(TryRecvError::Closed) => return Ok(()),
                 Err(TryRecvError::Empty) => break,
@@ -486,11 +514,14 @@ async fn run(
             if floor.is_some_and(|n| n > cursor + 1) {
                 let snap = snapshot(api, None, None, &mut cache).await?;
                 cursor = snap.cursor;
+                shown = snap.review.clone();
                 send_snapshot(sink, snap).await?;
                 continue;
             }
             pending = rows.len() == 256;
             for mut row in rows {
+                // Every review move with mail stores that mail in the task.
+                review_due |= !row["task"].is_null();
                 cursor = row["seq"].as_i64().expect("bug: mail has seq");
                 mail(&mut row, &api.control_path);
                 send(sink, row).await?;
@@ -499,11 +530,27 @@ async fn run(
                 continue;
             }
         }
+        if review_due {
+            review_due = false;
+            let now = review_list(api.mailroom.observed_reviews().await?);
+            if now != shown {
+                let mut frame = now.clone();
+                frame["event"] = json!("review");
+                send(sink, frame).await?;
+                shown = now;
+            }
+        }
         tokio::select! {
+            // Mail goes out before the review move it caused.
+            changed=review.changed()=>{if changed.is_err(){return Ok(());} review_due=true; pending=true;},
             changed=changes.changed()=>{if changed.is_err(){return Ok(());} pending=true;},
             event=states.recv()=>match event {
                 Ok(e)=>if let Some(v)=state(api,e,&mut cache).await? {send(sink,v).await?;},
-                Err(RecvError::Lagged(_))=>send_snapshot(sink,snapshot(api,None,Some(cursor),&mut cache).await?).await?,
+                Err(RecvError::Lagged(_))=>{
+                    let snap=snapshot(api,None,Some(cursor),&mut cache).await?;
+                    shown=snap.review.clone();
+                    send_snapshot(sink,snap).await?
+                },
                 Err(RecvError::Closed)=>return Ok(())
             },
             event=activity.recv()=>match event {
@@ -651,6 +698,181 @@ mod tests {
         task.abort();
         assert!(task.await.expect_err("aborted").is_cancelled());
     }
+    /// A request from the operator to `to`, and the infeasible claim on it.
+    async fn claim(api: &ControlApi, to: AgentId) -> (TaskId, MessageId) {
+        let note = |act, key: &str| NewMessage {
+            from: Sender::Human,
+            to,
+            body: Body::new("body").expect("body"),
+            reply_to: None,
+            client_key: ClientKey(key.into()),
+            act,
+            task: None,
+        };
+        let budget = crate::swarm::Budget {
+            tokens: None,
+            wall_secs: 600,
+            messages: 5,
+            hops: 0,
+        };
+        let (_, request) = api
+            .mailroom
+            .accept(note(
+                Act::Request {
+                    deliverable: "x".into(),
+                    budget,
+                    stakes: crate::swarm::Stakes::Normal,
+                },
+                "request",
+            ))
+            .await
+            .expect("request");
+        let task = request.task().expect("task");
+        let report = Act::Report {
+            task,
+            outcome: crate::swarm::Outcome::Infeasible {
+                evidence: crate::swarm::Evidence {
+                    tried: "t".into(),
+                    obstacle: "o".into(),
+                    reproduction: None,
+                },
+            },
+            verdict: None,
+        };
+        let (_, report) = api
+            .mailroom
+            .accept(NewMessage {
+                from: Sender::Agent(to),
+                ..note(report, "report")
+            })
+            .await
+            .expect("report");
+        (task, report.id())
+    }
+    #[tokio::test]
+    async fn the_feed_shows_tasks_entering_and_leaving_review() {
+        let (_dir, api, id) = api().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let a = api.clone();
+        let task =
+            tokio::spawn(async move { feed(&a, &mut Record { tx, pause: None }, None).await });
+        let first = recv(&mut rx).await;
+        assert_eq!(first["event"], "snapshot");
+        assert_eq!(first["review"], json!({"tasks":[],"truncated":false}));
+        let (claimed, _) = claim(&api, id).await;
+        let review = loop {
+            let v = recv(&mut rx).await;
+            if v["event"] == "review" {
+                break v;
+            }
+        };
+        assert_eq!(
+            review,
+            json!({"event":"review","truncated":false,"tasks":[{"task":claimed,
+                "assignee":format!("agent:{id}"),"state":"review","finding":"unverified"}]})
+        );
+        api.mailroom
+            .resolve_review(claimed, crate::mailroom::ReviewDecision::Confirm)
+            .await
+            .expect("confirm");
+        let cleared = loop {
+            let v = recv(&mut rx).await;
+            if v["event"] == "review" {
+                break v;
+            }
+        };
+        assert_eq!(
+            cleared,
+            json!({"event":"review","tasks":[],"truncated":false})
+        );
+        task.abort();
+        assert!(task.await.expect_err("aborted").is_cancelled());
+    }
+    #[tokio::test]
+    async fn only_ls_lists_verifiers() {
+        let dir = tempfile::tempdir().expect("dir");
+        let room = Arc::new(
+            Mailroom::open(
+                dir.path().join("mail.db"),
+                Config {
+                    verifier_available: true,
+                    ..Config::default()
+                },
+            )
+            .await
+            .expect("room"),
+        );
+        let (_other, base, _) = api().await;
+        let api = ControlApi {
+            broker: Arc::new(
+                Broker::new(room.clone(), vec![], Default::default()).expect("broker"),
+            ),
+            mailroom: room.clone(),
+            bindings: base.bindings.clone(),
+            control_path: base.control_path.clone(),
+            ui_url: None,
+        };
+        let id = room
+            .register(AgentName::parse("a").expect("name"))
+            .await
+            .expect("agent");
+        let (_, report) = claim(&api, id).await;
+        let spec = |name: &str| AgentSpec {
+            name: AgentName::parse(name).expect("name"),
+            kind: "claude".into(),
+            cwd: "/".into(),
+            workspace: None,
+            model: None,
+            permissions: Default::default(),
+            idle_after: None,
+        };
+        room.save_spec(id, spec("a")).await.expect("spec");
+        let v = room
+            .open_verification(
+                report,
+                crate::mailroom::VerifierStart {
+                    spec: spec("checker"),
+                    budget: crate::swarm::Budget {
+                        tokens: None,
+                        wall_secs: 60,
+                        messages: 1,
+                        hops: 0,
+                    },
+                    verifier_family: "gpt".into(),
+                    claimant_family: "claude".into(),
+                    snapshot_clean: true,
+                },
+            )
+            .await
+            .expect("verification");
+        let names = |rows: Value| {
+            rows.as_array()
+                .expect("rows")
+                .iter()
+                .map(|r| (r["name"].clone(), r["role"].clone()))
+                .collect::<Vec<_>>()
+        };
+        let ls = names(api.agents(true).await.expect("ls"));
+        assert!(ls.contains(&(json!("@a"), json!("worker"))), "{ls:?}");
+        assert!(
+            ls.contains(&(json!("@checker"), json!("verifier"))),
+            "{ls:?}"
+        );
+        assert_eq!(
+            names(api.agents(false).await.expect("list")),
+            vec![(json!("@a"), json!("worker"))]
+        );
+        let tasks = api.tasks().await.expect("tasks");
+        let verification = v.task.expect("task");
+        assert!(
+            tasks
+                .as_array()
+                .expect("tasks")
+                .iter()
+                .any(|t| t["id"] == json!(verification)),
+            "{tasks}"
+        );
+    }
     #[test]
     fn activity_buffers_keep_the_newest_text_of_the_newest_life() {
         let agent = AgentId::new();
@@ -783,6 +1005,7 @@ mod tests {
                     state_rx,
                     activity_rx,
                     changes_rx,
+                    tokio::sync::watch::channel(0).1,
                 ),
             )
             .await
@@ -1062,12 +1285,15 @@ mod runtime_tests {
                         idle_after: None,
                     },
                     0,
+                    AgentRole::Worker,
                 )
             })
             .collect();
+        let review_row = json!({"task":TaskId::new(),"assignee":format!("agent:{agent}"),"state":"review","finding":"inconclusive"});
         (
             SnapshotInput {
                 cursor: i64::MAX,
+                review: json!({"tasks":vec![review_row;1000],"truncated":true}),
                 mail_state,
                 specs,
                 handles: vec![None; 1024],

@@ -319,11 +319,14 @@ pub(super) fn label(name: &str) {
                 "accept"
             } else if name.contains("::mail_page::") {
                 "feed_page"
-            } else if name.contains("::observed_agents::") {
+            } else if name.contains("::observed_agents::") || name.contains("::observed_roster::") {
                 "list_agents"
             } else if name.contains("::observed_message::") {
                 "messages_id"
-            } else if name.contains("::resolve::") || name.contains("::sender_label::") {
+            } else if name.contains("::resolve::")
+                || name.contains("::resolve_for::")
+                || name.contains("::sender_label::")
+            {
                 "agent_lookup"
             } else {
                 name

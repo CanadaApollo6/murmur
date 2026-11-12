@@ -399,10 +399,20 @@ pub(crate) fn page(db: &Connection, cursor: i64) -> Result<(Option<i64>, Vec<Val
     Ok((floor, rows))
 }
 
-pub(crate) fn agents(db: &Connection) -> Result<Vec<(AgentId, crate::supervisor::AgentSpec, i64)>> {
-    let mut stmt=db.prepare("SELECT s.agent,s.spec,COALESCE(q.n,0) FROM agent_specs s JOIN agents a ON a.id=s.agent LEFT JOIN (SELECT recipient,SUM(n) n FROM mail_edges WHERE state='queued' GROUP BY recipient) q ON q.recipient=s.agent WHERE a.retired=0 ORDER BY a.name")?;
+/// An agent row as `agentctl ls` and the feed list it.
+pub type ObservedAgent = (AgentId, crate::supervisor::AgentSpec, i64, AgentRole);
+pub(crate) fn agents(db: &Connection) -> Result<Vec<ObservedAgent>> {
+    let mut stmt=db.prepare("SELECT s.agent,s.spec,COALESCE(q.n,0),a.role FROM agent_specs s JOIN agents a ON a.id=s.agent LEFT JOIN (SELECT recipient,SUM(n) n FROM mail_edges WHERE state='queued' GROUP BY recipient) q ON q.recipient=s.agent WHERE a.retired=0 ORDER BY a.name")?;
     Ok(stmt
-        .query_map([], |r| Ok((json_col(r, 0)?, json_col(r, 1)?, r.get(2)?)))?
+        .query_map([], |r| {
+            let role: String = r.get(3)?;
+            Ok((
+                json_col(r, 0)?,
+                json_col(r, 1)?,
+                r.get(2)?,
+                AgentRole::parse(&role).ok_or(rusqlite::Error::InvalidQuery)?,
+            ))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -425,9 +435,7 @@ impl Mailroom {
     pub async fn mail_page(&self, cursor: i64) -> Result<(Option<i64>, Vec<Value>)> {
         self.observe(move |s| page(&s.db, cursor)).await
     }
-    pub async fn observed_agents(
-        &self,
-    ) -> Result<Vec<(AgentId, crate::supervisor::AgentSpec, i64)>> {
+    pub async fn observed_agents(&self) -> Result<Vec<ObservedAgent>> {
         self.observe(|s| agents(&s.db)).await
     }
     pub async fn observed_message(&self, id: MessageId) -> Result<Value> {
@@ -723,11 +731,11 @@ mod tests {
             assert_eq!(
                 s.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .expect("version"),
-                4
+                5
             );
         }
         let db = Connection::open(&path).expect("db");
-        db.execute_batch("PRAGMA user_version=5").expect("v5");
+        db.execute_batch("PRAGMA user_version=6").expect("v6");
         drop(db);
         assert!(Store::open(&path, Config::default()).is_err());
     }

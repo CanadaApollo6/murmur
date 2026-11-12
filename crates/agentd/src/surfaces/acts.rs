@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::model::{Envelope, Sender};
-use crate::swarm::{Act, ArtifactRef, Budget, Evidence, Outcome, Stakes, TaskId};
+use crate::swarm::{
+    Act, ArtifactRef, Budget, Evidence, Finding, Outcome, Stakes, TaskId, VERIFICATION_DELIVERABLE,
+    VerifierVerdict,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -31,7 +34,44 @@ pub enum ActArgs {
     Report {
         task: TaskId,
         outcome: OutcomeArgs,
+        /// Only a verifier sends one, on its verification task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verdict: Option<VerdictArgs>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VerdictArgs {
+    Confirmed { tried: Text },
+    Refuted { path: Text, reproduction: Text },
+}
+
+impl From<VerdictArgs> for VerifierVerdict {
+    fn from(v: VerdictArgs) -> Self {
+        match v {
+            VerdictArgs::Confirmed { tried } => Self::Confirmed { tried: tried.0 },
+            VerdictArgs::Refuted { path, reproduction } => Self::Refuted {
+                path: path.0,
+                reproduction: reproduction.0,
+            },
+        }
+    }
+}
+
+/// Displays a stored verdict. The mailroom validated its text on the way in.
+impl From<&VerifierVerdict> for VerdictArgs {
+    fn from(v: &VerifierVerdict) -> Self {
+        match v {
+            VerifierVerdict::Confirmed { tried } => Self::Confirmed {
+                tried: Text(tried.clone()),
+            },
+            VerifierVerdict::Refuted { path, reproduction } => Self::Refuted {
+                path: Text(path.clone()),
+                reproduction: Text(reproduction.clone()),
+            },
+        }
+    }
 }
 
 /// Sender-written text with at least one non-whitespace character.
@@ -146,10 +186,15 @@ impl ActArgs {
                 },
                 parent_task,
             ),
-            Self::Report { task, outcome } => (
+            Self::Report {
+                task,
+                outcome,
+                verdict,
+            } => (
                 Act::Report {
                     task,
                     outcome: outcome.into(),
+                    verdict: verdict.map(Into::into),
                 },
                 None,
             ),
@@ -227,6 +272,18 @@ pub(crate) fn outcome_json(o: &Outcome) -> Value {
     serde_json::to_value(OutcomeArgs::from(o)).expect("bug: outcome serializes")
 }
 
+/// A review finding as `agentctl tasks` and the feed show it.
+pub(crate) fn finding_json(f: &Finding) -> Value {
+    match f {
+        Finding::Unverified { reason } => json!({"kind":"unverified","reason":reason}),
+        Finding::Confirmed => json!({"kind":"confirmed"}),
+        Finding::Refuted { path, reproduction } => {
+            json!({"kind":"refuted","path":path,"reproduction":reproduction})
+        }
+        Finding::Inconclusive => json!({"kind":"inconclusive"}),
+    }
+}
+
 fn outcome_kind(o: &Outcome) -> &'static str {
     match o {
         Outcome::Done { .. } => "done",
@@ -256,7 +313,18 @@ pub(crate) fn content(env: &Envelope) -> String {
     let body = env.body().as_str();
     match env.act() {
         Act::Request { deliverable, .. } => format!("{body}\n\nDeliverable: {deliverable}"),
-        Act::Report { outcome, .. } => format!("{body}\n\nOutcome: {}", outcome_json(outcome)),
+        Act::Report {
+            outcome, verdict, ..
+        } => {
+            let mut text = format!("{body}\n\nOutcome: {}", outcome_json(outcome));
+            if let Some(v) = verdict {
+                text.push_str(&format!(
+                    "\nVerdict: {}",
+                    serde_json::to_value(VerdictArgs::from(v)).expect("bug: verdict serializes")
+                ));
+            }
+            text
+        }
         _ => body.to_owned(),
     }
 }
@@ -267,7 +335,11 @@ pub(crate) fn content(env: &Envelope) -> String {
 pub(crate) fn task_note(env: &Envelope) -> Option<String> {
     let id = env.task()?;
     match env.act() {
-        Act::Request { budget, stakes, .. } => {
+        Act::Request {
+            budget,
+            stakes,
+            deliverable,
+        } => {
             let tokens = budget
                 .tokens
                 .map_or_else(|| "unmetered".to_owned(), |t| t.to_string());
@@ -278,23 +350,41 @@ pub(crate) fn task_note(env: &Envelope) -> Option<String> {
                     " The human operator requested it and reads outcomes with agentctl tasks, so address the report to yourself.",
                 ),
             };
+            // A verification task is opened only by the broker, as the operator.
+            let (sample, pick) = if *env.from() == Sender::Human
+                && deliverable == VERIFICATION_DELIVERABLE
+            {
+                (
+                    json!({"kind":"report","task":id,"outcome":{"kind":"done"},"verdict":{"kind":"refuted","path":"PATH","reproduction":"REPRODUCTION"}}),
+                    "Send done with a refuted verdict if you found a path, done with a confirmed verdict if the claim holds, or failed if you cannot decide.",
+                )
+            } else {
+                (
+                    json!({"kind":"report","task":id,"outcome":{"kind":"done","artifacts":["LOCATOR"]}}),
+                    "Pick the outcome kind that is true and replace LOCATOR with what you produced.",
+                )
+            };
             Some(format!(
-                "This message opens task {id} and assigns it to you. The deliverable is in the message above. Stakes: {stakes:?}. Budget: {} s wall time, {} messages, {} hops, {tokens} tokens.\nWhen the task ends, report once with send_message: to \"agent:{report_to}\", act {}. Pick the outcome kind that is true and replace LOCATOR with what you produced.{human}",
-                budget.wall_secs,
-                budget.messages,
-                budget.hops,
-                json!({"kind":"report","task":id,"outcome":{"kind":"done","artifacts":["LOCATOR"]}}),
+                "This message opens task {id} and assigns it to you. The deliverable is in the message above. Stakes: {stakes:?}. Budget: {} s wall time, {} messages, {} hops, {tokens} tokens.\nWhen the task ends, report once with send_message: to \"agent:{report_to}\", act {sample}. {pick}{human}",
+                budget.wall_secs, budget.messages, budget.hops,
             ))
         }
-        Act::Report { outcome, .. } => {
+        Act::Report {
+            outcome, verdict, ..
+        } => {
             let next = match outcome {
                 Outcome::Partial { .. } | Outcome::Infeasible { .. } => {
-                    "The task now waits for verification."
+                    "The task now waits for a verifier or the operator."
                 }
                 _ => "The task is closed.",
             };
+            let verdict = match verdict {
+                Some(VerifierVerdict::Confirmed { .. }) => " and verdict confirmed",
+                Some(VerifierVerdict::Refuted { .. }) => " and verdict refuted",
+                None => "",
+            };
             Some(format!(
-                "This message reports on task {id} with outcome {}. {next} No reply is needed.",
+                "This message reports on task {id} with outcome {}{verdict}. {next} No reply is needed.",
                 outcome_kind(outcome)
             ))
         }
@@ -371,8 +461,16 @@ pub(crate) fn schema() -> Value {
                 "properties":{
                     "kind":kind("report"),
                     "task":task_id("The id of the task assigned to you, from the message that opened it."),
+                    "verdict":{
+                        "description":"Only for a verification task, and required there with outcome done. Leave it out or null otherwise. failed and blocked carry none and mean you could not decide.",
+                        "oneOf":[
+                            {"type":"null"},
+                            outcome("confirmed", "The claim holds: you found no way through.", json!({"tried":text("What you tried.")}), &["tried"]),
+                            outcome("refuted", "You found a way through.", json!({"path":text("What to change."),"reproduction":text("How to see that it works.")}), &["path","reproduction"])
+                        ]
+                    },
                     "outcome":{
-                        "description":"How the task ended. partial and infeasible wait for verification; the others close the task.",
+                        "description":"How the task ended. partial and infeasible wait for a verifier or the operator; the others close the task.",
                         "oneOf":[
                             outcome("done", "You produced the deliverable.", json!({"artifacts":artifacts}), &[]),
                             outcome("partial", "Only part is possible as specified.", json!({"artifacts":artifacts,"not_possible":text("The part that cannot be done."),"evidence":evidence}), &["not_possible","evidence"]),
@@ -408,6 +506,8 @@ mod tests {
         };
         let budget = |b: Value| request(json!({"budget":b}));
         let report = |outcome: Value| json!({"kind":"report","task":task,"outcome":outcome});
+        let verdict =
+            |v: Value| json!({"kind":"report","task":task,"outcome":{"kind":"done"},"verdict":v});
         let cases = [
             (json!({"kind":"inform"}), true),
             (request(json!({})), true),
@@ -442,6 +542,25 @@ mod tests {
             ),
             (report(json!({"kind":"failed","tried":"t"})), true),
             (report(json!({"kind":"blocked","on":"input"})), true),
+            (verdict(json!({"kind":"confirmed","tried":"t"})), true),
+            (
+                verdict(json!({"kind":"refuted","path":"p","reproduction":"r"})),
+                true,
+            ),
+            (verdict(Value::Null), true),
+            (verdict(json!({"kind":"refuted","path":"p"})), false),
+            (
+                verdict(json!({"kind":"refuted","path":" ","reproduction":"r"})),
+                false,
+            ),
+            (verdict(json!({"kind":"confirmed","tried":""})), false),
+            (verdict(json!({"kind":"confirmed"})), false),
+            (
+                verdict(json!({"kind":"confirmed","tried":"t","x":1})),
+                false,
+            ),
+            (verdict(json!({"kind":"inconclusive"})), false),
+            (verdict(json!("confirmed")), false),
             (json!({"kind":"inform","typo":1}), false),
             (json!({"kind":"inform","outcome":{"kind":"done"}}), false),
             (json!({"kind":"request"}), false),

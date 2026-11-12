@@ -1393,7 +1393,7 @@ async fn task_acts_open_report_and_list_through_real_surfaces() {
         report(&children[1], json!({"kind":"done"})),
     )
     .await;
-    assert!(error, "a verifying task takes no second report");
+    assert!(error, "a task in review takes no second report");
     assert!(
         text.contains("task must be open and owned by sender"),
         "{text}"
@@ -1497,12 +1497,12 @@ async fn task_acts_open_report_and_list_through_real_surfaces() {
         ),
         (
             &children[1],
-            "verifying",
+            "review",
             json!({"kind":"infeasible","evidence":evidence}),
         ),
         (
             &children[2],
-            "verifying",
+            "review",
             json!({"kind":"partial","artifacts":[],"not_possible":"half","evidence":evidence}),
         ),
         (&children[3], "open", Value::Null),
@@ -1514,7 +1514,74 @@ async fn task_acts_open_report_and_list_through_real_surfaces() {
         assert_eq!(r["requester"], "@a");
         assert_eq!(r["assignee"], "@b");
         assert_eq!(r["deliverable"], "child result");
+        let finding = if state == "review" {
+            json!({"kind":"unverified","reason":"no verifier is available"})
+        } else {
+            Value::Null
+        };
+        assert_eq!(r["finding"], finding, "{r}");
     }
+
+    // The operator settles the claims in review.
+    let resolve = |task: &str, decision: &str| {
+        Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("--socket")
+            .arg(d.socket())
+            .args(["resolve", task, decision])
+            .output()
+    };
+    let output = resolve(&children[3], "confirm").await.expect("agentctl");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("is not in review"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let unknown = agentd::swarm::TaskId::new().to_string();
+    for (task, reason) in [
+        ("not-a-task", "\"not-a-task\" is not a task id"),
+        (unknown.as_str(), "not found"),
+    ] {
+        let output = resolve(task, "confirm").await.expect("agentctl");
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(reason),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        d.ctl(&["resolve", &children[1], "confirm"]).await,
+        json!({"task":children[1],"state":"closed"})
+    );
+    assert_eq!(
+        d.ctl(&["resolve", &children[2], "refute"]).await,
+        json!({"task":children[2],"state":"open"})
+    );
+    let tasks = d.ctl(&["tasks"]).await;
+    let rows = tasks.as_array().expect("tasks");
+    let row = |id: &str| {
+        rows.iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("task {id}: {tasks}"))
+    };
+    assert_eq!(row(&children[1])["state"], "closed");
+    assert_eq!(
+        row(&children[1])["outcome"],
+        json!({"kind":"infeasible","evidence":evidence})
+    );
+    assert_eq!(row(&children[2])["state"], "open");
+    assert_eq!(row(&children[2])["finding"], Value::Null);
+    let refuted = format!(
+        "The operator refuted your partial report on task {}.",
+        children[2]
+    );
+    d.wait_wire("b", |v| {
+        prompts(v)
+            .iter()
+            .any(|p| p["params"]["prompt"].to_string().contains(&refuted))
+    })
+    .await;
     d.stop(nix::sys::signal::Signal::SIGTERM).await;
 }
 
