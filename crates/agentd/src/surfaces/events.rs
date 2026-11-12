@@ -423,6 +423,10 @@ pub(crate) async fn state(
         Event::TurnEnded { agent, outcome } => {
             json!({"event":"turn_ended","agent":format!("agent:{agent}"),"outcome":match outcome {TurnOutcome::Completed=>"completed",TurnOutcome::Cancelled=>"cancelled",TurnOutcome::Refused=>"refused",TurnOutcome::MaxTokens=>"max_tokens",TurnOutcome::Failed{..}=>"failed"}})
         }
+        Event::Retired { agent } => {
+            cache.remove(&agent);
+            json!({"event":"agent_retired","agent":format!("agent:{agent}")})
+        }
         Event::EgressDenied { agent, host, port } => {
             json!({"event":"egress_denied","agent":format!("agent:{agent}"),"host":cut(&host,1024),"port":port})
         }

@@ -1005,6 +1005,10 @@ impl Mailroom {
         }).await
     }
 
+    pub async fn retired(&self, agent: AgentId) -> Result<bool> {
+        self.call(move |s| retired(&s.db, agent)).await
+    }
+
     pub async fn view(&self, conversation: ConversationId) -> Result<ConversationView> {
         self.call(move |s| view(&s.db, conversation)).await
     }

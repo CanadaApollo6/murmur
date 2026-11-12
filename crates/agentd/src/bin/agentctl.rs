@@ -69,6 +69,10 @@ enum Command {
     Restart {
         to: String,
     },
+    /// Stop the agent for good and free its name.
+    Retire {
+        to: String,
+    },
     Held {
         to: Option<String>,
     },
@@ -226,6 +230,7 @@ async fn run(args: Args) -> Result<()> {
         Command::Cancel { to } => ControlRequest::Cancel { to },
         Command::Stop { to } => ControlRequest::Stop { to },
         Command::Restart { to } => ControlRequest::Restart { to },
+        Command::Retire { to } => ControlRequest::Retire { to },
         Command::Held { to } => ControlRequest::Held { to },
         Command::Release { id } => ControlRequest::Release {
             id: MessageId(id.parse()?),
