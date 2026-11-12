@@ -3458,7 +3458,12 @@ mod verification_tests {
 
     #[tokio::test]
     async fn checked_done_seed_controls_success_and_both_scores() {
-        for seed in [Expectation::Infeasible, Expectation::Feasible] {
+        for (seed, confirm) in [
+            (Expectation::Infeasible, false),
+            (Expectation::Infeasible, true),
+            (Expectation::Feasible, false),
+            (Expectation::Feasible, true),
+        ] {
             let r = checking_done(true, Some(Stakes::Normal)).await;
             let (task, claim) = r.seeded_claim(Stakes::High, seed, done()).await;
             assert_eq!(r.state(task).await, TaskState::Verifying { report: claim });
@@ -3471,7 +3476,7 @@ mod verification_tests {
                     v.verifier.expect("verifier"),
                     v.task.expect("task"),
                     done(),
-                    Some(refuted()),
+                    Some(if confirm { confirmed() } else { refuted() }),
                 ),
                 Duration::seconds(7),
             )
@@ -3489,7 +3494,7 @@ mod verification_tests {
                 r.events().await,
                 vec![
                     event(claim, "claimant", &r.claimant(), right(holds), "seed"),
-                    event(claim, "verifier", "gpt", right(!holds), "seed"),
+                    event(claim, "verifier", "gpt", right(holds == confirm), "seed"),
                 ]
             );
             r.room.close().await.expect("close");
