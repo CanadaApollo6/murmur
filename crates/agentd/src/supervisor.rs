@@ -3856,7 +3856,12 @@ mod expiry_tests {
             let broker = broker.clone();
             async move { broker.expire_tasks().await }
         });
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        while room.jobs_run.load(SeqCst) == before {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // The first sweep has started. Half the retry interval later, no
+        // second one has.
+        tokio::time::sleep(EXPIRY_RETRY / 2).await;
         let sweeps = room.jobs_run.load(SeqCst) - before;
         assert_eq!(sweeps, 1, "one failed sweep, then a wait");
         sweeper.abort();
