@@ -575,8 +575,10 @@ worker sandbox can bind it or anything under it. The copy follows these rules:
 
 Four limits stop the copy: file content over `max_snapshot_bytes`, more than
 `max_snapshot_entries` files and directories, directories nested deeper than
-128 levels, and a copy that takes longer than 120 seconds. The entry count
-includes entries that the copy drops or skips. At a limit, the partial copy is
+128 levels, and a copy that takes longer than 120 seconds. The time includes
+the flush to disk at the end. The flush cannot be interrupted, so a slow one is
+refused only when it returns. The entry count includes entries that the copy
+drops or skips. At a limit, the partial copy is
 deleted and the claim goes to `review` as `unverified`, with the limit as the
 reason.
 

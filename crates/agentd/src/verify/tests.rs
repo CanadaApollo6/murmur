@@ -488,6 +488,22 @@ fn a_copy_past_its_deadline_is_refused_and_deleted() {
 }
 
 #[test]
+fn a_flush_that_ends_past_the_deadline_is_refused_and_deleted() {
+    let t = tree();
+    let limits = Limits {
+        time: Duration::from_millis(200),
+        ..bytes(1 << 20)
+    };
+    let slow = |_: &Path| {
+        std::thread::sleep(Duration::from_millis(250));
+        Ok(())
+    };
+    let error = take_snapshot_with(&t.source, &t.dir, limits, true, slow).expect_err("too slow");
+    assert!(matches!(error, SnapshotError::TooSlow { .. }), "{error}");
+    assert!(!t.dir.exists());
+}
+
+#[test]
 fn a_workspace_nested_past_the_depth_limit_is_refused() {
     let t = tree();
     let nest = |levels: usize| vec!["d"; levels].join("/");

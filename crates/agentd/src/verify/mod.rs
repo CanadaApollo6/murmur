@@ -456,12 +456,24 @@ fn unlock_tree(dir: &Path) -> nix::Result<()> {
 /// The copy runs no program and follows no symlink. It copies a symlink as a
 /// symlink, skips sockets, FIFOs and devices, drops every `.git` entry, and
 /// renames each name in `INSTRUCTION_NAMES` with `NEUTRALIZED_SUFFIX`. It
-/// stops at any of `limits` and at `MAX_DEPTH`.
+/// stops at any of `limits` and at `MAX_DEPTH`. The time limit covers the
+/// flush too. The flush cannot be interrupted, so a slow one is refused only
+/// when it returns.
 pub fn take_snapshot(
     source: &Path,
     dir: &Path,
     limits: Limits,
     clean: bool,
+) -> Result<bool, SnapshotError> {
+    take_snapshot_with(source, dir, limits, clean, sync_filesystem)
+}
+
+fn take_snapshot_with(
+    source: &Path,
+    dir: &Path,
+    limits: Limits,
+    clean: bool,
+    flush: impl FnOnce(&Path) -> Result<(), SnapshotError>,
 ) -> Result<bool, SnapshotError> {
     if let Some(clean) = read_marker(dir).map_err(io_at(dir))? {
         return Ok(clean);
@@ -482,10 +494,12 @@ pub fn take_snapshot(
             .create(dir)
             .map_err(io_at(dir))?;
         let workspace = dir.join(WORKSPACE_DIR);
-        copy_tree(source, &workspace, limits)?;
+        let mut left = Left::new(limits);
+        copy_tree(source, &workspace, &mut left)?;
         // One flush for the whole copy, then the marker. A marker never
         // outlives the files it vouches for.
-        sync_filesystem(dir)?;
+        flush(dir)?;
+        left.time()?;
         write_marker(dir, clean)
     })();
     if let Err(error) = result {
@@ -567,14 +581,13 @@ struct Waiting {
     to: OsString,
 }
 
-fn copy_tree(source: &Path, dest: &Path, limits: Limits) -> Result<(), SnapshotError> {
+fn copy_tree(source: &Path, dest: &Path, left: &mut Left) -> Result<(), SnapshotError> {
     let root = nix::fcntl::open(
         source,
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         Mode::empty(),
     )
     .map_err(errno_at(source))?;
-    let mut left = Left::new(limits);
     // A stack, not recursion, so a deep tree cannot overflow it.
     let mut stack = Vec::new();
     copy_dir(
@@ -584,7 +597,7 @@ fn copy_tree(source: &Path, dest: &Path, limits: Limits) -> Result<(), SnapshotE
             shown: source.to_owned(),
             depth: 0,
         }),
-        &mut left,
+        left,
         &mut stack,
     )?;
     while let Some(Waiting { parent, from, to }) = stack.pop() {
@@ -601,7 +614,7 @@ fn copy_tree(source: &Path, dest: &Path, limits: Limits) -> Result<(), SnapshotE
             depth: parent.depth + 1,
         });
         drop(parent);
-        copy_dir(&dir, &mut left, &mut stack)?;
+        copy_dir(&dir, left, &mut stack)?;
     }
     Ok(())
 }
