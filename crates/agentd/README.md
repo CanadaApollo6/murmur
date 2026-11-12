@@ -585,6 +585,10 @@ version 4 database upgrades it in place. Existing agents become workers, and a
 task left in `verifying` gets a pending verification. An older `agentd` refuses
 a version 5 database.
 
+At startup, when `verifier_available` is off, every pending verification is
+settled as `unverified` and its task goes to `review`. So a task that an older
+build left in `verifying` reaches the operator.
+
 Agent specs, resume handles and mail survive daemon restarts. SIGINT and SIGTERM
 stop connections, shut down broker actors, then drain and close the mailroom.
 Stale sockets are reclaimed; live sockets and regular files are preserved.

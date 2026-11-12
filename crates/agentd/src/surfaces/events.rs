@@ -438,7 +438,7 @@ pub async fn feed(api: &ControlApi, sink: &mut impl Sink, resume: Option<Anchor>
     let states = api.broker.event_hub().state();
     let activity = api.broker.event_hub().activity();
     let changes = api.mailroom.changes();
-    let review = api.mailroom.reviews();
+    let review = api.mailroom.task_changes();
     run(api, sink, resume, states, activity, changes, review).await
 }
 async fn run(
@@ -541,7 +541,8 @@ async fn run(
             }
         }
         tokio::select! {
-            changed=review.changed()=>{if changed.is_err(){return Ok(());} review_due=true;},
+            // Mail goes out before the review move it caused.
+            changed=review.changed()=>{if changed.is_err(){return Ok(());} review_due=true; pending=true;},
             changed=changes.changed()=>{if changed.is_err(){return Ok(());} pending=true;},
             event=states.recv()=>match event {
                 Ok(e)=>if let Some(v)=state(api,e,&mut cache).await? {send(sink,v).await?;},

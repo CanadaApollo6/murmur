@@ -640,11 +640,11 @@ impl Broker {
         .map_err(crate::mailroom::Error::from)?
     }
     /// Expires tasks at their deadlines and wakes the agents told about it.
-    /// Sleeps until the earliest deadline or the next mailroom change, so a
-    /// newly opened task with an earlier deadline is seen. Returns when the
-    /// mailroom closes.
+    /// Sleeps until the earliest deadline or the next task change, so a newly
+    /// opened or reopened task with an earlier deadline is seen. Returns when
+    /// the mailroom closes.
     pub async fn expire_tasks(&self) {
-        let mut changes = self.mailroom.changes();
+        let mut changes = self.mailroom.task_changes();
         loop {
             changes.borrow_and_update();
             let next = match self
@@ -3608,7 +3608,7 @@ mod expiry_tests {
     use std::sync::atomic::Ordering::SeqCst;
 
     use super::*;
-    use crate::swarm::{Act, Budget, Stakes, TaskState};
+    use crate::swarm::{Act, Budget, Evidence, Outcome, Stakes, TaskState};
 
     #[tokio::test]
     async fn the_expiry_loop_wakes_for_an_earlier_deadline_opened_while_it_sleeps() {
@@ -3664,6 +3664,100 @@ mod expiry_tests {
         .expect("the early task expires within its one second budget");
         let late = room.task(late.task().expect("task")).await.expect("late");
         assert_eq!(late.state, TaskState::Open);
+        sweeper.abort();
+        match sweeper.await {
+            Err(error) if error.is_cancelled() => {}
+            other => panic!("expiry loop ended unexpectedly: {other:?}"),
+        }
+        drop(broker);
+        Arc::try_unwrap(room)
+            .map_err(|_| "mailroom still shared")
+            .expect("sole owner")
+            .close()
+            .await
+            .expect("close");
+    }
+
+    #[tokio::test]
+    async fn the_expiry_loop_wakes_for_a_task_reopened_without_mail() {
+        let dir = tempfile::tempdir().expect("dir");
+        let room = Arc::new(
+            Mailroom::open(dir.path().join("mail.db"), Default::default())
+                .await
+                .expect("mailroom"),
+        );
+        let broker =
+            Arc::new(Broker::new(room.clone(), vec![], Default::default()).expect("broker"));
+        let a = room
+            .register(AgentName::parse("a").expect("name"))
+            .await
+            .expect("register");
+        let message = |from, act| NewMessage {
+            from,
+            to: a,
+            body: Body::new("work").expect("body"),
+            reply_to: None,
+            client_key: ClientKey(MessageId::new().to_string()),
+            act,
+            task: None,
+        };
+        let (_, request) = room
+            .accept(message(
+                Sender::Human,
+                Act::Request {
+                    deliverable: "work".into(),
+                    budget: Budget {
+                        tokens: None,
+                        wall_secs: 1,
+                        messages: 1,
+                        hops: 1,
+                    },
+                    stakes: Stakes::Normal,
+                },
+            ))
+            .await
+            .expect("task");
+        let task = request.task().expect("task");
+        room.accept(message(
+            Sender::Agent(a),
+            Act::Report {
+                task,
+                outcome: Outcome::Infeasible {
+                    evidence: Evidence {
+                        tried: "every mirror".into(),
+                        obstacle: "the archive is gone".into(),
+                        reproduction: None,
+                    },
+                },
+                verdict: None,
+            },
+        ))
+        .await
+        .expect("claim");
+        // A retired owner gets no notice, so the reopen below stores no mail.
+        room.retire(a).await.expect("retire");
+        let before = room.jobs_run.load(SeqCst);
+        let sweeper = tokio::spawn({
+            let broker = broker.clone();
+            async move { broker.expire_tasks().await }
+        });
+        // The first sweep has started. It sees no open task and would sleep
+        // until the next change.
+        while room.jobs_run.load(SeqCst) == before {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let notified = room
+            .resolve_review(task, crate::mailroom::ReviewDecision::Refute)
+            .await
+            .expect("refute");
+        assert_eq!(notified, None);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while room.task(task).await.expect("task").state != TaskState::Expired {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the reopened task expires within its one second budget");
         sweeper.abort();
         match sweeper.await {
             Err(error) if error.is_cancelled() => {}

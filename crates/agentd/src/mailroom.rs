@@ -268,8 +268,7 @@ pub struct Mailroom {
     worker: thread::JoinHandle<Result<()>>,
     observers: Arc<tokio::sync::Semaphore>,
     changes: tokio::sync::watch::Receiver<i64>,
-    /// Bumped when a task enters or leaves review without any mail.
-    reviews: tokio::sync::watch::Sender<u64>,
+    tasks: tokio::sync::watch::Receiver<u64>,
     #[cfg(test)]
     pub(crate) jobs_run: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -304,6 +303,20 @@ impl Mailroom {
         let mut store = tokio::task::spawn_blocking(move || Store::open(&path, config)).await??;
         let (jobs, rx) = mpsc::channel::<Job>();
         let (changes_tx, changes) = tokio::sync::watch::channel(feed::head(&store.db)?);
+        let (tasks_tx, tasks) = tokio::sync::watch::channel(0u64);
+        // A task can move with no mail: an expiry whose recipients are all
+        // retired, or an operator resolve. Watching the table itself means no
+        // caller has to remember to announce a move. The hook also fires for
+        // a write that is rolled back, which only wakes a watcher early.
+        let task_written = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = task_written.clone();
+        store.db.update_hook(Some(
+            move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+                if table == "tasks" {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+        ));
         #[cfg(test)]
         let jobs_run = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         #[cfg(test)]
@@ -336,6 +349,9 @@ impl Mailroom {
                         #[cfg(test)]
                         trace::cache_delta(cache, &store.db);
                         pending_notification |= store.db.total_changes()!=before;
+                        if task_written.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                            tasks_tx.send_modify(|n| *n += 1);
+                        }
                     }
                     if pending_notification && retry_at.is_none_or(|deadline|std::time::Instant::now()>=deadline) {
                         #[cfg(test)]
@@ -379,7 +395,7 @@ impl Mailroom {
             worker,
             observers: Arc::new(tokio::sync::Semaphore::new(1)),
             changes,
-            reviews: tokio::sync::watch::channel(0).0,
+            tasks,
             #[cfg(test)]
             jobs_run,
         })
@@ -411,10 +427,10 @@ impl Mailroom {
         self.changes.clone()
     }
 
-    /// Changes when a task enters or leaves review with no mail to show it.
-    /// Every other review move stores mail in its task, so `changes` covers it.
-    pub fn reviews(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.reviews.subscribe()
+    /// Changes after every operation that wrote a task row. A task can
+    /// change state with no mail, so `changes` alone does not show it.
+    pub fn task_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.tasks.clone()
     }
 
     /// Tasks in review, oldest first, with their owner and finding.
@@ -784,9 +800,6 @@ impl Mailroom {
             Ok(settled)
         })
         .await
-        .inspect(|_| {
-            self.reviews.send_modify(|n| *n += 1);
-        })
     }
 
     /// Verifiers whose verification is settled and who are not retired yet.
@@ -811,11 +824,8 @@ impl Mailroom {
         task: TaskId,
         decision: ReviewDecision,
     ) -> Result<Option<AgentId>> {
-        let notified = self
-            .call(move |s| s.resolve_review_at(task, decision, OffsetDateTime::now_utc()))
-            .await?;
-        self.reviews.send_modify(|n| *n += 1);
-        Ok(notified)
+        self.call(move |s| s.resolve_review_at(task, decision, OffsetDateTime::now_utc()))
+            .await
     }
 
     pub async fn pending_for(&self, agent: AgentId) -> Result<Vec<Envelope>> {
@@ -1107,6 +1117,30 @@ impl Store {
         }
         if version < 5 {
             db.execute_batch(include_str!("schema-v5.sql"))?;
+        }
+        let mut db = db;
+        if !config.verifier_available {
+            // No runner will take these, so they go to the operator. This
+            // covers a task an older build left verifying and a daemon
+            // restarted without its verifier.
+            let tx = db.transaction()?;
+            let pending = tx
+                .prepare(&format!(
+                    "{VERIFICATION_SELECT} WHERE state='pending' ORDER BY rowid"
+                ))?
+                .query_map([], verification_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for v in pending {
+                settle(
+                    &tx,
+                    &v,
+                    Finding::Unverified {
+                        reason: NO_VERIFIER.into(),
+                    },
+                    None,
+                )?;
+            }
+            tx.commit()?;
         }
         let last_prune = feed::head(&db)?;
         Ok(Self {
@@ -2121,6 +2155,8 @@ fn expired(t: &Task, notified: Vec<AgentId>) -> Error {
     }
 }
 
+const NO_VERIFIER: &str = "no verifier is available";
+
 /// Everything that changes a task's state or spend.
 enum TaskEvent<'a> {
     /// The owner sent one message in the task's context.
@@ -2230,7 +2266,7 @@ fn advance(t: &mut Task, event: TaskEvent<'_>) -> Result<()> {
                 Outcome::Partial { .. } | Outcome::Infeasible { .. } => TaskState::Review {
                     report,
                     finding: Finding::Unverified {
-                        reason: "no verifier is available".into(),
+                        reason: NO_VERIFIER.into(),
                     },
                 },
                 _ => TaskState::Closed {

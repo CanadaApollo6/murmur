@@ -1997,13 +1997,34 @@ async fn a_version_three_database_opens_and_its_open_tasks_expire() {
     assert_eq!(user_version(&path), 5);
 }
 
-#[tokio::test]
-async fn a_version_four_database_keeps_its_rows_and_its_verifying_tasks() {
-    let config = || Config {
+fn verifying() -> Config {
+    Config {
         verifier_available: true,
         ..Config::default()
-    };
-    let (dir, mail, a, _) = setup(config()).await;
+    }
+}
+
+fn checker() -> VerifierStart {
+    VerifierStart {
+        spec: agentd::supervisor::AgentSpec {
+            name: AgentName::parse("checker").expect("name"),
+            kind: "claude".into(),
+            cwd: "/".into(),
+            workspace: None,
+            model: None,
+            permissions: Default::default(),
+            idle_after: None,
+        },
+        budget: budget(5),
+        verifier_family: "gpt".into(),
+        claimant_family: "claude".into(),
+        snapshot_clean: true,
+    }
+}
+
+/// A version 4 file with one task that an infeasible report left verifying.
+async fn version_four_with_a_verifying_task() -> (TempDir, std::path::PathBuf, TaskId, MessageId) {
+    let (dir, mail, a, _) = setup(verifying()).await;
     let root = request(&mail, Sender::Human, a, None, budget(10))
         .await
         .expect("root")
@@ -2035,8 +2056,122 @@ async fn a_version_four_database_keeps_its_rows_and_its_verifying_tasks() {
         )
         .expect("stored report");
     assert!(!act.contains("verdict"), "{act}");
+    (dir, path, root, claim)
+}
 
-    let mail = Mailroom::open(&path, config()).await.expect("upgrade");
+#[tokio::test]
+async fn a_version_four_verifying_task_goes_to_the_operator_without_a_verifier() {
+    let (_dir, path, root, claim) = version_four_with_a_verifying_task().await;
+    let review = TaskState::Review {
+        report: claim,
+        finding: Finding::Unverified {
+            reason: "no verifier is available".into(),
+        },
+    };
+    // The second open is a restart. It finds nothing pending.
+    for _ in 0..2 {
+        let mail = Mailroom::open(&path, Config::default())
+            .await
+            .expect("open");
+        assert_eq!(mail.task(root).await.expect("task").state, review);
+        assert_eq!(mail.pending_verifications().await.expect("pending"), []);
+        mail.close().await.expect("close");
+    }
+    let mail = Mailroom::open(&path, Config::default())
+        .await
+        .expect("open");
+    mail.resolve_review(root, ReviewDecision::Confirm)
+        .await
+        .expect("the operator can settle it");
+    assert!(matches!(
+        mail.task(root).await.expect("task").state,
+        TaskState::Closed { success: true, .. }
+    ));
+    mail.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn a_task_that_moves_without_mail_is_announced() {
+    let (_dir, mail, a, _) = setup(verifying()).await;
+    let root = request(&mail, Sender::Human, a, None, budget(10))
+        .await
+        .expect("root")
+        .task()
+        .expect("task");
+    let mut claim = send(Sender::Agent(a), a);
+    claim.act = Act::Report {
+        task: root,
+        outcome: Outcome::Infeasible {
+            evidence: Evidence {
+                tried: "every mirror".into(),
+                obstacle: "the archive is gone".into(),
+                reproduction: None,
+            },
+        },
+        verdict: None,
+    };
+    let (_, claim) = mail.accept(claim).await.expect("claim");
+    let v = mail
+        .open_verification(claim.id(), checker())
+        .await
+        .expect("open verification");
+    let check = mail
+        .task(v.task.expect("verification task"))
+        .await
+        .expect("task");
+    // Retired agents get no notice, so each move below stores no mail.
+    mail.retire(v.verifier.expect("verifier"))
+        .await
+        .expect("retire the verifier");
+    mail.retire(a).await.expect("retire the claimant");
+    // The mailroom announces a change after it answers. One more call puts
+    // the announcements of the retirements behind us.
+    mail.task(root).await.expect("task");
+    let mut tasks = mail.task_changes();
+    let mut mailed = mail.changes();
+    let announced = |tasks: &mut tokio::sync::watch::Receiver<u64>| {
+        let mut tasks = tasks.clone();
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), tasks.changed())
+                .await
+                .expect("the task move is announced")
+                .expect("mailroom is open");
+        }
+    };
+
+    tasks.borrow_and_update();
+    mailed.borrow_and_update();
+    let sweep = mail
+        .expire_tasks(check.opened + seconds(100_000))
+        .await
+        .expect("sweep");
+    assert_eq!(sweep.expired, vec![check.id]);
+    assert_eq!(sweep.notified, vec![]);
+    assert_eq!(
+        mail.task(root).await.expect("task").state,
+        TaskState::Review {
+            report: claim.id(),
+            finding: Finding::Inconclusive
+        }
+    );
+    announced(&mut tasks).await;
+
+    tasks.borrow_and_update();
+    let notified = mail
+        .resolve_review(root, ReviewDecision::Refute)
+        .await
+        .expect("refute");
+    assert_eq!(notified, None);
+    assert_eq!(mail.task(root).await.expect("task").state, TaskState::Open);
+    announced(&mut tasks).await;
+    assert!(!mailed.has_changed().expect("mailroom is open"));
+    mail.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn a_version_four_database_keeps_its_rows_and_its_verifying_tasks() {
+    let (_dir, path, root, claim) = version_four_with_a_verifying_task().await;
+    let mail = Mailroom::open(&path, verifying()).await.expect("upgrade");
     assert_eq!(
         mail.task(root).await.expect("task").state,
         TaskState::Verifying { report: claim }
@@ -2047,24 +2182,7 @@ async fn a_version_four_database_keeps_its_rows_and_its_verifying_tasks() {
     assert_eq!(pending[0].claimant_task, root);
     // Opening the verification reads the stored report back.
     let v = mail
-        .open_verification(
-            claim,
-            VerifierStart {
-                spec: agentd::supervisor::AgentSpec {
-                    name: AgentName::parse("checker").expect("name"),
-                    kind: "claude".into(),
-                    cwd: "/".into(),
-                    workspace: None,
-                    model: None,
-                    permissions: Default::default(),
-                    idle_after: None,
-                },
-                budget: budget(5),
-                verifier_family: "gpt".into(),
-                claimant_family: "claude".into(),
-                snapshot_clean: true,
-            },
-        )
+        .open_verification(claim, checker())
         .await
         .expect("open verification");
     let brief = mail
