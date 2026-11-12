@@ -652,12 +652,89 @@ frame when that list changes. The feed shows only the finding's kind.
 
 Roles, verifications and reopened clocks need schema version 5. Opening a
 version 4 database upgrades it in place. Existing agents become workers, and a
-task left in `verifying` gets a pending verification. An older `agentd` refuses
-a version 5 database.
+task left in `verifying` gets a pending verification.
 
 At startup, when `verifier_available` is off, every pending verification is
 settled as `unverified` and its task goes to `review`. So a task that an older
-build left in `verifying` reaches the operator.
+build left in `verifying` reaches the operator. A seeded task closes by its
+seed instead.
+
+#### Seeded tasks
+
+A seeded task is a probe whose true answer the operator already knows. It
+measures agents. It is not real work.
+
+```sh
+agentctl send @builder "Fix the flaky test." --act '{"kind":"request","deliverable":"a passing test","budget":{"wall_secs":600,"messages":20,"hops":2}}' --expect infeasible
+```
+
+`--expect feasible` says the task can be done as specified. `--expect
+infeasible` says it cannot. The flag works only with act kind `request`, and
+only on the operator's control socket. The `send_message` tool has no such
+field. The seed is stored in the `seeds` table in the transaction that opens
+the task. No envelope, message body, verifier brief, feed frame, `agentctl ls`
+or `agentctl tasks` row shows it. Children of a seeded task and verification
+tasks are not seeded.
+
+The seed replaces the operator, so a seeded task never waits in `review`:
+
+- `done`, `failed` and `blocked` close it as on any task.
+- A `partial` or `infeasible` claim is true when the seed is `infeasible` and
+  false when it is `feasible`.
+- With no verifier available, the claim closes the task at once. It closes as
+  a success when the claim is true and as a failure when it is false.
+- With a verifier available, the task stays `verifying` until the check
+  settles: a verdict, an inconclusive report, an expired verification task, or
+  `unverifiable`. It then closes by the seed in the same way. The verdict and
+  the stakes do not change that.
+- A stale settlement changes nothing and scores nothing.
+
+The note on the claimant's report is the same on a seeded task. It still says
+that a claim waits for a verifier or the operator.
+
+The secrecy has one limit. Up to and including its report, an agent sees the
+same thing on a seeded task and on an ordinary one. Later it can learn that a
+task was ordinary: only an ordinary task can be reopened by `resolve refute`,
+and the owner gets a notice. No notice proves nothing, so an agent never learns
+that a task was seeded. The operator's surfaces do show a difference. In
+`agentctl tasks` and the feed, an ordinary claim waits in `review` and a seeded
+claim is closed.
+
+#### Calibration
+
+The `calibration_events` table records whether a claimant or a verifier was
+right. Each row names the report, the role (`claimant` or `verifier`), the
+subject, the score (`correct`, `wrong` or `abstain`) and the source of the
+truth (`seed` or `operator`). A claimant row names the agent. A verifier row
+names the verifier's family, not the verifier agent. A report has at most one
+row per role. Each row is written in the transaction that settles or resolves
+the claim, and rows are never changed or deleted.
+
+| Truth | Claimant | Verifier |
+| --- | --- | --- |
+| Seed `feasible` | `done` correct. `partial` and `infeasible` wrong. | `confirmed` wrong. `refuted` correct. |
+| Seed `infeasible` | `done` wrong. `partial` and `infeasible` correct. | `confirmed` correct. `refuted` wrong. |
+| `resolve confirm` | Correct. | `confirmed` correct. `refuted` wrong. |
+| `resolve refute` | Wrong. | `confirmed` wrong. `refuted` correct. |
+
+On a seeded task, `failed` and `blocked` abstain, and so do an inconclusive
+verifier and an expired verification task. `unverifiable` and an `unverified`
+finding record no verifier row. A `confirmed` verdict that closes an unseeded
+task records nothing, because nobody knows the truth. A seeded claimant is
+scored when a `done`, `failed` or `blocked` report is accepted, or when its
+claim settles. Nothing in the broker acts on these rows yet.
+
+```sh
+agentctl calibration
+```
+
+`agentctl calibration` prints one entry per claimant agent and per verifier
+family. A claimant entry has `agent` and its current or last `name`. A verifier
+entry has `family`. Both have `seed` and `operator` counts of `correct`,
+`wrong` and `abstain`. It is the only command that shows anything about seeds.
+
+Seeds and calibration events need schema version 6. Opening a version 5
+database upgrades it in place. An older `agentd` refuses a version 6 database.
 
 Agent specs, resume handles and mail survive daemon restarts. SIGINT and SIGTERM
 stop connections, shut down broker actors, then drain and close the mailroom.
@@ -800,7 +877,8 @@ Dropping the handle also drains submissions, but does not wait for thread exit.
 - Ledger operations are `task`, `tasks`, `expire_tasks(now)`, `new_epoch` and
   `exposures`. Verification operations are `pending_verifications`,
   `open_verification`, `verification`, `unverifiable`, `settled_verifiers` and
-  `resolve_review`. `expire_tasks` expires every task due at `now` and returns the
+  `resolve_review`. `accept_seeded` opens a seeded task, and `calibration`
+  reads the calibration counts. `expire_tasks` expires every task due at `now` and returns the
   tasks, the agents it notified and the next deadline. Running it twice has no
   second effect.
   A Request creates its task inside `accept`; there is no separate creation path.

@@ -2216,3 +2216,150 @@ async fn an_expired_task_lists_as_expired_with_its_real_spend() {
     );
     d.stop(nix::sys::signal::Signal::SIGTERM).await;
 }
+
+/// `feasible` as a word. `infeasible` is an outcome kind agents may write.
+fn says_feasible(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.match_indices("feasible").any(|(at, _)| {
+        !lower[..at]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+    })
+}
+
+#[tokio::test]
+async fn a_seeded_task_settles_by_its_seed_and_only_calibration_shows_it() {
+    let mut d = Daemon::new(None).await;
+    d.spawn("a", "claude", Some("start")).await;
+    let wire_a = d.wait_wire("a", |v| !prompts(v).is_empty()).await;
+    let token_a = session_token(&wire_a).to_owned();
+    let a = d.ctl(&["ls"]).await[0]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_owned();
+    let request =
+        json!({"kind":"request","deliverable":"a passing suite","budget":budget(600,10,1)})
+            .to_string();
+    let open = |expect: Option<&'static str>| {
+        let mut args = vec!["send", "@a", "probe work", "--act", &request];
+        if let Some(expect) = expect {
+            args.extend(["--expect", expect]);
+        }
+        let d = &d;
+        async move { opened_task(d.ctl(&args).await.as_str().expect("send status")) }
+    };
+
+    // Only a request can carry a seed, and an agent has no way to set one.
+    for args in [
+        vec!["send", "@a", "plain", "--expect", "feasible"],
+        vec![
+            "send",
+            "@a",
+            "inform",
+            "--act",
+            r#"{"kind":"inform"}"#,
+            "--expect",
+            "infeasible",
+        ],
+    ] {
+        let error = d.ctl_error(&args).await;
+        assert!(error.contains("--expect needs act kind request"), "{error}");
+    }
+    let mut seeded = json!({"to":"@a","body":"x","act":{"kind":"request","deliverable":"d","budget":budget(5,1,1)}});
+    seeded["act"]["expect"] = json!("feasible");
+    let (error, text) = send_tool(&d, &token_a, "seed-act", seeded.clone()).await;
+    assert!(error && text.contains("unknown field `expect`"), "{text}");
+    seeded["act"].as_object_mut().expect("act").remove("expect");
+    seeded["expect"] = json!("feasible");
+    let (error, text) = send_tool(&d, &token_a, "seed-arg", seeded).await;
+    assert!(error && text.contains("unknown field `expect`"), "{text}");
+
+    let feasible = open(Some("feasible")).await;
+    let infeasible = open(Some("infeasible")).await;
+    let unseeded = open(None).await;
+    let report = |task: &str, outcome: Value| json!({"to":a,"body":"report","act":{"kind":"report","task":task,"outcome":outcome}});
+    let evidence = json!({"tried":"read the spec","obstacle":"the input does not exist"});
+    let claim = json!({"kind":"infeasible","evidence":evidence});
+    let mut tool_texts = Vec::new();
+    for (key, task, outcome) in [
+        ("false-claim", &feasible, claim.clone()),
+        ("wrong-done", &infeasible, json!({"kind":"done"})),
+        ("unseeded-claim", &unseeded, claim.clone()),
+    ] {
+        let (error, text) = send_tool(&d, &token_a, key, report(task, outcome)).await;
+        assert!(!error, "{text}");
+        tool_texts.push(text);
+    }
+
+    // The seed replaces the operator: no seeded task waits in review.
+    let tasks = d.ctl(&["tasks"]).await;
+    let state = |id: &str| {
+        tasks
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("task {id}: {tasks}"))["state"]
+            .clone()
+    };
+    assert_eq!(state(&feasible), "closed");
+    assert_eq!(state(&infeasible), "closed");
+    assert_eq!(state(&unseeded), "review");
+    assert_eq!(
+        d.ctl(&["resolve", &unseeded, "refute"]).await,
+        json!({"task":unseeded,"state":"open"})
+    );
+
+    assert_eq!(
+        d.ctl(&["calibration"]).await,
+        json!([{
+            "role":"claimant","agent":a,"name":"@a",
+            "seed":{"correct":0,"wrong":2,"abstain":0},
+            "operator":{"correct":0,"wrong":1,"abstain":0},
+        }])
+    );
+
+    // Nothing an agent or the feed sees names the seed.
+    let wire = wait_text(&d, "a", "The operator refuted your infeasible report").await;
+    let (mut watch, mut lines) = d.watch();
+    let snapshot = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .expect("feed snapshot")
+        .expect("watch output")
+        .expect("snapshot line");
+    watch.kill().await.expect("stop watch");
+    let tools = d
+        .relay(
+            &token_a,
+            json!({"jsonrpc":"2.0","id":"tools","method":"tools/list"}),
+        )
+        .await;
+    let agents = d
+        .relay(
+            &token_a,
+            json!({"jsonrpc":"2.0","id":"list","method":"tools/call","params":{"name":"list_agents","arguments":{}}}),
+        )
+        .await;
+    let outputs = [
+        (
+            "wire",
+            std::fs::read_to_string(d.root.path().join("a/wire.jsonl")).expect("wire"),
+        ),
+        ("prompts", wire),
+        ("tool results", tool_texts.join("\n")),
+        ("tools/list", tools.to_string()),
+        ("list_agents", agents.to_string()),
+        ("ls", d.ctl(&["ls"]).await.to_string()),
+        ("tasks", d.ctl(&["tasks"]).await.to_string()),
+        ("feed", snapshot),
+    ];
+    for (name, text) in &outputs {
+        assert!(!says_feasible(text), "{name} names the seed: {text}");
+        assert!(!text.to_lowercase().contains("seed"), "{name}: {text}");
+        assert!(!text.contains("expect"), "{name}: {text}");
+    }
+    d.stop(nix::sys::signal::Signal::SIGTERM).await;
+    let log = std::fs::read_to_string(d.root.path().join("daemon.log")).expect("log");
+    assert!(!says_feasible(&log), "the daemon log names the seed: {log}");
+}

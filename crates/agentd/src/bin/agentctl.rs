@@ -4,9 +4,11 @@ use std::path::PathBuf;
 
 use agentd::model::*;
 use agentd::supervisor::AgentSpec;
+use agentd::surfaces::acts::ActArgs;
 use agentd::surfaces::{
     ControlRequest, Result, Socket, default_state_dir, read_frame_limit, write_frame,
 };
+use agentd::swarm::Expectation;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 use tokio::io::BufReader;
@@ -52,6 +54,10 @@ enum Command {
         /// for example '{"kind":"request","deliverable":"...","budget":{"wall_secs":600,"messages":20,"hops":2}}'.
         #[arg(long)]
         act: Option<String>,
+        /// Seed the task a request opens with its true answer. Seeded tasks
+        /// measure agents; `calibration` shows the results.
+        #[arg(long, value_enum)]
+        expect: Option<Expect>,
     },
     Approvals,
     Approve {
@@ -98,6 +104,14 @@ enum Command {
         #[arg(value_enum)]
         decision: Decision,
     },
+    /// Print how often each claimant and verifier family was right, by
+    /// seeded tasks and by operator decisions.
+    Calibration,
+}
+#[derive(Clone, ValueEnum)]
+enum Expect {
+    Feasible,
+    Infeasible,
 }
 #[derive(Clone, ValueEnum)]
 enum Decision {
@@ -214,14 +228,29 @@ async fn run(args: Args) -> Result<()> {
             key,
         },
         Command::Ls => ControlRequest::Ls,
-        Command::Send { to, text, act } => ControlRequest::Send {
+        Command::Send {
             to,
-            body: Body::new(text)?,
-            key,
-            act: act
+            text,
+            act,
+            expect,
+        } => {
+            let act = act
                 .map(|act| serde_json::from_str(&act).map_err(|e| format!("invalid --act: {e}")))
-                .transpose()?,
-        },
+                .transpose()?;
+            if expect.is_some() && !matches!(act, Some(ActArgs::Request { .. })) {
+                return Err("--expect needs act kind request".into());
+            }
+            ControlRequest::Send {
+                to,
+                body: Body::new(text)?,
+                key,
+                act,
+                expect: expect.map(|e| match e {
+                    Expect::Feasible => Expectation::Feasible,
+                    Expect::Infeasible => Expectation::Infeasible,
+                }),
+            }
+        }
         Command::Approvals => ControlRequest::Approvals,
         Command::Approve { id, option } => ControlRequest::Approve {
             id: PermissionId(id.parse()?),
@@ -241,6 +270,7 @@ async fn run(args: Args) -> Result<()> {
         Command::Watch { cursor, nonce } => ControlRequest::Watch { cursor, nonce },
         Command::Ui => ControlRequest::Ui,
         Command::Tasks => ControlRequest::Tasks,
+        Command::Calibration => ControlRequest::Calibration,
         Command::Resolve { task, decision } => ControlRequest::Resolve {
             task: TaskId(
                 task.parse()

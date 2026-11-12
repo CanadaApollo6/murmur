@@ -15,7 +15,7 @@ use crate::KindConfig;
 use crate::mailroom::{Mailroom, NewMessage, SendOutcome};
 use crate::model::*;
 use crate::supervisor::{AgentSpec, Broker, Operation, Phase, phase_error};
-use crate::swarm::{Act, AgentRole, TaskId, TaskState};
+use crate::swarm::{Act, AgentRole, Expectation, TaskId, TaskState};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -242,6 +242,9 @@ pub enum ControlRequest {
         key: ClientKey,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         act: Option<acts::ActArgs>,
+        /// Seeds the task that a request opens with its true answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<Expectation>,
     },
     Approvals,
     Approve {
@@ -280,6 +283,8 @@ pub enum ControlRequest {
         task: TaskId,
         decision: crate::mailroom::ReviewDecision,
     },
+    /// How often claimants and verifier families were right.
+    Calibration,
 }
 
 pub struct ControlApi {
@@ -314,6 +319,10 @@ impl ControlApi {
         Ok(self.broker.event_hub().permissions())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each sending surface passes the fields of one send"
+    )]
     async fn send(
         &self,
         from: AuthenticatedSender,
@@ -322,6 +331,7 @@ impl ControlApi {
         reply_to: Option<MessageId>,
         key: ClientKey,
         act: Option<acts::ActArgs>,
+        seed: Option<Expectation>,
     ) -> Result<Value> {
         let id = match (&act, Recipient::parse(to)?) {
             // The mailroom checks a report's recipient against the task, so a
@@ -332,15 +342,18 @@ impl ControlApi {
         let (act, task) = act.map_or((Act::Inform, None), acts::ActArgs::into_act);
         let (outcome, env) = self
             .broker
-            .send(NewMessage {
-                from: from.sender(),
-                to: id,
-                body,
-                reply_to,
-                client_key: key,
-                act,
-                task,
-            })
+            .send_seeded(
+                NewMessage {
+                    from: from.sender(),
+                    to: id,
+                    body,
+                    reply_to,
+                    client_key: key,
+                    act,
+                    task,
+                },
+                seed,
+            )
             .await?;
         let status = match outcome {
             SendOutcome::Queued { .. } => "Queued".to_owned(),
@@ -414,14 +427,20 @@ impl ControlApi {
                 let to = format!("@{}", spec.name.as_str());
                 let handle = self.broker.spawn(spec).await?;
                 if let Some(body) = first_message {
-                    self.send(Bindings::human(), &to, body, None, key, None)
+                    self.send(Bindings::human(), &to, body, None, key, None, None)
                         .await?;
                 }
                 Ok(json!({"id":format!("agent:{}",handle.id),"name":to,"cwd":handle.cwd}))
             }
             ControlRequest::Ls => self.agents(true).await,
-            ControlRequest::Send { to, body, key, act } => {
-                self.send(Bindings::human(), &to, body, None, key, act)
+            ControlRequest::Send {
+                to,
+                body,
+                key,
+                act,
+                expect,
+            } => {
+                self.send(Bindings::human(), &to, body, None, key, act, expect)
                     .await
             }
             ControlRequest::Approvals => Ok(json!(
@@ -514,6 +533,26 @@ impl ControlApi {
                 };
                 Ok(json!({"task":task,"state":state}))
             }
+            ControlRequest::Calibration => Ok(json!(
+                self.mailroom
+                    .calibration()
+                    .await?
+                    .into_iter()
+                    .map(|c| {
+                        let mut row = match c.subject {
+                            crate::mailroom::CalibrationSubject::Claimant { agent, name } => {
+                                json!({"role":"claimant","agent":format!("agent:{agent}"),"name":format!("@{name}")})
+                            }
+                            crate::mailroom::CalibrationSubject::Verifier { family } => {
+                                json!({"role":"verifier","family":family})
+                            }
+                        };
+                        row["seed"] = json!(c.seed);
+                        row["operator"] = json!(c.operator);
+                        row
+                    })
+                    .collect::<Vec<_>>()
+            )),
             ControlRequest::Ui => Ok(
                 json!({"url":self.ui_url,"status":self.ui_url.clone().unwrap_or_else(|| "Add to kinds.toml:\n[ui]\nlisten = \"127.0.0.1:7434\"".into())}),
             ),
@@ -566,6 +605,7 @@ impl ControlApi {
                                 args.reply_to,
                                 binding.key(session, &id),
                                 args.act,
+                                None,
                             )
                             .await
                             .map(|v| v["status"].as_str().unwrap_or("Queued").to_owned()),
