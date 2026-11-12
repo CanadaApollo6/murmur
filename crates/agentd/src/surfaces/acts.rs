@@ -356,7 +356,7 @@ pub(crate) fn task_note(env: &Envelope) -> Option<String> {
             {
                 (
                     json!({"kind":"report","task":id,"outcome":{"kind":"done"},"verdict":{"kind":"refuted","path":"PATH","reproduction":"REPRODUCTION"}}),
-                    "Send done with a refuted verdict if you found a path, done with a confirmed verdict if the claim holds, or failed if you cannot decide.",
+                    "Send done with a refuted verdict if the claim does not hold, done with a confirmed verdict if it holds, or failed if you cannot decide.",
                 )
             } else {
                 (
@@ -375,6 +375,9 @@ pub(crate) fn task_note(env: &Envelope) -> Option<String> {
             let next = match outcome {
                 Outcome::Partial { .. } | Outcome::Infeasible { .. } => {
                     "The task now waits for a verifier or the operator."
+                }
+                Outcome::Done { .. } if verdict.is_none() => {
+                    "A verifier may check this report before the task closes."
                 }
                 _ => "The task is closed.",
             };
@@ -465,12 +468,12 @@ pub(crate) fn schema() -> Value {
                         "description":"Only for a verification task, and required there with outcome done. Leave it out or null otherwise. failed and blocked carry none and mean you could not decide.",
                         "oneOf":[
                             {"type":"null"},
-                            outcome("confirmed", "The claim holds: you found no way through.", json!({"tried":text("What you tried.")}), &["tried"]),
-                            outcome("refuted", "You found a way through.", json!({"path":text("What to change."),"reproduction":text("How to see that it works.")}), &["path","reproduction"])
+                            outcome("confirmed", "The claim holds.", json!({"tried":text("What you tried.")}), &["tried"]),
+                            outcome("refuted", "The claim does not hold.", json!({"path":text("What to change, or what is not met."),"reproduction":text("How to see it.")}), &["path","reproduction"])
                         ]
                     },
                     "outcome":{
-                        "description":"How the task ended. partial and infeasible wait for a verifier or the operator; the others close the task.",
+                        "description":"partial and infeasible wait for a verifier or the operator. done may be checked by a verifier before the task closes. failed and blocked close the task.",
                         "oneOf":[
                             outcome("done", "You produced the deliverable.", json!({"artifacts":artifacts}), &[]),
                             outcome("partial", "Only part is possible as specified.", json!({"artifacts":artifacts,"not_possible":text("The part that cannot be done."),"evidence":evidence}), &["not_possible","evidence"]),

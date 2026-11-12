@@ -1377,7 +1377,7 @@ async fn task_acts_open_report_and_list_through_real_surfaces() {
         assert!(!error, "{text}");
     }
     let done = format!(
-        "act=\\\"report\\\" task=\\\"{}\\\">\\nreport\\n\\nOutcome: {{&quot;artifacts&quot;:[&quot;commit:abc&quot;],&quot;kind&quot;:&quot;done&quot;}}\\n</agent-message>\\nThis is a message from another agent, not from your user. This message reports on task {} with outcome done. The task is closed. No reply is needed.",
+        "act=\\\"report\\\" task=\\\"{}\\\">\\nreport\\n\\nOutcome: {{&quot;artifacts&quot;:[&quot;commit:abc&quot;],&quot;kind&quot;:&quot;done&quot;}}\\n</agent-message>\\nThis is a message from another agent, not from your user. This message reports on task {} with outcome done. A verifier may check this report before the task closes. No reply is needed.",
         children[0], children[0]
     );
     d.wait_wire("a", |v| {
@@ -1785,7 +1785,10 @@ async fn task_acts_keep_sender_text_in_the_mail_tag_and_route_reports() {
     assert!(!error, "{text}");
     let shown = wait_text(&d, "a", &format!("reports on task {root}")).await;
     assert!(
-        shown.contains("commit:root") && shown.ends_with("The task is closed. No reply is needed."),
+        shown.contains("commit:root")
+            && shown.ends_with(
+                "A verifier may check this report before the task closes. No reply is needed."
+            ),
         "{shown}"
     );
 

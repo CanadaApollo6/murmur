@@ -58,6 +58,34 @@ fn a_verify_table_parses_with_defaults() {
 }
 
 #[test]
+fn check_done_parses_thresholds_and_rejects_unknown_values() {
+    let default = parse(&format!("{KINDS}[verify]\nkinds = [\"codex\"]\n"))
+        .expect("valid defaults")
+        .expect("settings");
+    assert_eq!(default.check_done, Some(Stakes::Normal));
+    for (value, expected) in [
+        ("never", None),
+        ("low", Some(Stakes::Low)),
+        ("normal", Some(Stakes::Normal)),
+        ("high", Some(Stakes::High)),
+    ] {
+        let settings = parse(&format!(
+            "{KINDS}[verify]\nkinds = [\"codex\"]\ncheck_done = \"{value}\"\n"
+        ))
+        .expect("valid threshold")
+        .expect("settings");
+        assert_eq!(settings.check_done, expected, "{value}");
+    }
+    for kinds in ["[\"codex\"]", "[]"] {
+        let error = parse(&format!(
+            "{KINDS}[verify]\nkinds = {kinds}\ncheck_done = \"sometimes\"\n"
+        ))
+        .expect_err("unknown threshold");
+        assert!(error.contains("[verify] check_done"), "{error}");
+    }
+}
+
+#[test]
 fn no_verify_table_or_no_kinds_means_no_verifier() {
     assert!(parse(KINDS).expect("valid").is_none());
     assert!(
