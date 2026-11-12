@@ -731,11 +731,11 @@ mod tests {
             assert_eq!(
                 s.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .expect("version"),
-                5
+                6
             );
         }
         let db = Connection::open(&path).expect("db");
-        db.execute_batch("PRAGMA user_version=6").expect("v6");
+        db.execute_batch("PRAGMA user_version=7").expect("v7");
         drop(db);
         assert!(Store::open(&path, Config::default()).is_err());
     }

@@ -104,7 +104,7 @@ pub enum VerificationState {
 /// What settling a verification did.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Settlement {
-    /// The claimant's task closed as a success.
+    /// The claimant's task closed: as a success, or by its seed.
     Closed,
     /// The claimant's task went to the operator.
     Review { finding: Finding },
@@ -127,6 +127,31 @@ pub struct Verification {
     /// The verifier's report, when it sent one.
     pub verdict: Option<MessageId>,
     pub result: Option<Settlement>,
+}
+
+/// How many calibration events of each score one subject has from one source.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Counts {
+    pub correct: u64,
+    pub wrong: u64,
+    pub abstain: u64,
+}
+
+/// Who calibration events are about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CalibrationSubject {
+    /// The agent that made the reports, with its current or last name.
+    Claimant { agent: AgentId, name: String },
+    /// Verifiers of one family.
+    Verifier { family: String },
+}
+
+/// One subject's calibration, split by where the truth came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Calibration {
+    pub subject: CalibrationSubject,
+    pub seed: Counts,
+    pub operator: Counts,
 }
 
 /// The operator's answer for a task in review.
@@ -739,6 +764,17 @@ impl Mailroom {
         self.call(move |s| s.accept(msg)).await
     }
 
+    /// `accept` with the true answer of the task that the operator's
+    /// request opens. The seed is stored with the task and never shown to agents.
+    pub async fn accept_seeded(
+        &self,
+        msg: NewMessage,
+        seed: Option<Expectation>,
+    ) -> Result<(SendOutcome, Envelope)> {
+        self.call(move |s| s.accept_at(msg, seed, OffsetDateTime::now_utc()))
+            .await
+    }
+
     /// Expires every open task whose deadline is at or before `now` and
     /// queues its notices in the same transaction.
     pub async fn expire_tasks(&self, now: OffsetDateTime) -> Result<Sweep> {
@@ -847,6 +883,52 @@ impl Mailroom {
     ) -> Result<Option<AgentId>> {
         self.call(move |s| s.resolve_review_at(task, decision, OffsetDateTime::now_utc()))
             .await
+    }
+
+    /// Calibration counts per subject: claimants first, then verifier families.
+    pub async fn calibration(&self) -> Result<Vec<Calibration>> {
+        self.call(|s| {
+            let mut stmt = s.db.prepare(
+                "SELECT c.agent,a.name,c.family,c.source,c.score,COUNT(*) FROM calibration_events c \
+                 LEFT JOIN agents a ON a.id=c.agent \
+                 GROUP BY c.role,c.agent,c.family,c.source,c.score ORDER BY c.role,c.agent,c.family",
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut out: Vec<Calibration> = Vec::new();
+            while let Some(r) = rows.next()? {
+                let subject = match optional_json_col::<AgentId>(r, 0)? {
+                    Some(agent) => CalibrationSubject::Claimant {
+                        agent,
+                        name: r.get(1)?,
+                    },
+                    None => CalibrationSubject::Verifier { family: r.get(2)? },
+                };
+                if out.last().is_none_or(|c| c.subject != subject) {
+                    out.push(Calibration {
+                        subject,
+                        seed: Counts::default(),
+                        operator: Counts::default(),
+                    });
+                }
+                let entry = out.last_mut().expect("bug: an entry was just pushed");
+                let source: String = r.get(3)?;
+                let counts = match source.as_str() {
+                    "seed" => &mut entry.seed,
+                    "operator" => &mut entry.operator,
+                    _ => return Err(Error::Rejected(format!("unknown calibration source {source}"))),
+                };
+                let score: String = r.get(4)?;
+                let count = match score.as_str() {
+                    "correct" => &mut counts.correct,
+                    "wrong" => &mut counts.wrong,
+                    "abstain" => &mut counts.abstain,
+                    _ => return Err(Error::Rejected(format!("unknown calibration score {score}"))),
+                };
+                *count = r.get(5)?;
+            }
+            Ok(out)
+        })
+        .await
     }
 
     pub async fn pending_for(&self, agent: AgentId) -> Result<Vec<Envelope>> {
@@ -1121,7 +1203,7 @@ impl Store {
             ));
         }
         let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 5 {
+        if version > 6 {
             return Err(Error::Rejected(format!(
                 "unsupported schema version {version}"
             )));
@@ -1138,6 +1220,9 @@ impl Store {
         }
         if version < 5 {
             db.execute_batch(include_str!("schema-v5.sql"))?;
+        }
+        if version < 6 {
+            db.execute_batch(include_str!("schema-v6.sql"))?;
         }
         let mut db = db;
         if !config.verifier_available {
@@ -1176,16 +1261,23 @@ impl Store {
     }
 
     fn accept(&mut self, msg: NewMessage) -> Result<(SendOutcome, Envelope)> {
-        self.accept_at(msg, OffsetDateTime::now_utc())
+        self.accept_at(msg, None, OffsetDateTime::now_utc())
     }
 
     fn accept_at(
         &mut self,
         msg: NewMessage,
+        seed: Option<Expectation>,
         now: OffsetDateTime,
     ) -> Result<(SendOutcome, Envelope)> {
         let tx = self.db.transaction()?;
         check_roles(&tx, &msg)?;
+        if seed.is_some() && (msg.from != Sender::Human || !matches!(msg.act, Act::Request { .. }))
+        {
+            return Err(Error::Rejected(
+                "only an operator request can carry an expected answer".into(),
+            ));
+        }
         let sender = json(&msg.from)?;
         if let Some(id) = tx
             .query_row(
@@ -1198,10 +1290,15 @@ impl Store {
             let stored = message(&tx, id)?;
             let reused =
                 || Error::Rejected("client_key was already used for a different message".into());
+            let stored_seed = match (&stored.act, stored.task) {
+                (Act::Request { .. }, Some(t)) => seed_of(&tx, t)?,
+                _ => None,
+            };
             if stored.to != msg.to
                 || stored.body != msg.body
                 || stored.in_reply_to != msg.reply_to
                 || stored.act != msg.act
+                || stored_seed != seed
             {
                 return Err(reused());
             }
@@ -1402,6 +1499,7 @@ impl Store {
                 validate_outcome(outcome)?;
                 let verification = verification_by(&tx, "task", &json(id)?)?;
                 let finding = check_verdict(outcome, verdict.as_ref(), verification.is_some())?;
+                let seed = seed_of(&tx, *id)?;
                 advance(
                     &mut t,
                     TaskEvent::Report {
@@ -1409,12 +1507,13 @@ impl Store {
                         outcome,
                         at: now,
                         verifier: self.config.verifier_available,
+                        seed,
                     },
                 )?;
                 env.task = Some(*id);
                 report_effect = match (verification, finding) {
                     (Some(v), Some(finding)) => ReportEffect::Settle(v, finding),
-                    _ => ReportEffect::Claim(t.state.clone()),
+                    _ => ReportEffect::Claim(t.state.clone(), seed),
                 };
                 updated_task = Some(t);
             }
@@ -1466,25 +1565,56 @@ impl Store {
         }
         if let Some(t) = new_task {
             insert_task(&tx, &t)?;
+            if let Some(seed) = seed {
+                tx.execute(
+                    "INSERT INTO seeds(task,expected) VALUES (?,?)",
+                    params![json(&t.id)?, seed_name(seed)],
+                )?;
+            }
         }
         match report_effect {
             ReportEffect::None => {}
             ReportEffect::Settle(v, finding) => {
                 settle(&tx, &v, finding, Some(env.id))?;
             }
-            ReportEffect::Claim(TaskState::Verifying { report }) => {
-                tx.execute(
-                    "INSERT INTO verifications(report_msg,claimant_task,state) VALUES (?,?,'pending')",
-                    params![json(&report)?, json(&env.task)?],
-                )?;
+            ReportEffect::Claim(state, seed) => {
+                let settled = match &state {
+                    TaskState::Verifying { report } => {
+                        tx.execute(
+                            "INSERT INTO verifications(report_msg,claimant_task,state) VALUES (?,?,'pending')",
+                            params![json(report)?, json(&env.task)?],
+                        )?;
+                        None
+                    }
+                    TaskState::Review { finding, .. } => Some(Settlement::Review {
+                        finding: finding.clone(),
+                    }),
+                    // A seeded claim with no verifier closes at once.
+                    TaskState::Closed {
+                        outcome: Outcome::Partial { .. } | Outcome::Infeasible { .. },
+                        ..
+                    } => Some(Settlement::Closed),
+                    _ => None,
+                };
+                if let Some(settled) = settled {
+                    tx.execute(
+                        "INSERT INTO verifications(report_msg,claimant_task,state,result) VALUES (?,?,'settled',?)",
+                        params![json(&env.id)?, json(&env.task)?, json(&settled)?],
+                    )?;
+                }
+                if let (Some(seed), TaskState::Closed { outcome, .. }, Sender::Agent(claimant)) =
+                    (seed, &state, &env.from)
+                {
+                    let impossible = seed == Expectation::Infeasible;
+                    record(
+                        &tx,
+                        env.id,
+                        Subject::Claimant(*claimant),
+                        claimant_right(outcome, impossible),
+                        "seed",
+                    )?;
+                }
             }
-            ReportEffect::Claim(TaskState::Review { report, finding }) => {
-                tx.execute(
-                    "INSERT INTO verifications(report_msg,claimant_task,state,result) VALUES (?,?,'settled',?)",
-                    params![json(&report)?, json(&env.task)?, json(&Settlement::Review { finding })?],
-                )?;
-            }
-            ReportEffect::Claim(_) => {}
         }
         let outcome = if recorded {
             SendOutcome::Recorded { id: env.id }
@@ -1633,6 +1763,20 @@ impl Store {
             )));
         };
         let outcome = report_outcome(&tx, report)?;
+        let claim_true = decision == ReviewDecision::Confirm;
+        record(
+            &tx,
+            report,
+            Subject::Claimant(t.owner),
+            claimant_right(&outcome, claim_true),
+            "operator",
+        )?;
+        if let (Some(family), Some(right)) = (
+            verification_by(&tx, "report_msg", &json(&report)?)?.and_then(|v| v.verifier_family),
+            verifier_right(&finding, claim_true),
+        ) {
+            record(&tx, report, Subject::Verifier(&family), right, "operator")?;
+        }
         let notified = match decision {
             ReviewDecision::Confirm => {
                 advance(
@@ -1640,6 +1784,7 @@ impl Store {
                     TaskEvent::Close {
                         report,
                         outcome: &outcome,
+                        success: true,
                     },
                 )?;
                 save_task(&tx, &t)?;
@@ -1697,8 +1842,8 @@ enum ReportEffect {
     None,
     /// A verifier's report settles this verification.
     Settle(Verification, Finding),
-    /// A claimant's report left its task in this state.
-    Claim(TaskState),
+    /// A claimant's report left its task in this state. The task has this seed.
+    Claim(TaskState, Option<Expectation>),
 }
 
 /// The delivery state a new message starts in.
@@ -1913,9 +2058,10 @@ fn outcome_name(o: &Outcome) -> &'static str {
 }
 /// Settles `v` with `finding` and moves the claimant's task, in the
 /// caller's transaction. The task moves only while it is still `Verifying`
-/// this report. A `Confirmed` finding closes it as a success unless its
-/// stakes are `High` or the snapshot was not clean; every other finding
-/// sends it to the operator.
+/// this report. A seeded task closes by its seed, and the claimant and the
+/// verifier are scored against it. Otherwise a `Confirmed` finding closes it
+/// as a success unless its stakes are `High` or the snapshot was not clean;
+/// every other finding sends it to the operator.
 fn settle(
     tx: &Connection,
     v: &Verification,
@@ -1923,8 +2069,34 @@ fn settle(
     verdict: Option<MessageId>,
 ) -> Result<Settlement> {
     let mut claim = task(tx, v.claimant_task)?;
+    let seed = seed_of(tx, claim.id)?;
     let settlement = if claim.state != (TaskState::Verifying { report: v.report }) {
         Settlement::Stale
+    } else if let Some(seed) = seed {
+        let outcome = report_outcome(tx, v.report)?;
+        let claim_true = seed == Expectation::Infeasible;
+        advance(
+            &mut claim,
+            TaskEvent::Close {
+                report: v.report,
+                outcome: &outcome,
+                success: claim_true,
+            },
+        )?;
+        save_task(tx, &claim)?;
+        record(
+            tx,
+            v.report,
+            Subject::Claimant(claim.owner),
+            claimant_right(&outcome, claim_true),
+            "seed",
+        )?;
+        if let (Some(family), Some(right)) =
+            (&v.verifier_family, verifier_right(&finding, claim_true))
+        {
+            record(tx, v.report, Subject::Verifier(family), right, "seed")?;
+        }
+        Settlement::Closed
     } else {
         let close = finding == Finding::Confirmed
             && claim.stakes != Stakes::High
@@ -1936,6 +2108,7 @@ fn settle(
                 TaskEvent::Close {
                     report: v.report,
                     outcome: &outcome,
+                    success: true,
                 },
             )?;
             Settlement::Closed
@@ -1967,6 +2140,76 @@ fn settle(
         )));
     }
     Ok(settlement)
+}
+fn seed_of(db: &Connection, task: TaskId) -> Result<Option<Expectation>> {
+    let expected: Option<String> = db
+        .query_row(
+            "SELECT expected FROM seeds WHERE task=?",
+            [json(&task)?],
+            |r| r.get(0),
+        )
+        .optional()?;
+    expected
+        .map(|e| match e.as_str() {
+            "feasible" => Ok(Expectation::Feasible),
+            "infeasible" => Ok(Expectation::Infeasible),
+            _ => Err(Error::Rejected(format!("unknown seed {e}"))),
+        })
+        .transpose()
+}
+fn seed_name(seed: Expectation) -> &'static str {
+    match seed {
+        Expectation::Feasible => "feasible",
+        Expectation::Infeasible => "infeasible",
+    }
+}
+/// Who a calibration event is about.
+enum Subject<'a> {
+    Claimant(AgentId),
+    Verifier(&'a str),
+}
+/// Records whether `subject` was right about `report`, in the caller's
+/// transaction. `right` is `None` for an abstention.
+fn record(
+    tx: &Connection,
+    report: MessageId,
+    subject: Subject<'_>,
+    right: Option<bool>,
+    source: &str,
+) -> Result<()> {
+    let (role, agent, family) = match subject {
+        Subject::Claimant(agent) => ("claimant", Some(json(&agent)?), None),
+        Subject::Verifier(family) => ("verifier", None, Some(family)),
+    };
+    let score = match right {
+        Some(true) => "correct",
+        Some(false) => "wrong",
+        None => "abstain",
+    };
+    tx.execute(
+        "INSERT INTO calibration_events(report_msg,role,agent,family,score,source) VALUES (?,?,?,?,?,?)",
+        params![json(&report)?, role, agent, family, score, source],
+    )?;
+    Ok(())
+}
+/// Whether a report was right, given whether the work truly cannot be done.
+/// `failed` and `blocked` claim nothing, so they abstain.
+fn claimant_right(outcome: &Outcome, impossible: bool) -> Option<bool> {
+    match outcome {
+        Outcome::Done { .. } => Some(!impossible),
+        Outcome::Partial { .. } | Outcome::Infeasible { .. } => Some(impossible),
+        Outcome::Failed { .. } | Outcome::Blocked { .. } => None,
+    }
+}
+/// Whether a verifier's finding was right about a claim. The outer `None`
+/// means no verifier looked, so there is nothing to score.
+fn verifier_right(finding: &Finding, claim_true: bool) -> Option<Option<bool>> {
+    match finding {
+        Finding::Confirmed => Some(Some(claim_true)),
+        Finding::Refuted { .. } => Some(Some(!claim_true)),
+        Finding::Inconclusive => Some(None),
+        Finding::Unverified { .. } => None,
+    }
 }
 fn json(value: &impl Serialize) -> Result<String> {
     Ok(serde_json::to_string(value)?)
@@ -2200,15 +2443,18 @@ enum TaskEvent<'a> {
         report: MessageId,
         outcome: &'a Outcome,
         at: OffsetDateTime,
-        /// A runner opens verifications. Without one, a claim goes to review.
+        /// A runner opens verifications. Without one, a claim goes to review,
+        /// or closes by the seed of a seeded task.
         verifier: bool,
+        seed: Option<Expectation>,
     },
     /// Only for a task that is `due`.
     Expire,
-    /// A `Verifying` or `Review` task closes as a success with the claimant's outcome.
+    /// A `Verifying` or `Review` task closes with the claimant's outcome.
     Close {
         report: MessageId,
         outcome: &'a Outcome,
+        success: bool,
     },
     /// A `Verifying` task goes to the operator.
     Review { report: MessageId, finding: Finding },
@@ -2288,6 +2534,7 @@ fn advance(t: &mut Task, event: TaskEvent<'_>) -> Result<()> {
             outcome,
             at,
             verifier,
+            seed,
         } => {
             // A clock that stepped back reads as no time spent.
             let open_for = u64::try_from((at - t.opened).whole_seconds()).unwrap_or(0);
@@ -2296,10 +2543,16 @@ fn advance(t: &mut Task, event: TaskEvent<'_>) -> Result<()> {
                 Outcome::Partial { .. } | Outcome::Infeasible { .. } if verifier => {
                     TaskState::Verifying { report }
                 }
-                Outcome::Partial { .. } | Outcome::Infeasible { .. } => TaskState::Review {
-                    report,
-                    finding: Finding::Unverified {
-                        reason: NO_VERIFIER.into(),
+                Outcome::Partial { .. } | Outcome::Infeasible { .. } => match seed {
+                    Some(seed) => TaskState::Closed {
+                        outcome: outcome.clone(),
+                        success: seed == Expectation::Infeasible,
+                    },
+                    None => TaskState::Review {
+                        report,
+                        finding: Finding::Unverified {
+                            reason: NO_VERIFIER.into(),
+                        },
                     },
                 },
                 _ => TaskState::Closed {
@@ -2312,10 +2565,12 @@ fn advance(t: &mut Task, event: TaskEvent<'_>) -> Result<()> {
             t.spent.wall_secs = t.budget.wall_secs;
             t.state = TaskState::Expired;
         }
-        TaskEvent::Close { outcome, .. } => {
+        TaskEvent::Close {
+            outcome, success, ..
+        } => {
             t.state = TaskState::Closed {
                 outcome: outcome.clone(),
-                success: true,
+                success,
             };
         }
         TaskEvent::Review { report, finding } => {
@@ -2524,7 +2779,11 @@ mod budget_tests {
         }
         async fn send(&self, msg: NewMessage, after: Duration) -> Result<Envelope> {
             let now = self.t0 + after;
-            Ok(self.room.call(move |s| s.accept_at(msg, now)).await?.1)
+            Ok(self
+                .room
+                .call(move |s| s.accept_at(msg, None, now))
+                .await?
+                .1)
         }
         async fn request(
             &self,
@@ -2821,10 +3080,19 @@ mod verification_tests {
         }
         async fn send(&self, msg: NewMessage, after: Duration) -> Result<(SendOutcome, Envelope)> {
             let now = self.t0 + after;
-            self.room.call(move |s| s.accept_at(msg, now)).await
+            self.room.call(move |s| s.accept_at(msg, None, now)).await
         }
         /// An operator task for the claimant.
         async fn task(&self, stakes: Stakes, wall_secs: u64) -> TaskId {
+            self.seeded(stakes, wall_secs, None).await
+        }
+        /// An operator task for the claimant with this seed.
+        async fn seeded(
+            &self,
+            stakes: Stakes,
+            wall_secs: u64,
+            seed: Option<Expectation>,
+        ) -> TaskId {
             let mut msg = mail(Sender::Human, self.a, None);
             msg.body = Body::new("Make the suite pass.").expect("body");
             msg.act = Act::Request {
@@ -2837,12 +3105,49 @@ mod verification_tests {
                 },
                 stakes,
             };
-            self.send(msg, Duration::ZERO)
+            let now = self.t0;
+            self.room
+                .call(move |s| s.accept_at(msg, seed, now))
                 .await
                 .expect("request")
                 .1
                 .task()
                 .expect("task")
+        }
+        /// The claimant reports `claim` on a new task with this seed.
+        async fn seeded_claim(
+            &self,
+            stakes: Stakes,
+            seed: Expectation,
+            claim: Outcome,
+        ) -> (TaskId, MessageId) {
+            let task = self.seeded(stakes, 600, Some(seed)).await;
+            let (_, env) = self
+                .send(report(self.a, task, claim, None), Duration::seconds(5))
+                .await
+                .expect("claim");
+            (task, env.id())
+        }
+        /// Every calibration event as (report, role, subject, score, source).
+        /// A claimant's subject is its stored id.
+        async fn events(&self) -> Vec<(MessageId, String, String, String, String)> {
+            self.room
+                .call(|s| {
+                    Ok(s.db
+                        .prepare(
+                            "SELECT report_msg,role,COALESCE(agent,family),score,source \
+                             FROM calibration_events ORDER BY rowid",
+                        )?
+                        .query_map([], |r| {
+                            Ok((json_col(r, 0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                        })?
+                        .collect::<rusqlite::Result<_>>()?)
+                })
+                .await
+                .expect("events")
+        }
+        fn claimant(&self) -> String {
+            json(&self.a).expect("id")
         }
         /// The claimant reports `claim` on a new task with these stakes.
         async fn claim(&self, stakes: Stakes, claim: Outcome) -> (TaskId, MessageId) {
@@ -3706,5 +4011,548 @@ mod verification_tests {
         assert_eq!(t.state, TaskState::Expired);
         assert_eq!(t.spent.wall_secs, 60);
         r.room.close().await.expect("close");
+    }
+
+    fn event(
+        report: MessageId,
+        role: &str,
+        subject: &str,
+        score: &str,
+        source: &str,
+    ) -> (MessageId, String, String, String, String) {
+        (
+            report,
+            role.into(),
+            subject.into(),
+            score.into(),
+            source.into(),
+        )
+    }
+    fn right(correct: bool) -> &'static str {
+        if correct { "correct" } else { "wrong" }
+    }
+    fn failed() -> Outcome {
+        Outcome::Failed { tried: "x".into() }
+    }
+    fn done() -> Outcome {
+        Outcome::Done { artifacts: vec![] }
+    }
+
+    #[tokio::test]
+    async fn a_seeded_report_closes_and_scores_the_claimant_without_a_verifier() {
+        let outcomes = [
+            done(),
+            partial(),
+            infeasible(),
+            failed(),
+            Outcome::Blocked { on: "y".into() },
+        ];
+        let r = Room::new(false).await;
+        let mut want = Vec::new();
+        for seed in [Expectation::Feasible, Expectation::Infeasible] {
+            let impossible = seed == Expectation::Infeasible;
+            for outcome in &outcomes {
+                let (task, report) = r.seeded_claim(Stakes::High, seed, outcome.clone()).await;
+                let (success, score) = match outcome {
+                    Outcome::Done { .. } => (true, right(!impossible)),
+                    Outcome::Partial { .. } | Outcome::Infeasible { .. } => {
+                        assert_eq!(
+                            r.room.verification(report).await.expect("row").result,
+                            Some(Settlement::Closed)
+                        );
+                        (impossible, right(impossible))
+                    }
+                    _ => (false, "abstain"),
+                };
+                assert_eq!(
+                    r.state(task).await,
+                    TaskState::Closed {
+                        outcome: outcome.clone(),
+                        success
+                    },
+                    "{seed:?} {outcome:?}"
+                );
+                want.push(event(report, "claimant", &r.claimant(), score, "seed"));
+            }
+        }
+        assert_eq!(r.events().await, want);
+        r.room.close().await.expect("close");
+
+        // An unseeded task scores nothing, and its claim still waits for the operator.
+        let r = Room::new(false).await;
+        for outcome in outcomes {
+            let claim = matches!(
+                outcome,
+                Outcome::Partial { .. } | Outcome::Infeasible { .. }
+            );
+            let (task, _) = r.claim(Stakes::Normal, outcome).await;
+            assert_eq!(
+                matches!(r.state(task).await, TaskState::Review { .. }),
+                claim
+            );
+        }
+        assert_eq!(r.events().await, []);
+        r.room.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_seeded_claim_closes_by_its_seed_whatever_the_verdict_and_the_stakes() {
+        // The verifier's report, or `None` for a verification task that expires.
+        let checks = [
+            Some((done(), Some(confirmed()))),
+            Some((done(), Some(refuted()))),
+            Some((failed(), None)),
+            None,
+        ];
+        for seed in [Expectation::Feasible, Expectation::Infeasible] {
+            let claim_true = seed == Expectation::Infeasible;
+            for check in checks.clone() {
+                let r = Room::new(true).await;
+                let (task, claim) = r.seeded_claim(Stakes::High, seed, partial()).await;
+                assert_eq!(r.state(task).await, TaskState::Verifying { report: claim });
+                assert_eq!(r.events().await, [], "a pending claim scores nothing");
+                let v = r
+                    .open(claim, start("checker", false), Duration::seconds(6))
+                    .await;
+                let score = match check {
+                    Some((outcome, verdict)) => {
+                        let score = match &verdict {
+                            Some(VerifierVerdict::Confirmed { .. }) => right(claim_true),
+                            Some(VerifierVerdict::Refuted { .. }) => right(!claim_true),
+                            None => "abstain",
+                        };
+                        r.send(
+                            report(
+                                v.verifier.expect("verifier"),
+                                v.task.expect("task"),
+                                outcome,
+                                verdict,
+                            ),
+                            Duration::seconds(7),
+                        )
+                        .await
+                        .expect("verdict");
+                        score
+                    }
+                    None => {
+                        let sweep = r
+                            .room
+                            .expire_tasks(r.t0 + Duration::seconds(66))
+                            .await
+                            .expect("sweep");
+                        assert_eq!(sweep.expired, v.task.into_iter().collect::<Vec<_>>());
+                        "abstain"
+                    }
+                };
+                assert_eq!(
+                    r.state(task).await,
+                    TaskState::Closed {
+                        outcome: partial(),
+                        success: claim_true
+                    },
+                    "{seed:?} {score}"
+                );
+                assert_eq!(
+                    r.room.verification(claim).await.expect("row").result,
+                    Some(Settlement::Closed)
+                );
+                assert_eq!(
+                    r.events().await,
+                    [
+                        event(claim, "claimant", &r.claimant(), right(claim_true), "seed"),
+                        event(claim, "verifier", "gpt", score, "seed"),
+                    ]
+                );
+                r.room.close().await.expect("close");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unverifiable_seeded_claim_scores_only_the_claimant() {
+        let r = Room::new(true).await;
+        let (task, first) = r
+            .seeded_claim(Stakes::Normal, Expectation::Infeasible, infeasible())
+            .await;
+        assert_eq!(
+            r.room
+                .unverifiable(first, "no second family".into())
+                .await
+                .expect("unverifiable"),
+            Settlement::Closed
+        );
+        assert_eq!(
+            r.state(task).await,
+            TaskState::Closed {
+                outcome: infeasible(),
+                success: true
+            }
+        );
+        // A claim still pending when the daemon starts without a verifier
+        // closes by its seed the same way.
+        let (pending, second) = r
+            .seeded_claim(Stakes::Normal, Expectation::Feasible, infeasible())
+            .await;
+        let Room {
+            _dir,
+            room,
+            a,
+            b,
+            t0,
+        } = r;
+        room.close().await.expect("close");
+        let room = Mailroom::open(_dir.path().join("mail.db"), Config::default())
+            .await
+            .expect("reopen");
+        let r = Room {
+            _dir,
+            room,
+            a,
+            b,
+            t0,
+        };
+        assert_eq!(
+            r.state(pending).await,
+            TaskState::Closed {
+                outcome: infeasible(),
+                success: false
+            }
+        );
+        assert_eq!(
+            r.events().await,
+            [
+                event(first, "claimant", &r.claimant(), "correct", "seed"),
+                event(second, "claimant", &r.claimant(), "wrong", "seed"),
+            ]
+        );
+        r.room.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn the_operator_scores_the_claimant_and_the_verifier_finding() {
+        for decision in [ReviewDecision::Confirm, ReviewDecision::Refute] {
+            let confirm = decision == ReviewDecision::Confirm;
+            // How the claim reached review, and the verifier's score. `None`
+            // is a claim no verifier could take.
+            for (check, score) in [
+                (Some((done(), Some(confirmed()))), Some(right(confirm))),
+                (Some((done(), Some(refuted()))), Some(right(!confirm))),
+                (Some((failed(), None)), Some("abstain")),
+                (None, None),
+            ] {
+                let r = Room::new(true).await;
+                let (task, claim) = r.claim(Stakes::High, infeasible()).await;
+                match check {
+                    Some((outcome, verdict)) => {
+                        let v = r
+                            .open(claim, start("checker", true), Duration::seconds(6))
+                            .await;
+                        r.send(
+                            report(
+                                v.verifier.expect("verifier"),
+                                v.task.expect("task"),
+                                outcome,
+                                verdict,
+                            ),
+                            Duration::seconds(7),
+                        )
+                        .await
+                        .expect("verdict");
+                    }
+                    None => {
+                        r.room
+                            .unverifiable(claim, "no second family".into())
+                            .await
+                            .expect("unverifiable");
+                    }
+                }
+                assert!(matches!(r.state(task).await, TaskState::Review { .. }));
+                assert_eq!(r.events().await, [], "a claim in review scores nothing yet");
+                r.resolve(task, decision, Duration::seconds(8))
+                    .await
+                    .expect("resolve");
+                let mut want = vec![event(
+                    claim,
+                    "claimant",
+                    &r.claimant(),
+                    right(confirm),
+                    "operator",
+                )];
+                if let Some(score) = score {
+                    want.push(event(claim, "verifier", "gpt", score, "operator"));
+                }
+                assert_eq!(r.events().await, want, "{decision:?} {score:?}");
+                r.room.close().await.expect("close");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_automatic_confirmation_and_a_stale_settlement_score_nothing() {
+        let r = Room::new(true).await;
+        let (task, claim) = r.claim(Stakes::Normal, infeasible()).await;
+        let v = r
+            .open(claim, start("checker", true), Duration::seconds(6))
+            .await;
+        r.send(
+            report(
+                v.verifier.expect("verifier"),
+                v.task.expect("task"),
+                done(),
+                Some(confirmed()),
+            ),
+            Duration::seconds(7),
+        )
+        .await
+        .expect("verdict");
+        assert!(matches!(
+            r.state(task).await,
+            TaskState::Closed { success: true, .. }
+        ));
+
+        let (task, claim) = r
+            .seeded_claim(Stakes::Normal, Expectation::Infeasible, infeasible())
+            .await;
+        let v = r
+            .open(claim, start("checker-2", true), Duration::seconds(6))
+            .await;
+        let moved = TaskState::Review {
+            report: claim,
+            finding: Finding::Inconclusive,
+        };
+        let state = json(&moved).expect("state");
+        let id = json(&task).expect("id");
+        r.room
+            .call(move |s| {
+                Ok(s.db.execute("UPDATE tasks SET state=? WHERE id=?", params![state, id])?)
+            })
+            .await
+            .expect("move");
+        r.send(
+            report(
+                v.verifier.expect("verifier"),
+                v.task.expect("task"),
+                done(),
+                Some(confirmed()),
+            ),
+            Duration::seconds(7),
+        )
+        .await
+        .expect("verdict");
+        assert_eq!(r.state(task).await, moved);
+        assert_eq!(
+            r.room.verification(claim).await.expect("row").result,
+            Some(Settlement::Stale)
+        );
+        assert_eq!(r.events().await, []);
+        r.room.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn only_an_operator_request_is_seeded_and_each_report_scores_once() {
+        let r = Room::new(true).await;
+        let root = r
+            .seeded(Stakes::Normal, 600, Some(Expectation::Infeasible))
+            .await;
+        let seed_of_task = |task: TaskId| r.room.call(move |s| seed_of(&s.db, task));
+        assert_eq!(
+            seed_of_task(root).await.expect("seed"),
+            Some(Expectation::Infeasible)
+        );
+        let child = || NewMessage {
+            act: Act::Request {
+                deliverable: "half of it".into(),
+                budget: Budget {
+                    tokens: None,
+                    wall_secs: 10,
+                    messages: 1,
+                    hops: 0,
+                },
+                stakes: Stakes::Normal,
+            },
+            ..mail(Sender::Agent(r.a), r.b, Some(root))
+        };
+        for msg in [child(), mail(Sender::Human, r.a, None)] {
+            let now = r.t0;
+            let refused = r
+                .room
+                .call(move |s| s.accept_at(msg, Some(Expectation::Feasible), now))
+                .await;
+            assert!(
+                matches!(refused, Err(Error::Rejected(ref reason)) if reason.contains("only an operator request")),
+                "{refused:?}"
+            );
+        }
+        // A child carved from a seeded task is not seeded.
+        let (_, env) = r.send(child(), Duration::seconds(1)).await.expect("child");
+        assert_eq!(
+            seed_of_task(env.task().expect("child task"))
+                .await
+                .expect("seed"),
+            None
+        );
+
+        // A retry must carry the same seed.
+        let request = || {
+            let mut msg = mail(Sender::Human, r.a, None);
+            msg.client_key = ClientKey("seeded-retry".into());
+            msg.act = Act::Request {
+                deliverable: "a passing suite".into(),
+                budget: Budget {
+                    tokens: None,
+                    wall_secs: 600,
+                    messages: 1,
+                    hops: 0,
+                },
+                stakes: Stakes::Normal,
+            };
+            msg
+        };
+        for (seed, duplicate) in [
+            (Some(Expectation::Feasible), false),
+            (Some(Expectation::Feasible), true),
+            (Some(Expectation::Infeasible), false),
+            (None, false),
+        ] {
+            let (msg, now) = (request(), r.t0);
+            let sent = r.room.call(move |s| s.accept_at(msg, seed, now)).await;
+            match (seed, duplicate, sent) {
+                (_, true, Ok((SendOutcome::Duplicate { .. }, _))) => {}
+                (Some(Expectation::Feasible), false, Ok((SendOutcome::Queued { .. }, _))) => {}
+                (_, false, Err(Error::Rejected(reason))) => {
+                    assert!(reason.contains("client_key was already used"), "{reason}");
+                }
+                (seed, _, sent) => panic!("{seed:?}: {sent:?}"),
+            }
+        }
+
+        // A verification task is not seeded, and a retried verdict scores once.
+        let (_, claim) = r
+            .send(report(r.a, root, infeasible(), None), Duration::seconds(2))
+            .await
+            .expect("claim");
+        let v = r
+            .open(claim.id(), start("checker", true), Duration::seconds(3))
+            .await;
+        let vtask = v.task.expect("task");
+        assert_eq!(seed_of_task(vtask).await.expect("seed"), None);
+        let verdict = || NewMessage {
+            client_key: ClientKey("verdict".into()),
+            ..report(
+                v.verifier.expect("verifier"),
+                vtask,
+                done(),
+                Some(refuted()),
+            )
+        };
+        r.send(verdict(), Duration::seconds(4))
+            .await
+            .expect("verdict");
+        let retry = r.send(verdict(), Duration::seconds(5)).await;
+        assert!(
+            matches!(retry, Ok((SendOutcome::Duplicate { .. }, _))),
+            "{retry:?}"
+        );
+        assert_eq!(
+            r.events().await,
+            [
+                event(claim.id(), "claimant", &r.claimant(), "correct", "seed"),
+                event(claim.id(), "verifier", "gpt", "wrong", "seed"),
+            ]
+        );
+
+        // The table keeps one row per report and role, and never changes a row.
+        let report_msg = json(&claim.id()).expect("id");
+        for sql in [
+            "INSERT INTO calibration_events(report_msg,role,family,score,source) VALUES (?1,'verifier','other','correct','seed')",
+            "UPDATE calibration_events SET score='correct' WHERE report_msg=?1",
+            "DELETE FROM calibration_events WHERE report_msg=?1",
+        ] {
+            let report_msg = report_msg.clone();
+            let refused = r
+                .room
+                .call(move |s| Ok(s.db.execute(sql, [report_msg])?))
+                .await;
+            assert!(refused.is_err(), "{sql}: {refused:?}");
+        }
+        assert_eq!(r.events().await.len(), 2);
+        r.room.close().await.expect("close");
+    }
+
+    /// `text` with every 26 character ULID replaced, so runs compare.
+    fn without_ids(text: &str) -> String {
+        let mut out = String::new();
+        let mut run = String::new();
+        for c in text.chars().chain(std::iter::once(' ')) {
+            if c.is_ascii_digit() || c.is_ascii_uppercase() {
+                run.push(c);
+                continue;
+            }
+            out.push_str(if run.len() == 26 { "ID" } else { &run });
+            run.clear();
+            out.push(c);
+        }
+        out.pop();
+        out
+    }
+
+    #[tokio::test]
+    async fn agents_and_the_feed_cannot_tell_the_seed() {
+        let mut views = Vec::new();
+        let mut feeds = Vec::new();
+        for seed in [
+            None,
+            Some(Expectation::Feasible),
+            Some(Expectation::Infeasible),
+        ] {
+            let r = Room::new(true).await;
+            let task = r.seeded(Stakes::Normal, 600, seed).await;
+            let (_, claim) = r
+                .send(report(r.a, task, infeasible(), None), Duration::seconds(5))
+                .await
+                .expect("claim");
+            let v = r
+                .open(claim.id(), start("checker", true), Duration::seconds(6))
+                .await;
+            let verifier = v.verifier.expect("verifier");
+            let (recorded, _) = r
+                .send(
+                    report(verifier, v.task.expect("task"), done(), Some(refuted())),
+                    Duration::seconds(7),
+                )
+                .await
+                .expect("verdict");
+            assert!(matches!(recorded, SendOutcome::Recorded { .. }));
+            let again = r
+                .send(report(r.a, task, infeasible(), None), Duration::seconds(8))
+                .await
+                .expect_err("one report per claim");
+            let mut view = vec![again.to_string()];
+            for agent in [r.a, r.b, verifier] {
+                for env in r.room.pending_for(agent).await.expect("mail") {
+                    view.push(format!(
+                        "{} -> {}\n{}\n{}\n{:?}",
+                        json(env.from()).expect("from"),
+                        env.to(),
+                        json(env.act()).expect("act"),
+                        crate::surfaces::acts::content(&env),
+                        crate::surfaces::acts::task_note(&env),
+                    ));
+                }
+            }
+            views.push(without_ids(&view.join("\n\n")));
+            let (agents, reviews) = r.room.observed_roster().await.expect("feed");
+            feeds.push(without_ids(&format!(
+                "{}\n{}",
+                json(&agents).expect("agents"),
+                json(&reviews).expect("reviews")
+            )));
+            r.room.close().await.expect("close");
+        }
+        assert!(views[0].contains("Outcome: {"), "{}", views[0]);
+        assert_eq!(views[1], views[0]);
+        assert_eq!(views[2], views[0]);
+        // The feed shows the unseeded claim in review. The two seeds look the same.
+        assert_eq!(feeds[1], feeds[2]);
     }
 }

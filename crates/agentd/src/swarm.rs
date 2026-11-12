@@ -52,6 +52,16 @@ pub enum Finding {
     Inconclusive,
 }
 
+/// The true answer of a seeded task. Only the operator sets or reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Expectation {
+    /// The task can be done as specified.
+    Feasible,
+    /// The task cannot be done as specified.
+    Infeasible,
+}
+
 /// The role an agent was registered with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
