@@ -21,6 +21,8 @@ pub(crate) struct Credentials {
     retired: HashMap<PathBuf, HashSet<[u8; 32]>>,
     exhausted: HashSet<PathBuf>,
     accepted: HashMap<AgentId, std::time::Instant>,
+    /// Copies whose last change never reached the host. `discard` keeps them.
+    unsynced: HashMap<AgentId, HashSet<PathBuf>>,
 }
 const HISTORY_LIMIT: usize = 1024;
 const COPY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -40,6 +42,21 @@ fn host_file(path: &Path) -> Result<(Dir, OsString)> {
         Dir::open(path.parent().ok_or("credential needs parent")?, false)?,
         path.file_name().ok_or("credential needs name")?.into(),
     ))
+}
+impl Copy {
+    /// The private file holds a change the host never took. Bytes the broker
+    /// rejected do not count.
+    fn unsynced(&self) -> bool {
+        let read = Dir::open(&self.home, false)
+            .and_then(|home| home.parent(&self.relative, false))
+            .and_then(|(dir, name)| dir.read(&name));
+        match read {
+            Ok(Some(bytes)) => {
+                Some(&bytes) != self.baseline.as_ref() && self.rejected != Some(digest(&bytes))
+            }
+            _ => false,
+        }
+    }
 }
 impl Credentials {
     pub fn launch(
@@ -70,6 +87,14 @@ impl Credentials {
             let old = dir.read(&name)?;
             if !dir.replace(&name, old.as_deref(), bytes.as_deref())? {
                 return Err("private credential changed during launch".into());
+            }
+            // Only a copy this launch replaced has nothing left to keep. A
+            // launch that fails earlier leaves the record for a later retire.
+            if let Some(unsynced) = self.unsynced.get_mut(&id) {
+                unsynced.remove(relative);
+                if unsynced.is_empty() {
+                    self.unsynced.remove(&id);
+                }
             }
             copies.push(Copy {
                 host: host.clone(),
@@ -205,10 +230,48 @@ impl Credentials {
     pub fn finish(&mut self, id: AgentId) {
         self.sync_copies(id, true);
         if let Some(copies) = self.copies.remove(&id) {
+            let unsynced: HashSet<PathBuf> = copies
+                .iter()
+                .filter(|copy| copy.unsynced())
+                .map(|copy| copy.relative.clone())
+                .collect();
+            if unsynced.is_empty() {
+                self.unsynced.remove(&id);
+            } else {
+                self.unsynced.insert(id, unsynced);
+            }
             for copy in copies {
                 self.retire(&copy);
             }
         }
+    }
+    /// Deletes a retired agent's credential copies and returns the ones it
+    /// kept. A copy stays when its last change never reached the host, so the
+    /// only refreshed credential is not destroyed. The agent could write its
+    /// home, so nothing is read and no path component is followed through a link.
+    pub fn discard(
+        &mut self,
+        id: AgentId,
+        home: &Path,
+        relatives: &[PathBuf],
+    ) -> std::io::Result<Vec<PathBuf>> {
+        let mut kept = vec![];
+        for relative in relatives {
+            if self
+                .unsynced
+                .get(&id)
+                .is_some_and(|set| set.contains(relative))
+            {
+                kept.push(relative.clone());
+                continue;
+            }
+            match Dir::open(home, false).and_then(|home| home.parent(relative, false)) {
+                Ok((dir, name)) => dir.clear(&name)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(kept)
     }
 }
 
@@ -231,6 +294,91 @@ mod tests {
         let home = path.join("private");
         std::fs::create_dir(&home).expect("home");
         (root, human, host, home)
+    }
+    #[test]
+    fn discard_removes_the_copy_and_never_follows_a_link() {
+        let (_root, human, host, home) = fixture();
+        let relative = PathBuf::from(".codex/auth.json");
+        let paths = [relative.clone()];
+        let id = AgentId::new();
+        let mut c = Credentials::default();
+        let none: Vec<PathBuf> = vec![];
+        assert_eq!(
+            c.discard(id, &home.join("absent"), &paths)
+                .expect("no home"),
+            none
+        );
+        assert_eq!(c.discard(id, &home, &paths).expect("no copy"), none);
+        std::fs::create_dir(home.join(".codex")).expect("CLI dir");
+        // Larger than a credential read accepts. Removal must not read it.
+        std::fs::write(
+            home.join(&relative),
+            vec![b' '; crate::private_fs::LIMIT as usize + 1],
+        )
+        .expect("copy");
+        assert_eq!(c.discard(id, &home, &paths).expect("discard"), none);
+        assert!(!home.join(&relative).exists(), "the copy is gone");
+        std::os::unix::fs::symlink(&host, home.join(&relative)).expect("leaf link");
+        c.discard(id, &home, &paths)
+            .expect("a leaf link is removed");
+        assert!(
+            home.join(&relative).symlink_metadata().is_err(),
+            "the link is gone"
+        );
+        assert!(host.exists(), "the link's target survives");
+        std::fs::remove_dir(home.join(".codex")).expect("remove CLI dir");
+        std::os::unix::fs::symlink(human.join(".codex"), home.join(".codex")).expect("link");
+        c.discard(id, &home, &paths)
+            .expect_err("a linked CLI dir is refused");
+        assert!(host.exists(), "the human's credential survives");
+    }
+    #[test]
+    fn discard_keeps_a_refresh_that_never_reached_the_host() {
+        let (_root, human, host, home) = fixture();
+        let relative = PathBuf::from(".codex/auth.json");
+        let paths = [relative.clone()];
+        let private = home.join(&relative);
+        let id = AgentId::new();
+        let mut c = Credentials::default();
+        c.launch(id, "codex", &sources(&host, &human), &home)
+            .expect("launch");
+        std::fs::write(&private, br#"{"token":1}"#).expect("refresh");
+        let parent = host.parent().expect("parent");
+        let moved = human.join("moved");
+        std::fs::rename(parent, &moved).expect("unavailable host parent");
+        c.finish(id);
+        // A restart that cannot read the host replaces nothing, so the
+        // refresh is still the only copy and stays protected.
+        std::fs::create_dir(parent).expect("host parent");
+        std::fs::create_dir(&host).expect("unreadable host credential");
+        c.launch(id, "codex", &sources(&host, &human), &home)
+            .expect_err("launch with an unreadable host credential");
+        c.finish(id);
+        std::fs::remove_dir(&host).expect("remove unreadable credential");
+        std::fs::remove_dir(parent).expect("remove host parent");
+        std::fs::rename(&moved, parent).expect("restore parent");
+        assert_eq!(c.discard(id, &home, &paths).expect("discard"), paths);
+        assert_eq!(
+            std::fs::read(&private).expect("kept copy"),
+            br#"{"token":1}"#,
+            "the only refreshed credential survives"
+        );
+        assert_eq!(std::fs::read(&host).expect("host"), br#"{"token":0}"#);
+
+        // A refresh the host took, and bytes the broker rejected, both go.
+        for (bytes, host_after) in [
+            (&br#"{"token":2}"#[..], &br#"{"token":2}"#[..]),
+            (&br#"{"other":2}"#[..], &br#"{"token":0}"#[..]),
+        ] {
+            std::fs::write(&host, br#"{"token":0}"#).expect("reset host");
+            c.launch(id, "codex", &sources(&host, &human), &home)
+                .expect("launch");
+            std::fs::write(&private, bytes).expect("change");
+            c.finish(id);
+            assert_eq!(std::fs::read(&host).expect("host"), host_after);
+            assert!(c.discard(id, &home, &paths).expect("discard").is_empty());
+            assert!(!private.exists(), "the copy is gone");
+        }
     }
     #[test]
     fn host_io_and_cas_failures_retry_identical_valid_refresh_bytes() {

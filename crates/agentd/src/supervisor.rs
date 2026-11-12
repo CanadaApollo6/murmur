@@ -54,6 +54,9 @@ pub enum Phase {
 pub enum Operation {
     Stop,
     Restart,
+    /// Stops, then marks the agent retired and removes its actor. A retire
+    /// absorbs any later stop or restart sent while it waits.
+    Retire,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +102,10 @@ pub enum Event {
     TurnEnded {
         agent: AgentId,
         outcome: TurnOutcome,
+    },
+    /// The agent's actor and handle left the broker for good.
+    Retired {
+        agent: AgentId,
     },
 }
 
@@ -354,15 +361,16 @@ impl Broker {
     pub async fn restore(&self, spec: AgentSpec) -> Result<AgentHandle> {
         self.spawn_inner(spec, true).await
     }
-    /// Stops or restarts an agent. An actor that exited in `Failed` or panicked
-    /// is respawned from its saved spec and reads the persisted stop flag, so
-    /// both work from any phase. An actor ended by shutdown or replacement
-    /// exits in `Ended` and is never respawned.
+    /// Stops, restarts or retires an agent. An actor that exited in `Failed` or
+    /// panicked is respawned from its saved spec and reads the persisted stop
+    /// flag, so all three work from any phase. An actor ended by shutdown or
+    /// replacement exits in `Ended` and is never respawned.
     pub async fn operate(&self, id: AgentId, op: Operation) -> Result<()> {
+        let mut respawned = false;
         loop {
             if let Some(handle) = self.handle(id).await {
                 match handle.operate(op).await {
-                    Err(Error::Closed) => {}
+                    Err(Error::Closed) if !respawned => {}
                     result => return result,
                 }
             }
@@ -374,8 +382,25 @@ impl Broker {
                 continue;
             }
             let result = self.respawn(id, op, previous.as_ref()).await;
+            if op == Operation::Retire && result.is_ok() {
+                // The respawned actor starts stopped and performs the retire.
+                respawned = true;
+                continue;
+            }
             return halt_reply(op, result, previous.and_then(|h| h.warning()).as_deref());
         }
+    }
+    /// Retires an agent from any phase. On return its session has ended, the
+    /// mailroom holds it retired, and the broker no longer has its handle. A
+    /// failed retire leaves the agent unretired, and repeating the call finishes it.
+    pub async fn retire(&self, id: AgentId) -> Result<()> {
+        let result = self.operate(id, Operation::Retire).await;
+        if let Some(handle) = self.handle(id).await
+            && self.mailroom.retired(id).await?
+        {
+            handle.commands.closed().await;
+        }
+        result
     }
     async fn respawn(
         &self,
@@ -389,6 +414,7 @@ impl Broker {
         if previous.is_some_and(|h| h.phase() == Phase::Ended) {
             return Err(Error::Closed);
         }
+        self.mailroom.resolve(Recipient::Id(id)).await?;
         let (_, spec) = self
             .mailroom
             .specs()
@@ -401,7 +427,9 @@ impl Broker {
         }
         // These writes are the end state the operator asked for. If the spawn
         // fails, the actor stays dead in Failed and a repeated command converges.
-        self.mailroom.set_stopped(id, op == Operation::Stop).await?;
+        self.mailroom
+            .set_stopped(id, op != Operation::Restart)
+            .await?;
         if previous.is_some_and(|h| {
             matches!(
                 h.phase(),
@@ -517,6 +545,9 @@ impl Broker {
         let adapter = AdapterSet::build(kind.clone());
         let actor = AgentActor {
             permissions_guard: self.events.owner(),
+            agents: self.agents.clone(),
+            retired: false,
+            kept_credentials: None,
             _lease: lease,
             mcp: self.mcp.clone(),
             isolation: self.isolation.clone(),
@@ -667,7 +698,11 @@ impl Broker {
             .collect::<Vec<_>>();
         for handle in handles {
             if !handle.commands.is_closed() {
-                handle.stop().await?;
+                match handle.stop().await {
+                    // A retired actor exits on its own.
+                    Ok(()) | Err(Error::Closed) => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
         Ok(())
@@ -675,6 +710,10 @@ impl Broker {
 }
 
 struct AgentActor {
+    agents: Arc<Mutex<HashMap<AgentId, AgentHandle>>>,
+    retired: bool,
+    /// What a retire tells the operator when it had to keep a credential copy.
+    kept_credentials: Option<String>,
     isolation: Option<(PathBuf, crate::sandbox::SandboxConfig)>,
     credentials: Arc<std::sync::Mutex<crate::credentials::Credentials>>,
     kind: KindConfig,
@@ -810,6 +849,10 @@ impl AgentActor {
                 last: error.to_string(),
             });
         }
+        if self.retired {
+            self.agents.lock().await.remove(&self.id);
+            self.emit(Event::Retired { agent: self.id });
+        }
     }
     async fn drive(&mut self) -> Result<()> {
         self.mailroom
@@ -828,6 +871,9 @@ impl AgentActor {
         let mut credentials_tick = tokio::time::interval(Duration::from_secs(2));
         loop {
             self.settle_halt().await?;
+            if self.retired {
+                return Ok(());
+            }
             self.pump().await?;
             let deadline = self.deadline();
             tokio::select! {
@@ -864,6 +910,48 @@ impl AgentActor {
                 () = async { match deadline { Some(d) => tokio::time::sleep_until(d).await, None => std::future::pending().await } } => self.timer().await?,
             }
         }
+    }
+    /// A retired agent never launches again, so its credential copies go.
+    /// Returns a note for the operator when a copy had to stay.
+    fn discard_credentials(&self) -> Result<Option<String>> {
+        let (crate::sandbox::Isolation::Bwrap(sb), Some((state, _))) =
+            (&self.kind.isolation, &self.isolation)
+        else {
+            return Ok(None);
+        };
+        let home = crate::sandbox::AgentPaths::new(state, self.id).home;
+        let relatives = sb
+            .credentials
+            .iter()
+            .map(|path| {
+                path.strip_prefix(crate::sandbox::host_home())
+                    .map(std::path::Path::to_path_buf)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| Error::Rejected(format!("credential path: {error}")))?;
+        let kept = self
+            .credentials
+            .lock()
+            .expect("bug: credential lock poisoned")
+            .discard(self.id, &home, &relatives)
+            .map_err(|error| {
+                Error::Rejected(format!(
+                    "retire could not delete the credential copy under {}: {error}; repeat `agentctl retire` to finish",
+                    home.display()
+                ))
+            })?;
+        if kept.is_empty() {
+            return Ok(None);
+        }
+        let kept = kept
+            .iter()
+            .map(|relative| home.join(relative).display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::warn!(agent=%self.id, %kept, "credential copy kept on retire");
+        Ok(Some(format!(
+            "agent retired, but its last credential refresh did not reach the host, so the copy was kept: {kept}"
+        )))
     }
     fn finish_credentials(&self) {
         self.credentials
@@ -1350,14 +1438,21 @@ impl AgentActor {
             self.emit(Event::PermissionAnswered { agent: self.id, id });
         }
     }
-    async fn operate(&mut self, op: Operation, reply: Reply) -> Result<()> {
+    async fn operate(&mut self, mut op: Operation, reply: Reply) -> Result<()> {
+        if self
+            .halting
+            .as_ref()
+            .is_some_and(|h| h.op == Operation::Retire)
+        {
+            op = Operation::Retire;
+        }
         if op == Operation::Stop && self.halting.is_none() && self.phase == Phase::Stopped {
             respond(reply, self.reply(op, Ok(())));
             return Ok(());
         }
         if let Err(error) = self
             .mailroom
-            .set_stopped(self.id, op == Operation::Stop)
+            .set_stopped(self.id, op != Operation::Restart)
             .await
         {
             respond(reply, self.reply(op, Err(error.into())));
@@ -1413,6 +1508,7 @@ impl AgentActor {
             let command = match op {
                 Operation::Stop => "stop",
                 Operation::Restart => "restart",
+                Operation::Retire => "retire",
             };
             let reason = format!(
                 "{command} did not settle the session: {error}; repeat `agentctl {command}` to settle it"
@@ -1429,11 +1525,14 @@ impl AgentActor {
         let result = match op {
             Operation::Stop => self.stopped(fresh).await,
             Operation::Restart => self.restart(fresh).await,
+            Operation::Retire => self.retire().await,
         };
         for reply in replies {
             let shown = match &result {
                 // A restart that could not open its session did not restart.
-                Ok(()) => phase_error(&self.phase).map_or(Ok(()), |e| Err(Error::Rejected(e))),
+                Ok(()) => phase_error(&self.phase)
+                    .or_else(|| self.kept_credentials.clone())
+                    .map_or(Ok(()), |e| Err(Error::Rejected(e))),
                 Err(error) => Err(Error::Rejected(error.to_string())),
             };
             respond(reply, self.reply(op, shown));
@@ -1446,6 +1545,16 @@ impl AgentActor {
             self.mailroom.forget_resume(self.id).await?;
         }
         self.phase(Phase::Stopped);
+        Ok(())
+    }
+    /// The stop flag is already persisted, so a failure here leaves a stopped
+    /// agent after a daemon restart, and the actor exits only once the row is retired.
+    /// The credential copies go first, so a retired agent never keeps one by accident.
+    async fn retire(&mut self) -> Result<()> {
+        self.kept_credentials = self.discard_credentials()?;
+        self.mailroom.retire(self.id).await?;
+        self.retired = true;
+        self.phase(Phase::Ended);
         Ok(())
     }
     async fn restart(&mut self, fresh: bool) -> Result<()> {
@@ -1628,6 +1737,7 @@ fn halt_reply(op: Operation, result: Result<()>, warning: Option<&str>) -> Resul
     let done = match op {
         Operation::Stop => "stopped",
         Operation::Restart => "restarted",
+        Operation::Retire => "retired",
     };
     Err(Error::Rejected(match result {
         Ok(()) => format!("agent {done}, but {warning}"),
@@ -2288,6 +2398,16 @@ mod halt_tests {
         agent: AgentHandle,
     }
     async fn harness(infinity: bool) -> Harness {
+        harness_with(infinity, CANCEL).await
+    }
+    async fn harness_with(infinity: bool, cancel_timeout: Duration) -> Harness {
+        harness_built(infinity, cancel_timeout, false).await
+    }
+    /// The credential path a sandboxed harness agent is configured with.
+    const CREDENTIAL: &str = ".agentd-retire-test/auth.json";
+    /// `sandboxed` gives the kind a credential copy under `<dir>/state` and
+    /// restores the agent stopped, so no sandbox is ever launched.
+    async fn harness_built(infinity: bool, cancel_timeout: Duration, sandboxed: bool) -> Harness {
         let dir = tempfile::tempdir().expect("dir");
         let room = Arc::new(
             Mailroom::open(dir.path().join("mail.db"), Default::default())
@@ -2299,9 +2419,17 @@ mod halt_tests {
         } else {
             KindConfig::claude("unused-fixture")
         };
-        kind.isolation = crate::sandbox::Isolation::None;
+        kind.isolation = if sandboxed {
+            crate::sandbox::Isolation::Bwrap(crate::sandbox::KindSandbox {
+                home: vec![],
+                credentials: vec![crate::sandbox::host_home().join(CREDENTIAL)],
+                egress: vec![],
+            })
+        } else {
+            crate::sandbox::Isolation::None
+        };
         kind.idle_after = None;
-        kind.cancel_timeout = CANCEL;
+        kind.cancel_timeout = cancel_timeout;
         let mut broker = Broker::new(
             room.clone(),
             vec![kind.clone()],
@@ -2312,21 +2440,30 @@ mod halt_tests {
             },
         )
         .expect("broker");
+        if sandboxed {
+            let (bound, _) = mpsc::unbounded_channel();
+            broker = broker.with_mcp(
+                Arc::new(crate::surfaces::Bindings::new(
+                    dir.path().join("mcp"),
+                    "agentd".into(),
+                    bound,
+                )),
+                state_root(&dir),
+                Default::default(),
+            );
+        }
         let script = Arc::new(Script::default());
         broker.test_adapter = Some(Arc::new(Scripted(script.clone())));
         let broker = Arc::new(broker);
-        let agent = broker
-            .spawn(AgentSpec {
-                name: AgentName::parse("a").expect("name"),
-                kind: kind.name.clone(),
-                cwd: dir.path().into(),
-                workspace: None,
-                model: None,
-                permissions: Default::default(),
-                idle_after: None,
-            })
-            .await
-            .expect("spawn");
+        let spec = spec(&kind.name, dir.path(), "a");
+        let agent = if sandboxed {
+            let id = room.register(spec.name.clone()).await.expect("register");
+            room.save_spec(id, spec.clone()).await.expect("saved spec");
+            room.set_stopped(id, true).await.expect("stop flag");
+            broker.restore(spec).await.expect("restore")
+        } else {
+            broker.spawn(spec).await.expect("spawn")
+        };
         let h = Harness {
             _dir: dir,
             room,
@@ -2334,8 +2471,32 @@ mod halt_tests {
             script,
             agent,
         };
-        h.wait(|p| *p == Phase::Idle).await;
+        let ready = if sandboxed {
+            Phase::Stopped
+        } else {
+            Phase::Idle
+        };
+        h.wait(|p| *p == ready).await;
         h
+    }
+    /// The state directory of a sandboxed harness. Credential paths are never
+    /// followed through a link, and a macOS temp directory sits behind one.
+    fn state_root(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path()
+            .canonicalize()
+            .expect("canonical temp directory")
+            .join("state")
+    }
+    fn spec(kind: &str, cwd: &std::path::Path, name: &str) -> AgentSpec {
+        AgentSpec {
+            name: AgentName::parse(name).expect("name"),
+            kind: kind.into(),
+            cwd: cwd.into(),
+            workspace: None,
+            model: None,
+            permissions: Default::default(),
+            idle_after: None,
+        }
     }
     impl Harness {
         async fn wait(&self, matches: impl Fn(&Phase) -> bool) {
@@ -2372,9 +2533,33 @@ mod halt_tests {
             id
         }
         async fn operate(&self, op: Operation) -> Result<()> {
-            tokio::time::timeout(CANCEL * 20, self.broker.operate(self.agent.id, op))
-                .await
-                .expect("operator command must finish within the halt deadline")
+            let id = self.agent.id;
+            tokio::time::timeout(CANCEL * 20, async {
+                match op {
+                    Operation::Retire => self.broker.retire(id).await,
+                    op => self.broker.operate(id, op).await,
+                }
+            })
+            .await
+            .expect("operator command must finish within the halt deadline")
+        }
+        /// The actor is gone, the broker forgot it and its mail is dead.
+        async fn assert_retired(&self, mail: Option<MessageId>, case: &str) {
+            assert!(self.agent.commands.is_closed(), "{case}: actor exited");
+            assert!(
+                self.broker.handle(self.agent.id).await.is_none(),
+                "{case}: handle removed"
+            );
+            assert!(
+                self.room.retired(self.agent.id).await.expect("retired"),
+                "{case}"
+            );
+            if let Some(mail) = mail {
+                assert!(
+                    matches!(self.state(mail).await, DeliveryState::Dead { .. }),
+                    "{case}: inbound mail is dead"
+                );
+            }
         }
         /// Every command sent before this one has been handled.
         async fn barrier(&self) {
@@ -2423,7 +2608,7 @@ mod halt_tests {
 
     #[tokio::test]
     async fn halt_deadline_ends_a_turn_whose_cancel_is_never_acknowledged() {
-        for op in [Operation::Stop, Operation::Restart] {
+        for op in [Operation::Stop, Operation::Restart, Operation::Retire] {
             let h = harness(false).await;
             let mail = h.busy().await;
             h.operate(op).await.expect("operator command");
@@ -2442,6 +2627,10 @@ mod halt_tests {
                         "restart of a busy agent resumes its session"
                     );
                 }
+                Operation::Retire => {
+                    h.assert_retired(Some(mail), "retire").await;
+                    assert_eq!(h.count(|s| &s.opens), 1);
+                }
             }
             h.broker.shutdown().await.expect("shutdown");
         }
@@ -2449,7 +2638,7 @@ mod halt_tests {
 
     #[tokio::test]
     async fn mail_sent_during_a_halt_is_not_offered_to_the_halting_session() {
-        for op in [Operation::Stop, Operation::Restart] {
+        for op in [Operation::Stop, Operation::Restart, Operation::Retire] {
             let h = harness(false).await;
             h.script.accepts_busy_mail.store(true, SeqCst);
             h.busy().await;
@@ -2471,7 +2660,7 @@ mod halt_tests {
     #[tokio::test]
     async fn a_halt_that_cannot_settle_says_so_and_a_repeat_repairs_it() {
         const REFUSE: &str = "CREATE TEMP TRIGGER refuse_settle BEFORE UPDATE OF state ON deliveries WHEN OLD.state='offered' BEGIN SELECT RAISE(ABORT,'injected settlement failure'); END;";
-        for op in [Operation::Stop, Operation::Restart] {
+        for op in [Operation::Stop, Operation::Restart, Operation::Retire] {
             for suspend_fails in [true, false] {
                 let case = format!("{op:?}, suspend fails: {suspend_fails}");
                 let h = harness(false).await;
@@ -2491,6 +2680,10 @@ mod halt_tests {
                 assert!(
                     matches!(h.state(mail).await, DeliveryState::Offered { .. }),
                     "{case}"
+                );
+                assert!(
+                    !h.room.retired(h.agent.id).await.expect("retired"),
+                    "{case}: an unsettled retire leaves a normal agent"
                 );
                 if !suspend_fails {
                     h.sql("DROP TRIGGER temp.refuse_settle").await;
@@ -2512,6 +2705,7 @@ mod halt_tests {
                             "{case}"
                         );
                     }
+                    Operation::Retire => h.assert_retired(Some(mail), &case).await,
                 }
                 h.broker.shutdown().await.expect("shutdown");
             }
@@ -2585,12 +2779,15 @@ mod halt_tests {
 
     #[tokio::test]
     async fn a_second_command_replaces_a_pending_halt_and_both_callers_hear() {
-        use Operation::{Restart, Stop};
+        use Operation::{Restart, Retire, Stop};
         for (first, second) in [
             (Stop, Stop),
             (Stop, Restart),
             (Restart, Stop),
             (Restart, Restart),
+            (Stop, Retire),
+            (Retire, Stop),
+            (Retire, Restart),
         ] {
             let case = format!("{first:?} then {second:?}");
             let h = harness(false).await;
@@ -2605,12 +2802,17 @@ mod halt_tests {
             a.expect("first caller");
             b.expect("second caller");
             assert_eq!(h.count(|s| &s.cancels), 1, "{case}");
-            match second {
-                Stop => {
+            match (first, second) {
+                (Retire, _) | (_, Retire) => {
+                    h.agent.commands.closed().await;
+                    h.assert_retired(None, &case).await;
+                    assert_eq!(h.count(|s| &s.opens), 1, "{case}");
+                }
+                (_, Stop) => {
                     assert_eq!(h.agent.phase(), Phase::Stopped, "{case}");
                     assert_eq!(h.count(|s| &s.opens), 1, "{case}");
                 }
-                Restart => {
+                (_, Restart) => {
                     assert_eq!(h.count(|s| &s.opens), 2, "{case}");
                     assert!(!h.room.stopped(h.agent.id).await.expect("flag"), "{case}");
                 }
@@ -2759,6 +2961,229 @@ mod halt_tests {
             "the rejected token is not resumed again"
         );
         assert!(!matches!(h.agent.phase(), Phase::NeedsRecovery { .. }));
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn retire_works_from_stopped_failed_and_needs_recovery() {
+        for from in ["stopped", "failed", "needs-recovery"] {
+            let h = harness(false).await;
+            let mut events = h.broker.events();
+            match from {
+                "stopped" => h.operate(Operation::Stop).await.expect("stop"),
+                "failed" => {
+                    h.sql("CREATE TEMP TRIGGER refuse_offer BEFORE UPDATE OF state ON deliveries WHEN NEW.state='offered' BEGIN SELECT RAISE(ABORT,'injected storage failure'); END;").await;
+                    h.send("kills the actor").await;
+                    tokio::time::timeout(Duration::from_secs(5), h.agent.commands.closed())
+                        .await
+                        .expect("actor dies");
+                    assert!(matches!(h.agent.phase(), Phase::Failed { .. }));
+                    h.sql("DROP TRIGGER temp.refuse_offer").await;
+                }
+                _ => {
+                    h.inject(SessionEvent::ResumeFailed {
+                        reason: "injected rejected token".into(),
+                    });
+                    h.wait(|p| matches!(p, Phase::NeedsRecovery { .. })).await;
+                }
+            }
+            let queued = h.send("never delivered").await;
+            h.operate(Operation::Retire)
+                .await
+                .unwrap_or_else(|e| panic!("retire from {from}: {e}"));
+            let current = h.broker.handle(h.agent.id).await;
+            assert!(
+                current.is_none(),
+                "{from}: a respawned actor is removed too"
+            );
+            h.assert_retired(Some(queued), from).await;
+            assert_eq!(h.count(|s| &s.opens), 1, "{from}: retire opens nothing");
+            let mut retired = false;
+            while let Ok(event) = events.try_recv() {
+                retired |= matches!(event, Event::Retired { agent } if agent == h.agent.id);
+            }
+            assert!(retired, "{from}: the feed hears the removal");
+            h.broker.shutdown().await.expect("shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn retire_deletes_the_credential_copy_before_it_commits() {
+        let h = harness_built(false, CANCEL, true).await;
+        let state = state_root(&h._dir);
+        let home = crate::sandbox::AgentPaths::new(&state, h.agent.id).home;
+        let copy = home.join(CREDENTIAL);
+        let cli = copy.parent().expect("CLI dir");
+        let outside = state.with_file_name("outside");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir(&outside).expect("outside");
+        std::fs::write(outside.join("auth.json"), b"{}").expect("target");
+        // The agent could have linked its CLI directory elsewhere. Nothing is
+        // deleted through a link, so the retire fails before it commits.
+        std::os::unix::fs::symlink(&outside, cli).expect("link");
+        let error = h
+            .operate(Operation::Retire)
+            .await
+            .expect_err("a removal that is refused");
+        assert!(
+            error.to_string().contains("repeat `agentctl retire`"),
+            "{error}"
+        );
+        assert!(
+            !h.room.retired(h.agent.id).await.expect("retired"),
+            "a failed removal leaves the agent unretired"
+        );
+        assert!(outside.join("auth.json").exists(), "the target survives");
+        std::fs::remove_file(cli).expect("unlink");
+        std::fs::create_dir(cli).expect("CLI dir");
+        std::fs::write(&copy, b"{\"token\":1}").expect("copy");
+        h.operate(Operation::Retire).await.expect("repeated retire");
+        assert!(!copy.exists(), "the copy is gone");
+        h.assert_retired(None, "credentials").await;
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn retire_keeps_a_credential_refresh_the_host_never_received() {
+        let h = harness_built(false, CANCEL, true).await;
+        let state = state_root(&h._dir);
+        let home = crate::sandbox::AgentPaths::new(&state, h.agent.id).home;
+        let copy = home.join(CREDENTIAL);
+        let human = state.with_file_name("human");
+        let host = human.join(CREDENTIAL);
+        let cli = host.parent().expect("CLI dir");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(cli).expect("host CLI dir");
+        std::fs::write(&host, b"{\"token\":0}").expect("host credential");
+        h.broker
+            .credentials
+            .lock()
+            .expect("credential lock")
+            .launch(
+                h.agent.id,
+                "claude",
+                &[(host.clone(), CREDENTIAL.into())],
+                &home,
+            )
+            .expect("launch");
+        std::fs::write(&copy, b"{\"token\":1}").expect("refresh");
+        let moved = human.join("moved");
+        std::fs::rename(cli, &moved).expect("unavailable host");
+        let error = h
+            .operate(Operation::Retire)
+            .await
+            .expect_err("a retire that kept a copy says so");
+        assert!(error.to_string().contains("agent retired, but "), "{error}");
+        assert!(
+            error.to_string().contains(&copy.display().to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&copy).expect("kept copy"),
+            b"{\"token\":1}",
+            "the only refreshed credential survives"
+        );
+        h.assert_retired(None, "kept credential").await;
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_retired_agent_stays_retired_and_its_name_is_free() {
+        let h = harness(false).await;
+        h.operate(Operation::Retire).await.expect("retire");
+        let again = h
+            .operate(Operation::Retire)
+            .await
+            .expect_err("second retire");
+        assert!(again.to_string().contains("is retired"), "{again}");
+        let restart = h.operate(Operation::Restart).await.expect_err("restart");
+        assert!(restart.to_string().contains("is retired"), "{restart}");
+        let unknown = h
+            .broker
+            .retire(AgentId::new())
+            .await
+            .expect_err("unknown agent");
+        assert!(unknown.to_string().contains("not found"), "{unknown}");
+        let error = h
+            .room
+            .resolve(Recipient::Id(h.agent.id))
+            .await
+            .expect_err("mail to a retired agent");
+        assert!(error.to_string().contains("is retired"), "{error}");
+        let next = h
+            .broker
+            .spawn(spec("claude", h._dir.path(), "a"))
+            .await
+            .expect("the name is free");
+        assert_ne!(next.id, h.agent.id);
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn retire_reports_infinity_work_that_may_still_be_running() {
+        let h = harness(true).await;
+        h.script.thread_busy.store(true, SeqCst);
+        let result = h.operate(Operation::Retire).await;
+        assert_detached(result, "agent retired, but ", "retire");
+        assert_eq!(h.count(|s| &s.cancels), 1, "retire interrupts the thread");
+        h.assert_retired(None, "infinity").await;
+        h.broker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_retire_waiting_on_a_slow_cancel_does_not_block_sends_or_lookups() {
+        let h = harness_with(false, Duration::from_secs(30)).await;
+        let session = h
+            .script
+            .latest
+            .lock()
+            .expect("bug: script lock")
+            .clone()
+            .expect("a's session");
+        let other = h
+            .broker
+            .spawn(spec("claude", h._dir.path(), "b"))
+            .await
+            .expect("spawn b");
+        h.busy().await;
+        let retire = h.broker.retire(h.agent.id);
+        tokio::pin!(retire);
+        queue(&h, retire.as_mut()).await;
+        let unblocked = async {
+            for to in [other.id, h.agent.id] {
+                h.broker
+                    .send(NewMessage {
+                        from: Sender::Human,
+                        to,
+                        body: Body::new("during retire").expect("body"),
+                        reply_to: None,
+                        client_key: ClientKey(ulid::Ulid::new().to_string()),
+                        act: crate::swarm::Act::Inform,
+                        task: None,
+                    })
+                    .await
+                    .expect("send");
+            }
+            assert!(h.broker.handle(other.id).await.is_some());
+            assert!(h.broker.handle(h.agent.id).await.is_some());
+        };
+        tokio::select! {
+            biased;
+            result = retire.as_mut() => panic!("retire finished before its cancel: {result:?}"),
+            done = tokio::time::timeout(Duration::from_secs(5), unblocked) => {
+                done.expect("sends and lookups must not wait for the retire");
+            }
+        }
+        session
+            .send(SessionEvent::TurnEnded {
+                outcome: TurnOutcome::Cancelled,
+            })
+            .expect("a's session is listening");
+        tokio::time::timeout(Duration::from_secs(5), retire)
+            .await
+            .expect("retire settles once the turn ends")
+            .expect("retire");
+        h.assert_retired(None, "slow cancel").await;
         h.broker.shutdown().await.expect("shutdown");
     }
 

@@ -1750,7 +1750,7 @@ async fn a_report_to_a_retired_requester_tells_the_assignee_what_to_do() {
     let mut d = Daemon::new(None).await;
     d.spawn("b", "codex", Some("start")).await;
     d.wait_wire("b", |v| !prompts(v).is_empty()).await;
-    // No surface retires an agent yet, so the test does it in the database
+    // The requester was never spawned, so the test retires it in the database
     // while the daemon is down.
     d.stop(nix::sys::signal::Signal::SIGTERM).await;
     let mail = Mailroom::open(d.root.path().join("state/mail.db"), Default::default())
@@ -1881,6 +1881,197 @@ async fn ls_and_the_feed_show_why_a_crashed_agent_crashed() {
         row["error"], frame["error"],
         "ls shows the same reason as the feed: {row}"
     );
+}
+
+impl Daemon {
+    async fn ctl_error(&self, args: &[&str]) -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("--socket")
+            .arg(self.socket())
+            .args(args)
+            .output()
+            .await
+            .expect("agentctl");
+        assert!(!output.status.success(), "agentctl {args:?} must fail");
+        String::from_utf8_lossy(&output.stderr).trim().to_owned()
+    }
+    fn delivery_state(&self, id: &str) -> String {
+        let snapshot = tempfile::tempdir().expect("database snapshot");
+        for file in ["mail.db", "mail.db-wal"] {
+            std::fs::copy(
+                self.root.path().join("state").join(file),
+                snapshot.path().join(file),
+            )
+            .expect("copy database");
+        }
+        rusqlite::Connection::open(snapshot.path().join("mail.db"))
+            .expect("database snapshot")
+            .query_row(
+                "SELECT state FROM deliveries WHERE message_id=?",
+                [json!(id).to_string()],
+                |r| r.get(0),
+            )
+            .expect("delivery state")
+    }
+    fn watch(
+        &self,
+    ) -> (
+        Child,
+        tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    ) {
+        let mut watch = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("--socket")
+            .arg(self.socket())
+            .arg("watch")
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("watch");
+        let lines = BufReader::new(watch.stdout.take().expect("watch stdout")).lines();
+        (watch, lines)
+    }
+}
+
+/// The first process the fake adapter logged in `root`.
+fn adapter_pid(wire: &[Value]) -> i32 {
+    wire.iter()
+        .find_map(|v| v["pid"].as_i64())
+        .expect("adapter pid") as i32
+}
+
+async fn wait_exited(pid: i32) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => return,
+                Ok(stat) if stat.rsplit(')').next().is_some_and(|s| s.starts_with(" Z")) => {
+                    return;
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("the adapter process exits");
+}
+
+#[tokio::test]
+async fn agentctl_retire_removes_an_idle_agent_for_good() {
+    let mut d = Daemon::new(None).await;
+    d.spawn("b", "codex", Some("start")).await;
+    let wire = d.wait_wire("b", |v| !prompts(v).is_empty()).await;
+    let pid = adapter_pid(&wire);
+    let ls = d.ctl(&["ls"]).await;
+    let old = ls[0]["id"].as_str().expect("id").to_owned();
+    let (mut watch, mut events) = d.watch();
+    assert_eq!(d.ctl(&["retire", "@b"]).await, json!({"retired":"@b"}));
+    assert_eq!(d.ctl(&["ls"]).await, json!([]));
+    wait_exited(pid).await;
+    let frame = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let line = events
+                .next_line()
+                .await
+                .expect("watch line")
+                .expect("frame");
+            let frame: Value = serde_json::from_str(&line).expect("frame JSON");
+            if frame["event"] == "agent_retired" {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("the feed reports the removal");
+    assert_eq!(frame, json!({"event":"agent_retired","agent":old}));
+    watch.kill().await.expect("stop watch");
+    watch.wait().await.expect("reap watch");
+    let (mut watch, mut events) = d.watch();
+    let line = events
+        .next_line()
+        .await
+        .expect("watch line")
+        .expect("snapshot");
+    let snapshot: Value = serde_json::from_str(&line).expect("snapshot JSON");
+    assert_eq!(snapshot["event"], "snapshot");
+    assert_eq!(snapshot["agents"], json!([]), "{snapshot}");
+    watch.kill().await.expect("stop watch");
+    watch.wait().await.expect("reap watch");
+
+    assert_eq!(
+        d.ctl_error(&["retire", "@b"]).await,
+        "agentctl: not found: b"
+    );
+    let bare = old.strip_prefix("agent:").expect("agent id");
+    assert_eq!(
+        d.ctl_error(&["retire", &old]).await,
+        format!("agentctl: rejected: agent {bare} is retired")
+    );
+    assert_eq!(
+        d.ctl_error(&["send", &old, "hello"]).await,
+        format!("agentctl: rejected: agent {bare} is retired")
+    );
+
+    d.spawn("b", "codex", None).await;
+    let ls = d.ctl(&["ls"]).await;
+    let new = ls[0]["id"].as_str().expect("id").to_owned();
+    assert_ne!(new, old, "the name is reused by a new agent");
+    d.stop(nix::sys::signal::Signal::SIGTERM).await;
+    d.child = Daemon::start(&d.root);
+    d.ready().await;
+    let ls = d.ctl(&["ls"]).await;
+    assert_eq!(ls.as_array().expect("rows").len(), 1, "{ls}");
+    assert_eq!(
+        ls[0]["id"], new,
+        "a restart does not restore the retired agent"
+    );
+    d.stop(nix::sys::signal::Signal::SIGTERM).await;
+}
+
+#[tokio::test]
+async fn agentctl_retire_mid_turn_kills_its_inbound_mail_and_keeps_what_it_sent() {
+    let mut d = Daemon::new(None).await;
+    d.spawn("b", "codex", None).await;
+    assert_eq!(d.ctl(&["stop", "@b"]).await, json!({"stopped":"@b"}));
+    d.spawn("a", "claude", Some("mcp-send hold")).await;
+    let wire = d.wait_wire("a", |v| !prompts(v).is_empty()).await;
+    let pid = adapter_pid(&wire);
+    for _ in 0..1000 {
+        if d.root.path().join("a/mcp-result.json").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let status: Value = serde_json::from_str(
+        &std::fs::read_to_string(d.root.path().join("a/mcp-result.json")).expect("MCP result"),
+    )
+    .expect("MCP result JSON");
+    assert_eq!(status["result"]["isError"], false, "{status}");
+    let status = d.ctl(&["send", "@a", "behind the turn"]).await;
+    let queued = status
+        .as_str()
+        .expect("status")
+        .split(' ')
+        .nth(1)
+        .expect("message id");
+    assert_eq!(d.delivery_state(queued), "queued", "{status}");
+
+    assert_eq!(d.ctl(&["retire", "@a"]).await, json!({"retired":"@a"}));
+    d.wait_wire("a", |v| v.iter().any(|m| m["method"] == "session/cancel"))
+        .await;
+    wait_exited(pid).await;
+    assert_eq!(d.delivery_state(queued), "dead");
+    let names = d.ctl(&["ls"]).await;
+    assert_eq!(names.as_array().expect("rows").len(), 1, "{names}");
+    assert_eq!(names[0]["name"], "@b");
+
+    assert_eq!(d.ctl(&["restart", "@b"]).await, json!({"restarted":"@b"}));
+    d.wait_wire("b", |v| {
+        prompts(v)
+            .iter()
+            .any(|p| p.to_string().contains("peer payload"))
+    })
+    .await;
+    d.stop(nix::sys::signal::Signal::SIGTERM).await;
 }
 
 #[tokio::test]
